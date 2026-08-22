@@ -27,10 +27,13 @@ export const SIDEBAR_ASK_TOKEN = 'pi-ask';
 /**
  * D93：构造 report_metadata 的 pi-todo token 补丁。
  * 有 title → 值 = title（侧边栏可排 `$pi-todo`）；无 todo → 空串（herdr patch 语义删除键，不留旧摘要）。
- * stale（M13b 清理头键）合并进同一次上报。
+ *
+ * D96 修正：**不再合并 stale**——stale（16 个 null）是一次性清理（reportMetadata 单独发），
+ * 合并会使总数 17 > herdr tokens maxProperties=16 → 整个请求被拒 → title/tokens 全丢
+ * （用户实机：pane title 消失 + 侧边栏 token 消失，D93 回归根因）。
  */
-export function sidebarTodoTokens(title: string | null, stale?: Record<string, string | null>): Record<string, string> {
-  return { ...(stale ?? {}), [SIDEBAR_TODO_TOKEN]: title ?? '' };
+export function sidebarTodoTokens(title: string | null): Record<string, string> {
+  return { [SIDEBAR_TODO_TOKEN]: title ?? '' };
 }
 
 const STALE_CHUNK_COUNT = 15;

@@ -83,15 +83,18 @@ test('staleTokenClearance: 头 + 15 分块全部 null（清 M13b 残留）', () 
   assert.equal(BLOCKED_LABEL_KEY, 'blocked');
 });
 
-test('sidebarTodoTokens（D93）：有 title → 键=pi-todo 值=title；无 → 空串清键；stale 合并', () => {
+test('sidebarTodoTokens（D93/D96）：有 title → 键=pi-todo 值=title；无 → 空串清键；不合并 stale', () => {
   assert.equal(SIDEBAR_TODO_TOKEN, 'pi-todo');
   const withTodo = sidebarTodoTokens('▶1 ○0 ■0 ✓0 · a');
   assert.equal(withTodo['pi-todo'], '▶1 ○0 ■0 ✓0 · a');
   assert.equal(Object.keys(withTodo).length, 1);
   // 无 todo：空串（herdr patch 语义 = 删除键，不留旧摘要）
   assert.equal(sidebarTodoTokens(null)['pi-todo'], '');
-  // stale 清理头合并进同一次上报（M13b 一次性清干净）
-  const merged = sidebarTodoTokens('t', { 'pi-herdr': null });
-  assert.equal(merged['pi-herdr'], null as unknown as string);
-  assert.equal(merged['pi-todo'], 't');
+  // D96：stale 不再合并进日常上报（stale 16 + pi-todo 1 = 17 > herdr tokens max=16
+  // → 整个请求被拒 → title/tokens 全丢。stale 由 reportMetadata 单独批次发送）
+  const daily = sidebarTodoTokens('t');
+  assert.ok(!('pi-herdr' in daily), '日常上报只带 pi-todo，不掺 stale');
+  assert.deepEqual(Object.keys(daily), ['pi-todo']);
+  // stale 清理本身就是 16 个（单独批次的独立函数）
+  assert.equal(Object.keys(staleTokenClearance()).length, 16);
 });

@@ -307,7 +307,17 @@ export class HerdrClient implements HerdrClientLike {
       void meta.session;
       const title = formatPaneTitle(meta.items, null, { progressSuffix: meta.progressSuffix });
       const blocked = formatBlockedLabel(meta.items);
-      const staleTokens = this.clearedStaleTokens ? undefined : staleTokenClearance();
+      // D96：stale 清理与日常上报分离——stale(16) + pi-todo(1) = 17 > herdr tokens max=16
+      // → 整个请求被拒 → title/tokens 全丢（D93 回归根因）。stale 单独批次，成功后才置位。
+      if (!this.clearedStaleTokens) {
+        await this.request('pane.report_metadata', {
+          pane_id: this.env.paneId,
+          source: REPORT_AGENT_SOURCE,
+          tokens: staleTokenClearance(),
+          ttl_ms: 86400000,
+        });
+        this.clearedStaleTokens = true;
+      }
       await this.request('pane.report_metadata', {
         pane_id: this.env.paneId,
         source: REPORT_AGENT_SOURCE,
@@ -315,11 +325,10 @@ export class HerdrClient implements HerdrClientLike {
         ...(blocked
           ? { state_labels: { [BLOCKED_LABEL_KEY]: blocked } }
           : { clear_state_labels: true }),
-        // D93：todo 摘要同源进 custom token（空串 = 清键，无 todo 不留旧摘要）
-        tokens: sidebarTodoTokens(title, staleTokens),
+        // D93：todo 摘要进 custom token（空串 = 清键，无 todo 不留旧摘要）
+        tokens: sidebarTodoTokens(title),
         ttl_ms: 86400000,
       });
-      this.clearedStaleTokens = true;
     } catch {
       /* 静默：标题投影尽力而为，绝不影响 pi 主流程 */
     }

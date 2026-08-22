@@ -48,7 +48,7 @@ const TOOLS = ['subagent', 'resume_subagent', 'list_agents', 'send_message', 'in
 
 async function mount(pi: ReturnType<typeof fakePi>, ledger?: DisposeLedger) {
   const surface = new PiSurface(pi as unknown as object, ledger);
-  const slots = { applyReplySession: null, reconcileOnReply: null };
+  const slots = { applyReplySession: null, reconcileOnReply: null, listRunningSubs: null };
   const root = new Context();
   const deps = {
     client: fakeClient(),
@@ -78,9 +78,12 @@ test('core/subagent：五工具注册 + 生命周期钩子 + 槽回填', async (
   assert.ok((pi.listeners.get('turn_start') ?? []).length >= 1, 'GC turn_start 钩子在');
   assert.equal(typeof slots.applyReplySession, 'function', 'O6 槽回填');
   assert.equal(typeof slots.reconcileOnReply, 'function', 'M17 槽回填');
+  assert.equal(typeof slots.listRunningSubs, 'function', 'D96 槽回填');
   // 槽语义：未知 pane no-op / 对账走 reconcileOnSettlement
   slots.applyReplySession?.('unknown', null);
   assert.deepEqual(slots.reconcileOnReply?.('unknown') ?? [], []);
+  // D96：无 subagent 时 listRunningSubs 空
+  assert.deepEqual(slots.listRunningSubs?.() ?? [], []);
 
   const r = await pi.tools.get('list_agents')?.execute?.() as { content: Array<{ text: string }> };
   assert.match(r.content[0].text, /No background subagents/);

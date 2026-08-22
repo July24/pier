@@ -409,6 +409,14 @@ export default async function (pi: ExtensionAPI) {
   pi.on('agent_settled', async () => {
     agentActive = false;
     reportAgent('idle', null);
+    // D96：master settled（run 结束/想总结）时仍有后台 subagent running → 注入提醒。
+    // worker 侧 subagentSlots.listRunningSubs 为 null（不注入）。
+    const running = subagentSlots.listRunningSubs?.() ?? [];
+    if (running.length > 0 && !isSubagent) {
+      const brief = running.map((s) => `${s.paneId} (${s.description})`).join('、');
+      const notice = `注意：仍有 ${running.length} 个后台 subagent 在运行：${brief}。若你的任务依赖它们，请等待其结算（list_agents 查看状态）；若不等待，请说明放弃原因。`;
+      void sendUserMessageIn(notice);
+    }
   });
 
   // v1.3 M8：blocked 自上报（D29 豁免依赖 blocked 可见）。
@@ -494,7 +502,9 @@ export default async function (pi: ExtensionAPI) {
   const subagentSlots: {
     applyReplySession: ((paneId: string, sessionFile: string | null) => void) | null;
     reconcileOnReply: ((paneId: string) => string[]) | null;
-  } = { applyReplySession: null, reconcileOnReply: null };
+    /** D96：处于 running 状态的后台 subagent 描述列表（master settled 时检查用）。 */
+    listRunningSubs: (() => Array<{ paneId: string; description: string }>) | null;
+  } = { applyReplySession: null, reconcileOnReply: null, listRunningSubs: null };
   /** pipe server 盒（common 持有创建/关闭；core/subagent 的 root effect 也经盒关）。 */
   const pipeServerBox: { current: ReturnType<typeof startPipeServer> | null } = { current: null };
   /** 最近一次机器请求（结算时按它决定是否 push、push 给谁）。 */
@@ -502,12 +512,14 @@ export default async function (pi: ExtensionAPI) {
   /** 缓存的扩展上下文（interrupt 用 ctx.abort()，D48）。 */
   let latestCtx: { abort?: () => void } | null = null;
 
+  // D96：triggerTurn:true——followUp 在 idle 时立即触发新 turn（否则通知只排队不唤醒，
+  // 用户实机：subagent 结算后 idle master 不醒来处理，任务丢失；extensions.md:1410）。
   const sendUserMessageIn = (content: string): Promise<void> =>
-    (pi as { sendUserMessage?: (content: string, opts?: { deliverAs?: string }) => Promise<void> })
-      .sendUserMessage?.(content, { deliverAs: 'followUp' }) ?? Promise.resolve();
+    (pi as { sendUserMessage?: (content: string, opts?: { deliverAs?: string; triggerTurn?: boolean }) => Promise<void> })
+      .sendUserMessage?.(content, { deliverAs: 'followUp', triggerTurn: true }) ?? Promise.resolve();
   const sendUserMessageAs = (content: string, mode: 'steer' | 'followUp'): Promise<void> =>
-    (pi as { sendUserMessage?: (content: string, opts?: { deliverAs?: string }) => Promise<void> })
-      .sendUserMessage?.(content, { deliverAs: mode }) ?? Promise.resolve();
+    (pi as { sendUserMessage?: (content: string, opts?: { deliverAs?: string; triggerTurn?: boolean }) => Promise<void> })
+      .sendUserMessage?.(content, { deliverAs: mode, triggerTurn: true }) ?? Promise.resolve();
 
   /* ── D92：结算通知缓冲（followup 堆积修复）─────────────────────────────
    * 旧路径 pi.sendUserMessage(followUp) 的 pi 语义 =「agent 没有更多 tool call

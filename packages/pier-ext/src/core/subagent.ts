@@ -45,6 +45,8 @@ export interface SubagentEnv {
 export interface SubagentSlots {
   applyReplySession: ((paneId: string, sessionFile: string | null) => void) | null;
   reconcileOnReply: ((paneId: string) => string[]) | null;
+  /** D96：running 后台 subagent 列表（master settled 时检查用；worker 侧为 null）。 */
+  listRunningSubs: (() => Array<{ paneId: string; description: string }>) | null;
 }
 
 export interface SubagentDeps {
@@ -141,6 +143,12 @@ export default function subagentPlugin(ctx: Context): void {
   slots.reconcileOnReply = (paneId) => {
     const entry = subs.get(paneId);
     return entry ? d.reconcileOnSettlement(entry.description, 'settled') : [];
+  };
+  // D96：master settled 时检查还有哪些后台 subagent 在 running（防过早总结）
+  slots.listRunningSubs = () => {
+    return [...subs.values()]
+      .filter((s) => s.background && s.status === 'running')
+      .map((s) => ({ paneId: s.paneId, description: s.description }));
   };
 
   function rebuildSubs(eventCtx: unknown): void {
