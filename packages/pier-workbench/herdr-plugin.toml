@@ -1,0 +1,63 @@
+# pier-workbench：引导主 tab + blocked 通知 + M23 焦点热力布局。
+#
+# ⚠️ herdr 插件 v1 无 SDK/无运行时 UI："整个 herdr CLI 即插件 API"。
+# 本清单只声明入口，逻辑在 scripts/ 下用 Node 实现。
+
+id = "pier.workbench"
+name = "pier-workbench"
+version = "0.1.0"
+description = "pier × herdr 工作台融合：主 tab 引导、blocked 通知、焦点热力布局"
+min_herdr_version = "0.8.0"
+platforms = ["linux", "macos", "windows"]
+
+# ── 事件钩子：子代理 blocked → 通知（人类闸门；M4）─────────────────
+# 同上的路径规范化处理。
+[[events]]
+on = "pane.agent_status_changed"
+command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/notify-agent-state.mjs')"]
+
+# ── 事件钩子：workspace 打开 → 自动引导主 tab（v1.3 M7，D28）────────
+# [[startup]] 只在会话恢复+socket 就绪跑一次，不是 per-workspace 触发（实测）；
+# 新 workspace 的正解是 workspace.created / worktree.opened 事件钩子。
+# bootstrap.mjs 幂等：workspace 已有 pi 主控 pane（agent=pi 或 title 含 ⏳）则跳过。
+[[events]]
+on = "workspace.created"
+command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/bootstrap.mjs')"]
+
+[[events]]
+on = "worktree.opened"
+command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/bootstrap.mjs')"]
+
+# ── M23 档 1：人类聚焦后把焦点 pane 放大为主窗（D67）────────────────
+# pane.created 只记账龄，供 F1 无 cause 时的 3s 白名单。
+[[events]]
+on = "pane.created"
+command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/heat-reflow.mjs')"]
+
+[[events]]
+on = "pane.focused"
+command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/heat-reflow.mjs')"]
+
+# ── M23 档 2（D90-F 语义桥）：agent 状态变化 → 从窗分级重排 ──────────
+# blocked 出现/消失即时升/降位（事件驱动，非轮询；D3 合规）。
+[[events]]
+on = "pane.agent_status_changed"
+command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/heat-reflow.mjs')"]
+
+# ── D95（V25）：pane 回收（subagent 完成被 GC）→ 数量重排 ────────────
+# pane.closed 事件载荷只有 {pane_id, workspace_id}（无 tab_id）——归属 tab 由
+# onCreated 记录的 pane→tab 映射反查（reflow.ts onCountChanged）。
+[[events]]
+on = "pane.closed"
+command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/heat-reflow.mjs')"]
+
+# ── 启动钩子：会话恢复后重放上次引导的作战室布局（v1.3 M7，D28）────
+# one-shot：读 HERDR_PLUGIN_STATE_DIR/boot.jsonl，对缺失的 main tab/pane 重建。
+[[startup]]
+command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/restore-layout.mjs')"]
+
+# ── 链接处理器：识别 pi: 会话链接跳转到对应 pane（M3，先留骨架）────────
+#
+# [[link_handlers]]
+# pattern = "pi:(?<session>[a-zA-Z0-9_\\-]+)"
+# action = "pier.workbench.focus-session"

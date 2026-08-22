@@ -1,0 +1,1244 @@
+/**
+ * 档1 core/subagent（subagent 族迁 loader entry —— D78 挂载树 / D81 融合核心）。
+ *
+ * 承接（master-only）：五工具（subagent/resume_subagent/list_agents/send_message/
+ * interrupt_agent）+ 注册表（subs/pollers/持久化/重建）+ 扩展管道客户端（prompt/
+ * follow_up/interrupt 注入）+ poller（结算观察/通知去重）+ 历史（history-store
+ * 代际）+ 复活（revive）+ 任务 tab 放置（D25/D26）+ GC（tab 级 + pane 级 + ticker）。
+ *
+ * 依赖全经 `pi-herdr.subagent-deps`（client/env/extPath/sessionRoot/回调槽…）：
+ * common 段的 pipe 消费者（applyReplySession/reconcileOnReply）经 slots 反向暴露。
+ * reconcileOnSettlement（M17 对账）与 withReconcileNotes/claimSettleNotice 留在
+ * index session 状态层，本插件回调消费（③ 的显式留守决策）。
+ */
+import { Context } from '@deepseek-ai/cordis';
+import { Type } from 'typebox';
+import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { homedir } from 'node:os';
+import { join, dirname } from 'node:path';
+import type { PiSurface } from '../pi-surface.ts';
+import type { HerdrClientLike, HerdrAgentState } from '../herdr-client.ts';
+import type { TodosService } from '../todos-service.ts';
+import { mountSubagentScope } from '../subagent-scope.ts';
+import { Semaphore, SUBS_CUSTOM_TYPE, classifyWorktreeZone, foldSubsRegistry, formatSubagentResult, isPathUnder, makeProgressUpdate, makeRegistry, planTabPlacement, psQuote, tabNameForTask, type SubEntry, type SubagentSpec, type TabPlacementPlan, type WorktreeZone } from '../subagent-core.ts';
+import { hasAssistantAfter, hasPendingToolCall, lastAssistantText, listSessionFiles, readSessionFile, sessionFileById } from '../session-tail.ts';
+import { appendHistory, applyReportedSessionFile, historyFilePath, latestGeneration, normalizeEntryKind, readHistory, type HistoryEntry } from '../history-store.ts';
+import { execFile } from 'node:child_process';
+import { stat as statCb } from 'node:fs';
+import { resolve as pathResolve } from 'node:path';
+import { promisify } from 'node:util';
+const statAsync = promisify(statCb);
+import { pingUntilReady, pipeNameFor, pipeRequest } from '../pipe-channel.ts';
+import { shouldClosePane, shouldCloseTaskTab } from '../gc-core.ts';
+import { composeForRole } from '../manifest-compose.ts';
+import { formatSettlementNotice } from '../vocab.ts';
+import { parseShapeTree, pickGridSplit } from './grid-shape.ts';
+
+export interface SubagentEnv {
+  paneId: string;
+  tabId: string;
+  workspaceId: string;
+}
+
+/** common 段 pipe 消费者槽（插件挂载时回填）。 */
+export interface SubagentSlots {
+  applyReplySession: ((paneId: string, sessionFile: string | null) => void) | null;
+  reconcileOnReply: ((paneId: string) => string[]) | null;
+}
+
+export interface SubagentDeps {
+  client: HerdrClientLike;
+  env: SubagentEnv | null;
+  /** 本扩展入口（index.ts）路径——launchLine 的 -e 参数。 */
+  extPath: string;
+  /** master 树根（scope 挂载）。 */
+  sessionRoot: Context;
+  slots: SubagentSlots;
+  getSessionId: () => string;
+  getBlockedDepth: () => number;
+  reconcileOnSettlement: (description: string, outcome: 'settled' | 'failed') => string[];
+  withReconcileNotes: (base: string, notes: readonly string[]) => string;
+  claimSettleNotice: (key: string) => boolean;
+  /**
+   * D92 结算通知注入器（index.ts 提供）：忙时入缓冲、turn_end 折叠 steer 批量注入。
+   * 缺省回退 pi.sendUserMessage(followUp)（旧路径——整个 run 结束才回填，测试桩用）。
+   */
+  deliverNotice?: (content: string) => Promise<void>;
+  /** terminal 族 GC 豁免槽。 */
+  terminalState: { activePaneIds: () => Set<string> };
+  todos: TodosService;
+}
+
+const SUBAGENT_DESCRIPTION = [
+  'Delegate a self-contained subtask to an isolated subagent that runs in its own herdr pane as an interactive pi session (separate context window; it does NOT see this conversation). A human can also open that pane and talk to the subagent directly.',
+  '`description`: short display label for the pane; `prompt`: the COMPLETE task — include all needed context, since only the prompt reaches the subagent. The description also doubles as the todo-reconcile key: when delegating a todo entry, use the entry content WITHOUT its ` <sub>` marker as the description, and the entry is auto-completed when this subagent settles.',
+  'The subagent shares this workspace and works independently; the result is its final text answer.',
+  'Concurrent delegation is supported: several subagent calls in one message run in parallel (at most 4 at once). Use this for well-scoped, independent subtasks; do not delegate the current step itself.',
+  '`run_in_background` (default false): when true, the call returns immediately with an agentId; the subagent keeps running in its pane. Use list_agents to see its state, send_message to give it follow-up work, interrupt_agent to stop it. When it settles, you receive a notification message with its closing output.',
+  '`tab` (optional): name of a task tab to place the subagent into (join if a tab with this name exists, otherwise create it). Overrides the default placement. Default placement groups by git worktree: a subagent working in your checkout shares your tab; one working in a separate worktree (pass its path via `cwd`; create worktrees with `git worktree add`) gets its own tab named after the worktree directory.',
+  '`role` + `allowed_tools`: when role matches a profile (searched: workspace .pi-herdr/roles/ → user-global ~/.pi/agent/herdr-pi/roles/ → builtin), the worker toolset becomes the composed manifest — baseline ∪ allowed_tools minus role-deny tools (deny always wins). Custom roles: drop a JSON profile into .pi-herdr/roles/ (master/worker-default reserved). Unknown role names remain display labels only.',
+].join(' ');
+
+/** 子代理并发上限（D10）。 */
+const SUBAGENT_CONCURRENCY = 4;
+/** 单子代理等待上限（内部 marker PI_HERDR_SUBAGENT_TIMEOUT_MS 可调，默认 10 分钟）。 */
+const SUBAGENT_TIMEOUT_MS = Number(process.env.PI_HERDR_SUBAGENT_TIMEOUT_MS ?? 600000) || 600000;
+/** 就绪等待上限（TUI 启动 + herdr 检测）。 */
+const SUB_READY_TIMEOUT_MS = 30000;
+
+function defaultAgentSessionsDir(): string {
+  const base = process.env.PI_CODING_AGENT_DIR || join(homedir(), '.pi', 'agent');
+  return join(base, 'sessions');
+}
+
+function agentRootDir(): string {
+  return dirname(defaultAgentSessionsDir());
+}
+
+export default function subagentPlugin(ctx: Context): void {
+  const surface = ctx.get('pi-herdr.surface') as PiSurface<object>;
+  const d = ctx.get('pi-herdr.subagent-deps') as SubagentDeps;
+  const { client, env, sessionRoot, slots, terminalState, todos } = d;
+  const pi = surface.raw as {
+    appendEntry?: (customType: string, data: unknown) => void;
+    sendUserMessage?: (content: string, opts?: { deliverAs?: string }) => Promise<void>;
+  };
+  const scoped = surface.forModule(import.meta.url);
+
+  const runtime = {
+    nodePath: process.execPath,
+    cliPath: process.argv[1] ?? '',
+    extPath: d.extPath,
+  };
+  const subSemaphore = new Semaphore(SUBAGENT_CONCURRENCY);
+
+  /* 子代理注册表（custom 条目持久化，分支正确；parent 重启后可从分支重建） */
+  const subs = new Map<string, SubEntry>();
+  const pollers = new Set<string>();
+  const subScopes = new Map<string, { dispose: () => Promise<void> }>();
+  /** D50：每 pane 最近一次机器请求 id（interrupt 按轮次占位、pollLoop 去重用）。 */
+  const lastRequestIdByPane = new Map<string, string>();
+
+  function persistSubs(): void {
+    try {
+      pi.appendEntry?.(SUBS_CUSTOM_TYPE, makeRegistry([...subs.values()]));
+    } catch {
+      /* 持久化尽力而为 */
+    }
+  }
+
+  // slots 回填：common 段 pipe reply 消费
+  slots.applyReplySession = (paneId, sessionFile) => {
+    const entry = subs.get(paneId);
+    if (!entry) return;
+    const next = applyReportedSessionFile(entry.sessionFile, sessionFile);
+    if (next === entry.sessionFile) return;
+    entry.sessionFile = next;
+    persistSubs();
+    writeHistory(entry);
+  };
+  slots.reconcileOnReply = (paneId) => {
+    const entry = subs.get(paneId);
+    return entry ? d.reconcileOnSettlement(entry.description, 'settled') : [];
+  };
+
+  function rebuildSubs(eventCtx: unknown): void {
+    try {
+      const entries = (eventCtx as { sessionManager?: { getBranch?: () => readonly unknown[] } })
+        ?.sessionManager?.getBranch?.() ?? [];
+      const reg = foldSubsRegistry(entries as Parameters<typeof foldSubsRegistry>[0]);
+      for (const sub of reg.subs) subs.set(sub.paneId, sub);
+    } catch {
+      /* 重建失败不影响主流程 */
+    }
+  }
+
+  scoped.on('session_start', async (_event: unknown, eventCtx: unknown) => {
+    rebuildSubs(eventCtx);
+  });
+  scoped.on('session_tree', async (_event: unknown, eventCtx: unknown) => {
+    rebuildSubs(eventCtx);
+  });
+
+  /* ── D41：stop 未完成提醒（仅主控；子代理不注册本块） ── */
+
+  let todoReminders = 0;
+  const TODO_REMINDERS_MAX = 3;
+  scoped.on('agent_settled', async () => {
+    if (todoReminders >= TODO_REMINDERS_MAX) return;
+    if (pollers.size > 0) return; // 有在途子代理 → 主控本来就在等，不催
+    if (d.getBlockedDepth() > 0) return; // 等人类回答 → 不催
+    const open = todos.items.filter((it) => it.status === 'pending' || it.status === 'in_progress');
+    if (open.length === 0) return;
+    todoReminders += 1;
+    const list = open
+      .map((it) => (it.status === 'in_progress' ? `▶ ${it.content}` : `· ${it.content}`))
+      .join('\n');
+    const reminder = `<system-reminder>You stopped with unfinished todos (Reminder ${todoReminders}/${TODO_REMINDERS_MAX}):\n${list}\nContinue working on them before stopping, or call todo_write to update the list if they no longer apply.</system-reminder>`;
+    try {
+      await pi.sendUserMessage?.(reminder, { deliverAs: 'followUp' });
+    } catch {
+      /* 静默 */
+    }
+  });
+
+  /* ── 通道助手（M11：就绪 = 管道握手） ── */
+
+  /** 就绪等待：管道 ping（子扩展 session_start 起 server 即就绪；D47）。 */
+  async function waitSubReady(cwd: string, paneId: string): Promise<boolean> {
+    return pingUntilReady(pipeNameFor(cwd, paneId), SUB_READY_TIMEOUT_MS);
+  }
+
+  /**
+   * 子代理会话文件候选（v1.3 M7 修复结算文本串线，实测）：
+   *  1. 上报路径（本扩展 report_agent_session 的 .jsonl path）；
+   *  2. 上报 session id → 按 id 还原；
+   *  3. 目录内最新 4 个（排除主控自己的会话——父在写盘时其 mtime 常最新，
+   *     曾实测致结算文本取到父的回复）。
+   */
+  async function resolveSessionFileCandidates(paneId: string, cwd: string): Promise<string[]> {
+    const out: string[] = [];
+    try {
+      const reported = await client.getAgentSessionPath(paneId);
+      if (reported) {
+        if (/\.jsonl$/.test(reported)) out.push(reported);
+        else {
+          const byId = sessionFileById(cwd, defaultAgentSessionsDir(), reported);
+          if (byId) out.push(byId);
+        }
+      }
+    } catch {
+      /* 走目录扫描 */
+    }
+    const ownSession = d.getSessionId();
+    for (const f of listSessionFiles(cwd, defaultAgentSessionsDir(), 4)) {
+      if (f !== ownSession && !out.includes(f)) out.push(f);
+    }
+    return out;
+  }
+
+  /** 定位可解析的子代理会话文件（spawn/结算登记用）。 */
+  async function resolveSessionFile(paneId: string, cwd: string): Promise<string | null> {
+    for (const file of await resolveSessionFileCandidates(paneId, cwd)) {
+      if (readSessionFile(file)) return file;
+    }
+    return null;
+  }
+
+  /** 结算后（带重试）取注入时间点之后的最终回答。 */
+  async function collectFinalText(
+    paneId: string,
+    cwd: string,
+    sinceTs: number,
+    attempts = 12,
+  ): Promise<string | null> {
+    for (let i = 0; i < attempts; i++) {
+      for (const file of await resolveSessionFileCandidates(paneId, cwd)) {
+        const entries = readSessionFile(file);
+        if (!entries) continue;
+        const r = lastAssistantText(entries, { sinceTs });
+        if (r?.text) return r.text;
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    return null;
+  }
+
+  /**
+   * 子会话结算状态（v1.3 M8 结算竞态修复）：
+   *  herdr 的 idle/done 在"注入瞬间"也是真，不能当结算信号；
+   *  以会话内容为准——定稿文本 = 已结算；挂起 toolCall = 未结算；
+   *  有 assistant 活动但无文本 = 真·无输出；无活动 = 还没开始。
+   */
+  async function subSessionState(
+    paneId: string,
+    cwd: string,
+    sinceTs: number,
+  ): Promise<{ text: string | null; pendingTool: boolean; activity: boolean }> {
+    for (const file of await resolveSessionFileCandidates(paneId, cwd)) {
+      const entries = readSessionFile(file);
+      if (!entries) continue;
+      const r = lastAssistantText(entries, { sinceTs });
+      if (r?.text) return { text: r.text, pendingTool: false, activity: true };
+      if (hasPendingToolCall(entries, sinceTs)) return { text: null, pendingTool: true, activity: true };
+      if (hasAssistantAfter(entries, sinceTs)) return { text: null, pendingTool: false, activity: true };
+    }
+    return { text: null, pendingTool: false, activity: false };
+  }
+
+  /** 等待结算：idle/done=settled、blocked=人类闸门、超时切片循环。 */
+  async function waitSubSettled(
+    paneId: string,
+    timeoutMs: number,
+  ): Promise<'settled' | 'blocked' | 'timeout'> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const state = await client.waitAgent(paneId, ['idle', 'done', 'blocked'], 30000);
+      if (state === 'idle' || state === 'done') return 'settled';
+      if (state === 'blocked') return 'blocked';
+      // null = 30s 切片超时（working 中或异常），继续
+    }
+    return 'timeout';
+  }
+
+  /** D92：结算通知统一出口——经 deps 缓冲（忙时 turn_end 折叠注入），缺省回退旧 followUp 直投。 */
+  const injectNotice = (content: string): Promise<void> =>
+    d.deliverNotice ? d.deliverNotice(content)
+      : (pi.sendUserMessage?.(content, { deliverAs: 'followUp' }) ?? Promise.resolve());
+
+  /** 后台子代理轮询器：结算→取文→followUp 通知；blocked 让位给人类；D94：用户接管检测。 */
+  async function pollLoop(
+    paneId: string,
+    cwd: string,
+    spawnedAt: number,
+    injectTs: number,
+    description: string,
+    requestId: string,
+  ): Promise<void> {
+    void spawnedAt;
+    const startedAt = Date.now();
+    try {
+      while (true) {
+        const entry = subs.get(paneId);
+        if (!entry || entry.status === 'settled') return;
+
+        // D94：归还检测——若用户已接管且 idle 超 60s，自动归还控制权
+        if (entry.userTakeover) {
+          try {
+            const agents = await client.listAgents();
+            const agent = agents.find((a) => a.paneId === paneId);
+            if (agent) {
+              const currentStatus = agent.status;
+              const previousStatus = entry.lastAgentStatus;
+              
+              if (currentStatus === 'idle') {
+                // 状态刚变为 idle（从 working/blocked 转来）→ 记录 idle 起点
+                if (previousStatus !== 'idle') {
+                  entry.observationStartedAt = Date.now();
+                  entry.lastAgentStatus = 'idle';
+                  persistSubs();
+                } else if (entry.observationStartedAt) {
+                  // 持续 idle → 检查是否超过 60s
+                  if (Date.now() - entry.observationStartedAt > 60000) {
+                    // Idle 超 60s，归还控制权
+                    entry.userTakeover = false;
+                    entry.observationStartedAt = null;
+                    entry.lastAgentStatus = null;
+                    persistSubs();
+                    // 继续正常管理流程（下一轮会走正常 waitAgent 分支）
+                  }
+                }
+              } else {
+                // working/blocked → 重置 idle 计时（只记录状态，不记时间）
+                entry.lastAgentStatus = currentStatus;
+                entry.observationStartedAt = null; // 清除 idle 计时
+                persistSubs();
+              }
+            }
+          } catch {
+            // listAgents 失败静默
+          }
+          // 已接管，跳过正常管理逻辑，5s 后再检查
+          if (entry.userTakeover) {
+            await new Promise((resolve) => setTimeout(resolve, 5000));
+            continue;
+          }
+        }
+
+        let state: HerdrAgentState | null;
+        try {
+          state = await client.waitAgent(paneId, ['idle', 'done', 'blocked'], 30000);
+        } catch {
+          state = null;
+        }
+        if (state === 'blocked') continue; // 人类闸门：保持 running，通知钩子已触发
+        if (state === 'idle' || state === 'done') {
+          const s = await subSessionState(paneId, cwd, injectTs);
+          if (s.text || (!s.pendingTool && s.activity)) {
+            // Settled
+            const closing = s.text;
+
+            // D94：观察期逻辑——settled 后 30s 内检测用户介入
+            if (!entry.observationStartedAt) {
+              // 首次 settled → 启动 30s 观察期
+              entry.observationStartedAt = Date.now();
+              entry.lastAgentStatus = 'idle';
+              persistSubs();
+              // 短暂等待后进入下一轮（观察期检测）
+              await new Promise((resolve) => setTimeout(resolve, 1000));
+              continue;
+            } else {
+              // 已在观察期
+              const elapsed = Date.now() - entry.observationStartedAt;
+
+              // 检测用户介入：查询当前状态是否变为 working
+              try {
+                const agents = await client.listAgents();
+                const agent = agents.find((a) => a.paneId === paneId);
+                if (agent && agent.status === 'working') {
+                  // 用户介入！标记接管，取消结算
+                  entry.userTakeover = true;
+                  entry.observationStartedAt = Date.now();
+                  entry.lastAgentStatus = 'working';
+                  persistSubs();
+                  continue; // 跳过结算，进入用户接管模式
+                }
+              } catch {
+                // listAgents 失败静默
+              }
+
+              if (elapsed < 30000) {
+                // 观察期未结束，继续等待
+                await new Promise((resolve) => setTimeout(resolve, 1000));
+                continue;
+              }
+
+              // 观察期结束（30s 无用户介入），正常结算
+              entry.observationStartedAt = null; // 清除观察期标记
+            }
+
+            // 正常结算逻辑
+            // O6：reply 已写的 sessionFile 是权威；poll 只在缺失时用扫描补，绝不反向覆盖
+            if (!entry.sessionFile) {
+              entry.sessionFile = applyReportedSessionFile(
+                entry.sessionFile,
+                await resolveSessionFile(paneId, cwd),
+              );
+            }
+            entry.status = 'consumed';
+            entry.consumedAt = Date.now();
+            persistSubs();
+            writeHistory(entry, { outcome: closing });
+            // M17：结算自动对账（先于通知；与 reply 快路径幂等双跑）
+            const notes = d.reconcileOnSettlement(description, 'settled');
+            const notice = d.withReconcileNotes(
+              formatSettlementNotice(`${paneId} (${description})`, closing),
+              notes,
+            );
+            // D50：push 快路径可能已发过通知 → 按轮次（paneId+请求id）去重，只发一条
+            if (d.claimSettleNotice(`${paneId}:${requestId}`)) {
+              try {
+                await injectNotice(notice);
+              } catch {
+                /* 注入失败静默（下次 turn 可 list_agents 自查） */
+              }
+            }
+            return;
+          }
+          // 挂起 toolCall（等人类输入）或还没开工 → 继续等
+        }
+        // 切片超时：检查 pane 存活与总预算
+        let alive = false;
+        try {
+          alive = (await client.listAgents()).some((a) => a.paneId === paneId);
+        } catch {
+          alive = true; // 查询失败不误判
+        }
+        if (!alive) {
+          entry.status = 'consumed';
+          entry.consumedAt = Date.now(); // O8：提前退出路径必须置消费时间，否则 tab TTL 被卡住
+          persistSubs();
+          writeHistory(entry, { outcome: 'pane closed before settling' });
+          const notes = d.reconcileOnSettlement(description, 'failed');
+          const notice = d.withReconcileNotes(
+            `Background subagent ${paneId} (${description}) stopped before settling (its pane closed).`,
+            notes,
+          );
+          try {
+            await injectNotice(notice);
+          } catch {
+            /* 静默 */
+          }
+          return;
+        }
+        if (Date.now() - startedAt > SUBAGENT_TIMEOUT_MS) {
+          entry.status = 'consumed';
+          entry.consumedAt = Date.now(); // O8：observation timeout 同样置消费时间
+          persistSubs();
+          writeHistory(entry, { outcome: 'observation timeout' });
+          const notes = d.reconcileOnSettlement(description, 'failed');
+          const notice = d.withReconcileNotes(
+            `Background subagent ${paneId} (${description}) stopped being observed before settling; check its pane.`,
+            notes,
+          );
+          try {
+            await injectNotice(notice);
+          } catch {
+            /* 静默 */
+          }
+          return;
+        }
+      }
+    } finally {
+      pollers.delete(paneId);
+    }
+  }
+
+  function startPoller(paneId: string, cwd: string, spawnedAt: number, injectTs: number, description: string, requestId: string): void {
+    if (pollers.has(paneId)) return;
+    pollers.add(paneId);
+    void (async () => {
+      if (!subScopes.has(paneId)) {
+        const fiber = await mountSubagentScope(sessionRoot, paneId, {
+          onDispose: () => { pollers.delete(paneId); },
+        });
+        subScopes.set(paneId, fiber);
+      }
+      await pollLoop(paneId, cwd, spawnedAt, injectTs, description, requestId);
+      const fiber = subScopes.get(paneId);
+      subScopes.delete(paneId);
+      try { await fiber?.dispose(); } catch { /* already gone */ }
+    })();
+  }
+
+  /* ── 工具：subagent（v1.3：任务 tab 放置 + 短/长 pane + 历史 + GC） ── */
+
+  /** 串行化 tab 创建/追加（同消息并行委派的读改写互斥；D26 放置决策在锁内做）。 */
+  const tabMutex = new Semaphore(1);
+
+  function histFile(cwd: string): string {
+    return historyFilePath(agentRootDir(), cwd);
+  }
+
+  function toHistory(e: SubEntry): HistoryEntry {
+    return {
+      taskId: e.taskId,
+      kind: e.kind,
+      paneId: e.paneId,
+      tabId: e.tabId,
+      tabName: e.tabName,
+      workspaceId: env?.workspaceId ?? '',
+      cwd: e.cwd,
+      description: e.description,
+      sessionFile: e.sessionFile,
+      launchCommand: e.launchCommand,
+      status: e.status,
+      outcome: null,
+      createdAt: e.createdAt,
+      consumedAt: e.consumedAt ?? null,
+      closedAt: null,
+      revivedFrom: e.revivedFrom ?? null,
+    };
+  }
+
+  function writeHistory(e: SubEntry, patch?: Partial<HistoryEntry>): void {
+    appendHistory(histFile(e.cwd), { ...toHistory(e), ...(patch ?? {}) });
+  }
+
+  /** 存活任务 tab（本 workspace；herdr 为权威，tab.rename/自动关后自动纠正）。 */
+  async function liveTabs(): Promise<Array<{ tabName: string; tabId: string }>> {
+    try {
+      const ws = env?.workspaceId ?? '';
+      return (await client.tabList())
+        .filter((t) => !ws || t.workspaceId === ws)
+        .map((t) => ({ tabName: t.label, tabId: t.tabId }));
+    } catch {
+      return [];
+    }
+  }
+
+  /* ── D86：git worktree 分组键 ─────────────────────────────────── */
+
+  /** worktree 列表缓存（spawn 时一次查询；TTL 短——放置只需近似新鲜度）。 */
+  let worktreesCache: { at: number; list: string[] } | null = null;
+  const WORKTREES_CACHE_MS = 5000;
+
+  /**
+   * 列出 repo 的全部 git worktree（`git worktree list --porcelain`，主检出在前）。
+   * 非 git 目录 / git 不可用 → 空数组（分类器自然全兜底 main，规则退化不炸）。
+   */
+  async function listWorktrees(cwd: string): Promise<string[]> {
+    if (worktreesCache && Date.now() - worktreesCache.at < WORKTREES_CACHE_MS) return worktreesCache.list;
+    const list = await new Promise<string[]>((resolve) => {
+      execFile('git', ['-C', cwd, 'worktree', 'list', '--porcelain'], { timeout: 5000 }, (err, stdout) => {
+        if (err) return resolve([]);
+        const out: string[] = [];
+        for (const line of String(stdout).split('\n')) {
+          const m = /^worktree (.+)$/.exec(line.trim());
+          if (m) out.push(m[1]);
+        }
+        resolve(out);
+      });
+    });
+    worktreesCache = { at: Date.now(), list };
+    return list;
+  }
+
+  /**
+   * 按放置计划在任务 tab 内新建子 pane（v1.3 D25/D26 + D86 worktree 分组）：
+   *  - new：tab.create{label}（focus 默认 false 不抢焦点）+ 根 pane 注入启动命令；
+   *  - append：校验既有 tab 存活 → split 追加（进程不重启）；
+   *    tab 已消失 → 降级为同名的 new。放置决策在互斥锁内做（同名竞态）。
+   * D86：placement.zone 由调用方算好传入（main → master 所在 tab；worktree → 目录名 tab）。
+   */
+  async function spawnPaneInTaskTab(
+    placement: { desiredTab?: string | null; description: string; zone?: WorktreeZone },
+    cwd: string,
+    envOver: Record<string, string>,
+    launch: string,
+  ): Promise<{ tabId: string; paneId: string; tabName: string }> {
+    const release = await tabMutex.acquire();
+    try {
+      // D86：main tab = master pane 所在 tab（paneId 反查；HERDR_TAB_ID 注入不可依赖，实测可为空）
+      const allPanes = await client.listPanes();
+      const mainTabId = allPanes.find((p) => p.paneId === env?.paneId)?.tabId
+        ?? (env?.tabId ? env.tabId : null);
+      let plan: TabPlacementPlan = planTabPlacement({
+        desiredTab: placement.desiredTab,
+        description: placement.description,
+        knownTabs: await liveTabs(),
+        zone: placement.zone,
+        mainTabId,
+      });
+      if (plan.mode === 'append' && plan.tabId) {
+        // D91 网格形态：目标格 = tab 内面积最大的格子（沿长轴分裂，自然铺成方格）；
+        // board 等无 agent 常驻 shell（agentStatus=unknown）不入候选，避免被 worker 蚕食。
+        const exclude = new Set(
+          allPanes.filter((p) => p.tabId === plan.tabId && p.agentStatus === 'unknown').map((p) => p.paneId),
+        );
+        let pick: { targetPaneId: string; direction: 'right' | 'down' } | null = null;
+        try {
+          const snapshot = await client.exportLayout({ tabId: plan.tabId });
+          const tree = snapshot?.root ? parseShapeTree(snapshot.root) : null;
+          if (tree) pick = pickGridSplit(tree, { exclude });
+        } catch { /* 布局导出失败 → 回退锚分裂（旧行为） */ }
+        // 锚兜底：agent 已知状态的工作 pane 优先（避开 board pane）
+        const anchorPaneId = pick?.targetPaneId
+          ?? allPanes.find((p) => p.tabId === plan.tabId && p.agentStatus !== 'unknown')?.paneId
+          ?? allPanes.find((p) => p.tabId === plan.tabId)?.paneId;
+        if (anchorPaneId) {
+          const paneId = await client.splitPane({
+            direction: pick?.direction ?? 'right',
+            cwd,
+            env: envOver,
+            targetPaneId: anchorPaneId,
+          });
+          await client.sendPaneText(paneId, launch);
+          return { tabId: plan.tabId!, paneId, tabName: plan.tabName };
+        }
+        // 锚 pane 缺失（tab 已空/已关）→ 同名新 tab；main tab 消失（罕见）→ 兜底新 tab
+        plan = { mode: 'new', tabName: plan.tabName, tabId: null };
+      }
+      const created = await client.createTab({
+        workspaceId: env?.workspaceId ?? '',
+        label: plan.tabName,
+        cwd,
+        env: envOver,
+      });
+      await client.sendPaneText(created.paneId, launch);
+      return { tabId: created.tabId, paneId: created.paneId, tabName: plan.tabName };
+    } finally {
+      release();
+    }
+  }
+
+  function launchLine(resumeFile?: string | null, roleModel?: string | null, approve = false): string {
+    const base = `& ${psQuote(runtime.nodePath)} ${psQuote(runtime.cliPath)}${approve ? ' -a' : ''} -e ${psQuote(runtime.extPath)}`
+      + (roleModel ? ` --provider ${psQuote(roleModel.split('/')[0])} --model ${psQuote(roleModel.split('/')[1] ?? roleModel)}` : '');
+    return resumeFile ? `${base} --session ${psQuote(resumeFile)}` : base;
+  }
+
+  /**
+   * D86 信任旗标：委派即信任，但仅限 master 自己的检出与其 worktree（同 git 仓库 =
+   * 同一批项目文件，master 本就载着它们跑）。外来目录不加 -a —— pi 的 Trust 对话框
+   * 成为天然闸门（spawn 会在握手超时处失败，人不点头不执行未知项目扩展）。
+   */
+  async function approveFor(cwd: string, masterCwd: string): Promise<boolean> {
+    if (isPathUnder(cwd, masterCwd)) return true;
+    const zone = classifyWorktreeZone({ cwd, masterCwd, worktrees: await listWorktrees(masterCwd) });
+    return zone.zone === 'worktree';
+  }
+
+  /* ── GC：turn_start 回收（v1.3 M8：tab 级为主 + pane 级兼容/孤儿路径） ── */
+
+  let prevTurnStart = Date.now();
+
+  async function gcPass(): Promise<void> {
+    if (subs.size === 0) return;
+    // D44：唯一用户可见开关——TTL 秒（默认 600）；0 = 不自动关（只由人关）
+    const ttlMs = Number(process.env.PI_HERDR_TASK_TAB_TTL ?? 600) * 1000;
+    const autoCloseTabs = ttlMs > 0;
+    let panesList: Array<{ paneId: string; tabId: string; agentStatus: string }>;
+    try {
+      panesList = await client.listPanes();
+    } catch {
+      return;
+    }
+    const statuses = new Map(panesList.map((p) => [p.paneId, p.agentStatus]));
+    // D71：有活跃终端会话的 pane 豁免回收（tab 级与 pane 级两处）
+    const termPaneIds = terminalState.activePaneIds();
+
+    // 任务 tab 分组（含 closed 条目：closed 工作 pane 也算完成）
+    const byTab = new Map<string, SubEntry[]>();
+    for (const e of subs.values()) {
+      if (!e.tabId) continue;
+      const arr = byTab.get(e.tabId) ?? [];
+      arr.push(e);
+      byTab.set(e.tabId, arr);
+    }
+    const taskTabIds = new Set(byTab.keys());
+    // D86 R4：main tab（master 所在）永不整关——它的 consumed 子代理走 pane 级回收
+    const mainTabId = env?.tabId ?? '';
+
+    // 1) tab 级（判定规则在 gc-core.shouldCloseTaskTab，纯函数单测覆盖）
+    for (const [tabId, entries] of byTab) {
+      if (tabId === mainTabId) continue; // D86 R4：main tab 豁免（防 master 连坐）
+      const tabPanes = panesList.filter((p) => p.tabId === tabId);
+      if (tabPanes.length === 0) {
+        // tab 已消失（人关/自动关）→ 补记 closed
+        for (const e of entries) {
+          if (e.status !== 'closed') {
+            e.status = 'closed';
+            writeHistory(e, { status: 'closed', closedAt: Date.now() });
+          }
+        }
+        continue;
+      }
+      const should = shouldCloseTaskTab({
+        entries,
+        paneStatuses: tabPanes.map((p) => p.agentStatus),
+        ttlMs,
+        now: Date.now(),
+      });
+      if (!autoCloseTabs || !should) continue;
+      if (tabPanes.some((p) => termPaneIds.has(p.paneId))) continue; // 活跃终端豁免
+      try {
+        await client.tabClose(tabId);
+      } catch {
+        /* tab 已消失 */
+      }
+      for (const e of entries) {
+        if (e.status !== 'closed') {
+          e.status = 'closed';
+          writeHistory(e, { status: 'closed', closedAt: Date.now() });
+        }
+      }
+      await new Promise((r) => setTimeout(r, 300)); // 串行关闭（#1358 同类风险护栏）
+    }
+
+    // 2) pane 级（v1.2 兼容路径 + 孤儿 + D86 main tab 回收）：
+    //    不属于任何「可整关任务 tab」的 consumed 短 pane（main tab 也算——R4）
+    const closableTaskTabIds = new Set([...taskTabIds].filter((t) => t !== mainTabId));
+    const candidates = [...subs.values()].filter(
+      (e) => e.status === 'consumed' && !(e.tabId && closableTaskTabIds.has(e.tabId)),
+    );
+    for (const e of candidates) {
+      if (termPaneIds.has(e.paneId)) continue; // 活跃终端豁免（D71）
+      if (!shouldClosePane({
+        consumedAt: e.consumedAt ?? null,
+        herdrStatus: statuses.get(e.paneId),
+        prevTurnStart,
+      })) continue;
+      if (statuses.get(e.paneId) === undefined) {
+        // pane 已消失（随 tab 被关）→ 补记 closed
+        e.status = 'closed';
+        writeHistory(e, { status: 'closed', closedAt: Date.now() });
+        continue;
+      }
+      try {
+        await client.closePane(e.paneId);
+      } catch {
+        /* pane 已消失 */
+      }
+      e.status = 'closed';
+      writeHistory(e, { status: 'closed', closedAt: Date.now() });
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    persistSubs();
+  }
+
+  /** GC 互斥 + 双驱动：turn_start 与周期 ticker。 */
+  let gcRunning = false;
+  async function runGcSafely(): Promise<void> {
+    if (gcRunning) return;
+    gcRunning = true;
+    try {
+      await gcPass();
+    } catch {
+      /* GC 失败静默，下轮/tick 重试 */
+    } finally {
+      gcRunning = false;
+    }
+  }
+
+  scoped.on('turn_start', async () => {
+    const now = Date.now();
+    await runGcSafely();
+    prevTurnStart = now;
+  });
+
+  const gcTickMs = Number(process.env.PI_HERDR_GC_TICK_MS ?? 30000);
+  const gcTicker = gcTickMs > 0 ? setInterval(() => { void runGcSafely(); }, gcTickMs) : null;
+  // GC ticker 经 effect 拆（hmr 重载本模块 = 旧 ticker 拆、新 ticker 起，D80⑤ 语义）。
+  // 注意：pipe server 的关闭 effect **不在这里**——server 由 index common 段创建持有，
+  // 挂进本插件会被 hmr 重载误杀（跨属资源，d87 修）。
+  ctx.effect(() => () => {
+    if (gcTicker) clearInterval(gcTicker);
+  }, 'gc-ticker');
+
+  /**
+   * D94：查找已存在的同 session pane（resume 复用而非重复 spawn）。
+   * 返回 paneId + tabId，若无匹配或 agent 已死则 null。
+   */
+  async function findExistingPaneWithSession(sessionFile: string | null): Promise<{ paneId: string; tabId: string } | null> {
+    if (!sessionFile) return null;
+    try {
+      const agents = await client.listAgents();
+      const match = agents.find((a) => a.session === sessionFile && a.status !== 'unknown');
+      if (!match) return null;
+      // listAgents 不带 tabId，需要 pane.list 补
+      const panes = await client.listPanes();
+      const pane = panes.find((p) => p.paneId === match.paneId);
+      return pane ? { paneId: match.paneId, tabId: pane.tabId } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 复活已关闭任务（resume 工具与 send_message 自动复活共用）。 */
+  async function reviveEntry(entry: SubEntry): Promise<SubEntry> {
+    const latest = latestGeneration(readHistory(histFile(entry.cwd)), entry.taskId) ?? entry;
+    const resumeFile = latest.sessionFile && /\.jsonl$/.test(latest.sessionFile) ? latest.sessionFile : null;
+    // D86 信任旗标同 spawn：master 检出/worktree 才 -a（revive 无 toolCtx，用进程 cwd 代 master 检出）
+    const approve = await approveFor(entry.cwd, process.cwd());
+    const spawned = await spawnPaneInTaskTab(
+      { desiredTab: entry.tabName || latest.tabName || null, description: entry.description },
+      entry.cwd,
+      { PI_HERDR_SUBAGENT: '1' },
+      launchLine(resumeFile, null, approve),
+    );
+    const ready = await waitSubReady(entry.cwd, spawned.paneId);
+    if (!ready) throw new Error(`revived pane ${spawned.paneId} pipe not ready`);
+    entry.paneId = spawned.paneId;
+    entry.tabId = spawned.tabId;
+    entry.tabName = spawned.tabName;
+    entry.sessionFile = resumeFile;
+    entry.status = 'running';
+    entry.consumedAt = null;
+    entry.revivedFrom = latest.paneId;
+    entry.launchCommand = [launchLine(resumeFile, null, approve)];
+    entry.createdAt = Date.now();
+    writeHistory(entry);
+    return entry;
+  }
+
+  scoped.registerTool({
+    name: 'subagent',
+    label: 'Subagent',
+    description: SUBAGENT_DESCRIPTION,
+    parameters: Type.Object({
+      description: Type.String({ description: 'Short label for this subtask (pane title)' }),
+      prompt: Type.String({ description: 'The complete self-contained task for the subagent' }),
+      run_in_background: Type.Optional(Type.Boolean({ description: 'Return immediately with an agentId; the subagent keeps running in its own pane (default false)' })),
+      cwd: Type.Optional(Type.String({ description: 'Working directory for the subagent (absolute, or relative to this workspace). Use it to delegate into a git worktree: panes group by worktree — same checkout as you share your tab; a separate worktree gets its own tab named after the worktree directory. Create worktrees yourself with git worktree add' })),
+      role: Type.Optional(Type.String({ description: 'Role for this pane. Role profiles are searched in this order: workspace .pi-herdr/roles/<name>.json → user-global ~/.pi/agent/herdr-pi/roles/<name>.json → builtin src/roles/. Builtins: worker-default [default, read+write; omit role = this]. Custom roles: add a JSON profile in .pi-herdr/roles/ (fields: role/version/manifest{tools,rules,unknownTools}); names master/worker-default are reserved. A matching profile governs the toolset (deny rules cannot be bypassed); unknown role names remain display labels only' })),
+      allowed_tools: Type.Optional(Type.Array(Type.String(), { description: 'Extra tools the task needs beyond the role baseline (union; role deny rules always win). Only meaningful with a role profile' })),
+      tab: Type.Optional(Type.String({ description: 'Task tab name: join the existing tab with this name, or create a new tab named this. Overrides the default worktree-based placement; omit for automatic placement (same checkout = your tab, separate worktree = its own tab)' })),
+    }),
+    async execute(toolCallId, params, signal, onUpdate, toolCtx) {
+      void toolCallId;
+      void signal;
+      if (!client.available) {
+        return {
+          content: [{
+            type: 'text',
+            text: 'Error: subagent requires pi to run inside a herdr-managed pane (HERDR_ENV not set).',
+          }],
+          details: {},
+        };
+      }
+      const spec: SubagentSpec = {
+        description: String(params?.description ?? 'subagent'),
+        prompt: String(params?.prompt ?? ''),
+      };
+      if (!spec.prompt.trim()) {
+        return {
+          content: [{ type: 'text', text: 'Error: `prompt` must be a non-empty string' }],
+          details: {},
+        };
+      }
+      const background = params?.run_in_background === true;
+      const kind = normalizeEntryKind(typeof params?.role === 'string' ? params.role.trim() : undefined);
+      const masterCwd = (toolCtx as { cwd?: string }).cwd ?? process.cwd();
+      // D86 R5：cwd 参数 = 跨 worktree 委派的事实键（目录是事实，worktree 是分组推论）。
+      // 相对路径相对 master cwd 解析；不存在的目录拒绝（spawn 进无效目录只会白开 pane）。
+      const cwdParam = typeof params?.cwd === 'string' && params.cwd.trim() ? params.cwd.trim() : null;
+      let cwd = masterCwd;
+      if (cwdParam) {
+        cwd = pathResolve(masterCwd, cwdParam);
+        try {
+          const st = await statAsync(cwd);
+          if (!st.isDirectory()) throw new Error('not a directory');
+        } catch {
+          return {
+            content: [{ type: 'text', text: `Error: \`cwd\` is not an existing directory: ${cwdParam}` }],
+            details: {},
+          };
+        }
+      }
+      // D86 R1：分组键 = cwd 所属 git worktree（主检出 → main tab；其他 worktree → 目录名 tab）
+      const zone = classifyWorktreeZone({
+        cwd,
+        masterCwd,
+        worktrees: await listWorktrees(masterCwd),
+      });
+      // D86 信任旗标：master 自己的检出/worktree 才 -a；外来目录留 Trust 对话框作闸门
+      const approve = isPathUnder(cwd, masterCwd) || zone.zone === 'worktree';
+      // 档2（C7 v2）：role 命中档案 → 三态合成 manifest，env 下发 worker。
+      // roles-v1.0（V57/V58）：省略 role = worker-default manifest 生效
+      // （默认 executor：能写能执行、禁嵌套 spawn）——kind 历史分类不受影响。
+      const suggested = Array.isArray(params?.allowed_tools)
+        ? params.allowed_tools.filter((t): t is string => typeof t === 'string' && t.trim() !== '')
+        : [];
+      const manifestRole =
+        typeof params?.role === 'string' && params.role.trim() ? params.role.trim() : 'worker-default';
+      let roleManifestEnv: Record<string, string> = {};
+      let roleModel: string | null = null;
+      try {
+        const { role, manifest } = composeForRole(manifestRole, suggested, { loadRoleOpts: { baseDir: masterCwd } });
+        roleManifestEnv = {
+          PI_HERDR_ROLE_MANIFEST: JSON.stringify({
+            role: role.role,
+            version: role.version,
+            tools: manifest.tools,
+            permissions: manifest.permissions,
+            unknownTools: manifest.unknownTools,
+            services: role.services ?? {},
+          }),
+        };
+        // WS-D10：按角色路由模型；省略 = 进程默认
+        if (typeof role.model === 'string' && role.model.trim()) roleModel = role.model.trim();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text', text: `Error: role "${manifestRole}" manifest invalid — ${msg}` }],
+          details: {},
+        };
+      }
+      const release = await subSemaphore.acquire();
+      let paneId = '';
+      try {
+        onUpdate?.(makeProgressUpdate(`spawning ${kind !== 'task' ? `${kind} ` : ''}${background ? 'background ' : ''}subagent pane…`));
+        const spawnedAt = Date.now();
+        const taskId = randomUUID();
+        const spawned = await spawnPaneInTaskTab(
+          { desiredTab: typeof params?.tab === 'string' ? params.tab : null, description: spec.description, zone },
+          cwd,
+          { PI_HERDR_SUBAGENT: '1', ...roleManifestEnv },
+          launchLine(null, roleModel, approve),
+        );
+        paneId = spawned.paneId;
+        const entry: SubEntry = {
+          taskId,
+          kind,
+          paneId,
+          tabId: spawned.tabId,
+          tabName: spawned.tabName,
+          cwd,
+          description: spec.description,
+          background,
+          status: 'running',
+          sessionFile: null,
+          launchCommand: [launchLine(null, roleModel, approve)],
+          createdAt: Date.now(),
+          revivedFrom: null,
+        };
+        const ready = await waitSubReady(cwd, paneId);
+        if (!ready) throw new Error(`subagent pane ${paneId} pipe not ready within ${SUB_READY_TIMEOUT_MS}ms`);
+        entry.sessionFile = await resolveSessionFile(paneId, cwd);
+        subs.set(paneId, entry);
+        persistSubs();
+        writeHistory(entry);
+        onUpdate?.(makeProgressUpdate(`subagent ready in pane ${paneId}; injecting prompt via pipe…`));
+        // M11（D45/D46）：注入走扩展管道 → 子扩展 sendUserMessage(followUp)；
+        // PTY 键盘通道 100% 归人（无软锁窗口、无混行）。
+        const injectTs = Date.now();
+        const injected = await pipeRequest(pipeNameFor(cwd, paneId), {
+          type: 'prompt',
+          id: `prompt-${taskId}`,
+          text: spec.prompt,
+          from: pipeNameFor(cwd, env?.paneId ?? ''),
+          push: background,
+        });
+        if (injected.type !== 'ok') {
+          throw new Error(`pipe prompt rejected: ${injected.type === 'error' ? injected.message : 'unknown response'}`);
+        }
+
+        if (background) {
+          lastRequestIdByPane.set(paneId, `prompt-${taskId}`);
+          startPoller(paneId, cwd, spawnedAt, injectTs, spec.description, `prompt-${taskId}`);
+          return {
+            content: [{ type: 'text', text: `started subagent ${paneId} (task ${taskId})` }],
+            details: { paneId, taskId, background: true, role: kind },
+          };
+        }
+
+        let settled = await waitSubSettled(paneId, SUBAGENT_TIMEOUT_MS);
+        let text = await collectFinalText(paneId, cwd, injectTs);
+        // v1.3 M8：早结算竞态（注入瞬间 herdr 仍是 idle）→ 无文本时再等真实结算（最多 90s）
+        if (settled === 'settled' && !text) {
+          const reDeadline = Date.now() + 90000;
+          while (Date.now() < reDeadline) {
+            await new Promise((r) => setTimeout(r, 3000));
+            const st = await client.waitAgent(paneId, ['idle', 'done', 'blocked'], 15000);
+            if (st === 'blocked') {
+              settled = 'blocked';
+              break;
+            }
+            if (st === 'idle' || st === 'done') {
+              text = await collectFinalText(paneId, cwd, injectTs);
+              if (text) break;
+            }
+          }
+        }
+        const outcome =
+          settled === 'blocked' ? { kind: 'blocked' as const, text: text ?? '' }
+          : settled === 'timeout' ? { kind: 'timeout' as const, text: text ?? '' }
+          : text ? { kind: 'completed' as const, text }
+          : { kind: 'no-output' as const, text: '' };
+        entry.status = 'consumed';
+        entry.consumedAt = Date.now();
+        persistSubs();
+        writeHistory(entry, { outcome: outcome.kind === 'completed' ? text : null });
+        return {
+          content: [{ type: 'text', text: formatSubagentResult(outcome, spec.description) }],
+          details: { paneId, taskId, background, role: kind },
+        };
+      } catch (err) {
+        return {
+          content: [{
+            type: 'text',
+            text: formatSubagentResult(
+              { kind: 'spawn-failed', text: String((err as Error)?.message ?? err) },
+              spec.description,
+            ),
+          }],
+          details: {},
+        };
+      } finally {
+        release();
+      }
+    },
+  });
+
+  /* ── 工具：resume_subagent（历史复活，v1.2） ── */
+
+  scoped.registerTool({
+    name: 'resume_subagent',
+    label: 'Resume Subagent',
+    description:
+      'Revive a finished (collected) subagent from the delegation ledger: opens its saved conversation in a new pane (pi --session), then use send_message to give it new work. The ledger is an append-only JSONL file, one row per status change (same taskId rows = generations, latest row is current): fields taskId, description, status (running|settled|consumed|closed), outcome (closing text), paneId, sessionFile, launchCommand, createdAt. It is per-checkout at ~/.pi/agent/herdr-pi/history/<flattened-cwd>/history.jsonl (e.g. checkout F:\\repo -> --F--repo--), so each git worktree has its own volume. Use list_agents for live panes from this session; for tasks from earlier sessions or closed panes, read/grep the ledger file for the taskId, then pass it here.',
+    parameters: Type.Object({
+      taskId: Type.String({ description: 'The task id to revive' }),
+    }),
+    async execute(_tc, params, _sig, _upd, toolCtx) {
+      if (!client.available) {
+        return {
+          content: [{ type: 'text', text: 'Error: requires a herdr-managed pane.' }],
+          details: {},
+        };
+      }
+      const cwd = (toolCtx as { cwd?: string }).cwd ?? process.cwd();
+      const taskId = String(params?.taskId ?? '');
+      const latest = latestGeneration(readHistory(histFile(cwd)), taskId);
+      if (!latest) {
+        return {
+          content: [{ type: 'text', text: `Error: no history for task "${taskId}" in this workspace.` }],
+          details: {},
+        };
+      }
+      const release = await subSemaphore.acquire();
+      try {
+        // D94：复用已存在的同 session pane（避免双 pi 冲突）
+        const existing = await findExistingPaneWithSession(latest.sessionFile);
+        if (existing) {
+          const entry: SubEntry = {
+            taskId,
+            kind: latest.kind,
+            paneId: existing.paneId,
+            tabId: existing.tabId,
+            tabName: latest.tabName ?? tabNameForTask(latest.description),
+            cwd,
+            description: latest.description,
+            background: true,
+            status: 'running',
+            sessionFile: latest.sessionFile,
+            launchCommand: latest.launchCommand,
+            createdAt: Date.now(),
+            revivedFrom: latest.paneId,
+            consumedAt: null,
+          };
+          subs.set(entry.paneId, entry);
+          persistSubs();
+          writeHistory(entry);
+          return {
+            content: [{
+              type: 'text',
+              text: `resumed subagent ${entry.paneId} from task ${taskId} (reused existing pane with same session; pi still running there).`,
+            }],
+            details: { paneId: entry.paneId, taskId },
+          };
+        }
+        // 无现成 pane，才创建新的
+        const entry: SubEntry = {
+          taskId,
+          kind: latest.kind,
+          paneId: '',
+          tabId: '',
+          tabName: latest.tabName ?? tabNameForTask(latest.description),
+          cwd,
+          description: latest.description,
+          background: true,
+          status: 'running',
+          sessionFile: latest.sessionFile,
+          launchCommand: latest.launchCommand,
+          createdAt: Date.now(),
+          revivedFrom: latest.paneId,
+          consumedAt: null,
+        };
+        await reviveEntry(entry);
+        subs.set(entry.paneId, entry);
+        persistSubs();
+        return {
+          content: [{
+            type: 'text',
+            text: entry.sessionFile
+              ? `resumed subagent ${entry.paneId} from task ${taskId} (session restored).`
+              : `resumed subagent ${entry.paneId} from task ${taskId} (session file missing; fresh conversation).`,
+          }],
+          details: { paneId: entry.paneId, taskId },
+        };
+      } catch (err) {
+        return {
+          content: [{ type: 'text', text: `Error: failed to resume task "${taskId}": ${(err as Error).message}` }],
+          details: {},
+        };
+      } finally {
+        release();
+      }
+    },
+  });
+
+  /* ── 工具：list_agents（仅后台/常驻子代理；前台短 pane 是瞬态 UI） ── */
+
+  scoped.registerTool({
+    name: 'list_agents',
+    label: 'List Subagents',
+    description:
+      'List the background subagents you started, with their live state: running (working or blocked), idle (settled), plus pane ids, role (task or a role label), and descriptions. Foreground one-shot panes are transient and not listed. Covers only this session branch — for tasks from earlier sessions or collected panes, read the delegation ledger (path and format in resume_subagent) and resume by taskId.',
+    parameters: Type.Object({}),
+    async execute() {
+      const listed = [...subs.values()].filter((s) => s.background);
+      if (listed.length === 0) {
+        return { content: [{ type: 'text', text: 'No background subagents started (from this session branch).' }], details: {} };
+      }
+      // 按 taskId 去重：只显示每任务的最新代（复活后旧 paneId 不重复出现）
+      const byTask = new Map<string, SubEntry>();
+      for (const sub of listed) {
+        const prev = byTask.get(sub.taskId);
+        if (!prev || sub.createdAt >= prev.createdAt) byTask.set(sub.taskId, sub);
+      }
+      const lines: string[] = [];
+      for (const sub of byTask.values()) {
+        const tabTag = sub.tabName ? ` [tab: ${sub.tabName}]` : '';
+        if (sub.status === 'closed') {
+          lines.push(`${sub.taskId.slice(0, 8)} [idle] (${sub.kind}, closed; send_message revives)${tabTag} ${sub.description}`);
+          continue;
+        }
+        // 注册表状态即权威：settled = idle，其余 = running（含 blocked 人类闸门，对齐 DSH 映射）
+        const state = sub.status === 'settled' ? 'idle' : 'running';
+        // D94：用户接管标记
+        const takeoverMark = sub.userTakeover ? ', user-controlled' : '';
+        lines.push(`${sub.paneId} [${state}${takeoverMark}] (${sub.kind})${tabTag} ${sub.description}`);
+      }
+      return { content: [{ type: 'text', text: lines.join('\n') }], details: {} };
+    },
+  });
+
+  /* ── 工具：send_message（followUp 队列语义） ── */
+
+  scoped.registerTool({
+    name: 'send_message',
+    label: 'Send to Subagent',
+    description:
+      'Send a follow-up message to a background subagent. If it is working, the message is queued and delivered after it finishes (pi followUp queue); if it is idle, it wakes the subagent for a new turn. `agentId` is the id returned by the subagent tool or shown by list_agents.',
+    parameters: Type.Object({
+      agentId: Type.String({ description: 'The subagent id (herdr pane id)' }),
+      message: Type.String({ description: 'The follow-up message' }),
+    }),
+    async execute(_tc, params) {
+      const entry = subs.get(String(params?.agentId ?? ''));
+      if (!entry) {
+        return { content: [{ type: 'text', text: `Error: unknown subagent id "${params?.agentId}" (see list_agents)` }], details: {} };
+      }
+      const spawnedAt = Date.now();
+      try {
+        // 已关闭 → 自动复活（任务级可继续：pane 是临时宿主）
+        if (entry.status === 'closed') {
+          await reviveEntry(entry);
+          subs.set(entry.paneId, entry);
+          persistSubs();
+        }
+        // M11（D46）：follow_up 走扩展管道（sendUserMessage(followUp) 队列语义）
+        const ready = await waitSubReady(entry.cwd, entry.paneId);
+        if (!ready) throw new Error(`subagent pane ${entry.paneId} pipe not ready`);
+        const fuId = `fu-${Date.now()}`;
+        const res = await pipeRequest(pipeNameFor(entry.cwd, entry.paneId), {
+          type: 'follow_up',
+          id: fuId,
+          text: String(params?.message ?? ''),
+          from: pipeNameFor(entry.cwd, env?.paneId ?? ''),
+          push: true,
+        });
+        if (res.type !== 'ok') {
+          throw new Error(`pipe follow_up rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
+        }
+        entry.status = 'running';
+        persistSubs();
+        lastRequestIdByPane.set(entry.paneId, fuId);
+        startPoller(entry.paneId, entry.cwd, spawnedAt, Date.now(), entry.description, fuId);
+        return { content: [{ type: 'text', text: `Message sent to subagent ${entry.paneId}.` }], details: { paneId: entry.paneId } };
+      } catch (err) {
+        return { content: [{ type: 'text', text: `Error: failed to reach subagent ${entry.paneId}: ${(err as Error).message}` }], details: {} };
+      }
+    },
+  });
+
+  /* ── 工具：interrupt_agent（D48：管道 → 子扩展 ctx.abort() 进程内中止） ── */
+
+  scoped.registerTool({
+    name: 'interrupt_agent',
+    label: 'Interrupt Subagent',
+    description:
+      'Interrupt a background subagent (stops its current turn; fire-and-return). The subagent stays alive and can receive further send_message work.',
+    parameters: Type.Object({
+      agentId: Type.String({ description: 'The subagent id (herdr pane id)' }),
+    }),
+    async execute(_tc, params) {
+      const entry = subs.get(String(params?.agentId ?? ''));
+      if (!entry) {
+        return { content: [{ type: 'text', text: `Error: unknown subagent id "${params?.agentId}" (see list_agents)` }], details: {} };
+      }
+      if (entry.status === 'closed') {
+        // DSH 对齐：空闲/已结束目标是幂等 no-op
+        return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (already idle/closed; no-op).` }], details: {} };
+      }
+      try {
+        const res = await pipeRequest(pipeNameFor(entry.cwd, entry.paneId), {
+          type: 'interrupt',
+          id: `int-${Date.now()}`,
+        });
+        if (res.type !== 'ok') {
+          throw new Error(`pipe interrupt rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
+        }
+        // 被中断的轮次不结算通知（请求方已知情）
+        const lastId = lastRequestIdByPane.get(entry.paneId);
+        if (lastId) d.claimSettleNotice(`${entry.paneId}:${lastId}`);
+        return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (fire-and-return).` }], details: { paneId: entry.paneId } };
+      } catch (err) {
+        return { content: [{ type: 'text', text: `Error: failed to reach subagent ${entry.paneId}: ${(err as Error).message}` }], details: {} };
+      }
+    },
+  });
+}

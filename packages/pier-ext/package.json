@@ -1,0 +1,25 @@
+{
+  "name": "@pier/ext",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "pier: pi extension that fuses pi agent sessions with the herdr pane/tab orchestrator (todo_write discipline + interactive subagents)",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "skills": [
+      "./skills/pi-herdr-workflow"
+    ]
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "typebox": "~1.3.7"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "4.0.1"
+  }
+}
