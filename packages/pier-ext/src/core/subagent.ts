@@ -21,7 +21,7 @@ import type { PiSurface } from '../pi-surface.ts';
 import type { HerdrClientLike, HerdrAgentState } from '../herdr-client.ts';
 import type { TodosService } from '../todos-service.ts';
 import { mountSubagentScope } from '../subagent-scope.ts';
-import { Semaphore, SUBS_CUSTOM_TYPE, buildLaunchLine, classifyWorktreeZone, foldSubsRegistry, formatSubagentResult, isPathUnder, makeProgressUpdate, makeRegistry, planTabPlacement, tabNameForTask, type SubEntry, type SubagentSpec, type TabPlacementPlan, type WorktreeZone } from '../subagent-core.ts';
+import { Semaphore, SUBS_CUSTOM_TYPE, agoText, buildAliveNotice, buildBlockedGateNotice, buildLaunchLine, classifyWorktreeZone, foldSubsRegistry, formatSubagentResult, isAlive, isPathUnder, makeProgressUpdate, makeRegistry, planTabPlacement, psQuote, tabNameForTask, type AliveProbe, type SubEntry, type SubagentSpec, type TabPlacementPlan, type WorktreeZone } from '../subagent-core.ts';
 import { hasAssistantAfter, hasPendingToolCall, lastAssistantText, listSessionFiles, readSessionFile, sessionFileById } from '../session-tail.ts';
 import { appendHistory, applyReportedSessionFile, historyFilePath, latestGeneration, normalizeEntryKind, readHistory, type HistoryEntry } from '../history-store.ts';
 import { execFile } from 'node:child_process';
@@ -129,6 +129,9 @@ export default function subagentPlugin(ctx: Context): void {
       /* 持久化尽力而为 */
     }
   }
+
+  /** E2：已发过闸门通知的 pane（blocked 期间去重；解除后移除，二次 ask 可再通知）。 */
+  const blockedGateNotified = new Set<string>();
 
   // slots 回填：common 段 pipe reply 消费
   slots.applyReplySession = (paneId, sessionFile) => {
@@ -282,6 +285,17 @@ export default function subagentPlugin(ctx: Context): void {
     return null;
   }
 
+  /** E1/E2：读子 pane 的人类闸门问题（tokens['pi-ask']；子扩展 reportAskFlag 上报）。 */
+  async function readAskFlag(paneId: string): Promise<string | null> {
+    try {
+      const a = (await client.listAgents()).find((x) => x.paneId === paneId);
+      const v = a?.tokens?.['pi-ask'];
+      return typeof v === 'string' && v ? v : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** A2/B1 探活：pane 实时状态 + 会话候选最新 mtime（毫秒级，失败字段为 null）。 */
   async function probeAlive(paneId: string, cwd: string): Promise<AliveProbe> {
     const probe: AliveProbe = { paneExists: false, agentStatus: null, lastActivityMs: null };
@@ -396,7 +410,22 @@ export default function subagentPlugin(ctx: Context): void {
         } catch {
           state = null;
         }
-        if (state === 'blocked') continue; // 人类闸门：保持 running，通知钩子已触发
+        if (state === 'blocked') {
+          // E2（人类闸门）：blocked 时 master 对话流里也要知道（此前只有 herdr 系统
+          // 通知发给人类，master 毫不知情 → 可能自作主张揽活）。一次性 gate 通知注入；
+          // 解除（idle）后重置，二次 ask 新问题可再通知。
+          if (!blockedGateNotified.has(paneId)) {
+            blockedGateNotified.add(paneId);
+            const question = await readAskFlag(paneId);
+            try {
+              await injectNotice(buildBlockedGateNotice({ paneId, description, question }));
+            } catch {
+              /* 注入失败静默（下次 turn 可 list_agents 自查） */
+            }
+          }
+          continue; // 人类闸门：保持 running
+        }
+        if (state !== null) blockedGateNotified.delete(paneId); // 闸门解除（working/idle）
         if (state === 'idle' || state === 'done') {
           const s = await subSessionState(paneId, cwd, injectTs);
           if (s.text || (!s.pendingTool && s.activity)) {
@@ -997,8 +1026,6 @@ export default function subagentPlugin(ctx: Context): void {
         entry.sessionFile = await resolveSessionFile(paneId, cwd);
         subs.set(paneId, entry);
         persistSubs();
-        writeHistory(entry);
-        onUpdate?.(makeProgressUpdate(`subagent ready in pane ${paneId}; injecting prompt via pipe…`));
         // M11（D45/D46）：注入走扩展管道 → 子扩展 sendUserMessage(followUp)；
         // A1+A2（用户实证修复）：前台等待 = 内容闸 + 耐心阈值转后台。
         // 旧实现的 idle 即结算 + 90s 硬窗口在真实任务（working 期 4-6 分钟）上必然误判
@@ -1006,10 +1033,23 @@ export default function subagentPlugin(ctx: Context): void {
         const PATIENCE_MS = Number(process.env.PI_HERDR_FRONTIER_PATIENCE_MS ?? 300000) || 300000;
         const patienceDeadline = Date.now() + PATIENCE_MS;
         let text: string | null = null;
-        let settledKind: 'settled' | 'blocked' | 'timeout' = 'timeout';
+        let settledKind: 'settled' | 'timeout' = 'timeout';
         while (Date.now() < Math.min(patienceDeadline, spawnedAt + SUBAGENT_TIMEOUT_MS)) {
           const state = await client.waitAgent(paneId, ['idle', 'done', 'blocked'], 30_000);
-          if (state === 'blocked') { settledKind = 'blocked'; break; }
+          if (state === 'blocked') {
+            // E1（人类闸门）：blocked 不是终态——转后台 poller（人类答后续跑、结算自动通知），
+            // 返回 gate 通知：不揽活、提醒用户去 pane 答题、授权例外经 send_message 转达。
+            const question = await readAskFlag(paneId);
+            entry.background = true;
+            lastRequestIdByPane.set(paneId, `prompt-${taskId}`);
+            startPoller(paneId, cwd, spawnedAt, injectTs, spec.description, `prompt-${taskId}`);
+            persistSubs();
+            writeHistory(entry);
+            return {
+              content: [{ type: 'text', text: buildBlockedGateNotice({ paneId, description: spec.description, question }) }],
+              details: { paneId, taskId, background: true, blocked: true, role: kind },
+            };
+          }
           if (state === 'idle' || state === 'done') {
             // A1 内容闸：herdr idle 只是"可能是结算"——以会话内容定夺
             const s = await subSessionState(paneId, cwd, injectTs);
@@ -1035,7 +1075,6 @@ export default function subagentPlugin(ctx: Context): void {
             lastRequestIdByPane.set(paneId, `prompt-${taskId}`);
             startPoller(paneId, cwd, spawnedAt, injectTs, spec.description, `prompt-${taskId}`);
             persistSubs();
-            writeHistory(entry);
             const notice = buildAliveNotice(
               { paneId, description: spec.description, scenario: 'moved-to-bg', probe },
               Date.now(),
@@ -1049,8 +1088,7 @@ export default function subagentPlugin(ctx: Context): void {
           settledKind = 'timeout';
         }
         const outcome =
-          settledKind === 'blocked' ? { kind: 'blocked' as const, text: text ?? '' }
-          : settledKind === 'timeout' ? { kind: 'timeout' as const, text: text ?? '' }
+          settledKind === 'timeout' ? { kind: 'timeout' as const, text: text ?? '' }
           : text ? { kind: 'completed' as const, text }
           : { kind: 'no-output' as const, text: '' };
         entry.status = 'consumed';
@@ -1215,7 +1253,13 @@ export default function subagentPlugin(ctx: Context): void {
         const probe = probes.get(sub.paneId);
         const statusTag = probe?.agentStatus ? ` ${probe.agentStatus}` : '';
         const activityTag = probe?.lastActivityMs != null ? `, active ${agoText(probe.lastActivityMs, Date.now())}` : '';
-        lines.push(`${sub.paneId} [${state}${takeoverMark}${statusTag}${activityTag}] (${sub.kind})${tabTag} ${sub.description}`);
+        // E：blocked 时附上闸门问题摘要（提示 master 该叫用户去 pane，不是自己接手）
+        let gateTag = '';
+        if (probe?.agentStatus === 'blocked') {
+          const q = await readAskFlag(sub.paneId);
+          gateTag = q ? ` — AWAITING HUMAN: "${q}"` : ' — AWAITING HUMAN decision';
+        }
+        lines.push(`${sub.paneId} [${state}${takeoverMark}${statusTag}${activityTag}${gateTag}] (${sub.kind})${tabTag} ${sub.description}`);
       }
       return { content: [{ type: 'text', text: lines.join('\n') }], details: {} };
     },

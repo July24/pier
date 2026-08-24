@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { agoText, buildAliveNotice, isAlive, type AliveProbe } from '../src/subagent-core.ts';
+import { agoText, buildAliveNotice, buildBlockedGateNotice, isAlive, type AliveProbe } from '../src/subagent-core.ts';
 
 const NOW = 1_800_000_000_000;
 
@@ -70,4 +70,22 @@ test('buildAliveNotice: 会话活动未知时省略 activity 子句', () => {
     NOW,
   );
   assert.ok(!text.includes('last session activity'));
+});
+
+
+test('buildBlockedGateNotice: 闸门话术——不揽活/引导用户/授权例外经 send_message', () => {
+  const text = buildBlockedGateNotice({ paneId: 'wB:p3', description: 'Explore HR', question: '用哪个数据源？' });
+  assert.match(text, /BLOCKED waiting for a HUMAN decision in pane wB:p3/);
+  assert.match(text, /question: "用哪个数据源？"/);
+  assert.match(text, /Do NOT take over its work/);
+  assert.match(text, /Tell the user to open that pane/);
+  assert.match(text, /explicitly authorizes/);
+  assert.match(text, /send_message/);
+  assert.match(text, /do not redo the work yourself/);
+});
+
+test('buildBlockedGateNotice: question 缺省时省略子句', () => {
+  const text = buildBlockedGateNotice({ paneId: 'wB:p4', description: 'X', question: null });
+  assert.ok(!text.includes('question:'));
+  assert.match(text, /BLOCKED waiting for a HUMAN decision/);
 });

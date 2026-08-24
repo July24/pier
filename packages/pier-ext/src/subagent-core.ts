@@ -151,6 +151,23 @@ export function buildAliveNotice(
   ].join(' ');
 }
 
+/**
+ * 人类闸门通知（E1/E2 统一出口）：subagent blocked（ask_user_question 等人类）时
+ * 给 master 的话术——不揽活、引导用户去 pane、授权例外经 send_message 转达。
+ * question 来自 herdr tokens['pi-ask']（子扩展 reportAskFlag 上报）。
+ */
+export function buildBlockedGateNotice(opts: { paneId: string; description: string; question: string | null }): string {
+  const { paneId, description, question } = opts;
+  const q = question ? ` (question: "${question}")` : '';
+  return [
+    `Subagent "${description}" is BLOCKED waiting for a HUMAN decision in pane ${paneId}${q}.`,
+    'It keeps running in background; once the human answers it resumes, and you will be notified when it settles.',
+    'Do NOT take over its work and do NOT answer on the human\'s behalf.',
+    'Tell the user to open that pane in herdr and answer directly.',
+    'Only if the user explicitly authorizes you: relay their decision to the subagent via send_message — do not redo the work yourself.',
+  ].join(' ');
+}
+
 /* ── 子代理注册表（custom 条目持久化） ────────────────────────────── */
 
 export const SUBS_CUSTOM_TYPE = 'pi-herdr.subs';
