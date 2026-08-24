@@ -22,8 +22,8 @@ import { makeProgressUpdate } from '../subagent-core.ts';
 import { TODO_DETAILS_KEY, TODO_TOOL_NAME, formatTodoConfirmation, type TodoItem, type TodoStatus } from '../vocab.ts';
 import {
   TODO_EDIT_CUSTOM_TYPE,
-  boundedView,
   completionTransitions,
+  countTodos,
   fuzzyFind,
   listsEqual,
   makeSnapshot,
@@ -65,17 +65,11 @@ const TODO_MARKS: Record<TodoStatus, string> = {
   abandoned: '✗',
 };
 
-function widgetLines(items: TodoItem[]): string[] {
-  if (items.length === 0) return [];
-  const counts = { pending: 0, inProgress: 0, completed: 0, blocked: 0 };
-  for (const it of items) {
-    if (it.status === 'pending') counts.pending++;
-    else if (it.status === 'in_progress') counts.inProgress++;
-    else if (it.status === 'completed') counts.completed++;
-    else if (it.status === 'blocked') counts.blocked++;
-  }
-  const lines = [`todo: ${counts.inProgress}▶ ${counts.pending}○ ${counts.blocked}■ ${counts.completed}✓`];
-  // D43 phase 分组 + D39 有界（每组预算 10 行）
+/** pi TUI widget 硬上限（interactive-mode MAX_WIDGET_LINES=10，头部截断；我们自己控制在限内）。 */
+export const WIDGET_MAX_LINES = 10;
+
+/** 分组渲染（phase 头 + 条目行；不设预算，widget 与 /todos 共用）。 */
+function renderGroups(items: readonly TodoItem[]): string[] {
   const groups = new Map<string, TodoItem[]>();
   for (const it of items) {
     const key = it.phase ?? '';
@@ -83,16 +77,44 @@ function widgetLines(items: TodoItem[]): string[] {
     arr.push(it);
     groups.set(key, arr);
   }
+  const lines: string[] = [];
   for (const [phase, list] of groups) {
     if (phase) lines.push(`  [${phase}]`);
-    const view = boundedView(list, 10);
-    for (const it of view.visible) {
+    for (const it of list) {
       const suffix = it.status === 'blocked' && it.blocker ? ` — ${it.blocker}` : '';
       lines.push(`  ${TODO_MARKS[it.status]} ${it.content}${suffix}`);
     }
-    if (view.hiddenCompleted > 0 || view.hiddenOpen > 0) {
-      lines.push(`   +${view.hiddenCompleted + view.hiddenOpen} more (${view.hiddenCompleted} completed, ${view.hiddenOpen} open)`);
-    }
+  }
+  return lines;
+}
+
+/**
+ * widget 行（全局预算版，用户实证修复）：
+ * 旧实现按分组插入序逐组渲染（每组预算 10），pi 头部截 10 行 → 老 phase 吃光窗口、
+ * 最新任务组（in_progress 所在）整组不可见。新规则：
+ *  - 全局预算 = WIDGET_MAX_LINES（含摘要行与 +N 行）；
+ *  - 超额丢弃顺序 = 最老 completed → 最老 open（尾部/当前工作永远存活）；
+ *  - +N 行指路 /todos（全量视图）。
+ */
+export function widgetLines(items: readonly TodoItem[]): string[] {
+  if (items.length === 0) return [];
+  const c = countTodos(items);
+  const summary = `todo: ${c.inProgress}▶ ${c.pending}○ ${c.blocked}■ ${c.completed}✓`;
+
+  const kept = [...items];
+  while (
+    kept.length > 0
+    && 1 + renderGroups(kept).length + (items.length > kept.length ? 1 : 0) > WIDGET_MAX_LINES
+  ) {
+    const oldestCompleted = kept.findIndex((it) => it.status === 'completed');
+    kept.splice(oldestCompleted === -1 ? 0 : oldestCompleted, 1);
+  }
+
+  const hidden = items.filter((it) => !kept.includes(it));
+  const lines = [summary, ...renderGroups(kept)];
+  if (hidden.length > 0) {
+    const hiddenCompleted = hidden.filter((it) => it.status === 'completed').length;
+    lines.push(`   +${hidden.length} hidden (${hiddenCompleted}✓) · /todos 全量`);
   }
   return lines;
 }
@@ -290,9 +312,14 @@ export default function todoPlugin(ctx: Context): void {
         ui?.notify?.(`"${content}" ${verb}`, 'info');
         return;
       }
-      const lines = widgetLines(todos.items);
-      const text = lines.length ? lines.join('\n') : 'todo list is empty';
-      ui?.notify?.(text, 'info');
+      // 全量视图（/todos 不受 widget 10 行预算限制——"看整个列表"的正式入口）
+      const body = renderGroups(todos.items);
+      if (body.length === 0) {
+        ui?.notify?.('todo list is empty', 'info');
+        return;
+      }
+      const c = countTodos(todos.items);
+      ui?.notify?.([`todo: ${c.inProgress}▶ ${c.pending}○ ${c.blocked}■ ${c.completed}✓`, ...body].join('\n'), 'info');
     },
   });
 

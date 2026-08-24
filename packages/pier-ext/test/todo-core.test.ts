@@ -294,7 +294,7 @@ test('fuzzyFind: 精确 → 前缀 → 子串，歧义列出候选', () => {
   assert.deepEqual(fuzzyFind(items2, '不存在'), []);
 });
 
-test('boundedView: 预算内原样；超预算先丢 completed 再截断 open', () => {
+test('boundedView: 预算内原样；超预算隐最老保最新（open 超额截头部，completed 尾部填充）', () => {
   const items = [
     { content: 'o1', status: 'pending' },
     { content: 'o2', status: 'in_progress' },
@@ -308,13 +308,14 @@ test('boundedView: 预算内原样；超预算先丢 completed 再截断 open', 
     { content: 'c1', status: 'completed' },
     { content: 'c2', status: 'completed' },
   ];
+  // open 超额：保最新两条（o2/o3），最老 open（o1）与全部 completed 隐藏
   const v = boundedView(big, 2);
-  assert.deepEqual(v.visible.map((i) => i.content), ['o1', 'o2']);
+  assert.deepEqual(v.visible.map((i) => i.content), ['o2', 'o3']);
   assert.equal(v.hiddenOpen, 1);
   assert.equal(v.hiddenCompleted, 2);
-  // completed 可填充剩余预算
+  // completed 填充剩余预算：取最新（尾部 c2），不是最老 c1
   const v2 = boundedView(big, 4);
-  assert.deepEqual(v2.visible.map((i) => i.content), ['o1', 'o2', 'o3', 'c1']);
+  assert.deepEqual(v2.visible.map((i) => i.content), ['o1', 'o2', 'o3', 'c2']);
   assert.equal(v2.hiddenCompleted, 1);
   assert.equal(v2.hiddenOpen, 0);
 });

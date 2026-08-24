@@ -298,7 +298,7 @@ export function fuzzyFind(items: readonly TodoItem[], query: string): string[] {
   return substr.map((it) => it.content);
 }
 
-/** D39：有界视图选择——先丢 completed、再截断尾部；返回可见条目与摘要。 */
+/** D39：有界视图选择——先丢 completed、再截 open；两端都超额时保最新（尾部切片）。 */
 export interface BoundedView {
   visible: TodoItem[];
   /** 被隐藏的数量按状态计数（completed 单独计，其余合并）。 */
@@ -312,15 +312,18 @@ export function boundedView(items: readonly TodoItem[], budget: number): Bounded
   }
   const completed = items.filter((it) => it.status === 'completed');
   const open = items.filter((it) => it.status !== 'completed');
-  let visible = open.slice(0, budget);
+  // 修正（用户实证）：widget 是头部可见窗口——超预算必须隐最老（丢头部），保最新可见；
+  // 旧实现 slice(0, budget) 保最老，最新任务永远落在窗口外。
+  const visible = open.length > budget ? open.slice(-budget) : open;
   const hiddenOpen = open.length - visible.length;
   let hiddenCompleted = completed.length;
+  let final = visible;
   if (hiddenOpen === 0 && visible.length < budget) {
     const room = budget - visible.length;
-    visible = [...visible, ...completed.slice(0, room)];
+    final = [...visible, ...completed.slice(-room)];
     hiddenCompleted = completed.length - room;
   }
-  return { visible, hiddenCompleted, hiddenOpen };
+  return { visible: final, hiddenCompleted, hiddenOpen };
 }
 
 /** 当前 in_progress 中的第一条（上报 agent 状态时作为 message，供侧边栏显示"正在做什么"）。 */
