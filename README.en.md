@@ -116,6 +116,26 @@ npm install --ignore-scripts
 npm test          # node --test, 244 unit tests (planner / todo replay / session tail / GC / lifecycle)
 ```
 
+## Release process (tag → auto-publish to npm)
+
+Three version numbers must stay in sync when releasing (enforced by `.githooks/pre-push`; mismatched pushes are rejected):
+
+| Location | npm package |
+|---|---|
+| git tag (`v0.2.0` or `0.2.0`) | release trigger |
+| `packages/pier-ext/package.json` `version` | `pi-pier` |
+| root `package.json` `version` | `pier-setup` |
+
+```sh
+# 1. Bump both versions to the target (must be greater than anything already on npm)
+# 2. Commit, then tag with the same number and push:
+git commit -am "release: 0.2.0"
+git tag 0.2.0
+git push && git push --tags   # GitHub Actions runs tests and publishes via Trusted Publishing
+```
+
+> Hook setup: run once after cloning — `git config core.hooksPath .githooks` (the npm prepare script does this automatically on `npm install`). Versions only go up: npm rejects re-publishing the same version, and old tag names cannot be reused.
+
 ## Design principles
 
 - **Session JSONL is the single source of truth**: todos, delegations, and registries replay from session branches — restart and branch switches stay correct

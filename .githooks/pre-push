@@ -1,0 +1,48 @@
+#!/bin/sh
+# ─────────────────────────────────────────────────────────────────────
+# pier 发布守卫：push tag 时强制「三处版本号」一致，否则拒绝推送。
+#
+# 三处版本号（必须相同，且必须大于 npm 上已发布的版本）：
+#   1. git tag 本身（兼容 v 前缀与纯语义版本：v0.2.0 / 0.2.0）
+#   2. packages/pier-ext/package.json 的 version   （npm 包 pi-pier）
+#   3. 根 package.json 的 version                  （npm 包 pier-setup）
+#
+# 发版正确姿势：
+#   1. 同时修改上述两个 package.json 的 version → 目标版本
+#   2. git commit
+#   3. git tag <目标版本> && git push && git push --tags
+#
+# 安装（本仓库 clone 后一次性；npm install 也会经 prepare 自动执行）：
+#   git config core.hooksPath .githooks
+# ─────────────────────────────────────────────────────────────────────
+set -u
+
+fail() { echo "✗ [publish-guard] $1" >&2; echo '  提示：同时修改 packages/pier-ext/package.json 与根 package.json 的 version 为 tag 版本后重新打 tag。' >&2; exit 1; }
+
+ver_of() { # $1=ref $2=file 内的 json 路径文件 → 输出 version
+  git show "$1:$2" 2>/dev/null | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8")).version' 2>/dev/null
+}
+
+while read -r local_ref local_sha _remote_ref _remote_sha; do
+  case "$local_ref" in refs/tags/*) ;; *) continue ;; esac
+
+  # tag 删除推送（全零 sha）不校验
+  case "$local_sha" in 0000000000000000000000000000000000000000) continue ;; esac
+
+  tag="${local_ref#refs/tags/}"
+  ver="${tag#v}"
+
+  ext="$(ver_of "$tag" packages/pier-ext/package.json)" || true
+  root="$(ver_of "$tag" package.json)" || true
+
+  [ -n "$ext" ]  || fail "无法读取 tag $tag 处 packages/pier-ext/package.json 的 version"
+  [ -n "$root" ] || fail "无法读取 tag $tag 处根 package.json 的 version（根包 pier-setup 必须有 version 字段）"
+
+  if [ "$ver" != "$ext" ] || [ "$ver" != "$root" ]; then
+    fail "版本不一致：tag=$ver, pi-pier=$ext, pier-setup=$root"
+  fi
+
+  echo "✓ [publish-guard] $tag：tag = pi-pier@$ext = pier-setup@$root，一致"
+done
+
+exit 0

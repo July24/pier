@@ -31,7 +31,8 @@
     "packages/*"
   ],
   "scripts": {
-    "test": "node --test \"packages/*/test/*.test.ts\""
+    "test": "node --test \"packages/*/test/*.test.ts\"",
+    "prepare": "git config core.hooksPath .githooks"
   },
   "devDependencies": {
     "@deepseek-ai/cordis-plugin-group": "^1.0.1",
