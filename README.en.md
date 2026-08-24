@@ -66,7 +66,17 @@ herdr plugin install July24/pier/packages/pier-workbench --yes   # user mode (re
 herdr plugin link ./packages/pier-workbench                        # development
 ```
 
-The extension degrades gracefully outside a herdr environment (tools unregistered, reporting is free).
+The extension degrades gracefully outside a herdr environment (see Scope below).
+
+### Scope (only the herdr × pi intersection is affected)
+
+- **pi outside herdr**: the extension degrades — reporting is free, workbench tools
+  (`subagent`, terminal family) return a clear "requires a herdr-managed pane" error;
+  `todo_write` / `ask_user_question` stay available (session JSONL is the authority,
+  no herdr dependency).
+- **other agents inside herdr (claude code / codex etc.)**: tabs without a pi pane
+  are excluded from heat reflow; blocked notifications are pi-only; master-tab
+  auto-bootstrap can be disabled with `autoBootstrap: false` in boot-config.
 
 ### Bootstrap config (workbench half)
 

@@ -194,3 +194,47 @@ test('runReflow：防抖期被更新 token 顶掉 → 不应用', async () => {
   await runReflow(deps);
   assert.equal(calls.length, 0, '被顶掉的聚焦不应用');
 });
+
+test('runReflow：收紧闸（场景 B 隔离）——非 pi tab 不 reflow，pi tab 正常', async () => {
+  // piTabIds 缺省（旧接线/单测）→ 不过滤，行为不变
+  const unfiltered = makeDeps();
+  await runReflow(unfiltered.deps);
+  assert.ok(unfiltered.calls.some(([m]) => m === 'layout.set_split_ratio'), '缺省放行');
+
+  // tab 不在 pi 集合（claude code / codex / 纯 shell 的 tab）→ export 后止步，不应用 ratio
+  const foreign = makeDeps({ piTabIds: async () => new Set(['tab-other']) });
+  await runReflow(foreign.deps);
+  assert.ok(foreign.calls.some(([m]) => m === 'layout.export'), 'export 仍发生（tabId 解析来源）');
+  assert.ok(!foreign.calls.some(([m]) => m === 'layout.set_split_ratio'), '非 pi tab 零 ratio');
+
+  // tab 含 pi pane → 正常 reflow
+  const own = makeDeps({ piTabIds: async () => new Set(['tab-1']) });
+  await runReflow(own.deps);
+  assert.ok(own.calls.some(([m]) => m === 'layout.set_split_ratio'), 'pi tab 照常');
+
+  // 快照抛错 → 保守不动（空集合语义）
+  const broken = makeDeps({ piTabIds: async () => { throw new Error('socket down'); } });
+  await runReflow(broken.deps);
+  assert.ok(!broken.calls.some(([m]) => m === 'layout.set_split_ratio'), '快照失败零 ratio');
+});
+
+test('runReflow：收紧闸同样作用于 status/count 路径', async () => {
+  // agent_status_changed 路径
+  const st = makeDeps({ piTabIds: async () => new Set(['tab-other']) });
+  st.deps.ev = { ...st.deps.ev, hook: 'pane.agent_status_changed', type: 'pane.agent_status_changed', paneId: 'pane-c', cause: null };
+  let state = { tabs: { 'tab-1': { enabled: true, lastFocusPaneId: 'pane-a', lastApplyAt: 1 } }, panes: {}, debounce: null };
+  st.deps.loadState = () => state;
+  st.deps.saveState = (s) => { state = s; };
+  st.deps.listAgentStatuses = async () => ({ 'pane-c': 'blocked' });
+  await runReflow(st.deps);
+  assert.ok(!st.calls.some(([m]) => m === 'layout.set_split_ratio'), '非 pi tab 的 blocked 不触发重排');
+
+  // pane.created 数量路径
+  const cr = makeDeps({ piTabIds: async () => new Set(['tab-other']) });
+  cr.deps.ev = { ...cr.deps.ev, hook: 'pane.created', type: 'pane.created', paneId: 'pane-new' };
+  let st2 = { tabs: {}, panes: {}, debounce: null };
+  cr.deps.loadState = () => st2;
+  cr.deps.saveState = (s) => { st2 = s; };
+  await runReflow(cr.deps);
+  assert.ok(!cr.calls.some(([m]) => m === 'layout.set_split_ratio'), '非 pi tab 的数量变化不触发重排');
+});

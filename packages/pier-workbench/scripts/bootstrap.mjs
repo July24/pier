@@ -86,6 +86,12 @@ function deepFindFirst(obj, key, depth = 0) {
 }
 
 async function main() {
+  // 收紧闸（场景 B 隔离）：autoBootstrap=false 时新 workspace 不自动注入 pi
+  //（用户想在 herdr 里跑其他 agent 时关掉本开关即可；默认 true = 产品行为不变）。
+  if (config.autoBootstrap === false) {
+    console.log('[bootstrap] autoBootstrap disabled; skip');
+    process.exit(0);
+  }
   let event = {};
   try { event = JSON.parse(process.env.HERDR_PLUGIN_EVENT_JSON ?? '{}'); } catch { /* 留空 */ }
   const wsId = event?.workspace?.workspace_id ?? deepFindFirst(event, 'workspace_id') ?? '';
@@ -93,7 +99,6 @@ async function main() {
     console.error('[bootstrap] no workspace_id in event payload');
     process.exit(0);
   }
-
   const panes = (await request('pane.list', {})).panes ?? [];
   const wsPanes = panes.filter((p) => p.workspace_id === wsId);
   // D91 图标换代表：新 title 头 ▶…，旧会话 ⏳…（双匹配保幂等）

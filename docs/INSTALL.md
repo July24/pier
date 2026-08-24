@@ -93,7 +93,8 @@ copy packages\pier-workbench\scripts\boot-config.example.json <配置位置>\boo
 | WSL2 内跑 herdr + Windows 原生 pi | 未实测 | 推荐整栈同环境（herdr 与 pi 同在 WSL 或同在 Windows），socket 路径约定不同 |
 | herdr pane 命令进程退出 | 已知行为 | pane 被重置为新 shell、输出清空（子 pane 用常驻 shell 包裹规避） |
 | pane.send_input | 不可用 | Windows preview 只产生终端回显、不投递进程 stdin；派活用 pane.send_text+CR（实测） |
-| agent.prompt（bracketed-paste） | 对 pi TUI 不可用 | agent_prompt_stalled（实测）；派活走扩展管道注入（pane.send_text 仅起进程） |
+| 非 herdr 环境用 pi | ✅ 实测 | 自动降级：上报零成本，工作台工具报环境提示；todo_write / ask_user_question 照常可用 |
+| herdr 中用其他 agent | ✅ 收紧隔离 | 非 pi tab 不 reflow、blocked 通知仅 pi；`autoBootstrap: false` 可关主 tab 自动引导 |
 | agent start --kind pi | Windows npm 安装不可用 | `Start-Process pi` 无法执行 pi.ps1；启动走 layout.apply / split + shell 包裹（macOS/Linux 同款路径） |
 | herdr title 80 字符截断 | 已规避 | 标题投影本地先裁（TITLE_MAX=80）；明细走 /todos + widget |
 | state_labels | 仅合法键 | idle\|working\|blocked\|done\|unknown；blocked 徽标用 `blocked` 键 |

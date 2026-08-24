@@ -96,20 +96,15 @@ async function main() {
           return {};
         }
       },
-      // D95：ask_user_question 等待标志（pane.list tokens['pi-ask'] 非空 = 人类闸门）
-      listAskFlags: async () => {
+      // 收紧闸（场景 B 隔离）：含 pi pane 的 tab 集合——非 pi tab（claude code /
+      // codex / 纯 shell 的 tab）不 reflow，pier 只管 pi 工作台自己的 tab。
+      piTabIds: async () => {
+        const tabs = new Set();
         try {
           const result = await request('pane.list', {});
-          const panes = result?.panes ?? [];
-          const map = {};
-          for (const p of panes) {
-            const v = p?.tokens?.['pi-ask'];
-            if (p?.pane_id && v) map[p.pane_id] = true;
-          }
-          return map;
-        } catch {
-          return {};
-        }
+          for (const p of result?.panes ?? []) if (p?.agent === 'pi' && p?.tab_id) tabs.add(p.tab_id);
+        } catch { /* 快照失败 = 空集合 → 保守不动 */ }
+        return tabs;
       },
     });
     await app.root.plugin(reflowPlugin);

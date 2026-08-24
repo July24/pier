@@ -37,8 +37,18 @@ export interface ReflowDeps {
   listAgentStatuses?: () => Promise<AgentStatusMap>;
   /** D95：ask_user_question 等待标志（tokens['pi-ask'] 非空）。缺省 = 无 ask。 */
   listAskFlags?: () => Promise<Record<string, boolean>>;
+  /**
+   * 收紧闸（场景 B 隔离）：含 pi agent pane 的 tab 集合——非 pi tab（claude code /
+   * codex / 纯 shell）不 reflow。缺省 = 不过滤（单测/旧接线兼容）。
+   */
+  piTabIds?: () => Promise<Set<string>>;
 }
 
+/** tab 是否归 pier 管（含 pi pane）。dep 缺省放行；快照失败按不在集合处理（保守不动）。 */
+async function isPiTab(deps: ReflowDeps, tabId: string): Promise<boolean> {
+  if (!deps.piTabIds) return true;
+  try { return (await deps.piTabIds()).has(tabId); } catch { return false; }
+}
 type ReflowState = Record<string, any>;
 
 async function onCreated(deps: ReflowDeps, paneId: string): Promise<void> {
@@ -77,6 +87,7 @@ async function onCountChanged(deps: ReflowDeps): Promise<void> {
   const { root, tabId: exportedTabId, zoomed } = unwrapLayout(exported);
   const tabId = exportedTabId ?? deps.ev.tabId;
   if (!root || !tabId) return;
+  if (!(await isPiTab(deps, tabId))) return;
   const tabCfg = latest.tabs?.[tabId] ?? { enabled: true };
   const lastFocus = typeof (tabCfg as { lastFocusPaneId?: unknown }).lastFocusPaneId === 'string'
     ? (tabCfg as { lastFocusPaneId: string }).lastFocusPaneId
@@ -139,6 +150,7 @@ async function onFocused(deps: ReflowDeps): Promise<void> {
   const { root, tabId: exportedTabId, zoomed } = unwrapLayout(exported);
   const tabId = exportedTabId ?? deps.ev.tabId;
   if (!root || !tabId) return;
+  if (!(await isPiTab(deps, tabId))) return;
   const tabCfg = latest.tabs?.[tabId] ?? { enabled: true };
   const applied = await applyTiered(deps, { root, tabId, focusPaneId: paneId, zoomed, tabCfg });
   if (!applied) return;
@@ -169,6 +181,7 @@ async function onAgentStatusChanged(deps: ReflowDeps): Promise<void> {
   const { root, tabId: exportedTabId, zoomed } = unwrapLayout(exported);
   const tabId = exportedTabId ?? deps.ev.tabId;
   if (!root || !tabId) return;
+  if (!(await isPiTab(deps, tabId))) return;
   const tabCfg = latest.tabs?.[tabId] ?? { enabled: true };
   // 焦点沿用上次；该 pane 不在树或从未 focus 过 → 退化 first pane
   const lastFocus = typeof (tabCfg as { lastFocusPaneId?: unknown }).lastFocusPaneId === 'string'

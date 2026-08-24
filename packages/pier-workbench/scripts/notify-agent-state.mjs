@@ -27,6 +27,7 @@ try {
 // 只关心 agent 状态迁移到 blocked（人类闸门信号）
 if (event?.type !== 'pane.agent_status_changed') process.exit(0);
 const data = event.data ?? {};
+if (data.agent !== 'pi') process.exit(0); // 收紧闸：只对 pier 管的 pi subagent 发人类闸门通知
 if (data.agent_status !== 'blocked') process.exit(0);
 
 if (!SOCKET) process.exit(2);

@@ -64,7 +64,16 @@ herdr plugin install July24/pier/packages/pier-workbench --yes   # 用户模式�
 herdr plugin link ./packages/pier-workbench                        # 开发期
 ```
 
-扩展在非 herdr 环境下自动降级（工具不注册、上报零成本）。
+扩展在非 herdr 环境下自动降级（详见下节"作用域"）。
+
+### 作用域（只影响 herdr × pi 交叉场景）
+
+- **非 herdr 环境用 pi**：扩展自动降级——herdr 上报零成本，`subagent` / 终端族
+  工具返回"requires a herdr-managed pane"提示；`todo_write` / `ask_user_question`
+  照常可用（以会话 JSONL 为权威，无 herdr 依赖）。
+- **herdr 中用其他 agent（claude code / codex 等）**：不含 pi pane 的 tab 不参与
+  热力布局；blocked 通知只发给 pi；主 tab 自动引导可用 boot-config 的
+  `autoBootstrap: false` 关闭。
 
 ### 引导配置（workbench 半区）
 
