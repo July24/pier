@@ -42,7 +42,7 @@ while read -r local_ref local_sha _remote_ref _remote_sha; do
     fail "版本不一致：tag=$ver, pi-pier=$ext, pier-setup=$root"
   fi
 
-  echo "✓ [publish-guard] $tag：tag = pi-pier@$ext = pier-setup@$root，一致"
+  echo "✓ [publish-guard] ${tag}：tag = pi-pier@${ext} = pier-setup@${root}，一致"
 done
 
 exit 0
