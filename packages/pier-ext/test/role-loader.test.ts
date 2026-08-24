@@ -6,6 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { join } from 'node:path';
 import {
   loadRoleConfig,
   RoleLoaderError,
@@ -220,7 +221,7 @@ test('v1.1 builtinDirect：master 自应用无视 workspace 诱饵，直读内�
   const { ROLES_DIR } = await import('../src/role-loader.ts');
   const mem = layerReaderWith({ w: { 'master.json': { ...CUSTOM, role: 'master' } } }); // 诱饵（version 1.0.0）
   const read: LayerReader = (dir, fileName) => {
-    if (dir === ROLES_DIR) return ex(dir + '\\' + fileName) ? rf(dir + '\\' + fileName, 'utf8') : null; // 内置层走真实 fs
+    if (dir === ROLES_DIR) return ex(join(dir, fileName)) ? rf(join(dir, fileName), 'utf8') : null; // 内置层走真实 fs（平台原生分隔符）
     return mem.read(dir, fileName);
   };
   // 默认（spawn 语义）：诱饵存在 → 响亮报错
@@ -254,15 +255,12 @@ test('v1.1：命中层校验失败立即报 INVALID_ROLE_CONFIG（不静默落�
 });
 
 test('v1.1 目录助手：workspaceRolesDir(baseDir) / userRolesDir() 路径形态', () => {
-  assert.equal(workspaceRolesDir('F:\\ws'), 'F:\\ws\\.pi-herdr\\roles');
-  assert.equal(workspaceRolesDir(), joinSafe(process.cwd(), '.pi-herdr', 'roles'));
+  const WS = process.platform === 'win32' ? 'F:\\ws' : '/ws';
+  assert.equal(workspaceRolesDir(WS), join(WS, '.pi-herdr', 'roles'));
+  assert.equal(workspaceRolesDir(), join(process.cwd(), '.pi-herdr', 'roles'));
   assert.match(userRolesDir().replace(/\\/g, '/'), /\/\.pi\/agent\/herdr-pi\/roles$/);
-  const layers = roleLayers({ baseDir: 'F:\\ws' });
+  const layers = roleLayers({ baseDir: WS });
   assert.equal(layers.length, 3);
   assert.match(layers[0].dir.replace(/\\/g, '/'), /\.pi-herdr\/roles$/);
   assert.match(layers[2].dir.replace(/\\/g, '/'), /src\/roles$/);
 });
-
-function joinSafe(...parts: string[]): string {
-  return parts.join('\\').replace(/\\\\/g, '\\');
-}

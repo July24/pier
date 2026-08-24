@@ -24,11 +24,26 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 // 引导记录与历史记录同约定，落 ~/.pi/agent/herdr-pi/boot.jsonl（插件/扩展两侧同读）。
 const BOOT_FILE = path.join(os.homedir(), '.pi', 'agent', 'herdr-pi', 'boot.jsonl');
 
+// 配置解析：用户模式（plugin install）配置在 HERDR_PLUGIN_CONFIG_DIR（herdr 管理的
+// checkout 会被 reinstall 替换，配置不能落在插件目录里）；dev 模式（link）回退
+// scripts/boot-config.json（本仓库内，模板 .example.json）。
+function readBootConfig(here) {
+  const candidates = [
+    process.env.HERDR_PLUGIN_CONFIG_DIR ? path.join(process.env.HERDR_PLUGIN_CONFIG_DIR, 'boot-config.json') : null,
+    path.join(here, 'boot-config.json'),
+  ].filter(Boolean);
+  for (const f of candidates) {
+    try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { /* 下一处 */ }
+  }
+  return null;
+}
+
 let config = null;
 try {
-  config = JSON.parse(fs.readFileSync(path.join(here, 'boot-config.json'), 'utf8'));
-} catch {
-  console.error('[bootstrap] boot-config.json missing/broken');
+  config = readBootConfig(here);
+  if (!config) throw new Error('no boot-config.json in HERDR_PLUGIN_CONFIG_DIR or scripts/');
+} catch (e) {
+  console.error('[bootstrap] ' + e.message);
   process.exit(0);
 }
 
@@ -97,10 +112,16 @@ async function main() {
 
   // 档1 hmr 开发姿态（d87）：hmrDev=true 时 master 启动线带 --expose-internals +
   // PI_HERDR_HMR=1（双闸；bootstrap.ts 缺一即零 watcher）。默认 false = 生产姿态不变。
+  // 启动行按平台出 shell 语法：win32=PowerShell（& + '' 转义 + $env:），POSIX=sh（'\'' 转义 + env 前缀）。
   const hmrDev = config.hmrDev === true;
+  const cliParts = [config.piNode, config.piCli];
+  if (hmrDev) cliParts.splice(1, 0, '--expose-internals');
+  cliParts.push('-e', config.extPath);
+  const quote = (s) => (process.platform === 'win32' ? `'${s.replace(/'/g, "''")}'` : `'${s.replace(/'/g, `'\\''`)}'`);
+  const cli = (process.platform === 'win32' ? '& ' : '') + cliParts.map(quote).join(' ');
   const launch = hmrDev
-    ? `$env:PI_HERDR_HMR='1'; & '${config.piNode}' --expose-internals '${config.piCli}' -e '${config.extPath}'`
-    : `& '${config.piNode}' '${config.piCli}' -e '${config.extPath}'`;
+    ? (process.platform === 'win32' ? `$env:PI_HERDR_HMR='1'; ${cli}` : `PI_HERDR_HMR=1 ${cli}`)
+    : cli;
   await request('pane.send_text', { pane_id: target.pane_id, text: launch + '\r' });
 
   const tabId = event?.tab?.tab_id ?? deepFindFirst(event, 'tab_id') ?? target.tab_id ?? '';

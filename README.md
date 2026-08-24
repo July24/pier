@@ -35,37 +35,44 @@ pier 由**两个半区**组成，各装一处：
 
 - Node ≥ 22
 - pi ≥ 0.84（`@earendil-works/pi-coding-agent`）
-- herdr ≥ 0.8.0（Windows 为 preview beta）
+- herdr ≥ 0.8.0（macOS / Linux / Windows；Windows 为 preview beta）
 
-### 1. pi 侧扩展
+### 一键安装（推荐）
+
+克隆仓库后运行：
 
 ```sh
-# 从本仓库克隆后（仓库路径请按你的实际路径替换）
-pi install F:\path\to\pier\packages\pier-ext
+node install.mjs            # 用户模式：pi install git:… + herdr plugin install + 自动生成引导配置
+node install.mjs install --dev   # 开发模式：本地路径 pi install + herdr plugin link，改码即生效
+```
 
-# 或开发期直接用扩展路径加载
-pi -e F:\path\to\pier\packages\pier-ext\src\index.ts
+脚本自动校验环境（node / pi / herdr 版本）、探测 pi 的 node 与 cli.js 绝对路径、
+生成 boot-config.json（用户模式落 herdr 插件配置目录，重装不丢），并注册两半区。
+
+其他命令：`node install.mjs update`（卸载+重装，重探测路径）、`node install.mjs uninstall --purge`。
+发行规格可用 `--pi-spec=` / `--herdr-spec=` 覆盖（npm 发布或 fork 场景）。
+
+### 手动安装（等价步骤）
+
+```sh
+# pi 侧扩展（任选其一；git 源 = 用户模式，本地路径 = 开发模式）
+pi install git:github.com/July24/pier
+pi install ./packages/pier-ext        # 开发期
+
+# herdr 侧插件
+herdr plugin install July24/pier/packages/pier-workbench --yes   # 用户模式（重装即更新）
+herdr plugin link ./packages/pier-workbench                        # 开发期
 ```
 
 扩展在非 herdr 环境下自动降级（工具不注册、上报零成本）。
 
-### 2. herdr 侧插件
+### 引导配置（workbench 半区）
 
-```sh
-herdr plugin link F:\path\to\pier\packages\pier-workbench
-```
+master 主 tab 引导需要本机 node / pi 路径：`node install.mjs` 自动生成；手动可复制模板
+`packages/pier-workbench/scripts/boot-config.example.json`（含 macOS / Windows 双平台占位）。
+用户模式配置在 `herdr plugin config-dir pier.workbench`；开发模式在 `packages/pier-workbench/scripts/boot-config.json`。
 
-### 3. 引导配置（可选）
-
-`packages/pier-workbench/scripts/boot-config.json` 是**本机引导配置**（指定 node/pi 路径），默认不入库。首次使用请复制模板：
-
-```sh
-copy packages\pier-workbench\scripts\boot-config.example.json packages\pier-workbench\scripts\boot-config.json
-```
-
-并填入你自己的 `piNode` / `piCli` / `extPath` 绝对路径。
-
-### 4. 使用
+### 使用
 
 1. 在 herdr workspace 里开 pane 跑 pi（pane 内 `pi`），扩展检测 `HERDR_ENV` 自动开始上报
 2. 模型可调用 `todo_write`（窗格头实时投影）、`subagent`（前台/并行/后台）、`list_agents` / `send_message` / `interrupt_agent`
@@ -85,7 +92,7 @@ docs/              # 安装手册、role 档案说明、侧边栏 role 配置
 
 ```sh
 npm install --ignore-scripts
-npm test          # node --test，242 项单测（规划器 / todo 重放 / 会话尾 / GC / 生命周期）
+npm test          # node --test，244 项单测（规划器 / todo 重放 / 会话尾 / GC / 生命周期）
 ```
 
 ## 设计原则

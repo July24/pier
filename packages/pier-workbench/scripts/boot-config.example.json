@@ -1,9 +1,15 @@
 {
-  "_comment": "pier-workbench 引导配置模板：复制为 boot-config.json 并填本机路径（boot-config.json 不入库）",
+  "_comment": "pier-workbench 引导配置模板（dev 模式用；用户模式由 install.mjs 自动写 herdr plugin config-dir）。复制为 boot-config.json 并填本机路径，或直接跑仓库根 node install.mjs install --dev 自动生成",
   "mainTabLabel": "main",
-  "piNode": "C:\\<path-to>\\node.exe",
-  "piCli": "C:\\<path-to>\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\cli.js",
-  "extPath": "C:\\<path-to-pier>\\packages\\pier-ext\\src\\index.ts",
+  "piNode": "/opt/homebrew/opt/node@22/bin/node",
+  "piCli": "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+  "extPath": "/Users/<you>/Documents/pier/packages/pier-ext/src/index.ts",
   "workbenchPluginId": "pier.workbench",
-  "hmrDev": false
+  "hmrDev": false,
+
+  "_windows_example": {
+    "piNode": "C:\\Program Files\\nodejs\\node.exe",
+    "piCli": "C:\\Users\\<you>\\AppData\\Roaming\\npm\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\cli.js",
+    "extPath": "C:\\Users\\<you>\\Documents\\pier\\packages\\pier-ext\\src\\index.ts"
+  }
 }

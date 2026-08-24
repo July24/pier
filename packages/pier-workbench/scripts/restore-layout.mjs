@@ -18,11 +18,19 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 // 与 bootstrap 同约定：~/.pi/agent/herdr-pi/boot.jsonl（实测 HERDR_PLUGIN_STATE_DIR 未注入）。
 const BOOT_FILE = path.join(os.homedir(), '.pi', 'agent', 'herdr-pi', 'boot.jsonl');
 
+// 配置解析与 bootstrap 同约定：HERDR_PLUGIN_CONFIG_DIR（用户模式）→ scripts/（dev 模式）。
 let config = null;
 try {
-  config = JSON.parse(fs.readFileSync(path.join(here, 'boot-config.json'), 'utf8'));
-} catch {
-  console.error('[restore-layout] boot-config.json missing/broken');
+  const candidates = [
+    process.env.HERDR_PLUGIN_CONFIG_DIR ? path.join(process.env.HERDR_PLUGIN_CONFIG_DIR, 'boot-config.json') : null,
+    path.join(here, 'boot-config.json'),
+  ].filter(Boolean);
+  for (const f of candidates) {
+    try { config = JSON.parse(fs.readFileSync(f, 'utf8')); break; } catch { /* 下一处 */ }
+  }
+  if (!config) throw new Error('no boot-config.json in HERDR_PLUGIN_CONFIG_DIR or scripts/');
+} catch (e) {
+  console.error('[restore-layout] ' + e.message);
   process.exit(0);
 }
 
@@ -77,7 +85,10 @@ function deepFindId(obj, key, depth = 0) {
 }
 
 async function relaunchInPane(paneId) {
-  const launch = `& '${config.piNode}' '${config.piCli}' -e '${config.extPath}'`;
+  // 裸 argv → 平台 shell 语法（win32=PowerShell `&`+`''` 转义，POSIX=sh 单引号 `'\''` 转义）
+  const quote = (s) => (process.platform === 'win32' ? `'${s.replace(/'/g, "''")}'` : `'${s.replace(/'/g, `'\\''`)}'`);
+  const launch = (process.platform === 'win32' ? '& ' : '')
+    + [config.piNode, config.piCli, '-e', config.extPath].map(quote).join(' ');
   await request('pane.send_text', { pane_id: paneId, text: launch + '\r' });
 }
 

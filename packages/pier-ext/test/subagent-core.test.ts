@@ -5,15 +5,49 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   Semaphore,
+  buildLaunchLine,
   foldSubsRegistry,
   formatSubagentResult,
   makeProgressUpdate,
   psQuote,
+  shQuote,
 } from '../src/subagent-core.ts';
 
 test('psQuote: 单引号翻倍转义', () => {
   assert.equal(psQuote("it's"), "'it''s'");
   assert.equal(psQuote('plain'), "'plain'");
+});
+
+test('shQuote: POSIX 单引号引出转义（\'\\\'\'）', () => {
+  assert.equal(shQuote("it's"), `'it'\\''s'`);
+  assert.equal(shQuote('plain'), "'plain'");
+  assert.equal(shQuote('/a b/c d.ts'), `'/a b/c d.ts'`);
+});
+
+test('buildLaunchLine: win32=PowerShell & 语法，POSIX=sh 直启（platform 参数双分支）', () => {
+  const parts = ['/usr/local/bin/node', '/opt/pi/dist/cli.js', '-e', '/ext/index.ts'];
+  assert.equal(
+    buildLaunchLine(parts, 'win32'),
+    `& '/usr/local/bin/node' '/opt/pi/dist/cli.js' '-e' '/ext/index.ts'`,
+  );
+  assert.equal(
+    buildLaunchLine(parts, 'darwin'),
+    `'/usr/local/bin/node' '/opt/pi/dist/cli.js' '-e' '/ext/index.ts'`,
+  );
+  assert.equal(
+    buildLaunchLine(parts, 'linux'),
+    buildLaunchLine(parts, 'darwin'),
+    '非 win32 全部走 sh 分支',
+  );
+  // 引号内特殊字符在两种语法下都保持单字面量
+  assert.equal(
+    buildLaunchLine(["it's a path"], 'darwin'),
+    `'it'\\''s a path'`,
+  );
+  assert.equal(
+    buildLaunchLine(["it's a path"], 'win32'),
+    `& 'it''s a path'`,
+  );
 });
 
 const mk = (over: Record<string, unknown>) => ({

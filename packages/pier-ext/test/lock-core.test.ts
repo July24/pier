@@ -25,7 +25,12 @@ import {
   type LockAgentView,
 } from '../src/lock-core.ts';
 
-const CWD = 'F:\\proj';
+// 平台参数化：CWD 与锁定文件按平台取原生形态（异平台路径在本平台 resolve 会当相对路径）
+const CWD = process.platform === 'win32' ? 'F:\\proj' : '/proj';
+/** 锁定文件 a.cs（位于 CWD 下）的归一形态。 */
+const LOCKED = process.platform === 'win32' ? 'f:/proj/a.cs' : '/proj/a.cs';
+/** 同一文件的原始抖动形态（大小写/分隔符），验证归一后才匹配 token。 */
+const LOCKED_ALT = process.platform === 'win32' ? 'F:\\Proj\\A.CS' : '/Proj/A.CS';
 
 function agent(paneId: string, locks: Record<string, string>): LockAgentView {
   const tokens: Record<string, string | null> = {};
@@ -35,15 +40,25 @@ function agent(paneId: string, locks: Record<string, string>): LockAgentView {
 
 /* ── 路径归一（Windows 大小写/分隔符/相对路径） ────────────────── */
 
-test('normalizeLockPath：反斜杠→斜杠、小写、相对→绝对、去尾斜杠', () => {
-  assert.equal(normalizeLockPath('F:\\A\\B.cs', CWD), 'f:/a/b.cs');
-  assert.equal(normalizeLockPath('f:/a/b.cs', CWD), 'f:/a/b.cs');
-  assert.equal(normalizeLockPath('src/x.ts', CWD), 'f:/proj/src/x.ts');
-  assert.equal(normalizeLockPath('f:/a/', CWD), 'f:/a');
-  assert.equal(
-    normalizeLockPath('F:\\A\\..\\A\\B.cs', CWD),
-    normalizeLockPath('F:\\A\\B.cs', CWD),
-  );
+test('normalizeLockPath：分隔符统一、小写、相对→绝对、去尾斜杠', () => {
+  if (process.platform === 'win32') {
+    assert.equal(normalizeLockPath('F:\\A\\B.cs', CWD), 'f:/a/b.cs');
+    assert.equal(normalizeLockPath('f:/a/b.cs', CWD), 'f:/a/b.cs');
+    assert.equal(normalizeLockPath('src/x.ts', CWD), 'f:/proj/src/x.ts');
+    assert.equal(normalizeLockPath('f:/a/', CWD), 'f:/a');
+    assert.equal(
+      normalizeLockPath('F:\\A\\..\\A\\B.cs', CWD),
+      normalizeLockPath('F:\\A\\B.cs', CWD),
+    );
+  } else {
+    assert.equal(normalizeLockPath('/A/B.cs', CWD), '/a/b.cs');
+    assert.equal(normalizeLockPath('src/x.ts', CWD), '/proj/src/x.ts');
+    assert.equal(normalizeLockPath('/a/', CWD), '/a');
+    assert.equal(
+      normalizeLockPath('/A/../A/B.cs', CWD),
+      normalizeLockPath('/A/B.cs', CWD),
+    );
+  }
 });
 
 /* ── token 编解码（schema：键无点/冒号/斜杠 → 哈希键 + 值带路径） ─ */
@@ -102,26 +117,26 @@ test('findLockConflict：异 pane 持有 → holder；自己/无锁/null → nul
 /* ── 决策（skip/pass/warn/block） ─────────────────────────────── */
 
 test('planWriteGuard：非写工具 skip；无冲突 pass；同 pane 重入 pass', () => {
-  const agents = [agent('pA', { 'f:/a.cs': 'pA' })];
-  assert.equal(planWriteGuard({ toolName: 'read', input: { path: 'f:/a.cs' }, agents, ownPaneId: 'pB', cwd: CWD, hard: true }).kind, 'skip');
-  assert.equal(planWriteGuard({ toolName: 'write', input: { path: 'f:/other.cs', content: '' }, agents, ownPaneId: 'pB', cwd: CWD, hard: true }).kind, 'pass');
-  assert.equal(planWriteGuard({ toolName: 'write', input: { path: 'f:/a.cs', content: '' }, agents, ownPaneId: 'pA', cwd: CWD, hard: true }).kind, 'pass');
+  const agents = [agent('pA', { [LOCKED]: 'pA' })];
+  assert.equal(planWriteGuard({ toolName: 'read', input: { path: 'a.cs' }, agents, ownPaneId: 'pB', cwd: CWD, hard: true }).kind, 'skip');
+  assert.equal(planWriteGuard({ toolName: 'write', input: { path: 'other.cs', content: '' }, agents, ownPaneId: 'pB', cwd: CWD, hard: true }).kind, 'pass');
+  assert.equal(planWriteGuard({ toolName: 'write', input: { path: 'a.cs', content: '' }, agents, ownPaneId: 'pA', cwd: CWD, hard: true }).kind, 'pass');
 });
 
 test('planWriteGuard：软模式（默认）→ warn（归一路径匹配，工具放行）', () => {
-  const agents = [agent('pA', { 'f:/a.cs': 'pA' })];
-  const g = planWriteGuard({ toolName: 'write', input: { path: 'F:\\A.CS', content: '' }, agents, ownPaneId: 'pB', cwd: CWD, hard: false });
+  const agents = [agent('pA', { [LOCKED]: 'pA' })];
+  const g = planWriteGuard({ toolName: 'write', input: { path: LOCKED_ALT, content: '' }, agents, ownPaneId: 'pB', cwd: CWD, hard: false });
   assert.equal(g.kind, 'warn');
   if (g.kind !== 'warn') return;
   assert.equal(g.holderPaneId, 'pA');
   assert.match(g.warning, /pA/);
   assert.match(g.warning, /a\.cs/i);
-  assert.deepEqual(g.paths, ['f:/a.cs']);
+  assert.deepEqual(g.paths, [LOCKED]);
 });
 
 test('planWriteGuard：硬模式 → block（reason 给模型）', () => {
-  const agents = [agent('pA', { 'f:/a.cs': 'pA' })];
-  const g = planWriteGuard({ toolName: 'edit', input: { path: 'f:/a.cs', edits: [] }, agents, ownPaneId: 'pB', cwd: CWD, hard: true });
+  const agents = [agent('pA', { [LOCKED]: 'pA' })];
+  const g = planWriteGuard({ toolName: 'edit', input: { path: LOCKED_ALT, edits: [] }, agents, ownPaneId: 'pB', cwd: CWD, hard: true });
   assert.equal(g.kind, 'block');
   if (g.kind !== 'block') return;
   assert.equal(g.holderPaneId, 'pA');

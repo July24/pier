@@ -2,6 +2,11 @@
 #
 # ⚠️ herdr 插件 v1 无 SDK/无运行时 UI："整个 herdr CLI 即插件 API"。
 # 本清单只声明入口，逻辑在 scripts/ 下用 Node 实现。
+#
+# 跨平台约定：命令的 cwd = 插件根目录（herdr 保证），POSIX 条目用相对路径直启 node；
+# Windows 条目保留 powershell.exe 包裹——HERDR_PLUGIN_ROOT 实测带 \\?\ 前缀，
+# 直接拼进 node argv 无法解析，须先剥前缀（v1.1 Windows 实测结论，勿回退）。
+# 同一钩子的两条平台条目逻辑等价，改一处必须同步另一处。
 
 id = "pier.workbench"
 name = "pier-workbench"
@@ -11,9 +16,14 @@ min_herdr_version = "0.8.0"
 platforms = ["linux", "macos", "windows"]
 
 # ── 事件钩子：子代理 blocked → 通知（人类闸门；M4）─────────────────
-# 同上的路径规范化处理。
 [[events]]
 on = "pane.agent_status_changed"
+platforms = ["linux", "macos"]
+command = ["node", "scripts/notify-agent-state.mjs"]
+
+[[events]]
+on = "pane.agent_status_changed"
+platforms = ["windows"]
 command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/notify-agent-state.mjs')"]
 
 # ── 事件钩子：workspace 打开 → 自动引导主 tab（v1.3 M7，D28）────────
@@ -22,26 +32,56 @@ command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Le
 # bootstrap.mjs 幂等：workspace 已有 pi 主控 pane（agent=pi 或 title 含 ⏳）则跳过。
 [[events]]
 on = "workspace.created"
+platforms = ["linux", "macos"]
+command = ["node", "scripts/bootstrap.mjs"]
+
+[[events]]
+on = "workspace.created"
+platforms = ["windows"]
 command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/bootstrap.mjs')"]
 
 [[events]]
 on = "worktree.opened"
+platforms = ["linux", "macos"]
+command = ["node", "scripts/bootstrap.mjs"]
+
+[[events]]
+on = "worktree.opened"
+platforms = ["windows"]
 command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/bootstrap.mjs')"]
 
 # ── M23 档 1：人类聚焦后把焦点 pane 放大为主窗（D67）────────────────
 # pane.created 只记账龄，供 F1 无 cause 时的 3s 白名单。
 [[events]]
 on = "pane.created"
+platforms = ["linux", "macos"]
+command = ["node", "scripts/heat-reflow.mjs"]
+
+[[events]]
+on = "pane.created"
+platforms = ["windows"]
 command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/heat-reflow.mjs')"]
 
 [[events]]
 on = "pane.focused"
+platforms = ["linux", "macos"]
+command = ["node", "scripts/heat-reflow.mjs"]
+
+[[events]]
+on = "pane.focused"
+platforms = ["windows"]
 command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/heat-reflow.mjs')"]
 
 # ── M23 档 2（D90-F 语义桥）：agent 状态变化 → 从窗分级重排 ──────────
 # blocked 出现/消失即时升/降位（事件驱动，非轮询；D3 合规）。
 [[events]]
 on = "pane.agent_status_changed"
+platforms = ["linux", "macos"]
+command = ["node", "scripts/heat-reflow.mjs"]
+
+[[events]]
+on = "pane.agent_status_changed"
+platforms = ["windows"]
 command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/heat-reflow.mjs')"]
 
 # ── D95（V25）：pane 回收（subagent 完成被 GC）→ 数量重排 ────────────
@@ -49,11 +89,22 @@ command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Le
 # onCreated 记录的 pane→tab 映射反查（reflow.ts onCountChanged）。
 [[events]]
 on = "pane.closed"
+platforms = ["linux", "macos"]
+command = ["node", "scripts/heat-reflow.mjs"]
+
+[[events]]
+on = "pane.closed"
+platforms = ["windows"]
 command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/heat-reflow.mjs')"]
 
 # ── 启动钩子：会话恢复后重放上次引导的作战室布局（v1.3 M7，D28）────
 # one-shot：读 HERDR_PLUGIN_STATE_DIR/boot.jsonl，对缺失的 main tab/pane 重建。
 [[startup]]
+platforms = ["linux", "macos"]
+command = ["node", "scripts/restore-layout.mjs"]
+
+[[startup]]
+platforms = ["windows"]
 command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/restore-layout.mjs')"]
 
 # ── 链接处理器：识别 pi: 会话链接跳转到对应 pane（M3，先留骨架）────────

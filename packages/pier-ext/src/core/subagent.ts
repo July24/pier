@@ -21,7 +21,7 @@ import type { PiSurface } from '../pi-surface.ts';
 import type { HerdrClientLike, HerdrAgentState } from '../herdr-client.ts';
 import type { TodosService } from '../todos-service.ts';
 import { mountSubagentScope } from '../subagent-scope.ts';
-import { Semaphore, SUBS_CUSTOM_TYPE, classifyWorktreeZone, foldSubsRegistry, formatSubagentResult, isPathUnder, makeProgressUpdate, makeRegistry, planTabPlacement, psQuote, tabNameForTask, type SubEntry, type SubagentSpec, type TabPlacementPlan, type WorktreeZone } from '../subagent-core.ts';
+import { Semaphore, SUBS_CUSTOM_TYPE, buildLaunchLine, classifyWorktreeZone, foldSubsRegistry, formatSubagentResult, isPathUnder, makeProgressUpdate, makeRegistry, planTabPlacement, tabNameForTask, type SubEntry, type SubagentSpec, type TabPlacementPlan, type WorktreeZone } from '../subagent-core.ts';
 import { hasAssistantAfter, hasPendingToolCall, lastAssistantText, listSessionFiles, readSessionFile, sessionFileById } from '../session-tail.ts';
 import { appendHistory, applyReportedSessionFile, historyFilePath, latestGeneration, normalizeEntryKind, readHistory, type HistoryEntry } from '../history-store.ts';
 import { execFile } from 'node:child_process';
@@ -642,9 +642,13 @@ export default function subagentPlugin(ctx: Context): void {
   }
 
   function launchLine(resumeFile?: string | null, roleModel?: string | null, approve = false): string {
-    const base = `& ${psQuote(runtime.nodePath)} ${psQuote(runtime.cliPath)}${approve ? ' -a' : ''} -e ${psQuote(runtime.extPath)}`
-      + (roleModel ? ` --provider ${psQuote(roleModel.split('/')[0])} --model ${psQuote(roleModel.split('/')[1] ?? roleModel)}` : '');
-    return resumeFile ? `${base} --session ${psQuote(resumeFile)}` : base;
+    // 裸 argv → 平台 shell 语法（win32=PowerShell `&`，POSIX=sh）；引号转义在 buildLaunchLine
+    const parts = [runtime.nodePath, runtime.cliPath];
+    if (approve) parts.push('-a');
+    parts.push('-e', runtime.extPath);
+    if (roleModel) parts.push('--provider', roleModel.split('/')[0], '--model', roleModel.split('/')[1] ?? roleModel);
+    if (resumeFile) parts.push('--session', resumeFile);
+    return buildLaunchLine(parts);
   }
 
   /**

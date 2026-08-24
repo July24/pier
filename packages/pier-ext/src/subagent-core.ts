@@ -3,8 +3,9 @@
  * 无副作用、无 pi/herdr API 依赖 → 可单测。
  *
  * v1.1（DESIGN.md §12，方案 C）：子 pane 统一为交互式 pi TUI。
- *  - 启动：powershell 常驻包裹 `& node cli.js -e <本扩展>`（无 prompt 参数；
- *    prompt 经 pane.send_text 注入编辑器），herdr 自动检测 + 本扩展上报状态；
+ *  - 启动：常驻 shell 里 `node cli.js -e <本扩展>`（Windows 经 powershell 包裹、
+ *    POSIX 直启；无 prompt 参数，prompt 经扩展管道注入），herdr 自动检测 +
+ *    本扩展上报状态；
  *  - 并发上限 4（D10）：信号量压制并行 spawn；
  *  - 结果通道 = 子会话 JSONL（session-tail.ts），不再解析 pane 文本；
  *  - 软锁：仅在 herdr agent_status ∈ {idle} 时注入（index.ts 的状态门）。
@@ -19,6 +20,23 @@ export interface SubagentSpec {
 /** PowerShell 单引号转义（''）。 */
 export function psQuote(s: string): string {
   return `'${String(s).replace(/'/g, "''")}'`;
+}
+
+/** POSIX sh 单引号转义（'\''）。 */
+export function shQuote(s: string): string {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * 子代理启动命令行（注入子 pane 的 shell，经 pane.send_text + CR 提交）。
+ * 片段 = 裸 argv 词（如 ['pi', '--session', '<file>']）；win32 输出 PowerShell
+ * 调用语法（`&` 引导 + `''` 转义），其余输出 POSIX sh 语法（单引号 + `'\''` 转义）。
+ */
+export function buildLaunchLine(parts: readonly string[], platform: NodeJS.Platform = process.platform): string {
+  const quoted = platform === 'win32'
+    ? parts.map((s) => psQuote(s))
+    : parts.map((s) => shQuote(s));
+  return (platform === 'win32' ? '& ' : '') + quoted.join(' ');
 }
 
 /** 计数信号量：并发上限内的 acquire 立即执行，超出排队（FIFO）。 */

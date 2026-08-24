@@ -10,11 +10,17 @@
 - `scripts/heat-reflow.mjs` + `src/heat-layout.ts`：焦点热力布局（`pane.focused` / `agent_status_changed` / `pane.created` / `pane.closed` → 原地 ratio 重排）。
 - `scripts/boot-config.example.json`：本机引导配置模板（真实的 `boot-config.json` 不入库，含个人路径）。
 
-## 安装（开发）
+## 安装
 
 ```sh
-herdr plugin link F:\path\to\pier\packages\pier-workbench
+# 用户模式（重装即更新）
+herdr plugin install July24/pier/packages/pier-workbench --yes
+# 开发模式（本地 link，改码即生效）
+herdr plugin link /path/to/pier/packages/pier-workbench   # Windows: F:\path\to\pier\packages\pier-workbench
 ```
+
+引导配置（本机 node / pi 路径）由仓库根 `node install.mjs` 自动生成；手动见
+`scripts/boot-config.example.json`（双平台占位）。读取顺序：`HERDR_PLUGIN_CONFIG_DIR` → `scripts/`。
 
 ## 依赖
 

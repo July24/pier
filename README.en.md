@@ -35,35 +35,47 @@ pier ships as **two halves**, installed separately:
 
 - Node ≥ 22
 - pi ≥ 0.84 (`@earendil-works/pi-coding-agent`)
-- herdr ≥ 0.8.0 (Windows is preview beta)
+- herdr ≥ 0.8.0 (macOS / Linux / Windows; Windows is preview beta)
 
-### 1. pi extension
+### One-shot install (recommended)
+
+After cloning this repo:
 
 ```sh
-# after cloning this repo (replace the path with your actual checkout)
-pi install F:\path\to\pier\packages\pier-ext
+node install.mjs                 # user mode: pi install git:… + herdr plugin install + auto-generated bootstrap config
+node install.mjs install --dev   # dev mode: local-path pi install + herdr plugin link; code changes are live
+```
 
-# or during development, load the extension path directly
-pi -e F:\path\to\pier\packages\pier-ext\src\index.ts
+The script verifies the environment (node / pi / herdr versions), probes pi's node
+and cli.js absolute paths, generates boot-config.json (user mode stores it in the
+herdr plugin config dir, so reinstalls don't lose it), and registers both halves.
+
+Other commands: `node install.mjs update` (uninstall + reinstall, re-probes paths),
+`node install.mjs uninstall --purge`. Override the distribution specs with
+`--pi-spec=` / `--herdr-spec=` (npm publishing or forks).
+
+### Manual install (equivalent steps)
+
+```sh
+# pi extension (either one; git source = user mode, local path = dev mode)
+pi install git:github.com/July24/pier
+pi install ./packages/pier-ext        # development
+
+# herdr plugin
+herdr plugin install July24/pier/packages/pier-workbench --yes   # user mode (reinstall = update)
+herdr plugin link ./packages/pier-workbench                        # development
 ```
 
 The extension degrades gracefully outside a herdr environment (tools unregistered, reporting is free).
 
-### 2. herdr plugin
+### Bootstrap config (workbench half)
 
-```sh
-herdr plugin link F:\path\to\pier\packages\pier-workbench
-```
+Master-tab bootstrap needs local node / pi paths: `node install.mjs` generates
+them automatically; manually, copy `packages/pier-workbench/scripts/boot-config.example.json`
+(placeholders for both macOS and Windows). User mode reads it from
+`herdr plugin config-dir pier.workbench`; dev mode from `packages/pier-workbench/scripts/boot-config.json`.
 
-### 3. Bootstrap config (optional)
-
-`packages/pier-workbench/scripts/boot-config.json` is a **machine-local** bootstrap config (node/pi paths) and is not tracked. First use: copy the template and fill in your own absolute paths.
-
-```sh
-copy packages\pier-workbench\scripts\boot-config.example.json packages\pier-workbench\scripts\boot-config.json
-```
-
-### 4. Usage
+### Usage
 
 1. Run pi inside a herdr workspace pane (`pi` in the pane); the extension detects `HERDR_ENV` and starts reporting
 2. The model can call `todo_write` (live pane-title projection), `subagent` (foreground / parallel / background), `list_agents` / `send_message` / `interrupt_agent`
@@ -83,7 +95,7 @@ docs/              # install guide, role profile docs, sidebar role config
 
 ```sh
 npm install --ignore-scripts
-npm test          # node --test, 242 unit tests (planner / todo replay / session tail / GC / lifecycle)
+npm test          # node --test, 244 unit tests (planner / todo replay / session tail / GC / lifecycle)
 ```
 
 ## Design principles

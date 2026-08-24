@@ -4,6 +4,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { pathToFileURL } from 'node:url';
+import { resolve } from 'node:path';
 import { DisposeLedger, normalizeModuleKey } from '../src/ledger.ts';
 
 test('ledger：disposeKey 只拆匹配 key（hmr 补偿语义），未匹配保留', () => {
@@ -41,8 +43,10 @@ test('ledger：add 返回撤销函数（资源自拆后移除，防 hmr 补偿�
 });
 
 test('normalizeModuleKey：file:// URL 与路径互比（import.meta.url vs hmr filename）', () => {
-  const fromUrl = normalizeModuleKey('file:///F:/repo/pier/packages/pier-ext/src/core/x.ts');
-  const fromPath = normalizeModuleKey('F:\\repo\\pier\\packages\\pier-ext\\src\\core\\x.ts');
-  assert.equal(fromUrl, fromPath);
+  // 平台原生绝对路径对（pathToFileURL 内部会 resolve，异平台形态路径不能跨平台回环）
+  const native = resolve('x.ts');
+  assert.equal(normalizeModuleKey(pathToFileURL(native).href), normalizeModuleKey(native));
+  // Windows hmr filename 形态：反斜杠统一为斜杠（纯字符串语义，与平台无关）
+  assert.equal(normalizeModuleKey('F:\\repo\\pier\\x.ts'), 'F:/repo/pier/x.ts');
   assert.equal(normalizeModuleKey('pi-surface'), 'pi-surface', '逻辑名原样（D79 反注册场景）');
 });
