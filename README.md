@@ -16,7 +16,7 @@ pier 由**两个半区**组成，各装一处：
 
 | 半区 | 包 | 作用 |
 |---|---|---|
-| **pi 扩展** | `packages/pier-ext`（`@pier/ext`） | 在 pi 会话里注入 `todo_write` / `subagent` / `list_agents` / `send_message` / `interrupt_agent` 工具 + 经 herdr socket API 上报 pane 状态 |
+| **pi 扩展** | `packages/pier-ext`（npm: [`pi-pier`](https://www.npmjs.com/package/pi-pier)，[pi.dev 市场](https://pi.dev/packages/pi-pier)） | 在 pi 会话里注入 `todo_write` / `subagent` / `list_agents` / `send_message` / `interrupt_agent` 工具 + 经 herdr socket API 上报 pane 状态 |
 | **herdr 插件** | `packages/pier-workbench`（`pier.workbench`） | 主 tab 引导、blocked 人类闸门通知、焦点热力布局（聚焦 pane 原地放大） |
 
 ### 核心能力
@@ -39,24 +39,32 @@ pier 由**两个半区**组成，各装一处：
 
 ### 一键安装（推荐）
 
-克隆仓库后运行：
+无需克隆仓库，直接用 npm 包运行：
 
 ```sh
-node install.mjs            # 用户模式：pi install git:… + herdr plugin install + 自动生成引导配置
-node install.mjs install --dev   # 开发模式：本地路径 pi install + herdr plugin link，改码即生效
+npx pier-setup            # 用户模式：pi install npm:pi-pier + herdr plugin install + 自动生成引导配置
+npm i -g pier-setup       # 或全局安装后直接跑 pier-setup
+```
+
+开发模式仍需克隆仓库：
+
+```sh
+git clone https://github.com/July24/pier && cd pier
+node install.mjs install --dev   # 本地路径 pi install + herdr plugin link，改码即生效
 ```
 
 脚本自动校验环境（node / pi / herdr 版本）、探测 pi 的 node 与 cli.js 绝对路径、
 生成 boot-config.json（用户模式落 herdr 插件配置目录，重装不丢），并注册两半区。
 
-其他命令：`node install.mjs update`（卸载+重装，重探测路径）、`node install.mjs uninstall --purge`。
+其他命令：`pier-setup update`（卸载+重装，重探测路径）、`pier-setup uninstall --purge`。
 发行规格可用 `--pi-spec=` / `--herdr-spec=` 覆盖（npm 发布或 fork 场景）。
 
 ### 手动安装（等价步骤）
 
 ```sh
-# pi 侧扩展（任选其一；git 源 = 用户模式，本地路径 = 开发模式）
-pi install git:github.com/July24/pier
+# pi 侧扩展（任选其一；npm 源 = 用户模式推荐，git 源 = 跟随仓库最新，本地路径 = 开发模式）
+pi install npm:pi-pier                # 用户模式（npm 发布版，自动出现在 pi.dev/packages 市场）
+pi install git:github.com/July24/pier # 用户模式（跟随 main 最新）
 pi install ./packages/pier-ext        # 开发期
 
 # herdr 侧插件
@@ -92,7 +100,7 @@ master 主 tab 引导需要本机 node / pi 路径：`node install.mjs` 自动�
 
 ```
 packages/
-  pier-ext/        # pi 扩展（@pier/ext）：todo/subagent 工具、herdr 客户端、vocab 权威、skill
+  pier-ext/        # pi 扩展（npm: pi-pier）：todo/subagent 工具、herdr 客户端、vocab 权威、skill
   pier-workbench/  # herdr 插件（pier.workbench）：主 tab 引导 + blocked 通知 + 热力布局
 docs/              # 安装手册、role 档案说明、侧边栏 role 配置
 ```

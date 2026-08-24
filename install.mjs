@@ -34,7 +34,7 @@ const command = ['install', 'uninstall', 'update'].includes(argv[0]) ? argv.shif
 const flags = new Set(argv.filter((a) => a.startsWith('--') && !a.includes('=')));
 const optValue = (name) => argv.find((a) => a.startsWith(`--${name}=`))?.split('=').slice(1).join('=') ?? null;
 const dev = flags.has('--dev');
-const PI_SPEC = optValue('pi-spec') ?? 'git:github.com/July24/pier';
+const PI_SPEC = optValue('pi-spec') ?? 'npm:pi-pier';   // 用户模式默认 npm 发行版；--pi-spec=git:github.com/July24/pier 可跟随仓库 main
 const HERDR_SPEC = optValue('herdr-spec') ?? 'July24/pier/packages/pier-workbench';
 
 const log = (m) => console.log(m);

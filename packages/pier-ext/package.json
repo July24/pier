@@ -1,9 +1,36 @@
 {
-  "name": "@pier/ext",
+  "name": "pi-pier",
   "version": "0.1.0",
-  "private": true,
+  "description": "pier: pi extension that fuses pi agent sessions with the herdr pane/tab orchestrator — todo_write loop closure + interactive subagents in isolated panes",
+  "license": "MIT",
   "type": "module",
-  "description": "pier: pi extension that fuses pi agent sessions with the herdr pane/tab orchestrator (todo_write discipline + interactive subagents)",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "herdr",
+    "coding-agent",
+    "subagents",
+    "todo"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/July24/pier.git",
+    "directory": "packages/pier-ext"
+  },
+  "homepage": "https://github.com/July24/pier#readme",
+  "bugs": {
+    "url": "https://github.com/July24/pier/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "src",
+    "skills",
+    "schemas",
+    "README.md"
+  ],
   "pi": {
     "extensions": [
       "./src/index.ts"
@@ -12,14 +39,17 @@
       "./skills/pi-herdr-workflow"
     ]
   },
-  "keywords": [
-    "pi-package"
-  ],
+  "dependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/cordis-plugin-group": "^1.0.1",
+    "@deepseek-ai/cordis-plugin-loader": "^1.0.2"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.84.2",
     "typebox": "~1.3.7"
-  },
-  "dependencies": {
-    "@deepseek-ai/cordis": "4.0.1"
   }
 }

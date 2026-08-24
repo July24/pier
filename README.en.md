@@ -16,7 +16,7 @@ pier ships as **two halves**, installed separately:
 
 | Half | Package | Role |
 |---|---|---|
-| **pi extension** | `packages/pier-ext` (`@pier/ext`) | Injects `todo_write` / `subagent` / `list_agents` / `send_message` / `interrupt_agent` tools into a pi session, and reports pane state over the herdr socket API |
+| **pi extension** | `packages/pier-ext` (npm: [`pi-pier`](https://www.npmjs.com/package/pi-pier), [pi.dev gallery](https://pi.dev/packages/pi-pier)) | Injects `todo_write` / `subagent` / `list_agents` / `send_message` / `interrupt_agent` tools into a pi session, and reports pane state over the herdr socket API |
 | **herdr plugin** | `packages/pier-workbench` (`pier.workbench`) | Workspace bootstrap, blocked human-gate notifications, focus heat layout (focused pane grows in place) |
 
 ### Highlights
@@ -39,26 +39,34 @@ pier ships as **two halves**, installed separately:
 
 ### One-shot install (recommended)
 
-After cloning this repo:
+No clone needed — run the npm package directly:
 
 ```sh
-node install.mjs                 # user mode: pi install git:… + herdr plugin install + auto-generated bootstrap config
-node install.mjs install --dev   # dev mode: local-path pi install + herdr plugin link; code changes are live
+npx pier-setup            # user mode: pi install npm:pi-pier + herdr plugin install + auto-generated bootstrap config
+npm i -g pier-setup       # or install globally, then just run pier-setup
+```
+
+Dev mode still requires cloning the repo:
+
+```sh
+git clone https://github.com/July24/pier && cd pier
+node install.mjs install --dev   # local-path pi install + herdr plugin link; code changes are live
 ```
 
 The script verifies the environment (node / pi / herdr versions), probes pi's node
 and cli.js absolute paths, generates boot-config.json (user mode stores it in the
 herdr plugin config dir, so reinstalls don't lose it), and registers both halves.
 
-Other commands: `node install.mjs update` (uninstall + reinstall, re-probes paths),
-`node install.mjs uninstall --purge`. Override the distribution specs with
+Other commands: `pier-setup update` (uninstall + reinstall, re-probes paths),
+`pier-setup uninstall --purge`. Override the distribution specs with
 `--pi-spec=` / `--herdr-spec=` (npm publishing or forks).
 
 ### Manual install (equivalent steps)
 
 ```sh
-# pi extension (either one; git source = user mode, local path = dev mode)
-pi install git:github.com/July24/pier
+# pi extension (any one; npm source = recommended user mode, git source = latest main, local path = dev mode)
+pi install npm:pi-pier                # user mode (npm release, auto-listed on the pi.dev/packages gallery)
+pi install git:github.com/July24/pier # user mode (tracks main)
 pi install ./packages/pier-ext        # development
 
 # herdr plugin
@@ -80,7 +88,7 @@ The extension degrades gracefully outside a herdr environment (see Scope below).
 
 ### Bootstrap config (workbench half)
 
-Master-tab bootstrap needs local node / pi paths: `node install.mjs` generates
+Master-tab bootstrap needs local node / pi paths: `pier-setup` generates
 them automatically; manually, copy `packages/pier-workbench/scripts/boot-config.example.json`
 (placeholders for both macOS and Windows). User mode reads it from
 `herdr plugin config-dir pier.workbench`; dev mode from `packages/pier-workbench/scripts/boot-config.json`.
@@ -96,7 +104,7 @@ them automatically; manually, copy `packages/pier-workbench/scripts/boot-config.
 
 ```
 packages/
-  pier-ext/        # pi extension (@pier/ext): todo/subagent tools, herdr client, vocab authority, skill
+  pier-ext/        # pi extension (npm: pi-pier): todo/subagent tools, herdr client, vocab authority, skill
   pier-workbench/  # herdr plugin (pier.workbench): workspace bootstrap + blocked notify + heat layout
 docs/              # install guide, role profile docs, sidebar role config
 ```
