@@ -20,6 +20,8 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org/
+      # npm Trusted Publishing（OIDC）要求 npm ≥ 11.5；Node 22 自带 npm 10.x，需升级
+      - run: npm install -g npm@^11
 
       - name: Check tag matches package versions
         run: |
