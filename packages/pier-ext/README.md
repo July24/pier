@@ -1,22 +1,40 @@
 # pi-pier
 
+> [!IMPORTANT]
+> **This npm package is only the pi-extension half of pier.** pier is a two-half system — this extension plus a **herdr plugin** (`pier.workbench`). Without the herdr side you still get `todo_write` / `ask_user_question`, but subagents, pane integration, notifications, and the workspace bootstrap all require herdr. See [Install the herdr half](#install-the-herdr-half-companion-plugin) below.
+
 **pier** = **pi** × h**erdr** — a [pi](https://pi.dev/) extension that fuses coding agent sessions with the [herdr](https://herdr.dev/) pane/tab orchestrator.
 
-`pi-pier` is the **pi extension half** of the [pier monorepo](https://github.com/July24/pier). It fills two gaps pi deliberately leaves open — the **todo list loop** and **interactive subagents** — using herdr panes/tabs as the visual and interaction substrate. It degrades gracefully outside herdr.
+`pi-pier` fills two gaps pi deliberately leaves open — the **todo list loop** and **interactive subagents** — using herdr panes/tabs as the visual and interaction substrate. It degrades gracefully outside herdr.
 
-## Install
+## Install (this pi half)
 
 ```sh
 pi install npm:pi-pier
 ```
 
-Or from git:
+Or from git (monorepo root, same content):
 
 ```sh
 pi install git:github.com/July24/pier
 ```
 
-> The companion **herdr plugin half** (`pier.workbench`: main-tab bootstrap, blocked-gate notifications, focus-heat layout) is installed separately via `herdr plugin install July24/pier/packages/pier-workbench`, or all at once with the one-shot installer in the [repo](https://github.com/July24/pier): `node install.mjs`.
+## Install the herdr half (companion plugin)
+
+The herdr plugin `pier.workbench` provides the other half: main-tab bootstrap (auto-start a pi master session per workspace), blocked-gate notifications (system notifications when a subagent waits for a human), and the focus-heat layout (focused pane grows in place). Install it from the same repo:
+
+```sh
+herdr plugin install July24/pier/packages/pier-workbench --yes
+```
+
+Or install **both halves at once** with the one-shot installer from the monorepo:
+
+```sh
+git clone https://github.com/July24/pier && cd pier
+node install.mjs        # user mode: installs both halves + generates local bootstrap config
+```
+
+The installer also verifies node / pi / herdr versions, probes local paths, and writes the workbench bootstrap config (`boot-config.json`) into herdr's plugin config dir.
 
 ## What you get
 
@@ -45,7 +63,7 @@ Outside a herdr environment the extension auto-degrades: herdr reporting costs n
 
 - Node ≥ 22
 - pi ≥ 0.84 (`@earendil-works/pi-coding-agent`)
-- herdr ≥ 0.8.0 for the full pane experience (optional)
+- **herdr ≥ 0.8.0** — required for subagents / pane integration / notifications (see the IMPORTANT note above); without it only `todo_write` / `ask_user_question` work
 
 ## Development
 
