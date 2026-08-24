@@ -4,7 +4,9 @@ name: publish
 
 on:
   push:
-    tags: ['v*']
+    tags:
+      - 'v*'   # 带前缀风格
+      - '[0-9]*' # 纯语义版本风格（如 0.2.0）
 
 jobs:
   publish:
