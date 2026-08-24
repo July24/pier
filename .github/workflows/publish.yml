@@ -1,0 +1,40 @@
+# pier 双包发布：打 v* tag 触发，经 npm Trusted Publishing（OIDC）免 token 发布。
+# 前提：在 pi-pier 与 pier-setup 的 npm 包 Settings → Trusted Publishing 中登记本 workflow。
+name: publish
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # npm Trusted Publishing（OIDC）必需
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+
+      - name: Check tag matches package versions
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          EXT=$(node -p "require('./packages/pier-ext/package.json').version")
+          ROOT=$(node -p "require('./package.json').version")
+          [ "$TAG" = "$EXT" ] && [ "$TAG" = "$ROOT" ] || {
+            echo "✗ tag v$TAG 与包版本不一致（pi-pier=$EXT, pier-setup=$ROOT）"; exit 1; }
+
+      - run: npm install --ignore-scripts
+
+      - name: Test
+        run: npm test
+
+      - name: Publish pi-pier
+        run: npm publish
+        working-directory: packages/pier-ext
+
+      - name: Publish pier-setup
+        run: npm publish

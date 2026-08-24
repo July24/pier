@@ -1,2 +1,5 @@
 node_modules/
 packages/pier-workbench/scripts/boot-config.json
+# 本仓库的 CI workflow 需要入库（全局 gitignore 忽略了 .github/，此处显式例外）
+!.github/
+!.github/**
