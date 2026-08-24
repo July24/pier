@@ -169,6 +169,35 @@ export default function subagentPlugin(ctx: Context): void {
     rebuildSubs(eventCtx);
   });
 
+  /* ── B1（用户实证修复）：subagent isError 结果的探活改写 ──────────────
+   * 实测事故：前台误判 no-output → 模型读裸错误文案 → "failed, 我自己干" 抢活。
+   * pi 的 tool_result 事件官方语义 "Can modify result"——在文本进模型上下文前，
+   * 当场探活（agent.list + 会话 mtime）；判活则改写为统一存活通知（buildAliveNotice
+   * 与 A2 转后台同一出口）。hook 层硬保障，纯 prompt 防不住的自作主张在此物理拦截。 */
+  scoped.on('tool_result', async (event: { toolName?: string; toolCallId?: string; isError?: boolean; content?: Array<{ type: string; text?: string }> }) => {
+    if (event?.toolName !== 'subagent' || !event.isError) return;
+    // 从错误文本里取 pane id（我们自己的错误文案都带 pane）；取不到则不改写
+    const errText = (event.content ?? []).map((c) => c.text ?? '').join(' ');
+    const paneId = [...subs.keys()].find((id) => errText.includes(id))
+      ?? (errText.match(/\bw[A-Za-z0-9]+:p\d+\b/) ?? [])[0];
+    if (!paneId) return;
+    const entry = subs.get(paneId);
+    if (!entry || entry.status === 'settled' || entry.status === 'consumed') return;
+    const probe = await probeAlive(paneId, entry.cwd);
+    if (!isAlive(probe, Date.now())) return; // 真死了 → 保留原错误，模型可重做
+    // 活着 → 转 poller（若尚未在跑）并改写结果文本
+    if (!pollers.has(paneId)) {
+      entry.background = true;
+      startPoller(paneId, entry.cwd, entry.createdAt, entry.createdAt, entry.description, lastRequestIdByPane.get(paneId) ?? `probe-${paneId}`);
+      persistSubs();
+    }
+    const notice = buildAliveNotice(
+      { paneId, description: entry.description, scenario: 'error-alive', probe },
+      Date.now(),
+    );
+    return { content: [{ type: 'text', text: notice }] };
+  });
+
   /* ── D41：stop 未完成提醒（仅主控；子代理不注册本块） ── */
 
   let todoReminders = 0;
@@ -253,6 +282,28 @@ export default function subagentPlugin(ctx: Context): void {
     return null;
   }
 
+  /** A2/B1 探活：pane 实时状态 + 会话候选最新 mtime（毫秒级，失败字段为 null）。 */
+  async function probeAlive(paneId: string, cwd: string): Promise<AliveProbe> {
+    const probe: AliveProbe = { paneExists: false, agentStatus: null, lastActivityMs: null };
+    try {
+      const agents = await client.listAgents();
+      const a = agents.find((x) => x.paneId === paneId);
+      probe.paneExists = a != null;
+      probe.agentStatus = a?.status ?? null;
+    } catch {
+      /* agent.list 失败 → 状态未知，靠会话活动判定 */
+    }
+    for (const file of await resolveSessionFileCandidates(paneId, cwd)) {
+      try {
+        const mtime = (await statAsync(file)).mtimeMs;
+        if (probe.lastActivityMs == null || mtime > probe.lastActivityMs) probe.lastActivityMs = mtime;
+      } catch {
+        /* 文件消失跳过 */
+      }
+    }
+    return probe;
+  }
+
   /**
    * 子会话结算状态（v1.3 M8 结算竞态修复）：
    *  herdr 的 idle/done 在"注入瞬间"也是真，不能当结算信号；
@@ -273,21 +324,6 @@ export default function subagentPlugin(ctx: Context): void {
       if (hasAssistantAfter(entries, sinceTs)) return { text: null, pendingTool: false, activity: true };
     }
     return { text: null, pendingTool: false, activity: false };
-  }
-
-  /** 等待结算：idle/done=settled、blocked=人类闸门、超时切片循环。 */
-  async function waitSubSettled(
-    paneId: string,
-    timeoutMs: number,
-  ): Promise<'settled' | 'blocked' | 'timeout'> {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const state = await client.waitAgent(paneId, ['idle', 'done', 'blocked'], 30000);
-      if (state === 'idle' || state === 'done') return 'settled';
-      if (state === 'blocked') return 'blocked';
-      // null = 30s 切片超时（working 中或异常），继续
-    }
-    return 'timeout';
   }
 
   /** D92：结算通知统一出口——经 deps 缓冲（忙时 turn_end 折叠注入），缺省回退旧 followUp 直投。 */
@@ -964,49 +1000,57 @@ export default function subagentPlugin(ctx: Context): void {
         writeHistory(entry);
         onUpdate?.(makeProgressUpdate(`subagent ready in pane ${paneId}; injecting prompt via pipe…`));
         // M11（D45/D46）：注入走扩展管道 → 子扩展 sendUserMessage(followUp)；
-        // PTY 键盘通道 100% 归人（无软锁窗口、无混行）。
-        const injectTs = Date.now();
-        const injected = await pipeRequest(pipeNameFor(cwd, paneId), {
-          type: 'prompt',
-          id: `prompt-${taskId}`,
-          text: spec.prompt,
-          from: pipeNameFor(cwd, env?.paneId ?? ''),
-          push: background,
-        });
-        if (injected.type !== 'ok') {
-          throw new Error(`pipe prompt rejected: ${injected.type === 'error' ? injected.message : 'unknown response'}`);
-        }
-
-        if (background) {
-          lastRequestIdByPane.set(paneId, `prompt-${taskId}`);
-          startPoller(paneId, cwd, spawnedAt, injectTs, spec.description, `prompt-${taskId}`);
-          return {
-            content: [{ type: 'text', text: `started subagent ${paneId} (task ${taskId})` }],
-            details: { paneId, taskId, background: true, role: kind },
-          };
-        }
-
-        let settled = await waitSubSettled(paneId, SUBAGENT_TIMEOUT_MS);
-        let text = await collectFinalText(paneId, cwd, injectTs);
-        // v1.3 M8：早结算竞态（注入瞬间 herdr 仍是 idle）→ 无文本时再等真实结算（最多 90s）
-        if (settled === 'settled' && !text) {
-          const reDeadline = Date.now() + 90000;
-          while (Date.now() < reDeadline) {
-            await new Promise((r) => setTimeout(r, 3000));
-            const st = await client.waitAgent(paneId, ['idle', 'done', 'blocked'], 15000);
-            if (st === 'blocked') {
-              settled = 'blocked';
-              break;
+        // A1+A2（用户实证修复）：前台等待 = 内容闸 + 耐心阈值转后台。
+        // 旧实现的 idle 即结算 + 90s 硬窗口在真实任务（working 期 4-6 分钟）上必然误判
+        // no-output（实测：3 个健康子代理 101s 时被同时 consumed，成果 4 分钟后才产出）。
+        const PATIENCE_MS = Number(process.env.PI_HERDR_FRONTIER_PATIENCE_MS ?? 300000) || 300000;
+        const patienceDeadline = Date.now() + PATIENCE_MS;
+        let text: string | null = null;
+        let settledKind: 'settled' | 'blocked' | 'timeout' = 'timeout';
+        while (Date.now() < Math.min(patienceDeadline, spawnedAt + SUBAGENT_TIMEOUT_MS)) {
+          const state = await client.waitAgent(paneId, ['idle', 'done', 'blocked'], 30_000);
+          if (state === 'blocked') { settledKind = 'blocked'; break; }
+          if (state === 'idle' || state === 'done') {
+            // A1 内容闸：herdr idle 只是"可能是结算"——以会话内容定夺
+            const s = await subSessionState(paneId, cwd, injectTs);
+            if (s.text) { text = s.text; settledKind = 'settled'; break; }
+            if (s.pendingTool || (!s.text && !s.activity)) {
+              // 挂起 toolCall（等人类）或注入前瞬间的 idle → 不当结算，继续观察
+              await new Promise((r) => setTimeout(r, 2000));
+              continue;
             }
-            if (st === 'idle' || st === 'done') {
-              text = await collectFinalText(paneId, cwd, injectTs);
-              if (text) break;
-            }
+            // 有活动无文本（活动已停止）→ 再给 collectFinalText 的重试窗口
+            text = await collectFinalText(paneId, cwd, injectTs, 6);
+            if (text) { settledKind = 'settled'; break; }
+            await new Promise((r) => setTimeout(r, 2000));
+            continue;
           }
+          // null = 30s 切片超时（working 中）→ 继续循环
+        }
+        // A2 耐心阈值到点仍在跑 → 探活；活着 → 转后台并返回统一存活通知
+        if (!text && settledKind !== 'blocked') {
+          const probe = await probeAlive(paneId, cwd);
+          if (isAlive(probe, Date.now())) {
+            entry.background = true;
+            lastRequestIdByPane.set(paneId, `prompt-${taskId}`);
+            startPoller(paneId, cwd, spawnedAt, injectTs, spec.description, `prompt-${taskId}`);
+            persistSubs();
+            writeHistory(entry);
+            const notice = buildAliveNotice(
+              { paneId, description: spec.description, scenario: 'moved-to-bg', probe },
+              Date.now(),
+            );
+            return {
+              content: [{ type: 'text', text: notice }],
+              details: { paneId, taskId, background: true, movedToBackground: true, role: kind },
+            };
+          }
+          // 探活失败（pane 消失且会话沉寂）→ 保留原 timeout 语义
+          settledKind = 'timeout';
         }
         const outcome =
-          settled === 'blocked' ? { kind: 'blocked' as const, text: text ?? '' }
-          : settled === 'timeout' ? { kind: 'timeout' as const, text: text ?? '' }
+          settledKind === 'blocked' ? { kind: 'blocked' as const, text: text ?? '' }
+          : settledKind === 'timeout' ? { kind: 'timeout' as const, text: text ?? '' }
           : text ? { kind: 'completed' as const, text }
           : { kind: 'no-output' as const, text: '' };
         entry.status = 'consumed';
@@ -1138,7 +1182,7 @@ export default function subagentPlugin(ctx: Context): void {
     name: 'list_agents',
     label: 'List Subagents',
     description:
-      'List the background subagents you started, with their live state: running (working or blocked), idle (settled), plus pane ids, role (task or a role label), and descriptions. Foreground one-shot panes are transient and not listed. Covers only this session branch — for tasks from earlier sessions or collected panes, read the delegation ledger (path and format in resume_subagent) and resume by taskId.',
+      'List the background subagents you started, with their live state: running (working or blocked), idle (settled), plus pane ids, live agent status, last session activity time, role (task or a role label), and descriptions. Foreground one-shot panes are transient and not listed. Covers only this session branch — for tasks from earlier sessions or collected panes, read the delegation ledger (path and format in resume_subagent) and resume by taskId.',
     parameters: Type.Object({}),
     async execute() {
       const listed = [...subs.values()].filter((s) => s.background);
@@ -1151,6 +1195,12 @@ export default function subagentPlugin(ctx: Context): void {
         const prev = byTask.get(sub.taskId);
         if (!prev || sub.createdAt >= prev.createdAt) byTask.set(sub.taskId, sub);
       }
+      // C1：实时探活（pane 状态 + 会话活动时间）——master 能区分"在干活"vs"真卡死"
+      const probes = new Map<string, AliveProbe>();
+      await Promise.all([...byTask.values()].map(async (sub) => {
+        if (sub.status === 'closed') return;
+        try { probes.set(sub.paneId, await probeAlive(sub.paneId, sub.cwd)); } catch { /* 显示层尽力 */ }
+      }));
       const lines: string[] = [];
       for (const sub of byTask.values()) {
         const tabTag = sub.tabName ? ` [tab: ${sub.tabName}]` : '';
@@ -1162,7 +1212,10 @@ export default function subagentPlugin(ctx: Context): void {
         const state = sub.status === 'settled' ? 'idle' : 'running';
         // D94：用户接管标记
         const takeoverMark = sub.userTakeover ? ', user-controlled' : '';
-        lines.push(`${sub.paneId} [${state}${takeoverMark}] (${sub.kind})${tabTag} ${sub.description}`);
+        const probe = probes.get(sub.paneId);
+        const statusTag = probe?.agentStatus ? ` ${probe.agentStatus}` : '';
+        const activityTag = probe?.lastActivityMs != null ? `, active ${agoText(probe.lastActivityMs, Date.now())}` : '';
+        lines.push(`${sub.paneId} [${state}${takeoverMark}${statusTag}${activityTag}] (${sub.kind})${tabTag} ${sub.description}`);
       }
       return { content: [{ type: 'text', text: lines.join('\n') }], details: {} };
     },

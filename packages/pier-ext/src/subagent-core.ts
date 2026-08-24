@@ -98,6 +98,59 @@ export function formatSubagentResult(outcome: SubagentOutcome, description: stri
   }
 }
 
+/* ── 探活 + 存活通知（A2/B1 统一出口；纯逻辑，IO 在 adapter） ────── */
+
+/** 探活快照：pane 实时状态 + 会话活动时间（毫秒 epoch；null = 未知）。 */
+export interface AliveProbe {
+  paneExists: boolean;
+  agentStatus: string | null;
+  /** 会话文件 mtime（最新候选）；无文件/不可读 = null。 */
+  lastActivityMs: number | null;
+}
+
+/** 探活判活：pane 在 +（working/blocked 或近期有会话活动）→ 视为还在干活。 */
+export function isAlive(probe: AliveProbe, nowMs: number, staleAfterMs = 120_000): boolean {
+  if (!probe.paneExists) return false;
+  if (probe.agentStatus === 'working' || probe.agentStatus === 'blocked') return true;
+  // idle/unknown：会话 2 分钟内有活动仍算活（写作间隙/刚结算未采集）
+  return probe.lastActivityMs != null && nowMs - probe.lastActivityMs < staleAfterMs;
+}
+
+/** 人话相对时间（"12s ago" / "3m ago"）。 */
+export function agoText(ms: number, nowMs: number): string {
+  const s = Math.max(0, Math.round((nowMs - ms) / 1000));
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  return `${Math.floor(s / 3600)}h ago`;
+}
+
+/**
+ * 存活通知（A2 转后台返回值 与 B1 tool_result 改写 的统一构造出口）：
+ * 两场景同一话术——"它在干活 / 别重做 / 转后台了 / 结算会通知 / list_agents 可查"。
+ * scenario: 'moved-to-bg'（耐心阈值转后台）| 'error-alive'（工具报错但探活判活，兜底改写）。
+ */
+export function buildAliveNotice(
+  opts: { paneId: string; description: string; scenario: 'moved-to-bg' | 'error-alive'; probe: AliveProbe },
+  nowMs: number,
+): string {
+  const { paneId, description, scenario, probe } = opts;
+  const status = probe.agentStatus ?? 'unknown';
+  const activity = probe.lastActivityMs != null ? `, last session activity ${agoText(probe.lastActivityMs, nowMs)}` : '';
+  if (scenario === 'moved-to-bg') {
+    return [
+      `Subagent "${description}" is still running in pane ${paneId} (agent_status=${status}${activity}).`,
+      'The foreground wait has moved it to background so this call returns now.',
+      'Do NOT redo its work. When it settles you will receive a notification with its closing output.',
+      'Use list_agents to check its live state; send_message to give it follow-up work.',
+    ].join(' ');
+  }
+  return [
+    `The subagent "${description}" is ALIVE in pane ${paneId} (agent_status=${status}${activity}) — this "no readable output" result only means its final answer could not be read yet, NOT that the task failed.`,
+    'Do NOT redo its work. It is being moved to background; you will be notified when it settles.',
+    'Use list_agents to check its live state.',
+  ].join(' ');
+}
+
 /* ── 子代理注册表（custom 条目持久化） ────────────────────────────── */
 
 export const SUBS_CUSTOM_TYPE = 'pi-herdr.subs';

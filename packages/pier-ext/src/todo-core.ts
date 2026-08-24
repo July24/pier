@@ -93,20 +93,31 @@ export function validateTodos(
     const item: TodoItem = { content, status: status as TodoStatus };
     if ('blocker' in entry) {
       const blocker = entry.blocker;
-      if (status !== 'blocked') {
-        return { ok: false, error: `invalid todo: \`blocker\` is only allowed when status is "blocked" (got "${status}")` };
-      }
-      if (typeof blocker !== 'string' || blocker.trim() === '') {
+      // 容忍归一（用户实证修复）：Optional 字段用空串/null 填充是常见模型行为
+      //（grok 实测 9 连拒死循环）；status 是权威——非 blocked 态的 blocker 一律视为
+      // 缺省丢弃（无论是否有值），空值同样丢弃。仅类型畸形仍硬拒。
+      if (blocker != null && typeof blocker !== 'string') {
         return { ok: false, error: 'invalid todo: `blocker` must be a non-empty string' };
       }
-      item.blocker = blocker;
+      if (status === 'blocked') {
+        if (typeof blocker !== 'string' || blocker.trim() === '') {
+          return { ok: false, error: 'invalid todo: `blocker` must be a non-empty string' };
+        }
+        item.blocker = blocker;
+      }
     }
     if ('phase' in entry) {
       const phase = entry.phase;
-      if (typeof phase !== 'string' || phase.trim() === '' || phase.length > PHASE_MAX_LEN) {
+      if (phase != null && typeof phase !== 'string') {
         return { ok: false, error: `invalid todo: \`phase\` must be a non-empty string ≤ ${PHASE_MAX_LEN} chars` };
       }
-      item.phase = phase;
+      // 空串/纯空白 = 缺省（实证循环里 phase:"" 同样是被掩盖的雷）；超长是真实约束仍硬拒
+      if (typeof phase === 'string') {
+        if (phase.length > PHASE_MAX_LEN) {
+          return { ok: false, error: `invalid todo: \`phase\` must be a non-empty string ≤ ${PHASE_MAX_LEN} chars` };
+        }
+        if (phase.trim() !== '') item.phase = phase;
+      }
     }
     if (status === 'in_progress') {
       inProgress++;

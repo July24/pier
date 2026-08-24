@@ -157,18 +157,31 @@ test('validateTodos: 五态 + blocker + phase 通过', () => {
   ]);
 });
 
-test('validateTodos: blocker 只允许 blocked 态', () => {
-  const bad = validateTodos([{ content: 'a', status: 'pending', blocker: 'x' }]);
-  assert.equal(bad.ok, false);
-  assert.match(bad.error!, /only allowed when status is "blocked"/);
-  const empty = validateTodos([{ content: 'a', status: 'blocked', blocker: '  ' }]);
-  assert.equal(empty.ok, false);
-  assert.match(empty.error!, /non-empty string/);
+test('validateTodos: blocker 容忍归一（用户实证：模型用空串填充 Optional 字段）', () => {
+  // 非 blocked 态带 blocker（含非空值）→ 丢弃 blocker，status 是权威
+  const drop = validateTodos([{ content: 'a', status: 'completed', blocker: 'x' }]);
+  assert.equal(drop.ok, true);
+  assert.equal('blocker' in (drop as { items: TodoItem[] }).items[0], false);
+  // 空/空白 blocker（任意状态）→ 视为缺省
+  const empty = validateTodos([{ content: 'a', status: 'completed', blocker: '' }]);
+  assert.equal(empty.ok, true);
+  const emptyBlocked = validateTodos([{ content: 'a', status: 'blocked', blocker: '' }]);
+  assert.equal(emptyBlocked.ok, false, 'blocked 态必须有非空 blocker');
+  assert.match((emptyBlocked as { error: string }).error, /non-empty string/);
+  // blocked 态合法 blocker 保留
+  const ok = validateTodos([{ content: 'a', status: 'blocked', blocker: '等审核' }]);
+  assert.equal(ok.ok, true);
+  assert.equal((ok as { items: TodoItem[] }).items[0].blocker, '等审核');
+  // 类型畸形仍硬拒
+  const badType = validateTodos([{ content: 'a', status: 'blocked', blocker: 123 }]);
+  assert.equal(badType.ok, false);
 });
 
-test('validateTodos: phase 非空且 ≤30 字符', () => {
-  assert.equal(validateTodos([{ content: 'a', status: 'pending', phase: '' }]).ok, false);
+test('validateTodos: phase 空/空白视为缺省；超长仍拒；类型畸形仍拒', () => {
+  assert.equal(validateTodos([{ content: 'a', status: 'pending', phase: '' }]).ok, true);
+  assert.equal(validateTodos([{ content: 'a', status: 'pending', phase: '  ' }]).ok, true);
   assert.equal(validateTodos([{ content: 'a', status: 'pending', phase: 'x'.repeat(31) }]).ok, false);
+  assert.equal(validateTodos([{ content: 'a', status: 'pending', phase: 42 }]).ok, false);
   assert.equal(validateTodos([{ content: 'a', status: 'pending', phase: 'x'.repeat(30) }]).ok, true);
 });
 
