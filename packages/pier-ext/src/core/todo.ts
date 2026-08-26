@@ -20,6 +20,7 @@ import type { TodosService } from '../todos-service.ts';
 import { planTodoReadHook } from '../todo-read-hook.ts';
 import { makeProgressUpdate } from '../subagent-core.ts';
 import { TODO_DETAILS_KEY, TODO_TOOL_NAME, formatTodoConfirmation, type TodoItem, type TodoStatus } from '../vocab.ts';
+import { formatAge, isArchived } from '../stale-core.ts';
 import {
   TODO_EDIT_CUSTOM_TYPE,
   completionTransitions,
@@ -96,10 +97,16 @@ function renderGroups(items: readonly TodoItem[]): string[] {
  *  - 超额丢弃顺序 = 最老 completed → 最老 open（尾部/当前工作永远存活）；
  *  - +N 行指路 /todos（全量视图）。
  */
-export function widgetLines(items: readonly TodoItem[]): string[] {
+export function widgetLines(items: readonly TodoItem[], opts?: { archivedAgeMs?: number | null }): string[] {
   if (items.length === 0) return [];
   const c = countTodos(items);
-  const summary = `todo: ${c.inProgress}▶ ${c.pending}○ ${c.blocked}■ ${c.completed}✓`;
+  // 反冻结：归档列表不逐条渲染，两行说明 + 指路 /todos（死计划不再占满视窗）。
+  if (opts?.archivedAgeMs != null) {
+    return [
+      `todo: ${c.inProgress}▶ ${c.pending}○ ${c.blocked}■ ${c.completed}✓ · archived ${formatAge(opts.archivedAgeMs)}`,
+      '  archived — /todos 全量',
+    ];
+  }
 
   const kept = [...items];
   while (
@@ -111,7 +118,7 @@ export function widgetLines(items: readonly TodoItem[]): string[] {
   }
 
   const hidden = items.filter((it) => !kept.includes(it));
-  const lines = [summary, ...renderGroups(kept)];
+  const lines = [`todo: ${c.inProgress}▶ ${c.pending}○ ${c.blocked}■ ${c.completed}✓`, ...renderGroups(kept)];
   if (hidden.length > 0) {
     const hiddenCompleted = hidden.filter((it) => it.status === 'completed').length;
     lines.push(`   +${hidden.length} hidden (${hiddenCompleted}✓) · /todos 全量`);
@@ -151,12 +158,25 @@ export default function todoPlugin(ctx: Context): void {
     ctx.get('pi-herdr.todo-deps') as TodoDeps;
   const scoped = surface.forModule(import.meta.url);
 
+  /** 归档年龄（非归档 → null）；widget / /todos 共用。 */
+  function archivedAgeMs(now = Date.now()): number | null {
+    return todos.lastWriteAt != null && isArchived(todos.items, todos.lastWriteAt, now)
+      ? now - todos.lastWriteAt
+      : null;
+  }
+
+  /** 事件 ctx 里的 widget UI（有则 setWidget；守卫后具名使用，不做行内断言）。 */
+  function widgetUi(eventCtx: unknown): { setWidget?: (id: string, lines: string[]) => void } | undefined {
+    if (eventCtx === null || typeof eventCtx !== 'object' || !('ui' in eventCtx)) return undefined;
+    const ui = (eventCtx as { ui: unknown }).ui; // 'ui' in 已守卫
+    return ui !== null && typeof ui === 'object'
+      ? (ui as { setWidget?: (id: string, lines: string[]) => void })
+      : undefined;
+  }
+
   function renderWidget(eventCtx: unknown): void {
     try {
-      (eventCtx as { ui?: { setWidget?: (id: string, lines: string[]) => void } })?.ui?.setWidget?.(
-        'todos',
-        widgetLines(todos.items),
-      );
+      widgetUi(eventCtx)?.setWidget?.('todos', widgetLines(todos.items, { archivedAgeMs: archivedAgeMs() }));
     } catch {
       /* 无 widget 能力的 pi 版本静默降级 */
     }
@@ -165,18 +185,46 @@ export default function todoPlugin(ctx: Context): void {
   // 槽回填：index 的 session_start/session_tree 调用
   state.renderWidget = renderWidget;
 
-  /* ── 读钩（轮次计数器内聚；D39 提示注入） ── */
+  /* ── 读钩（轮次计数器内聚；D39 提示注入 + 反冻结 stale-core） ── */
   let todoReadTurn = 0;
   let lastEmptyGuardTurn: number | null = null;
-  scoped.on('before_agent_start', async () => {
+  // 反冻结状态：距上次写入轮数 / stale 警告计数与节奏 / 归档翻转检测
+  let lastWriteTurn: number | null = null;
+  let staleNotices = 0;
+  let lastStaleGuardTurn: number | null = null;
+  let lastArchivedMirror = false;
+
+  // 任何真实变更（todo_write / 人类编辑 / 对账 / 分支重建）都终结当前停滞期
+  todos.on('todo.updated', () => {
+    lastWriteTurn = todoReadTurn;
+    staleNotices = 0;
+  });
+
+  scoped.on('before_agent_start', async (eventCtx?: unknown) => {
     const plan = planTodoReadHook({
       items: todos.items,
       turn: todoReadTurn,
       lastEmptyGuardTurn,
+      lastWriteAt: todos.lastWriteAt,
+      turnsSinceWrite: lastWriteTurn == null ? null : todoReadTurn - lastWriteTurn,
+      now: Date.now(),
+      staleNotices,
+      lastStaleGuardTurn,
     });
+    if (plan.inject && (plan.effect === 'empty-guard' || plan.effect === 'archive-notice')) {
+      lastEmptyGuardTurn = todoReadTurn;
+    } else if (plan.effect === 'stale-notice') {
+      staleNotices += 1;
+      lastStaleGuardTurn = todoReadTurn;
+    }
     todoReadTurn += 1;
+    // 归档态翻转（纯时钟推进，无 todo 事件）→ 补一次投影刷新
+    if (plan.archived !== lastArchivedMirror) {
+      lastArchivedMirror = plan.archived;
+      renderWidget(eventCtx);
+      mirrorTodos();
+    }
     if (!plan.inject) return;
-    if (todos.items.length === 0) lastEmptyGuardTurn = todoReadTurn - 1;
     return {
       message: {
         customType: plan.message.customType,
@@ -319,7 +367,10 @@ export default function todoPlugin(ctx: Context): void {
         return;
       }
       const c = countTodos(todos.items);
-      ui?.notify?.([`todo: ${c.inProgress}▶ ${c.pending}○ ${c.blocked}■ ${c.completed}✓`, ...body].join('\n'), 'info');
+      const age = archivedAgeMs();
+      const head = `todo: ${c.inProgress}▶ ${c.pending}○ ${c.blocked}■ ${c.completed}✓`
+        + (age != null ? ` · archived ${formatAge(age)}（不再注入）` : '');
+      ui?.notify?.([head, ...body].join('\n'), 'info');
     },
   });
 

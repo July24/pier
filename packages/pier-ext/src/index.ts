@@ -24,9 +24,7 @@ import {
 import { collapseNotices } from './notice-buffer.ts';
 import {
   TODO_EDIT_CUSTOM_TYPE,
-  applyTodoEdits,
   currentActivity,
-  foldLatestTodos,
 } from './todo-core.ts';
 import { pipeNameFor, pipeRequest, startPipeServer } from './pipe-channel.ts';
 
@@ -156,7 +154,13 @@ export default async function (pi: ExtensionAPI) {
     const p = progressOf(todos.items);
     const eta = estimateEta({ completedAt: completedStamps, total: p.total, now: Date.now() });
     const suffix = formatProgressSuffix({ completed: p.completed, total: p.total, eta });
-    client.reportMetadata({ session: label, items: todos.items, progressSuffix: suffix }).catch(() => {});
+    // 反冻结：lastWriteAt 随行 → 标题侧 archived 判定（pane-title）
+    client.reportMetadata({
+      session: label,
+      items: todos.items,
+      progressSuffix: suffix,
+      lastWriteAt: todos.lastWriteAt,
+    }).catch(() => {});
   }
 
   /* ── M17：结算自动对账（纯规划器 + D38 权威路径；幂等，双路径双跑无害） ── */

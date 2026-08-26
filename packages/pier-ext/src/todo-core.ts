@@ -198,6 +198,8 @@ export function makeSnapshot(items: TodoItem[]): TodoSnapshot {
 export interface BranchEntryLike {
   /** pi 会话条目：type 为 'message' 的消息条目或 'custom' 的自定义条目。 */
   type?: string;
+  /** 会话 JSONL 顶层时间戳（ISO 字符串或 epoch ms；重建 lastWriteAt 用）。 */
+  timestamp?: unknown;
   message?: {
     role?: string;
     toolName?: string;
@@ -270,21 +272,56 @@ function extractEditPayload(data: unknown): TodoEditPayload | null {
  *  - custom(pi-herdr.todo-edit) → 在当前列表上应用 edits（人类编辑）。
  * 分支正确性 = 沿分支路径顺序折叠。
  */
-export function foldLatestTodos(entries: readonly BranchEntryLike[]): TodoItem[] | null {
+export interface FoldedTodos {
+  items: TodoItem[];
+  /** 产生该列表的最后一个条目时间戳（epoch ms）；条目无时间戳 → null。 */
+  writtenAt: number | null;
+}
+
+function entryTimestamp(entry: BranchEntryLike): number | null {
+  const ts = entry.timestamp;
+  if (typeof ts === 'number') return ts;
+  if (typeof ts === 'string') {
+    const parsed = Date.parse(ts);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+}
+
+/**
+ * 从 pi 会话分支条目里折叠出最新 todo 列表（D38 双源）：
+ *  - toolResult(todo_write) → 快照替换（last-wins）；
+ *  - custom(pi-herdr.todo-edit) → 在当前列表上应用 edits（人类编辑）。
+ * 分支正确性 = 沿分支路径顺序折叠。writtenAt = 最后一次触碰该列表的条目时间戳
+ * （无时间戳的旧条目 → null，陈旧度判定保守判 fresh）。
+ */
+export function foldLatestTodosMeta(entries: readonly BranchEntryLike[]): FoldedTodos | null {
   let found: TodoItem[] | null = null;
+  let writtenAt: number | null = null;
   for (const entry of entries) {
     if (entry.type === 'message') {
       const msg = entry.message;
       if (typeof msg !== 'object' || msg === null) continue;
       if (msg.role !== 'toolResult' || msg.toolName !== TODO_TOOL_NAME) continue;
       const snapshot = extractSnapshotFromDetails(msg.details);
-      if (snapshot) found = snapshot.items.map((it) => ({ ...it }));
+      if (snapshot) {
+        found = snapshot.items.map((it) => ({ ...it }));
+        writtenAt = entryTimestamp(entry);
+      }
     } else if (entry.type === 'custom' && entry.customType === TODO_EDIT_CUSTOM_TYPE) {
       const payload = extractEditPayload(entry.data);
-      if (payload && found) found = applyTodoEdits(found, payload.edits);
+      if (payload && found) {
+        found = applyTodoEdits(found, payload.edits);
+        writtenAt = entryTimestamp(entry) ?? (payload.ts > 0 ? payload.ts : writtenAt);
+      }
     }
   }
-  return found;
+  return found ? { items: found, writtenAt } : null;
+}
+
+/** foldLatestTodosMeta 的条目-only 视图（兼容既有调用方）。 */
+export function foldLatestTodos(entries: readonly BranchEntryLike[]): TodoItem[] | null {
+  return foldLatestTodosMeta(entries)?.items ?? null;
 }
 
 export function extractSnapshotFromDetails(details: unknown): TodoSnapshot | null {

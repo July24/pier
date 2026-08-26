@@ -5,6 +5,7 @@
  * herdr 把 title / state_label 截到 80 字符——本地先裁，避免半截 emoji。
  */
 import { countTodos, PI_HERDR_META_KEY, type TodoItem } from './vocab.ts';
+import { formatAge, isArchived } from './stale-core.ts';
 
 /** herdr 对 title / state_label 的字符上限（官方文档 + schema 实测）。 */
 export const TITLE_MAX = 80;
@@ -46,14 +47,23 @@ function clipTitle(s: string): string {
  * `▶i ○p ■b ✓c (N/M [~eta]) · <activity>`（D91 图标统一：黑白字符四件套）。
  * activity = 第一条 in_progress，否则 fallbackDescription，再否则只报计数。
  * 空列表 → null。progressSuffix（M16）= formatProgressSuffix 产物。
+ *
+ * 反冻结（stale-core D）：全完成 + 墙钟过期（archived）→ 死列表降权为
+ * `✓N done <age>`，不再以 ▶○■✓ 满权重视窗冒充当前状态；"在干嘛"由
+ * report_agent 的工具徽标/活动行承担，todo token 只报计划真实状态。
  */
 export function formatPaneTitle(
   items: readonly TodoItem[],
   fallbackDescription?: string | null,
-  opts?: { progressSuffix?: string | null },
+  opts?: { progressSuffix?: string | null; lastWriteAt?: number | null; now?: number },
 ): string | null {
   if (items.length === 0) return TITLE_EMPTY;
   const c = countTodos(items);
+  const now = opts?.now ?? Date.now();
+  if (isArchived(items, opts?.lastWriteAt ?? null, now)) {
+    const age = formatAge(now - (opts?.lastWriteAt as number));
+    return clipTitle(`✓${c.completed} done ${age}`);
+  }
   const activity =
     items.find((it) => it.status === 'in_progress')?.content
     ?? (fallbackDescription?.trim() ? fallbackDescription.trim() : null);

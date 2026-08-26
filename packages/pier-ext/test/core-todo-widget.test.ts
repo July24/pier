@@ -66,3 +66,19 @@ test('widgetLines: blocked 带 blocker 后缀', () => {
   const lines = widgetLines(items);
   assert.ok(lines.some((l) => l.includes('■ x — 等审核')));
 });
+
+test('widgetLines: 反冻结——归档列表不逐条渲染，两行降权', () => {
+  const items = [
+    it('Verify gateway', 'completed', 'verify'),
+    it('Verify ids', 'completed', 'verify'),
+    it('Update doc', 'completed', 'doc'),
+  ];
+  const lines = widgetLines(items, { archivedAgeMs: 16 * 3_600_000 });
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /todo: 0▶ 0○ 0■ 3✓ · archived 16h/);
+  assert.match(lines[1], /\/todos/);
+  assert.ok(!lines.some((l) => l.includes('Verify gateway')), '归档后死条目不再占视窗');
+  // 未传归档 → 原有全量渲染行为不变
+  const plain = widgetLines(items);
+  assert.ok(plain.some((l) => l.includes('✓ Verify gateway')));
+});

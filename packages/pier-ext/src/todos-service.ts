@@ -6,7 +6,7 @@
 import { EventEmitter } from 'node:events';
 import {
   applyTodoEdits,
-  foldLatestTodos,
+  foldLatestTodosMeta,
   type TodoEdit,
   type TodoItem,
 } from './todo-core.ts';
@@ -20,6 +20,11 @@ export interface TodosConfig {
 
 export class TodosService extends EventEmitter {
   items: TodoItem[] = [];
+  /**
+   * 列表最后一次真实变更时间（epoch ms）；分支重建取自条目时间戳，无则 null。
+   * 陈旧度判定（stale-core）的时钟锚点；null → 保守永不判 stale。
+   */
+  lastWriteAt: number | null = null;
   readonly config: TodosConfig;
 
   constructor(config: TodosConfig) {
@@ -38,6 +43,7 @@ export class TodosService extends EventEmitter {
   replace(items: readonly TodoItem[]): void {
     const before = this.items;
     this.items = items.map((it) => ({ ...it }));
+    this.lastWriteAt = Date.now();
     this.emitCompletedTransitions(before, this.items);
     this.emit('todo.updated', { items: this.items });
   }
@@ -45,6 +51,7 @@ export class TodosService extends EventEmitter {
   applyEdits(edits: readonly TodoEdit[]): void {
     const before = this.items;
     this.items = applyTodoEdits(this.items, edits);
+    this.lastWriteAt = Date.now();
     this.emitCompletedTransitions(before, this.items);
     this.emit('todo.edited', { edits, items: this.items });
     this.emit('todo.updated', { items: this.items });
@@ -59,8 +66,11 @@ export class TodosService extends EventEmitter {
   rebuild(entries: readonly unknown[]): void {
     // 与 v1.x rebuildFromBranch 同语义：分支上折叠不到快照时保留现值
     //（重建失败不影响主流程；下次 todo_write 会重新锚定）。
-    const folded = foldLatestTodos(entries as Parameters<typeof foldLatestTodos>[0]);
-    if (folded) this.items = folded;
+    const folded = foldLatestTodosMeta(entries as Parameters<typeof foldLatestTodosMeta>[0]);
+    if (folded) {
+      this.items = folded.items;
+      this.lastWriteAt = folded.writtenAt;
+    }
     this.emit('todo.updated', { items: this.items, reason: 'rebuild' });
   }
 }

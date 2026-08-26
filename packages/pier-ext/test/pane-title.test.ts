@@ -63,6 +63,27 @@ test('formatPaneTitle: 超 TITLE_MAX 本地先裁', () => {
   assert.equal(title.slice(0, 8), '▶1 ○0 ■0');
 });
 
+test('formatPaneTitle: 反冻结（stale-core D）——归档列表降权为 ✓N done <age>', () => {
+  const done3 = [
+    { content: 'Verify gateway', status: 'completed' as const },
+    { content: 'Verify ids', status: 'completed' as const },
+    { content: 'Update doc', status: 'completed' as const },
+  ];
+  const t0 = 100 * 3_600_000;
+  // 未传 lastWriteAt（旧调用方）→ 行为不变（满权重四件套）
+  assert.equal(formatPaneTitle(done3, null, {}), '▶0 ○0 ■0 ✓3');
+  // 新鲜（<1h）→ 满权重
+  assert.equal(formatPaneTitle(done3, null, { lastWriteAt: t0, now: t0 + 30 * 60_000 }), '▶0 ○0 ■0 ✓3');
+  // 归档（≥1h）→ `✓3 done <age>`，死列表不再冒充当前状态
+  assert.equal(formatPaneTitle(done3, null, { lastWriteAt: t0, now: t0 + 16 * 3_600_000 }), '✓3 done 16h');
+  // 有 open 项 → 永不归档（多老都满权重）
+  const withOpen = [...done3, { content: 'next', status: 'in_progress' as const }];
+  assert.equal(
+    formatPaneTitle(withOpen, null, { lastWriteAt: t0, now: t0 + 48 * 3_600_000 }),
+    '▶1 ○0 ■0 ✓3 · next',
+  );
+});
+
 test('formatBlockedLabel: 取第一条 blocked 的 blocker；无 blocked → null', () => {
   assert.equal(formatBlockedLabel([{ content: 'a', status: 'pending' }]), null);
   assert.equal(

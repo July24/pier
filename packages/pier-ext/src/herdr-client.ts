@@ -77,7 +77,7 @@ export interface HerdrClientLike {
   readonly available: boolean;
   reportAgent(state: PaneAgentState, message: string | null): Promise<void>;
   reportAgentSession(sessionPath: string | null): Promise<void>;
-  reportMetadata(meta: { session: string; items: TodoItem[]; progressSuffix?: string | null }): Promise<void>;
+  reportMetadata(meta: { session: string; items: TodoItem[]; progressSuffix?: string | null; lastWriteAt?: number | null }): Promise<void>;
   /** M18：写锁 token 上报（键 lock-<hash>，值 paneId|path；null = 释放；≤16 键/批自动分批）。 */
   reportLockTokens(tokens: Record<string, string | null>): Promise<void>;
   /**
@@ -302,10 +302,13 @@ export class HerdrClient implements HerdrClientLike {
     }
   }
 
-  async reportMetadata(meta: { session: string; items: TodoItem[]; progressSuffix?: string | null }): Promise<void> {
+  async reportMetadata(meta: { session: string; items: TodoItem[]; progressSuffix?: string | null; lastWriteAt?: number | null }): Promise<void> {
     try {
       void meta.session;
-      const title = formatPaneTitle(meta.items, null, { progressSuffix: meta.progressSuffix });
+      const title = formatPaneTitle(meta.items, null, {
+        progressSuffix: meta.progressSuffix,
+        lastWriteAt: meta.lastWriteAt,
+      });
       const blocked = formatBlockedLabel(meta.items);
       // D96：stale 清理与日常上报分离——stale(16) + pi-todo(1) = 17 > herdr tokens max=16
       // → 整个请求被拒 → title/tokens 全丢（D93 回归根因）。stale 单独批次，成功后才置位。
