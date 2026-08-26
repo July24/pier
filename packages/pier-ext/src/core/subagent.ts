@@ -23,7 +23,7 @@ import type { TodosService } from '../todos-service.ts';
 import { mountSubagentScope } from '../subagent-scope.ts';
 import { Semaphore, SUBS_CUSTOM_TYPE, agoText, buildAliveNotice, buildBlockedGateNotice, buildLaunchLine, buildLaunchParts, classifyWorktreeZone, foldSubsRegistry, formatSubagentResult, isAlive, isPathUnder, makeProgressUpdate, makeRegistry, planTabPlacement, psQuote, tabNameForTask, type AliveProbe, type SubEntry, type SubagentSpec, type TabPlacementPlan, type WorktreeZone } from '../subagent-core.ts';
 import { hasAssistantAfter, hasPendingToolCall, lastAssistantText, listSessionFiles, readSessionFile, sessionFileById } from '../session-tail.ts';
-import { appendHistory, applyReportedSessionFile, historyFilePath, latestGeneration, normalizeEntryKind, readHistory, type HistoryEntry } from '../history-store.ts';
+import { appendHistory, applyReportedSessionFile, historyFilePath, inheritOutcome, latestGeneration, normalizeEntryKind, readHistory, type HistoryEntry } from '../history-store.ts';
 import { execFile } from 'node:child_process';
 import { stat as statCb } from 'node:fs';
 import { resolve as pathResolve } from 'node:path';
@@ -66,9 +66,10 @@ export interface SubagentDeps {
    * D92 结算通知注入器（index.ts 提供）：忙时入缓冲、turn_end 折叠 steer 批量注入。
    * 缺省回退 pi.sendUserMessage(followUp)（旧路径——整个 run 结束才回填，测试桩用）。
    */
-  deliverNotice?: (content: string) => Promise<void>;
+  deliverNotice?: (content: string, paneId?: string) => Promise<void>;
+  /** B2：结算通知尚在缓冲未送达的 pane 集合（GC 豁免——先送达再回收）。 */
+  noticePending?: () => ReadonlySet<string>;
   /** terminal 族 GC 豁免槽。 */
-  terminalState: { activePaneIds: () => Set<string> };
   todos: TodosService;
 }
 
@@ -84,10 +85,18 @@ const SUBAGENT_DESCRIPTION = [
 
 /** 子代理并发上限（D10）。 */
 const SUBAGENT_CONCURRENCY = 4;
-/** 单子代理等待上限（内部 marker PI_HERDR_SUBAGENT_TIMEOUT_MS 可调，默认 10 分钟）。 */
+/** B1：观察超时 = 无活动时长预算（非总墙钟）——working 切片持续续命；marker
+ * PI_HERDR_SUBAGENT_TIMEOUT_MS 沿用旧名，语义已从「poller 起算总墙钟」改为
+ * 「距最近一次活动」——>10min 的健康长任务不再被误杀（session 01a03c0d 实证）。 */
 const SUBAGENT_TIMEOUT_MS = Number(process.env.PI_HERDR_SUBAGENT_TIMEOUT_MS ?? 600000) || 600000;
 /** 就绪等待上限（TUI 启动 + herdr 检测）。 */
 const SUB_READY_TIMEOUT_MS = 30000;
+/** D94/B4：结算观察窗（此期内 working 默认视为用户接管）。 */
+const OBSERVE_WINDOW_MS = Number(process.env.PI_HERDR_OBSERVE_MS ?? 30000) || 30000;
+/** B4：机器注入宽限——观察窗内的 working 若由自己的 prompt/follow_up 触发，不算接管。 */
+const MACHINE_INJECT_GRACE_MS = Number(process.env.PI_HERDR_INJECT_GRACE_MS ?? 30000) || 30000;
+/** D94：接管态归还阈值（持续 idle 即归还）。 */
+const TAKEOVER_IDLE_MS = Number(process.env.PI_HERDR_TAKEOVER_IDLE_MS ?? 60000) || 60000;
 
 function defaultAgentSessionsDir(): string {
   const base = process.env.PI_CODING_AGENT_DIR || join(homedir(), '.pi', 'agent');
@@ -114,7 +123,9 @@ export default function subagentPlugin(ctx: Context): void {
     extPath: d.extPath,
   };
   const subSemaphore = new Semaphore(SUBAGENT_CONCURRENCY);
-
+  /** B4：每 pane 最近一次机器注入（prompt/follow_up pipe 投递成功）时间——观察窗内的
+   * working 若发生在宽限期内，是自己的注入在被处理，不是用户接管。 */
+  const lastMachineInjectAt = new Map<string, number>();
   /* 子代理注册表（custom 条目持久化，分支正确；parent 重启后可从分支重建） */
   const subs = new Map<string, SubEntry>();
   const pollers = new Set<string>();
@@ -122,14 +133,20 @@ export default function subagentPlugin(ctx: Context): void {
   /** D50：每 pane 最近一次机器请求 id（interrupt 按轮次占位、pollLoop 去重用）。 */
   const lastRequestIdByPane = new Map<string, string>();
 
+  /** O1：上次落盘快照（内容哈希门控——01a03c0d 实证 48% session 行是心跳期重复快照）。 */
+  let lastSubsSnapshot = '';
+
   function persistSubs(): void {
     try {
-      pi.appendEntry?.(SUBS_CUSTOM_TYPE, makeRegistry([...subs.values()]));
+      const reg = makeRegistry([...subs.values()]);
+      const snap = JSON.stringify(reg);
+      if (snap === lastSubsSnapshot) return; // 内容未变不落（1s 观察窗/5s 接管循环的重复心跳）
+      lastSubsSnapshot = snap;
+      pi.appendEntry?.(SUBS_CUSTOM_TYPE, reg);
     } catch {
       /* 持久化尽力而为 */
     }
   }
-
   /** E2：已发过闸门通知的 pane（blocked 期间去重；解除后移除，二次 ask 可再通知）。 */
   const blockedGateNotified = new Set<string>();
 
@@ -141,7 +158,7 @@ export default function subagentPlugin(ctx: Context): void {
     if (next === entry.sessionFile) return;
     entry.sessionFile = next;
     persistSubs();
-    writeHistory(entry);
+    writeHistory(entry, undefined, 'session-report');
   };
   slots.reconcileOnReply = (paneId) => {
     const entry = subs.get(paneId);
@@ -160,16 +177,39 @@ export default function subagentPlugin(ctx: Context): void {
         ?.sessionManager?.getBranch?.() ?? [];
       const reg = foldSubsRegistry(entries as Parameters<typeof foldSubsRegistry>[0]);
       for (const sub of reg.subs) subs.set(sub.paneId, sub);
+      lastSubsSnapshot = ''; // 分支回放改变了状态 → 下次 persistSubs 强制落盘
     } catch {
       /* 重建失败不影响主流程 */
     }
   }
 
+  /** B6：master 崩溃遗留的 running 行——按 herdr 实况补 closed（pane 没了才关，
+   * pane 还在的真在跑则保留）。01a03c0d 台账实证：p6/p7 永久 running 无回收。 */
+  async function sweepZombieRunning(): Promise<void> {
+    if (!client.available || subs.size === 0) return;
+    let livePaneIds: ReadonlySet<string>;
+    try {
+      livePaneIds = new Set((await client.listPanes()).map((p) => p.paneId));
+    } catch {
+      return; // 查询失败不误关
+    }
+    let changed = false;
+    for (const [paneId, e] of subs) {
+      if (e.status !== 'running' || livePaneIds.has(paneId)) continue;
+      e.status = 'closed';
+      writeHistory(e, { status: 'closed', closedAt: Date.now() }, 'zombie-sweep');
+      changed = true;
+    }
+    if (changed) persistSubs();
+  }
+
   scoped.on('session_start', async (_event: unknown, eventCtx: unknown) => {
     rebuildSubs(eventCtx);
+    await sweepZombieRunning();
   });
   scoped.on('session_tree', async (_event: unknown, eventCtx: unknown) => {
     rebuildSubs(eventCtx);
+    await sweepZombieRunning();
   });
 
   /* ── B1（用户实证修复）：subagent isError 结果的探活改写 ──────────────
@@ -344,8 +384,8 @@ export default function subagentPlugin(ctx: Context): void {
   ): Promise<{ text: string | null; pendingTool: boolean; activity: boolean }> {
     for (const file of await resolveSessionFileCandidates(paneId, cwd)) {
       const entries = readSessionFile(file);
-      if (!entries) continue;
-      const r = lastAssistantText(entries, { sinceTs });
+      if (entries.length === 0) continue;
+      const r = lastAssistantText(entries, sinceTs);
       if (r?.text) return { text: r.text, pendingTool: false, activity: true };
       if (hasPendingToolCall(entries, sinceTs)) return { text: null, pendingTool: true, activity: true };
       if (hasAssistantAfter(entries, sinceTs)) return { text: null, pendingTool: false, activity: true };
@@ -368,7 +408,11 @@ export default function subagentPlugin(ctx: Context): void {
     requestId: string,
   ): Promise<void> {
     void spawnedAt;
+    // B1：无活动预算锚点——working 切片（waitAgent 超时 null）即心跳（O3）：每次续命；
+    // 只有「不 working 也无结算进展」的真空期才消耗预算（01a03c0d：27min 健康长任务
+    // 被旧总墙钟 10min 误杀两次）。startedAt 保留供通知文案诊断。
     const startedAt = Date.now();
+    let lastActivityAt = Date.now();
     try {
       while (true) {
         const entry = subs.get(paneId);
@@ -458,17 +502,29 @@ export default function subagentPlugin(ctx: Context): void {
               // 已在观察期
               const elapsed = Date.now() - entry.observationStartedAt;
 
-              // 检测用户介入：查询当前状态是否变为 working
+              // 检测用户介入：查询当前状态是否变为 working。
+              // B4：观察窗内 working ≠ 必然用户接管——自己的 follow_up 注入也呈现
+              // working。距最近机器注入 < MACHINE_INJECT_GRACE_MS 的 working 视为
+              // 注入被处理（取消结算继续观察），否则才判接管（01a03c0d：契约消息
+              // 20min 后投递，恰好撞进观察窗）。
               try {
                 const agents = await client.listAgents();
                 const agent = agents.find((a) => a.paneId === paneId);
                 if (agent && agent.status === 'working') {
-                  // 用户介入！标记接管，取消结算
-                  entry.userTakeover = true;
+                  const injectedAgo = Date.now() - (lastMachineInjectAt.get(paneId) ?? 0);
+                  if (injectedAgo > MACHINE_INJECT_GRACE_MS) {
+                    // 用户介入！标记接管，取消结算
+                    entry.userTakeover = true;
+                    entry.observationStartedAt = Date.now();
+                    entry.lastAgentStatus = 'working';
+                    persistSubs();
+                    continue; // 跳过结算，进入用户接管模式
+                  }
+                  // 机器注入在处理中 → 归零观察窗，等这轮 run 收尾再判结算
                   entry.observationStartedAt = Date.now();
-                  entry.lastAgentStatus = 'working';
                   persistSubs();
-                  continue; // 跳过结算，进入用户接管模式
+                  await new Promise((resolve) => setTimeout(resolve, 1000));
+                  continue;
                 }
               } catch {
                 // listAgents 失败静默
@@ -483,7 +539,6 @@ export default function subagentPlugin(ctx: Context): void {
               // 观察期结束（30s 无用户介入），正常结算
               entry.observationStartedAt = null; // 清除观察期标记
             }
-
             // 正常结算逻辑
             // O6：reply 已写的 sessionFile 是权威；poll 只在缺失时用扫描补，绝不反向覆盖
             if (!entry.sessionFile) {
@@ -494,15 +549,13 @@ export default function subagentPlugin(ctx: Context): void {
             }
             entry.status = 'consumed';
             entry.consumedAt = Date.now();
-            persistSubs();
-            writeHistory(entry, { outcome: closing });
+            writeHistory(entry, { outcome: closing }, 'poll-settle');
             // M17：结算自动对账（先于通知；与 reply 快路径幂等双跑）
             const notes = d.reconcileOnSettlement(description, 'settled');
             const notice = d.withReconcileNotes(
               formatSettlementNotice(`${paneId} (${description})`, closing),
               notes,
             );
-            // D50：push 快路径可能已发过通知 → 按轮次（paneId+请求id）去重，只发一条
             if (d.claimSettleNotice(`${paneId}:${requestId}`)) {
               try {
                 await injectNotice(notice);
@@ -514,6 +567,8 @@ export default function subagentPlugin(ctx: Context): void {
           }
           // 挂起 toolCall（等人类输入）或还没开工 → 继续等
         }
+        // B1/O3：state=null（30s 切片超时）= working 中的心跳 → 续命无活动预算。
+        if (state === null) lastActivityAt = Date.now();
         // 切片超时：检查 pane 存活与总预算
         let alive = false;
         try {
@@ -525,7 +580,7 @@ export default function subagentPlugin(ctx: Context): void {
           entry.status = 'consumed';
           entry.consumedAt = Date.now(); // O8：提前退出路径必须置消费时间，否则 tab TTL 被卡住
           persistSubs();
-          writeHistory(entry, { outcome: 'pane closed before settling' });
+          writeHistory(entry, { outcome: 'pane closed before settling' }, 'poll-pane-closed');
           const notes = d.reconcileOnSettlement(description, 'failed');
           const notice = d.withReconcileNotes(
             `Background subagent ${paneId} (${description}) stopped before settling (its pane closed).`,
@@ -538,14 +593,19 @@ export default function subagentPlugin(ctx: Context): void {
           }
           return;
         }
-        if (Date.now() - startedAt > SUBAGENT_TIMEOUT_MS) {
+        // B1：无活动预算超时——working 心跳持续续命，此处只在「pane 活着但
+        // 既不 working、也无结算进展」真空期超预算时触发（旧总墙钟 10min 误杀
+        // 27min 健康长任务 ×2，01a03c0d 实证）。
+        if (Date.now() - lastActivityAt > SUBAGENT_TIMEOUT_MS) {
           entry.status = 'consumed';
           entry.consumedAt = Date.now(); // O8：observation timeout 同样置消费时间
           persistSubs();
-          writeHistory(entry, { outcome: 'observation timeout' });
+          writeHistory(entry, { outcome: 'observation timeout' }, 'poll-timeout');
           const notes = d.reconcileOnSettlement(description, 'failed');
+          // O2：给行动钩子——list_agents 看活态；真在跑就让它跑完（结算会自动通知），
+          // 别 sleep 盲等（01a03c0d 实证 master 收到旧文案后连 sleep 90/120/180）。
           const notice = d.withReconcileNotes(
-            `Background subagent ${paneId} (${description}) stopped being observed before settling; check its pane.`,
+            `Background subagent ${paneId} (${description}) has shown no progress for ${Math.round((Date.now() - lastActivityAt) / 1000)}s (observed since ${new Date(startedAt).toISOString()}). Run list_agents to check its live state; if it is working, let it run — its settlement notice will arrive automatically. Do not sleep-wait.`,
             notes,
           );
           try {
@@ -587,7 +647,7 @@ export default function subagentPlugin(ctx: Context): void {
     return historyFilePath(agentRootDir(), cwd);
   }
 
-  function toHistory(e: SubEntry): HistoryEntry {
+  function toHistory(e: SubEntry, outcome: string | null): HistoryEntry {
     return {
       taskId: e.taskId,
       kind: e.kind,
@@ -600,7 +660,7 @@ export default function subagentPlugin(ctx: Context): void {
       sessionFile: e.sessionFile,
       launchCommand: e.launchCommand,
       status: e.status,
-      outcome: null,
+      outcome,
       createdAt: e.createdAt,
       consumedAt: e.consumedAt ?? null,
       closedAt: null,
@@ -608,8 +668,14 @@ export default function subagentPlugin(ctx: Context): void {
     };
   }
 
-  function writeHistory(e: SubEntry, patch?: Partial<HistoryEntry>): void {
-    appendHistory(histFile(e.cwd), { ...toHistory(e), ...(patch ?? {}) });
+  /** B5：每 taskId 最近非空 outcome（closed 补记行继承——latestGeneration 取最新行，
+   * 旧实现 closed 行恒 outcome:null → 结算成果在「最新行」语义下丢失）。 */
+  const lastOutcomeByTask = new Map<string, string>();
+
+  function writeHistory(e: SubEntry, patch?: Partial<HistoryEntry>, via?: string): void {
+    const outcome = inheritOutcome(lastOutcomeByTask.get(e.taskId), patch?.outcome);
+    if (typeof outcome === 'string' && outcome.length > 0) lastOutcomeByTask.set(e.taskId, outcome);
+    appendHistory(histFile(e.cwd), { ...toHistory(e, outcome), ...(patch ?? {}), ...(via ? { via } : {}) });
   }
 
   /** 存活任务 tab（本 workspace；herdr 为权威，tab.rename/自动关后自动纠正）。 */
@@ -751,9 +817,10 @@ export default function subagentPlugin(ctx: Context): void {
     } catch {
       return;
     }
-    const statuses = new Map(panesList.map((p) => [p.paneId, p.agentStatus]));
     // D71：有活跃终端会话的 pane 豁免回收（tab 级与 pane 级两处）
     const termPaneIds = terminalState.activePaneIds();
+    // B2：结算通知未送达的 pane 豁免（先送达再回收）——pD/pC 实证被 GC 抢关。
+    const pendingNoticeIds = d.noticePending?.() ?? new Set<string>();
 
     // 任务 tab 分组（含 closed 条目：closed 工作 pane 也算完成）
     const byTab = new Map<string, SubEntry[]>();
@@ -776,7 +843,7 @@ export default function subagentPlugin(ctx: Context): void {
         for (const e of entries) {
           if (e.status !== 'closed') {
             e.status = 'closed';
-            writeHistory(e, { status: 'closed', closedAt: Date.now() });
+            writeHistory(e, { status: 'closed', closedAt: Date.now() }, 'gc');
           }
         }
         continue;
@@ -788,7 +855,8 @@ export default function subagentPlugin(ctx: Context): void {
         now: Date.now(),
       });
       if (!autoCloseTabs || !should) continue;
-      if (tabPanes.some((p) => termPaneIds.has(p.paneId))) continue; // 活跃终端豁免
+      // B2：结算通知未送达的 pane 豁免（先送达再回收）
+      if (tabPanes.some((p) => termPaneIds.has(p.paneId) || pendingNoticeIds.has(p.paneId))) continue;
       try {
         await client.tabClose(tabId);
       } catch {
@@ -797,7 +865,7 @@ export default function subagentPlugin(ctx: Context): void {
       for (const e of entries) {
         if (e.status !== 'closed') {
           e.status = 'closed';
-          writeHistory(e, { status: 'closed', closedAt: Date.now() });
+          writeHistory(e, { status: 'closed', closedAt: Date.now() }, 'gc');
         }
       }
       await new Promise((r) => setTimeout(r, 300)); // 串行关闭（#1358 同类风险护栏）
@@ -810,7 +878,7 @@ export default function subagentPlugin(ctx: Context): void {
       (e) => e.status === 'consumed' && !(e.tabId && closableTaskTabIds.has(e.tabId)),
     );
     for (const e of candidates) {
-      if (termPaneIds.has(e.paneId)) continue; // 活跃终端豁免（D71）
+      if (termPaneIds.has(e.paneId) || pendingNoticeIds.has(e.paneId)) continue; // 活跃终端（D71）/未送达通知（B2）豁免
       if (!shouldClosePane({
         consumedAt: e.consumedAt ?? null,
         herdrStatus: statuses.get(e.paneId),
@@ -819,7 +887,7 @@ export default function subagentPlugin(ctx: Context): void {
       if (statuses.get(e.paneId) === undefined) {
         // pane 已消失（随 tab 被关）→ 补记 closed
         e.status = 'closed';
-        writeHistory(e, { status: 'closed', closedAt: Date.now() });
+        writeHistory(e, { status: 'closed', closedAt: Date.now() }, 'gc');
         continue;
       }
       try {
@@ -828,7 +896,7 @@ export default function subagentPlugin(ctx: Context): void {
         /* pane 已消失 */
       }
       e.status = 'closed';
-      writeHistory(e, { status: 'closed', closedAt: Date.now() });
+      writeHistory(e, { status: 'closed', closedAt: Date.now() }, 'gc');
       await new Promise((r) => setTimeout(r, 300));
     }
     persistSubs();
@@ -905,7 +973,7 @@ export default function subagentPlugin(ctx: Context): void {
     entry.revivedFrom = latest.paneId;
     entry.launchCommand = [launchLine(resumeFile, null, approve)];
     entry.createdAt = Date.now();
-    writeHistory(entry);
+    writeHistory(entry, undefined, 'revive');
     return entry;
   }
 
@@ -1005,7 +1073,6 @@ export default function subagentPlugin(ctx: Context): void {
       const release = await subSemaphore.acquire();
       let paneId = '';
       try {
-        onUpdate?.(makeProgressUpdate(`spawning ${kind !== 'task' ? `${kind} ` : ''}${background ? 'background ' : ''}subagent pane…`));
         const spawnedAt = Date.now();
         const taskId = randomUUID();
         const spawned = await spawnPaneInTaskTab(
@@ -1052,6 +1119,7 @@ export default function subagentPlugin(ctx: Context): void {
         if (injected.type !== 'ok') {
           throw new Error(`pipe prompt rejected: ${injected.type === 'error' ? injected.message : 'unknown response'}`);
         }
+        lastMachineInjectAt.set(paneId, injectTs); // B4：观察窗内 working 归因判据
         // A1+A2（用户实证修复）：前台等待 = 内容闸 + 耐心阈值转后台。
         // 旧实现的 idle 即结算 + 90s 硬窗口在真实任务（working 期 4-6 分钟）上必然误判
         // no-output（实测：3 个健康子代理 101s 时被同时 consumed，成果 4 分钟后才产出）。
@@ -1062,14 +1130,13 @@ export default function subagentPlugin(ctx: Context): void {
         while (Date.now() < Math.min(patienceDeadline, spawnedAt + SUBAGENT_TIMEOUT_MS)) {
           const state = await client.waitAgent(paneId, ['idle', 'done', 'blocked'], 30_000);
           if (state === 'blocked') {
-            // E1（人类闸门）：blocked 不是终态——转后台 poller（人类答后续跑、结算自动通知），
             // 返回 gate 通知：不揽活、提醒用户去 pane 答题、授权例外经 send_message 转达。
             const question = await readAskFlag(paneId);
             entry.background = true;
             lastRequestIdByPane.set(paneId, `prompt-${taskId}`);
             startPoller(paneId, cwd, spawnedAt, injectTs, spec.description, `prompt-${taskId}`);
             persistSubs();
-            writeHistory(entry);
+            writeHistory(entry, undefined, 'to-background');
             return {
               content: [{ type: 'text', text: buildBlockedGateNotice({ paneId, description: spec.description, question }) }],
               details: { paneId, taskId, background: true, blocked: true, role: kind },
@@ -1119,7 +1186,7 @@ export default function subagentPlugin(ctx: Context): void {
         entry.status = 'consumed';
         entry.consumedAt = Date.now();
         persistSubs();
-        writeHistory(entry, { outcome: outcome.kind === 'completed' ? text : null });
+        writeHistory(entry, { outcome: outcome.kind === 'completed' ? text : null }, 'fg-settle');
         return {
           content: [{ type: 'text', text: formatSubagentResult(outcome, spec.description) }],
           details: { paneId, taskId, background, role: kind },
@@ -1198,7 +1265,7 @@ export default function subagentPlugin(ctx: Context): void {
           };
           subs.set(entry.paneId, entry);
           persistSubs();
-          writeHistory(entry);
+          writeHistory(entry, undefined, 'resume');
           return {
             content: [{
               type: 'text',
@@ -1298,13 +1365,13 @@ export default function subagentPlugin(ctx: Context): void {
     },
   });
 
-  /* ── 工具：send_message（followUp 队列语义） ── */
+  /* ── 工具：send_message（steer 间隙投递） ── */
 
   scoped.registerTool({
     name: 'send_message',
     label: 'Send to Subagent',
     description:
-      'Send a follow-up message to a background subagent. If it is working, the message is queued and delivered after it finishes (pi followUp queue); if it is idle, it wakes the subagent for a new turn. `agentId` is the id returned by the subagent tool or shown by list_agents.',
+      'Send a follow-up message to a background subagent. If it is working, the message is delivered at its next tool-call gap (steer, seconds); if it is idle, it wakes the subagent for a new turn. `agentId` is the id returned by the subagent tool or shown by list_agents.',
     parameters: Type.Object({
       agentId: Type.String({ description: 'The subagent id (herdr pane id)' }),
       message: Type.String({ description: 'The follow-up message' }),
@@ -1322,7 +1389,9 @@ export default function subagentPlugin(ctx: Context): void {
           subs.set(entry.paneId, entry);
           persistSubs();
         }
-        // M11（D46）：follow_up 走扩展管道（sendUserMessage(followUp) 队列语义）
+        // M11（D46）：follow_up 走扩展管道。B3：带 steer——worker 长跑中途的补充
+        // 指令在 tool-call 间隙秒级到达（旧 followUp 队列语义 = 整个 run 结束才投，
+        // 01a03c0d 实证 20min 延迟致 worker 按旧契约返工）。
         const ready = await waitSubReady(entry.cwd, entry.paneId);
         if (!ready) throw new Error(`subagent pane ${entry.paneId} pipe not ready`);
         const fuId = `fu-${Date.now()}`;
@@ -1332,10 +1401,12 @@ export default function subagentPlugin(ctx: Context): void {
           text: String(params?.message ?? ''),
           from: pipeNameFor(entry.cwd, env?.paneId ?? ''),
           push: true,
+          steer: true,
         });
         if (res.type !== 'ok') {
           throw new Error(`pipe follow_up rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
         }
+        lastMachineInjectAt.set(entry.paneId, Date.now()); // B4：观察窗内 working 归因判据
         entry.status = 'running';
         persistSubs();
         lastRequestIdByPane.set(entry.paneId, fuId);

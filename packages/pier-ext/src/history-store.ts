@@ -47,6 +47,16 @@ export interface HistoryEntry {
   closedAt?: number | null;
   /** 打回重做/复活时的前代 paneId。 */
   revivedFrom?: string | null;
+  /** B5：写手标记（spawn / poll-settle / poll-timeout / gc / zombie-sweep …）——
+   * 同秒多行可审计（01a03c0d 台账 row#23/24 双写实证）。 */
+  via?: string;
+}
+
+/** B5：closed 行 outcome 继承——patch 未显式指定 outcome 时沿用该 taskId 最近非空值，
+ * 「最新行即现状」语义下结算成果不因 GC 补记而丢失。 */
+export function inheritOutcome(lastOutcome: string | null | undefined, patchOutcome: string | null | undefined): string | null {
+  if (patchOutcome !== undefined) return patchOutcome;
+  return lastOutcome ?? null;
 }
 
 export function historyFilePath(agentRoot: string, cwd: string): string {

@@ -37,6 +37,9 @@ export type PipeRequest =
       from?: string | null;
       /** D50：结算时是否 push reply（后台 true、前台 false——前台由调用方同步取结果）。 */
       push?: boolean;
+      /** B3：follow_up 以 steer 投递（tool-call 间隙即达，秒级）。缺省/ false =
+       * followUp 队列语义（run 结束才投）——初始 prompt 保持队列语义，续作指令走 steer。 */
+      steer?: boolean;
     }
   | { type: 'interrupt'; id: string }
   | {

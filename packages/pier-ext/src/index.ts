@@ -577,18 +577,24 @@ export default async function (pi: ExtensionAPI) {
    *   - agent_settled 兜底：run 真正结束后残余缓冲直投（触发新 run）。
    * 折叠规则（notice-buffer.ts）：≤3 条原文逐条，>3 条前 3 + 尾行计数/全量指引。 */
   const pendingSettleNotices: string[] = [];
-  const deliverNotice = async (content: string): Promise<void> => {
+  /** B2：缓冲中尚未送达的结算通知所属 pane（GC 豁免判据——01a03c0d 实证：
+   * pD 结算 3s 后 pane 被 GC 关掉，通知 100s 后才经 turn 间隙送达，master 只好 revive）。 */
+  const pendingNoticePaneIds = new Set<string>();
+  const deliverNotice = async (content: string, paneId?: string): Promise<void> => {
     // 反唤醒风暴：abort 后不直投（会触发新 run）——入缓冲，待下次自然 turn 投递。
     // 结算内容本身持久在台账（list_agents / resume_subagent 可查），推送让位于用户意图。
+    if (content !== '' && paneId !== undefined) pendingNoticePaneIds.add(paneId);
     if (agentActive || lastStopReason === ABORT_STOP_REASON) {
       pendingSettleNotices.push(content);
       return;
     }
     await sendUserMessageIn(content);
+    if (content !== '' && paneId !== undefined) pendingNoticePaneIds.delete(paneId);
   };
   const flushSettleNotices = async (mode: 'steer' | 'followUp'): Promise<void> => {
     if (pendingSettleNotices.length === 0) return;
     const collapsed = collapseNotices(pendingSettleNotices.splice(0));
+    pendingNoticePaneIds.clear(); // B2：折叠批次视为已送达（GC 恢复正常回收）
     if (collapsed) await sendUserMessageAs(collapsed, mode);
   };
   pi.on('turn_end', () => {
@@ -620,7 +626,12 @@ export default async function (pi: ExtensionAPI) {
             push: req.push === true,
             sinceTs: Date.now(),
           };
-          await sendUserMessageIn(req.text);
+          // B3：follow_up 带 steer → 以 steer 投递（pi 语义：当前 tool call 执行完、
+          // 下次 LLM 调用前到达）——长 run 中途的补充契约秒级生效，不再排队整个 run
+          // （01a03c0d：契约 20min 后才到，worker 按旧契约实现被迫返工）。
+          // 初始 prompt 不 steer：空闲 worker 上的 followUp 才触发新 run（D96 语义）。
+          if (req.steer === true) await sendUserMessageAs(req.text, 'steer');
+          else await sendUserMessageIn(req.text);
           return { type: 'ok', id: req.id };
         }
         if (req.type === 'interrupt') {
@@ -639,7 +650,7 @@ export default async function (pi: ExtensionAPI) {
             const body = (req.sessionFile ? `${head}\nSession: ${req.sessionFile}` : head)
               + (notes.length ? `\n${notes.join('\n')}` : '');
             // D92：经缓冲注入（忙时 turn_end 折叠 steer，闲时直投）
-            await deliverNotice(body);
+            await deliverNotice(body, req.paneId);
           }
           return { type: 'ok', id: req.id };
         }
@@ -750,7 +761,8 @@ export default async function (pi: ExtensionAPI) {
       env,
       extPath: fileURLToPath(import.meta.url),
       sessionRoot,
-      slots: subagentSlots,
+      deliverNotice,
+      noticePending: () => pendingNoticePaneIds,
       getSessionId: () => sessionId,
       getBlockedDepth: () => blockedDepth,
       reconcileOnSettlement,
