@@ -1,6 +1,6 @@
 {
   "name": "pier-setup",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "One-shot installer for pier: registers the pi-pier extension with pi and the pier.workbench plugin with herdr (install / uninstall / update)",
   "license": "MIT",
   "type": "module",
