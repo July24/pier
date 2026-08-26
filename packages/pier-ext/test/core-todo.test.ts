@@ -1,5 +1,5 @@
 /**
- * 档1 core/todo 插件接线：surface 挂载 todo_write + /todos /todo 命令 +
+ * 档1 core/todo 插件接线：surface 挂载 todo_write + /todos 命令 +
  * 读钩 + widget 槽回填 + tombstone。真实 TodosService + 假 pi。
  */
 import { test } from 'node:test';
@@ -62,7 +62,7 @@ test('core/todo：工具/双命令/读钩注册 + widget 槽回填', async () =>
   const { ctx, calls, state } = await mount(pi);
   assert.ok(pi.tools.has('todo_write'));
   assert.ok(pi.commands.has('todos'));
-  assert.ok(pi.commands.has('todo'));
+  assert.ok(!pi.commands.has('todo'), '/todo 导出已删（用户不用）');
   assert.ok((pi.listeners.get('before_agent_start') ?? []).length >= 1);
   assert.equal(typeof state.renderWidget, 'function', '槽已回填');
 

@@ -23,7 +23,7 @@ pier ships as **two halves**, installed separately:
 
 ### Highlights
 
-- **Todo loop**: `todo_write` with full-replace semantics, session JSONL as source of truth, correct branch rollback; live pane-title projection `▶i ○p ■b ✓c (N/M) · current task`; `/todos` command (including unblock)
+- **Todo loop**: `todo_write` with full-replace semantics, session JSONL as source of truth, correct branch rollback; live pane-title projection `▶i ○p ■b ✓c (N/M) · current task`; TUI widget is an activity-anchored window (the in_progress entry and its surrounding context stay visible as work moves down the list); `/todos` command (including unblock)
 - **Todo anti-freeze**: an all-completed list unchanged for ≥6 turns flips the read hook from recitation to a rewrite warning; after ≥1h it archives — first offering one rewrite window with old entries as reference, then (if ignored) a final notice that clears the list (rm persisted to JSONL; the empty guard takes over — multi-step work must re-track); `/todos` still shows history, session JSONL untouched
 - **Interactive subagents**: every subagent = an isolated pi session in its own pane (separate context window); **a human can enter that pane and talk to it directly** (fix bugs, take over, answer ask_user_question)
 - **Soft write-locks**: per-pane lock tokens on write paths; cross-pane conflicts warn or block

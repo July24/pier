@@ -7,14 +7,12 @@
  *  - `pi-herdr.todo-deps`：todos 服务（session 状态层，留在 index）+ options +
  *    mirrorTodos 回调 + appendEntry + state 槽（renderWidget 回填给 index 生命周期）。
  *
- * 本文件承接：todo_write 工具 + /todos /todo 命令 + TUI widget（widgetLines/
- * renderWidget/formatTodosMarkdown）+ 读钩（before_agent_start planTodoReadHook，
+ * 本文件承接：todo_write 工具 + /todos 命令（查看/编辑）+ TUI widget（widgetLines/
+ * renderWidget）+ 读钩（before_agent_start planTodoReadHook，
  * 轮次计数器内聚）。reconcile / 镜像 / reportAgent 仍在 index（session 状态层）。
  */
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
-import { join } from 'node:path';
-import { writeFileSync } from 'node:fs';
 import type { PiSurface } from '../pi-surface.ts';
 import type { TodosService } from '../todos-service.ts';
 import { planTodoReadHook } from '../todo-read-hook.ts';
@@ -90,11 +88,12 @@ function renderGroups(items: readonly TodoItem[]): string[] {
 }
 
 /**
- * widget 行（全局预算版，用户实证修复）：
- * 旧实现按分组插入序逐组渲染（每组预算 10），pi 头部截 10 行 → 老 phase 吃光窗口、
- * 最新任务组（in_progress 所在）整组不可见。新规则：
+ * widget 行（活动锚定窗口，用户实证二修）：
  *  - 全局预算 = WIDGET_MAX_LINES（含摘要行与 +N 行）；
- *  - 超额丢弃顺序 = 最老 completed → 最老 open（尾部/当前工作永远存活）；
+ *  - 窗口锚定第一条 in_progress：可见的条目是它前后的连续区段（正在做的
+ *    上下文——前因后果可见），不再是固定头部/尾部（旧实现超窗时只剩尾部，
+ *    正在执行的条目滚出视窗，01a03c0d 实证"显示最后几条，不管当前执行到哪"）；
+ *  - 无 in_progress → 锚定最后一条 open；全完成 → 尾部切片（刚完成的可见）；
  *  - +N 行指路 /todos（全量视图）。
  */
 export function widgetLines(items: readonly TodoItem[], opts?: { archivedAgeMs?: number | null }): string[] {
@@ -108,16 +107,12 @@ export function widgetLines(items: readonly TodoItem[], opts?: { archivedAgeMs?:
     ];
   }
 
-  const kept = [...items];
-  while (
-    kept.length > 0
-    && 1 + renderGroups(kept).length + (items.length > kept.length ? 1 : 0) > WIDGET_MAX_LINES
-  ) {
-    const oldestCompleted = kept.findIndex((it) => it.status === 'completed');
-    kept.splice(oldestCompleted === -1 ? 0 : oldestCompleted, 1);
-  }
-
-  const hidden = items.filter((it) => !kept.includes(it));
+  // 条目预算 = 总预算 - 摘要行 -（隐藏时的）+N 行。phase 头也占行——按渲染行数
+  // 迭代收缩：锚定窗口切片 → 超行则两端各收一格（保锚点），直到装得下。
+  const renderBudget = WIDGET_MAX_LINES - 1 - 1;
+  const [start, end] = anchorRange(items, renderBudget);
+  const kept = items.slice(start, end);
+  const hidden = items.filter((_, i) => i < start || i >= end);
   const lines = [`todo: ${c.inProgress}▶ ${c.pending}○ ${c.blocked}■ ${c.completed}✓`, ...renderGroups(kept)];
   if (hidden.length > 0) {
     const hiddenCompleted = hidden.filter((it) => it.status === 'completed').length;
@@ -126,30 +121,43 @@ export function widgetLines(items: readonly TodoItem[], opts?: { archivedAgeMs?:
   return lines;
 }
 
-/** D38：TODO.md 导出（分组 + 任务列表语法）。 */
-function formatTodosMarkdown(items: TodoItem[]): string {
-  const groups = new Map<string, TodoItem[]>();
-  for (const it of items) {
-    const key = it.phase ?? '默认';
-    const arr = groups.get(key) ?? [];
-    arr.push(it);
-    groups.set(key, arr);
+/**
+ * 活动锚定窗口：锚点 = 第一条 in_progress（无则最后一条 open；全完成 → 尾部）。
+ * 以渲染行数（含 phase 头）为预算，从锚点贪心扩张（尾部优先——后续工作先
+ * 可见），装不下即停；锚点条目永远在窗内。
+ */
+function anchorRange(items: readonly TodoItem[], renderBudget: number): [number, number] {
+  if (renderGroups(items).length <= renderBudget) return [0, items.length];
+  const anchor = items.findIndex((it) => it.status === 'in_progress');
+  const anchorIdx = anchor >= 0
+    ? anchor
+    : items.reduce((acc, it, i) => (it.status !== 'completed' ? i : acc), -1);
+  if (anchorIdx < 0) {
+    // 全完成：尾部切片（按行数从头收缩）
+    let end = items.length;
+    while (renderGroups(items.slice(0, end)).length > renderBudget && end > 1) end -= 1;
+    return [0, end];
   }
-  const lines = ['# TODO'];
-  for (const [phase, list] of groups) {
-    lines.push('', `## ${phase}`);
-    for (const it of list) {
-      const box = it.status === 'completed' ? 'x'
-        : it.status === 'in_progress' ? '/'
-        : it.status === 'blocked' ? '!'
-        : it.status === 'abandoned' ? '~'
-        : ' ';
-      const suffix = it.status === 'blocked' && it.blocker ? ` — blocker: ${it.blocker}` : '';
-      lines.push(`- [${box}] ${it.content}${suffix}`);
+  let start = anchorIdx;
+  let end = anchorIdx + 1;
+  const fits = () => renderGroups(items.slice(start, end)).length <= renderBudget;
+  let growTail = true;
+  while ((end < items.length || start > 0) && (end - start) < items.length) {
+    if (growTail && end < items.length) {
+      end += 1;
+      if (!fits()) { end -= 1; break; }
+    } else if (start > 0) {
+      start -= 1;
+      if (!fits()) { start += 1; break; }
+    } else if (end < items.length) {
+      end += 1;
+      if (!fits()) { end -= 1; break; }
+    } else {
+      break;
     }
+    growTail = !growTail; // 严格交替：锚点前因与后果均衡可见（用户实证诉求）
   }
-  lines.push('');
-  return lines.join('\n');
+  return [start, end];
 }
 
 export default function todoPlugin(ctx: Context): void {
@@ -321,7 +329,7 @@ export default function todoPlugin(ctx: Context): void {
     },
   });
 
-  /* ── 命令：/todos（查看 + done/drop/rm 人类编辑，D38）+ /todo export ── */
+  /* ── 命令：/todos（查看 + done/drop/rm/unblock 人类编辑，D38）── */
   scoped.registerCommand('todos', {
     description: 'Show the todo list, or edit it: /todos done|drop|rm|unblock <fuzzy content match>',
     handler: async (args: unknown, eventCtx: unknown) => {
@@ -369,7 +377,7 @@ export default function todoPlugin(ctx: Context): void {
         ui?.notify?.(`"${content}" ${verb}`, 'info');
         return;
       }
-      // 全量视图（/todos 不受 widget 10 行预算限制——"看整个列表"的正式入口）
+      // 全量视图（/todos 不受 widget 行预算限制——"看整个列表"的正式入口）
       const body = renderGroups(todos.items);
       if (body.length === 0) {
         ui?.notify?.('todo list is empty', 'info');
@@ -382,19 +390,5 @@ export default function todoPlugin(ctx: Context): void {
       ui?.notify?.([head, ...body].join('\n'), 'info');
     },
   });
-
-  scoped.registerCommand('todo', {
-    description: 'Export the current todo list to TODO.md in the working directory',
-    handler: async (_args: unknown, eventCtx: unknown) => {
-      const ui = (eventCtx as { ui?: { notify?: (text: string, level?: string) => void } }).ui;
-      const cwd = (eventCtx as { cwd?: string }).cwd ?? process.cwd();
-      try {
-        const target = join(cwd, 'TODO.md');
-        writeFileSync(target, formatTodosMarkdown(todos.items));
-        ui?.notify?.(`TODO.md written: ${target} (${todos.items.length} items)`, 'info');
-      } catch (err) {
-        ui?.notify?.(`failed to write TODO.md: ${(err as Error).message}`, 'error');
-      }
-    },
-  });
 }
+

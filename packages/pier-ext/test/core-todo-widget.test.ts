@@ -1,7 +1,8 @@
 /**
- * widget 全局预算（用户实证修复）：
- * pi TUI MAX_WIDGET_LINES=10 头部截断——旧实现按分组序渲染，老 phase 吃光窗口、
- * 最新任务组（in_progress 所在）整组不可见。缝：widgetLines（全局预算 + open 优先存活）。
+ * widget 活动锚定窗口（用户实证二修）：
+ * 可见区段锚定第一条 in_progress（无则最后一条 open）——正在做的条目及其
+ * 前后上下文可见，不再是固定头部/尾部（旧"丢最老"实现让执行位置滚出视窗）。
+ * 预算按渲染行数（含 phase 头）计，≤ WIDGET_MAX_LINES。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -55,6 +56,33 @@ test('widgetLines: 全 open 超窗 → 保最新（丢最老 open）', () => {
   assert.ok(itemLines.some((l) => l.includes('t11')), '最新存活');
   assert.ok(!itemLines.some((l) => /t0$/.test(l)), '最老（t0）隐藏');
   assert.ok(!itemLines.some((l) => /t3$/.test(l)), 't3 隐藏');
+});
+
+test('widgetLines: 活动锚定滚动——执行到中部时，窗口跟着 in_progress 走（前因后果可见）', () => {
+  // 12 条 open 无 phase：in_progress 在 t4 → 窗口以 t4 为锚（尾部优先扩张）
+  const items = Array.from({ length: 12 }, (_, i) =>
+    it(`t${i}`, i === 4 ? 'in_progress' : 'pending'));
+  const lines = widgetLines(items);
+  const joined = lines.join('\n');
+  assert.ok(lines.length <= WIDGET_MAX_LINES, '行数预算');
+  assert.ok(joined.includes('▶ t4'), '锚点（正在做）必可见');
+  assert.ok(joined.includes('○ t5'), '后续工作可见（尾部优先）');
+  assert.ok(joined.includes('○ t3'), '前一条上下文可见');
+  assert.ok(!joined.includes('○ t0'), '远处已完成让位');
+  assert.match(joined, /\+\d+ hidden/);
+});
+
+test('widgetLines: 无 in_progress → 锚定最后一条 open（最新存活）', () => {
+  const items = [
+    ...Array.from({ length: 10 }, (_, i) => it(`done${i}`, 'completed')),
+    it('next1', 'pending'),
+    it('next2', 'pending'),
+  ];
+  const lines = widgetLines(items);
+  const joined = lines.join('\n');
+  assert.ok(joined.includes('○ next2'), '最后一条 open 可见');
+  assert.ok(joined.includes('○ next1'), '相邻 open 可见');
+  assert.ok(!joined.includes('done0'), '老 completed 让位');
 });
 
 test('widgetLines: 空列表 → 空行数组', () => {
