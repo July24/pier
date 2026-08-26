@@ -53,6 +53,7 @@ import {
   releaseTokensFor,
   type LockAgentView,
 } from './lock-core.ts';
+import { ABORT_STOP_REASON, planSettleWake } from './settle-wake-core.ts';
 import { composeForRole } from './manifest-compose.ts';
 import { parseRuntimeManifest, planActiveTools, planToolGate, type RuntimeRoleManifest } from './tool-gate.ts';
 import { detectHerdrEnv } from './herdr-client.ts';
@@ -405,18 +406,47 @@ export default async function (pi: ExtensionAPI) {
   });
 
   let agentActive = false;
+  // D96 状态（settle-wake-core 去重/冷却的锚点）。
+  let d96NoticeKey: string | null = null;
+  let d96NoticeAt = 0;
+  // 反唤醒风暴（settle-wake-core）：追踪最后一次 assistant turn 的 stopReason，
+  // 'aborted' = 用户 ESC 显式叫停 → settled 时不得注入任何唤醒型消息。
+  let lastStopReason: string | null = null;
   pi.on('turn_start', async () => {
     agentActive = true;
     reportAgent('working', currentActivity(todos.items));
+  });
+  pi.on('turn_end', async (event: unknown) => {
+    if (event === null || typeof event !== 'object' || !('message' in event)) return;
+    const msg = (event as { message: unknown }).message; // 'message' in 已守卫
+    if (msg === null || typeof msg !== 'object') return;
+    const { role, stopReason } = msg as { role?: unknown; stopReason?: unknown };
+    if (role === 'assistant' && typeof stopReason === 'string') {
+      lastStopReason = stopReason;
+    }
   });
 
   pi.on('agent_settled', async () => {
     agentActive = false;
     reportAgent('idle', null);
+    const plan = planSettleWake({
+      lastStopReason,
+      running: subagentSlots.listRunningSubs?.() ?? [],
+      lastNoticeKey: d96NoticeKey,
+      lastNoticeAt: d96NoticeAt,
+      now: Date.now(),
+    });
+    d96NoticeKey = plan.noticeKey;
+    d96NoticeAt = plan.noticeAt;
+    if (!plan.wake) {
+      // 用户 abort 后静默：结算缓冲保留（pendingSettleNotices 不清空），
+      // 待下次自然 run 的 turn_end steer / 自然 settled 再投。
+      return;
+    }
     // D96：master settled（run 结束/想总结）时仍有后台 subagent running → 注入提醒。
     // worker 侧 subagentSlots.listRunningSubs 为 null（不注入）。
-    const running = subagentSlots.listRunningSubs?.() ?? [];
-    if (running.length > 0 && !isSubagent) {
+    if (plan.notice && !isSubagent) {
+      const running = subagentSlots.listRunningSubs?.() ?? [];
       const brief = running.map((s) => `${s.paneId} (${s.description})`).join('、');
       const notice = `注意：仍有 ${running.length} 个后台 subagent 在运行：${brief}。若你的任务依赖它们，请等待其结算（list_agents 查看状态）；若不等待，请说明放弃原因。`;
       void sendUserMessageIn(notice);
@@ -536,7 +566,9 @@ export default async function (pi: ExtensionAPI) {
    * 折叠规则（notice-buffer.ts）：≤3 条原文逐条，>3 条前 3 + 尾行计数/全量指引。 */
   const pendingSettleNotices: string[] = [];
   const deliverNotice = async (content: string): Promise<void> => {
-    if (agentActive) {
+    // 反唤醒风暴：abort 后不直投（会触发新 run）——入缓冲，待下次自然 turn 投递。
+    // 结算内容本身持久在台账（list_agents / resume_subagent 可查），推送让位于用户意图。
+    if (agentActive || lastStopReason === ABORT_STOP_REASON) {
       pendingSettleNotices.push(content);
       return;
     }
@@ -551,6 +583,8 @@ export default async function (pi: ExtensionAPI) {
     void flushSettleNotices('steer');
   });
   pi.on('agent_settled', () => {
+    // abort 后不投缓冲（会触发新 run；缓冲保留待下次自然 turn）——见 settle-wake-core。
+    if (lastStopReason === ABORT_STOP_REASON) return;
     void flushSettleNotices('followUp');
   });
 

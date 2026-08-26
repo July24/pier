@@ -33,7 +33,7 @@ import { pingUntilReady, pipeNameFor, pipeRequest } from '../pipe-channel.ts';
 import { shouldClosePane, shouldCloseTaskTab } from '../gc-core.ts';
 import { composeForRole } from '../manifest-compose.ts';
 import { formatSettlementNotice } from '../vocab.ts';
-import { parseShapeTree, pickGridSplit } from './grid-shape.ts';
+import { ABORT_STOP_REASON } from '../settle-wake-core.ts';
 
 export interface SubagentEnv {
   paneId: string;
@@ -205,7 +205,20 @@ export default function subagentPlugin(ctx: Context): void {
 
   let todoReminders = 0;
   const TODO_REMINDERS_MAX = 3;
+  // 反唤醒风暴：用户 ESC 中止后的 settled 不催（否则 abort → 提醒 → 新 run → 再 abort
+  // 死循环；与 index 的 D96/结算缓冲同款守卫，session 01a03bf0 实证）。
+  let lastAssistantStopReason: string | null = null;
+  scoped.on('turn_end', async (event: unknown) => {
+    if (event === null || typeof event !== 'object' || !('message' in event)) return;
+    const msg = (event as { message: unknown }).message; // 'message' in 已守卫
+    if (msg === null || typeof msg !== 'object') return;
+    const { role, stopReason } = msg as { role?: unknown; stopReason?: unknown };
+    if (role === 'assistant' && typeof stopReason === 'string') {
+      lastAssistantStopReason = stopReason;
+    }
+  });
   scoped.on('agent_settled', async () => {
+    if (lastAssistantStopReason === ABORT_STOP_REASON) return;
     if (todoReminders >= TODO_REMINDERS_MAX) return;
     if (pollers.size > 0) return; // 有在途子代理 → 主控本来就在等，不催
     if (d.getBlockedDepth() > 0) return; // 等人类回答 → 不催
@@ -1026,7 +1039,23 @@ export default function subagentPlugin(ctx: Context): void {
         entry.sessionFile = await resolveSessionFile(paneId, cwd);
         subs.set(paneId, entry);
         persistSubs();
+        onUpdate?.(makeProgressUpdate(`subagent ready in pane ${paneId}; injecting prompt via pipe…`));
         // M11（D45/D46）：注入走扩展管道 → 子扩展 sendUserMessage(followUp)；
+        // PTY 键盘通道 100% 归人（无软锁窗口、无混行）。
+        // 回归修复（session 01a03bf0 实证）：ecc0bc4 重写前台等待时误删本块——
+        // prompt 永不注入 + injectTs 未定义（ReferenceError → spawn-failed，
+        // 台账留幽灵 running 条目）。任何后续重构不得把注入与 injectTs 拆开。
+        const injectTs = Date.now();
+        const injected = await pipeRequest(pipeNameFor(cwd, paneId), {
+          type: 'prompt',
+          id: `prompt-${taskId}`,
+          text: spec.prompt,
+          from: pipeNameFor(cwd, env?.paneId ?? ''),
+          push: background,
+        });
+        if (injected.type !== 'ok') {
+          throw new Error(`pipe prompt rejected: ${injected.type === 'error' ? injected.message : 'unknown response'}`);
+        }
         // A1+A2（用户实证修复）：前台等待 = 内容闸 + 耐心阈值转后台。
         // 旧实现的 idle 即结算 + 90s 硬窗口在真实任务（working 期 4-6 分钟）上必然误判
         // no-output（实测：3 个健康子代理 101s 时被同时 consumed，成果 4 分钟后才产出）。
@@ -1100,6 +1129,14 @@ export default function subagentPlugin(ctx: Context): void {
           details: { paneId, taskId, background, role: kind },
         };
       } catch (err) {
+        // 回归修复（session 01a03bf0）：spawn 中途失败必须回收台账 + 关 pane——
+        // 否则幽灵 running 条目永不结算 → D96 提醒风暴 + send_message 打到
+        // 无任务上下文的空会话。pane 关闭尽力而为（board pane 例外场景由 GC 兜底）。
+        if (paneId) {
+          subs.delete(paneId);
+          persistSubs();
+          void client.closePane(paneId).catch(() => { /* 尽力而为 */ });
+        }
         return {
           content: [{
             type: 'text',
