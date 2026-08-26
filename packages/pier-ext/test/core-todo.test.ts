@@ -127,3 +127,37 @@ test('core/todo：/todos unblock 命令端到端（blocked → pending + 权威 
   assert.ok(notes.some((n) => n.includes('no change')));
   await ctx.fiber.dispose();
 });
+
+test('core/todo：R1 归档清空执行链——窗口拍不清，终态拍 rm 全量落盘 + 内存清空 → 空守卫接管', async () => {
+  const pi = fakePi();
+  const { ctx, todos } = await mount(pi);
+  const hook = pi.listeners.get('before_agent_start')?.[0];
+  // 全完成 + 墙钟 2h 前 → archived
+  todos.replace([{ content: '探查代码', status: 'completed' }, { content: '写文档', status: 'completed' }]);
+  todos.lastWriteAt = Date.now() - 2 * 3_600_000;
+
+  // 拍 1（R2 窗口）：注入重写窗口，列表不动
+  const win = (await hook?.()) as { message?: { content: string } } | undefined;
+  assert.match(win?.message?.content ?? '', /rewrite window/i);
+  assert.equal(todos.items.length, 2, '窗口不清空');
+  assert.ok(!pi.entries.some(([t]) => t === 'pi-herdr.todo-edit'), '窗口不落盘');
+
+  // 拍 2-N：lastEmptyGuardTurn 已记 → 静默；用真实时钟推进到下个到期拍不可行
+  //（EMPTY_GUARD_EVERY_N=4 轮），直接驱动第 5 拍：终态通知 + 清空 + rm 全量。
+  for (let i = 0; i < 3; i++) await hook?.();
+  const final = (await hook?.()) as { message?: { content: string } } | undefined;
+  assert.match(final?.message?.content ?? '', /cleared from tracking/);
+  assert.equal(todos.items.length, 0, 'R1：内存列表已清空');
+  const rmEntry = pi.entries.find(([t]) => t === 'pi-herdr.todo-edit') as [string, { edits: Array<{ op: string; content: string }> }] | undefined;
+  assert.ok(rmEntry, 'rm 全量 custom 条目已落盘（重启 rebuild 折叠得空表）');
+  assert.deepEqual(
+    rmEntry?.[1].edits.map((e) => e.op),
+    ['rm', 'rm'],
+  );
+
+  // 拍 6-N：空列表 → 空守卫（before-stopping 驱动复活）
+  for (let i = 0; i < 3; i++) await hook?.();
+  const empty = (await hook?.()) as { message?: { content: string } } | undefined;
+  assert.match(empty?.message?.content ?? '', /todo list is empty/i);
+  await ctx.fiber.dispose();
+});

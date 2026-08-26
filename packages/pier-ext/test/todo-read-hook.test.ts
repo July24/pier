@@ -101,29 +101,52 @@ test('stale（A）：每 N 轮一次 + 封顶 STALE_NOTICE_MAX', () => {
   assert.equal(due.inject, true);
 });
 
-test('archived（B）：墙钟 ≥1h → 归档通知，明细不再注入，与空守卫共用节奏', () => {
+test('archived（B+R2）：首个到期拍 = 重写窗口（stale-notice，带旧条目参照）', () => {
   const base = {
     items: ALL_DONE,
     lastWriteAt: 100 * HOUR,
     turnsSinceWrite: 1,
-    now: 100 * HOUR + 16 * HOUR, // 实证：16h 冻结
+    now: 100 * HOUR + 16 * HOUR, // 实证：16h 冻结（01a03253）；01a03c0d 同款 1h+ idle
   };
   const first = planTodoReadHook({ ...base, turn: 0, lastEmptyGuardTurn: null, staleNotices: 0, lastStaleGuardTurn: null });
   assert.equal(first.inject, true);
-  assert.equal(first.effect, 'archive-notice');
+  assert.equal(first.effect, 'stale-notice', 'R2：停滞期首次 → 重写窗口而非终态');
   assert.equal(first.archived, true);
-  assert.match(first.message.content, /archived/);
-  assert.match(first.message.content, /3 completed entries/);
-  assert.match(first.message.content, /16h ago/);
-  assert.ok(!first.message.content.includes('Verify gateway forwarding'), '归档后明细不再复读');
+  assert.equal(first.clearArchived, false, '窗口不清空');
+  assert.match(first.message.content, /rewrite window/i);
+  assert.match(first.message.content, /about to be archived/);
+  assert.ok(first.message.content.includes('Verify gateway forwarding'), '窗口附旧条目作改写参照');
 
-  const skip = planTodoReadHook({ ...base, turn: 1, lastEmptyGuardTurn: 0, staleNotices: 0, lastStaleGuardTurn: null });
-  assert.equal(skip.inject, false);
-  const again = planTodoReadHook({ ...base, turn: EMPTY_GUARD_EVERY_N, lastEmptyGuardTurn: 0, staleNotices: 0, lastStaleGuardTurn: null });
-  assert.equal(again.inject, true);
+  // 节奏共享：窗口后的 3 轮静默（lastEmptyGuardTurn 已记）
+  const skip = planTodoReadHook({ ...base, turn: 1, lastEmptyGuardTurn: 0, staleNotices: 1, lastStaleGuardTurn: 0 });
+  assert.equal(skip.inject, false, '与空守卫共用节奏：N 轮内不再注入');
 });
 
-test('时钟阈值边界：恰好 STALE_CLOCK_MS → archived（时钟优先于 turns）', () => {
+test('archived（B+R1/R3）：窗口被无视 → 终态通知 + clearArchived + 无 [] 豁免出口', () => {
+  const base = {
+    items: ALL_DONE,
+    lastWriteAt: 100 * HOUR,
+    turnsSinceWrite: 1,
+    now: 100 * HOUR + 16 * HOUR,
+  };
+  const second = planTodoReadHook({ ...base, turn: EMPTY_GUARD_EVERY_N, lastEmptyGuardTurn: 0, staleNotices: 1, lastStaleGuardTurn: 0 });
+  assert.equal(second.inject, true);
+  assert.equal(second.effect, 'archive-notice');
+  assert.equal(second.archived, true);
+  assert.equal(second.clearArchived, true, 'R1：通知注入即清空内存列表');
+  assert.match(second.message.content, /3 completed entries/);
+  assert.match(second.message.content, /16h ago/);
+  assert.match(second.message.content, /cleared from tracking.*list is now empty/s);
+  assert.match(second.message.content, /multi-step work must be tracked/);
+  assert.ok(!second.message.content.includes('if tracking is not needed'), 'R3：去掉豁免出口');
+  assert.ok(!second.message.content.includes('Verify gateway forwarding'), '终态明细不再复读');
+  // 非到期拍：inject false 且不置 clearArchived
+  const quiet = planTodoReadHook({ ...base, turn: EMPTY_GUARD_EVERY_N + 1, lastEmptyGuardTurn: EMPTY_GUARD_EVERY_N, staleNotices: 1, lastStaleGuardTurn: 0 });
+  assert.equal(quiet.inject, false);
+  assert.equal(quiet.clearArchived, false);
+});
+
+test('时钟阈值边界：恰好 STALE_CLOCK_MS → archived（时钟优先于 turns；R2 窗口态）', () => {
   const plan = planTodoReadHook({
     items: ALL_DONE,
     turn: 3,
@@ -134,5 +157,6 @@ test('时钟阈值边界：恰好 STALE_CLOCK_MS → archived（时钟优先于 
     staleNotices: 0,
     lastStaleGuardTurn: null,
   });
-  assert.equal(plan.effect, 'archive-notice');
+  assert.equal(plan.effect, 'stale-notice');
+  assert.equal(plan.archived, true, '时钟维度已归档（窗口态）');
 });

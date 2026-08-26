@@ -211,19 +211,28 @@ export default function todoPlugin(ctx: Context): void {
       staleNotices,
       lastStaleGuardTurn,
     });
-    if (plan.inject && (plan.effect === 'empty-guard' || plan.effect === 'archive-notice')) {
-      lastEmptyGuardTurn = todoReadTurn;
-    } else if (plan.effect === 'stale-notice') {
+    if (plan.inject && plan.effect === 'stale-notice') {
       staleNotices += 1;
       lastStaleGuardTurn = todoReadTurn;
     }
-    todoReadTurn += 1;
-    // 归档态翻转（纯时钟推进，无 todo 事件）→ 补一次投影刷新
-    if (plan.archived !== lastArchivedMirror) {
-      lastArchivedMirror = plan.archived;
-      renderWidget(eventCtx);
-      mirrorTodos();
+    // 空守卫 / 归档通知 / R2 重写窗口共用注入节奏（archived=true 的 stale 窗口同享，
+    // 否则终态通知会在窗口后紧跟一拍挤掉宽限）。
+    if (plan.inject && (plan.effect === 'empty-guard' || plan.archived)) {
+      lastEmptyGuardTurn = todoReadTurn;
     }
+    // R1：归档通知注入即清空——明细早已不再注入，保留死列表只会挡住空守卫的
+    // before-stopping 驱动（01a03c0d：归档后 2h 多步工作零跟踪）。rm 全量落
+    // JSONL，重启 rebuild 同样折叠得空表；历史明细仍在会话文件里。
+    if (plan.inject && plan.effect === 'archive-notice' && plan.clearArchived && todos.items.length > 0) {
+      const edits = todos.items.map((it) => ({ op: 'rm' as const, content: it.content }));
+      try {
+        appendEntry(TODO_EDIT_CUSTOM_TYPE, { version: 1, edits, ts: Date.now() });
+      } catch {
+        /* 尽力而为（内存清空照常） */
+      }
+      todos.replace([]);
+    }
+    todoReadTurn += 1;
     if (!plan.inject) return;
     return {
       message: {
