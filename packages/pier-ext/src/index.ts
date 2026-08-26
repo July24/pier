@@ -761,6 +761,7 @@ export default async function (pi: ExtensionAPI) {
       env,
       extPath: fileURLToPath(import.meta.url),
       sessionRoot,
+      slots: subagentSlots,
       deliverNotice,
       noticePending: () => pendingNoticePaneIds,
       getSessionId: () => sessionId,
@@ -768,7 +769,6 @@ export default async function (pi: ExtensionAPI) {
       reconcileOnSettlement,
       withReconcileNotes,
       claimSettleNotice,
-      deliverNotice,
       terminalState: terminalDeps.state,
       todos,
     });
