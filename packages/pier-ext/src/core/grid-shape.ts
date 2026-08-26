@@ -1,6 +1,10 @@
 /**
- * D91 网格形态：spawn 时挑「最大格子沿长轴分裂」，让 pane 自然铺成方格
- * （用户愿景：股票热力图式方格；横向格更易读最新输出）。
+ * D97 网格形态：spawn 时挑「最大格子」一律 down（上下拆），让 pane 长成全宽横条。
+ *
+ * 动因（用户实证）：热力把非焦点格压窄后，横条仍保全宽——pane title 静帧
+ * （slim-frame.ts 同源投影）一行横读；旧「方格」拓扑的非焦点格是竖窄条，
+ * title 折成一竖列不可读。静帧 overlay 的可见性谓词（长宽 < TUI 下限）与
+ * 本拓扑配套：横条命中行数下限、存量竖条命中列数下限，两代布局都被接住。
  *
  * 依据 herdr 0.8.2 源码：ratio = split 节点 first child 份额（split_rect：
  * first_w = width*ratio）；layout.apply 不能挂接既有 pane（只建新 shell），
@@ -67,8 +71,9 @@ export function paneCells(root: ShapeNode, width = 200, height = 50): PaneCell[]
 }
 
 /**
- * 挑分裂目标：面积最大的格子（并列取先序第一，稳定），沿长轴分裂——
- * 宽 ≥ 1.3×高 → right（左右分，保格子横向可读），否则 down。
+ * 挑分裂目标：面积最大的格子（并列取先序第一，稳定），一律 down（上下拆）。
+ * 模型 200×50 下 pane 数上限（热力 MAX_AUTO_LAYOUT_PANES=10）内条高最低 5 行
+ * ——低于 TUI 可用下限即静帧，正是设计语义（条 = title 帧，点击放大看真身）。
  * exclude = 不许动的格子（board 等无 agent 常驻 shell）。
  */
 export function pickGridSplit(
@@ -82,5 +87,5 @@ export function pickGridSplit(
   for (const c of cells) {
     if (c.w * c.h > best.w * best.h + 1e-9) best = c;
   }
-  return { targetPaneId: best.id, direction: best.w > best.h * 1.3 ? 'right' : 'down' };
+  return { targetPaneId: best.id, direction: 'down' };
 }

@@ -21,7 +21,7 @@ import type { PiSurface } from '../pi-surface.ts';
 import type { HerdrClientLike, HerdrAgentState } from '../herdr-client.ts';
 import type { TodosService } from '../todos-service.ts';
 import { mountSubagentScope } from '../subagent-scope.ts';
-import { Semaphore, SUBS_CUSTOM_TYPE, agoText, buildAliveNotice, buildBlockedGateNotice, buildLaunchLine, classifyWorktreeZone, foldSubsRegistry, formatSubagentResult, isAlive, isPathUnder, makeProgressUpdate, makeRegistry, planTabPlacement, psQuote, tabNameForTask, type AliveProbe, type SubEntry, type SubagentSpec, type TabPlacementPlan, type WorktreeZone } from '../subagent-core.ts';
+import { Semaphore, SUBS_CUSTOM_TYPE, agoText, buildAliveNotice, buildBlockedGateNotice, buildLaunchLine, buildLaunchParts, classifyWorktreeZone, foldSubsRegistry, formatSubagentResult, isAlive, isPathUnder, makeProgressUpdate, makeRegistry, planTabPlacement, psQuote, tabNameForTask, type AliveProbe, type SubEntry, type SubagentSpec, type TabPlacementPlan, type WorktreeZone } from '../subagent-core.ts';
 import { hasAssistantAfter, hasPendingToolCall, lastAssistantText, listSessionFiles, readSessionFile, sessionFileById } from '../session-tail.ts';
 import { appendHistory, applyReportedSessionFile, historyFilePath, latestGeneration, normalizeEntryKind, readHistory, type HistoryEntry } from '../history-store.ts';
 import { execFile } from 'node:child_process';
@@ -678,7 +678,7 @@ export default function subagentPlugin(ctx: Context): void {
         mainTabId,
       });
       if (plan.mode === 'append' && plan.tabId) {
-        // D91 网格形态：目标格 = tab 内面积最大的格子（沿长轴分裂，自然铺成方格）；
+        // D97 网格形态：目标格 = tab 内面积最大的格子，一律 down（全宽横条，title 静帧横读）；
         // board 等无 agent 常驻 shell（agentStatus=unknown）不入候选，避免被 worker 蚕食。
         const exclude = new Set(
           allPanes.filter((p) => p.tabId === plan.tabId && p.agentStatus === 'unknown').map((p) => p.paneId),
@@ -695,7 +695,7 @@ export default function subagentPlugin(ctx: Context): void {
           ?? allPanes.find((p) => p.tabId === plan.tabId)?.paneId;
         if (anchorPaneId) {
           const paneId = await client.splitPane({
-            direction: pick?.direction ?? 'right',
+            direction: pick?.direction ?? 'down',
             cwd,
             env: envOver,
             targetPaneId: anchorPaneId,
@@ -721,12 +721,8 @@ export default function subagentPlugin(ctx: Context): void {
 
   function launchLine(resumeFile?: string | null, roleModel?: string | null, approve = false): string {
     // 裸 argv → 平台 shell 语法（win32=PowerShell `&`，POSIX=sh）；引号转义在 buildLaunchLine
-    const parts = [runtime.nodePath, runtime.cliPath];
-    if (approve) parts.push('-a');
-    parts.push('-e', runtime.extPath);
-    if (roleModel) parts.push('--provider', roleModel.split('/')[0], '--model', roleModel.split('/')[1] ?? roleModel);
-    if (resumeFile) parts.push('--session', resumeFile);
-    return buildLaunchLine(parts);
+    // argv 构造在 buildLaunchParts（D97：默认 --tui-mode fullscreen，PI_HERDR_TUI=regular 逃生）
+    return buildLaunchLine(buildLaunchParts(runtime, { resumeFile, roleModel, approve }));
   }
 
   /**

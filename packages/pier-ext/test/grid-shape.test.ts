@@ -1,5 +1,5 @@
 /**
- * D91 网格形态单测：parseShapeTree / paneCells / pickGridSplit。
+ * D97 网格形态单测：parseShapeTree / paneCells / pickGridSplit（一律 down = 全宽横条）。
  * 缝：纯函数——spawn 增量分裂的选格与方向。
  */
 import { test } from 'node:test';
@@ -23,15 +23,15 @@ test('parseShapeTree：嵌套 pane 叶（layout.export 真实形状）+ 容错',
   assert.equal(parseShapeTree('garbage'), null);
 });
 
-test('pickGridSplit 序列：6 个 pane 依次长成方格（右→右→右→下→下）', () => {
+test('pickGridSplit 序列：6 个 pane 依次长成全宽横条（一律 down）', () => {
   // 模拟增量分裂：每次 pick 后把目标格拆成 first=原 pane / second=新 pane
   let tree: ShapeNode = P('p1');
   const expected: Array<[string, 'right' | 'down']> = [
-    ['p1', 'right'], // 200×50 → 左右分
-    ['p1', 'right'], // p1/p2 各 100×50，并列取先序 p1，仍宽 → 右
-    ['p2', 'right'], // p1,p3=50×50；p2=100×50 最大 → 右
-    ['p1', 'down'],  // 四格 50×50，并列取先序 p1，方 → 下
-    ['p3', 'down'],  // p3/p2/p4=50×50 最大并列取先序 p3 → 下
+    ['p1', 'down'], // 200×50 → 上下分
+    ['p1', 'down'], // p1/p2 各 200×25 并列取先序 p1 → 下
+    ['p2', 'down'], // p2=200×25 最大 → 下
+    ['p1', 'down'], // p1/p3/p2=200×12.5 并列取先序 p1 → 下
+    ['p3', 'down'], // p3/p2/p4=200×12.5 并列取先序 p3 → 下
   ];
   const seen: Array<[string, 'right' | 'down']> = [];
   for (let i = 0; i < expected.length; i++) {
@@ -42,10 +42,10 @@ test('pickGridSplit 序列：6 个 pane 依次长成方格（右→右→右→�
     tree = splitAt(tree, pick.targetPaneId, `p${i + 2}`, pick.direction);
   }
   assert.deepEqual(seen, expected);
-  // 终态：6 格，最窄不小于 25 列（200/4/2），全部横向或方形
+  // 终态：6 条全宽横条（w=200），条高最低 6 行 —— 静帧语义（<12 行即 title 帧）
   const cells = paneCells(tree);
   assert.equal(cells.length, 6);
-  for (const c of cells) assert.ok(c.w >= 25 && c.h >= 12, `${c.id} ${c.w}x${c.h} 过碎`);
+  for (const c of cells) assert.ok(c.w === 200 && c.h >= 6, `${c.id} ${c.w}x${c.h} 非全宽横条`);
 });
 
 test('pickGridSplit：exclude 把 board（无 agent 常驻 shell）摘出候选', () => {
@@ -53,14 +53,14 @@ test('pickGridSplit：exclude 把 board（无 agent 常驻 shell）摘出候选'
   const pick = pickGridSplit(tree, { exclude: new Set(['board']) });
   assert.ok(pick);
   assert.equal(pick.targetPaneId, 'work'); // work/work2 各 100×25 并列 → 先序第一
-  assert.equal(pick.direction, 'right'); // 100 > 25*1.3 → 沿长轴左右分
+  assert.equal(pick.direction, 'down'); // D97：一律上下拆（横条）
 });
 
 test('pickGridSplit：全被 exclude / 单 pane', () => {
   const tree = S('right', P('a'), P('b'));
   assert.equal(pickGridSplit(tree, { exclude: new Set(['a', 'b']) }), null);
   const single = pickGridSplit(P('solo'));
-  assert.deepEqual(single, { targetPaneId: 'solo', direction: 'right' });
+  assert.deepEqual(single, { targetPaneId: 'solo', direction: 'down' });
 });
 
 function splitAt(node: ShapeNode, target: string, newId: string, direction: 'right' | 'down'): ShapeNode {

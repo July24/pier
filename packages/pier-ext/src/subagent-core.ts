@@ -378,3 +378,33 @@ export function planTabPlacement(opts: {
   const tabName = nextTaskTabName(base, new Set(known.keys()));
   return { mode: 'new', tabName, tabId: null };
 }
+
+/* ── D97：worker 启动参数（纯逻辑，可单测） ───────────────────────── */
+
+/** launchLine 的运行时三要素（master 侧探测：node 解释器 / pi cli / 本扩展入口）。 */
+export interface LaunchRuntime {
+  nodePath: string;
+  cliPath: string;
+  extPath: string;
+}
+
+/**
+ * worker 启动裸 argv。`--tui-mode fullscreen`（D97 静帧前提）：
+ * alt-screen 行级差分——窄条静帧不变 → PTY 零输出，流式 thinking 不再整屏
+ * dump 闪烁；regular 主屏改动在视口上方即全量重倒（pi tui-main-screen
+ * firstChanged < viewportTop 路径），overlay 盖不住。
+ * `PI_HERDR_TUI=regular` 回退旧行为（逃生口）。
+ */
+export function buildLaunchParts(
+  runtime: LaunchRuntime,
+  opts: { resumeFile?: string | null; roleModel?: string | null; approve?: boolean } = {},
+  env: Pick<NodeJS.ProcessEnv, 'PI_HERDR_TUI'> = process.env,
+): string[] {
+  const parts = [runtime.nodePath, runtime.cliPath];
+  if (opts.approve) parts.push('-a');
+  parts.push('-e', runtime.extPath);
+  if (env.PI_HERDR_TUI !== 'regular') parts.push('--tui-mode', 'fullscreen');
+  if (opts.roleModel) parts.push('--provider', opts.roleModel.split('/')[0], '--model', opts.roleModel.split('/')[1] ?? opts.roleModel);
+  if (opts.resumeFile) parts.push('--session', opts.resumeFile);
+  return parts;
+}

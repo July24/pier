@@ -30,6 +30,7 @@ pier 由**两个半区**组成，各装一处：
 - **角色档案**：`master` / `worker-default` 内置，自定义 role 按 `.pi-herdr/roles/<name>.json` 挂载；工具集按角色收敛（deny 规则不可绕过）
 - **人类闸门**：子代理 `ask_user_question` → 侧边栏 blocked 标记 + 通知；用户手动接管（ESC 打断后输入）→ 启发式检测自动暂停/归还 master 管理
 - **焦点热力布局**：聚焦 pane 原地放大（0.72 目标），blocked / ask / working / idle 按权重分大小，多余 pane 自动压成 title 条
+- **横条拓扑 + 窄格静帧（防闪）**：新 pane 一律上下拆成全宽横条；worker 以 `--tui-mode fullscreen` 启动（备用屏行级差分）；pane 长宽放不下最小可用 TUI（<24 列或 <12 行）时覆盖一张 pane title 同源静帧——流式 thinking 不再让横条闪烁，点击聚焦放大即见真 TUI。逃生口：`PI_HERDR_TUI=regular`、`PI_HERDR_SLIM_FRAME=0`
 - **结算通知折叠**：后台子代理结算不再攒到 run 结束洪水回填——turn 间隙注入，最多 3 条逐条展示、其余折叠指路
 
 ## 安装

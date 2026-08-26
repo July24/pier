@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import {
   Semaphore,
   buildLaunchLine,
+  buildLaunchParts,
   foldSubsRegistry,
   formatSubagentResult,
   makeProgressUpdate,
@@ -47,6 +48,27 @@ test('buildLaunchLine: win32=PowerShell & 语法，POSIX=sh 直启（platform �
   assert.equal(
     buildLaunchLine(["it's a path"], 'win32'),
     `& 'it''s a path'`,
+  );
+});
+
+const RT = { nodePath: '/usr/local/bin/node', cliPath: '/opt/pi/dist/cli.js', extPath: '/ext/index.ts' };
+
+test('buildLaunchParts: 默认 --tui-mode fullscreen（D97 静帧前提）；PI_HERDR_TUI=regular 逃生', () => {
+  assert.deepEqual(
+    buildLaunchParts(RT, {}, {}),
+    ['/usr/local/bin/node', '/opt/pi/dist/cli.js', '-e', '/ext/index.ts', '--tui-mode', 'fullscreen'],
+  );
+  assert.deepEqual(
+    buildLaunchParts(RT, {}, { PI_HERDR_TUI: 'regular' }),
+    ['/usr/local/bin/node', '/opt/pi/dist/cli.js', '-e', '/ext/index.ts'],
+  );
+  // approve / roleModel / resume 全组合
+  assert.deepEqual(
+    buildLaunchParts(RT, { approve: true, roleModel: 'zai/glm-4.7', resumeFile: '/s.jsonl' }, {}),
+    [
+      '/usr/local/bin/node', '/opt/pi/dist/cli.js', '-a', '-e', '/ext/index.ts',
+      '--tui-mode', 'fullscreen', '--provider', 'zai', '--model', 'glm-4.7', '--session', '/s.jsonl',
+    ],
   );
 });
 

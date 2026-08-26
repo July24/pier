@@ -57,6 +57,8 @@ import { ABORT_STOP_REASON, planSettleWake } from './settle-wake-core.ts';
 import { composeForRole } from './manifest-compose.ts';
 import { parseRuntimeManifest, planActiveTools, planToolGate, type RuntimeRoleManifest } from './tool-gate.ts';
 import { detectHerdrEnv } from './herdr-client.ts';
+import { formatPaneTitle } from './pane-title.ts';
+import { registerSlimFrame, updateSlimFrame } from './slim-frame.ts';
 
 /**
  * WS-D7：master pane 自应用 manifest——与 subagent 同一条强制链
@@ -156,6 +158,12 @@ export default async function (pi: ExtensionAPI) {
     const eta = estimateEta({ completedAt: completedStamps, total: p.total, now: Date.now() });
     const suffix = formatProgressSuffix({ completed: p.completed, total: p.total, eta });
     // 反冻结：lastWriteAt 随行 → 标题侧 archived 判定（pane-title）
+    const title = formatPaneTitle(todos.items, null, {
+      progressSuffix: suffix,
+      lastWriteAt: todos.lastWriteAt,
+    });
+    // D97：窄格静帧与 pane 标题同参同源（thinking token 碰不到 → 静帧即冻结）
+    updateSlimFrame(title);
     client.reportMetadata({
       session: label,
       items: todos.items,
@@ -328,6 +336,10 @@ export default async function (pi: ExtensionAPI) {
     // 此时再 setWidget 会破坏 TUI 的 '/' 命令面板输入路由（'/' 被当消息文本送给模型）。
     const reason = (event as { reason?: string } | undefined)?.reason;
     if (reason !== 'resume') todoUi.renderWidget(ctx);
+    // D97：窄格静帧 overlay（幂等注册；herdr pane 内才有意义——普通终端窄窗
+    // 盖住交互面是事故，且热力放大才提供退出路径。resume 也重注册：pi 会话
+    // 切换会 resetExtensionUI 拆掉 overlay）。
+    if (env) registerSlimFrame(ctx);
     mirrorTodos();
     reportSession(sessionId);
     // D93：侧边栏身份 = role 名（display_agent 优先于 agent 检测值，0.8.2 actions.rs:563）。
