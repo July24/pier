@@ -30,7 +30,7 @@ pier ships as **two halves**, installed separately:
 - **Role profiles**: built-in `master` / `worker-default`; custom roles as `.pi-herdr/roles/<name>.json`; toolset converges per role (deny rules are not bypassable)
 - **Human gate**: subagent `ask_user_question` → sidebar blocked marker + notification; manual takeover (ESC-interrupt then typing) is heuristically detected so the master pauses/returns management automatically
 - **Focus heat layout**: focused pane grows in place (0.72 target); blocked / ask / working / idle sized by weight; surplus panes collapse to title strips
-- **Strip topology + slim frame (flicker-free)**: new panes split top/down into full-width strips; workers launch with `--tui-mode fullscreen` (alt-screen row diff); when a pane is too small for a usable TUI (<24 cols or <12 rows) a static pane-title frame overlays it — streaming thinking can no longer flicker the strip, click-to-focus enlarges and reveals the live TUI. Escape hatches: `PI_HERDR_TUI=regular`, `PI_HERDR_SLIM_FRAME=0`
+- **Strip topology + slim frame (flicker-free)**: new panes split top/down into full-width strips; master and workers launch with `--tui-mode fullscreen` (alt-screen row diff; manual `pi` follows global `tuiMode` setting); when a pane is too small for a usable TUI (<24 cols or <12 rows) a static pane-title frame overlays it — streaming thinking can no longer flicker the strip, click-to-focus enlarges and reveals the live TUI. Escape hatches: `PI_HERDR_TUI=regular`, `PI_HERDR_SLIM_FRAME=0`
 - **Settlement notice folding**: subagent settlements no longer flood back when a long main run ends — they inject at turn gaps, up to 3 shown, the rest folded with pointers
 
 ## Installation

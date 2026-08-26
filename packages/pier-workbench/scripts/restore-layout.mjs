@@ -84,11 +84,18 @@ function deepFindId(obj, key, depth = 0) {
   return null;
 }
 
+/** master 启动 argv（D97：默认 fullscreen，PI_HERDR_TUI=regular 逃生）。 */
+function masterCommand() {
+  const parts = [config.piNode, config.piCli];
+  if (process.env.PI_HERDR_TUI !== 'regular') parts.push('--tui-mode', 'fullscreen');
+  parts.push('-e', config.extPath);
+  return parts;
+}
+
 async function relaunchInPane(paneId) {
   // 裸 argv → 平台 shell 语法（win32=PowerShell `&`+`''` 转义，POSIX=sh 单引号 `'\''` 转义）
   const quote = (s) => (process.platform === 'win32' ? `'${s.replace(/'/g, "''")}'` : `'${s.replace(/'/g, `'\\''`)}'`);
-  const launch = (process.platform === 'win32' ? '& ' : '')
-    + [config.piNode, config.piCli, '-e', config.extPath].map(quote).join(' ');
+  const launch = (process.platform === 'win32' ? '& ' : '') + masterCommand().map(quote).join(' ');
   await request('pane.send_text', { pane_id: paneId, text: launch + '\r' });
 }
 
@@ -112,7 +119,7 @@ async function main() {
       try {
         created = await request('layout.apply', {
           tab_label: config.mainTabLabel,
-          root: { type: 'pane', command: [config.piNode, config.piCli, '-e', config.extPath], cwd },
+          root: { type: 'pane', command: masterCommand(), cwd },
         });
       } catch (e) {
         console.error(`[restore-layout] rebuild failed: ${e.message}`);

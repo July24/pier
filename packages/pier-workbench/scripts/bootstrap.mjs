@@ -121,6 +121,8 @@ async function main() {
   const hmrDev = config.hmrDev === true;
   const cliParts = [config.piNode, config.piCli];
   if (hmrDev) cliParts.splice(1, 0, '--expose-internals');
+  // D97：master 也 fullscreen（窄格静帧前提）；PI_HERDR_TUI=regular 逃生
+  if (process.env.PI_HERDR_TUI !== 'regular') cliParts.push('--tui-mode', 'fullscreen');
   cliParts.push('-e', config.extPath);
   const quote = (s) => (process.platform === 'win32' ? `'${s.replace(/'/g, "''")}'` : `'${s.replace(/'/g, `'\\''`)}'`);
   const cli = (process.platform === 'win32' ? '& ' : '') + cliParts.map(quote).join(' ');
