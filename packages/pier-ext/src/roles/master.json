@@ -1,6 +1,6 @@
 {
   "role": "master",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "主控角色（WS-D7 自应用；D83 镜像源）：自研核心全量（todos/协调/subagent 族/终端族）+ pi 内建检视执行 + web_search；D82 unknownTools=allow——用户安装的任意扩展默认可见可用（install 即授予）",
   "manifest": {
     "unknownTools": "allow",
@@ -16,6 +16,6 @@
     }
   },
   "services": {
-    "todos": { "mode": "parallel", "reminderLimit": 5 }
+    "todos": { "mode": "parallel" }
   }
 }

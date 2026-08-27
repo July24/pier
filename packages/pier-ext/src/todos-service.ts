@@ -32,7 +32,7 @@ export class TodosService extends EventEmitter {
     this.config = config;
   }
 
-  /** D75 阶段 3：role manifest services.todos（mode/reminderLimit）驱动；strict = 进程身份（worker）。 */
+  /** D75 阶段 3：role manifest services.todos（mode）驱动；strict = 进程身份（worker）。 */
   static configFromRuntime(manifest: RuntimeRoleManifest | null, isSubagent: boolean): TodosConfig {
     const strict = isSubagent;
     const mode = manifest?.services?.todos?.mode;

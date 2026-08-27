@@ -22,7 +22,7 @@ const READONLY = {
       '*': 'allow',
     },
   },
-  services: { todos: { mode: 'serial', reminderLimit: 3 } },
+  services: { todos: { mode: 'serial' } },
 } as const;
 
 test('validateRoleManifest：定稿 probe-role 档案通过并保留全部语义', () => {
@@ -138,20 +138,20 @@ test('constraints/rate_limits：已移除（WS-D6）——出现即未知键报 
   assert.ok((r as { issues: string[] }).issues.some((i) => i.includes('constraints')));
 });
 
-test('services.todos：mode 必须 serial/parallel；reminderLimit 正整数', () => {
+test('services.todos：mode 必须 serial/parallel（reminderLimit 已随死代码删除）', () => {
   const badMode = validateRoleManifest({
     ...READONLY,
-    services: { todos: { mode: 'concurrent' as never, reminderLimit: 3 } },
+    services: { todos: { mode: 'concurrent' as never } },
   });
   assert.equal(badMode.ok, false);
   assert.ok((badMode as { issues: string[] }).issues.some((i) => i.includes('mode')));
 
-  const badLimit = validateRoleManifest({
+  // reminderLimit 不再是契约键：静默忽略（与 services.todos 其他未知子键同姿态）
+  const stale = validateRoleManifest({
     ...READONLY,
-    services: { todos: { mode: 'serial', reminderLimit: 0 } },
+    services: { todos: { mode: 'serial', reminderLimit: 3 } },
   });
-  assert.equal(badLimit.ok, false);
-  assert.ok((badLimit as { issues: string[] }).issues.some((i) => i.includes('reminderLimit')));
+  assert.equal(stale.ok, true);
 });
 
 test('严格契约：未知顶层键报 issue（防 typo 静默失效）；role 名模式 [a-z0-9-]+', () => {

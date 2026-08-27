@@ -51,7 +51,7 @@ const TOOL_DESCRIPTION = [
   'Entries: `content` (non-empty, unique; short imperative, what-not-how; no numbering prefixes), `status` (pending | in_progress | completed | blocked | abandoned), optional `blocker` (only when blocked: what it is waiting for), optional `phase` (group name for multi-stage plans; omit for a flat list).',
   'Keep the list short (at most 15 entries): one entry per meaningful unit of work, not per micro-step.',
   'Mark tasks you are actively working on as in_progress; several may be in_progress when work genuinely runs in parallel.',
-  'Mark tasks done immediately after finishing. Never mark a task completed while its tests fail or its work is incomplete. If you cannot remember the exact content of an entry, re-derive it from the previous todo_write result instead of guessing.',
+  'Before stopping, reconcile open entries: anything waiting on a human (decision, approval, or an ops action you cannot perform) must be marked blocked with a blocker note — never left pending, and never executed just to clear the list; finished or obsolete entries must be completed or removed.',
   'Do not make todo_write the only tool call of a turn — batch it together with real work.',
   'Delegated work belongs on this list too. When you hand an entry to a subagent, append ` <sub>` to its content (the subagent is doing it, not you); when the subagent settles, a matching entry is auto-completed — you will see "Reconciled:" in the settlement note. If no auto-match fired, update the entry yourself.',
 ].join(' ');
@@ -256,6 +256,9 @@ export default function todoPlugin(ctx: Context): void {
     name: TODO_TOOL_NAME,
     label: 'Todo',
     description: TOOL_DESCRIPTION,
+    promptGuidelines: [
+      'Before stopping with open todo_write entries, reconcile them: entries waiting on a human decision, approval, or ops action must be marked blocked with a blocker note — never left pending, and never executed just to clear the list.',
+    ],
     parameters: Type.Object({
       todos: Type.Array(
         Type.Object(

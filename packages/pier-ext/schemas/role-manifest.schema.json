@@ -39,8 +39,7 @@
         "todos": {
           "type": "object",
           "properties": {
-            "mode": { "enum": ["serial", "parallel"] },
-            "reminderLimit": { "type": "integer", "exclusiveMinimum": 0 }
+            "mode": { "enum": ["serial", "parallel"] }
           },
           "additionalProperties": false
         }

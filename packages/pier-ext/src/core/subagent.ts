@@ -33,7 +33,7 @@ import { pingUntilReady, pipeNameFor, pipeRequest } from '../pipe-channel.ts';
 import { shouldClosePane, shouldCloseTaskTab } from '../gc-core.ts';
 import { composeForRole } from '../manifest-compose.ts';
 import { formatSettlementNotice } from '../vocab.ts';
-import { ABORT_STOP_REASON } from '../settle-wake-core.ts';
+import { TODO_REMINDER_CUSTOM_TYPE, planStopTodoReminder, todoReminderGraceMs } from '../todo-reminder-core.ts';
 
 export interface SubagentEnv {
   paneId: string;
@@ -114,6 +114,10 @@ export default function subagentPlugin(ctx: Context): void {
   const pi = surface.raw as {
     appendEntry?: (customType: string, data: unknown) => void;
     sendUserMessage?: (content: string, opts?: { deliverAs?: string }) => Promise<void>;
+    sendMessage?: (
+      message: { customType: string; content: string; display?: boolean; details?: Record<string, unknown> },
+      opts?: { deliverAs?: string; triggerTurn?: boolean },
+    ) => Promise<void>;
   };
   const scoped = surface.forModule(import.meta.url);
 
@@ -241,13 +245,27 @@ export default function subagentPlugin(ctx: Context): void {
     return { content: [{ type: 'text', text: notice }] };
   });
 
-  /* ── D41：stop 未完成提醒（仅主控；子代理不注册本块） ── */
+  /* ── D41：stop 未完成提醒（仅主控；子代理不注册本块）── 二修（01a040cc 实证）
+   * 事故：旧版在 settled 后 116ms 以 user-role sendUserMessage 注入
+   * 「Continue working on them before stopping」——通道权威压过模型收尾判断，
+   * 「待 push（留给用户决定）」12s 内被执行。三修：
+   *  - 通道：sendMessage(custom)（非 user 角色，来源可辨，不冒充用户）；
+   *  - 措辞：对账请求（继续已授权 / 等人工项标 blocked+blocker / 问用户一等出口）；
+   *  - 宽限：settled 后等 grace 再注入，期间任何 agent 启动即取消——
+   *    用户反制窗口（决策纯核心 todo-reminder-core）。
+   * 反唤醒风暴守卫保留：ESC 中止后的 settled 不催（01a03bf0 实证）。 */
 
   let todoReminders = 0;
-  const TODO_REMINDERS_MAX = 3;
-  // 反唤醒风暴：用户 ESC 中止后的 settled 不催（否则 abort → 提醒 → 新 run → 再 abort
-  // 死循环；与 index 的 D96/结算缓冲同款守卫，session 01a03bf0 实证）。
   let lastAssistantStopReason: string | null = null;
+  let todoReminderTimer: NodeJS.Timeout | null = null;
+
+  function cancelTodoReminder(): void {
+    if (todoReminderTimer !== null) {
+      clearTimeout(todoReminderTimer);
+      todoReminderTimer = null;
+    }
+  }
+
   scoped.on('turn_end', async (event: unknown) => {
     if (event === null || typeof event !== 'object' || !('message' in event)) return;
     const msg = (event as { message: unknown }).message; // 'message' in 已守卫
@@ -257,23 +275,40 @@ export default function subagentPlugin(ctx: Context): void {
       lastAssistantStopReason = stopReason;
     }
   });
+
+  // B3：宽限窗内 agent 被任何来源唤醒（用户输入 / 其他扩展）→ 本次提醒取消
+  scoped.on('agent_start', () => cancelTodoReminder());
+  scoped.on('session_shutdown', () => cancelTodoReminder());
+
   scoped.on('agent_settled', async () => {
-    if (lastAssistantStopReason === ABORT_STOP_REASON) return;
-    if (todoReminders >= TODO_REMINDERS_MAX) return;
-    if (pollers.size > 0) return; // 有在途子代理 → 主控本来就在等，不催
-    if (d.getBlockedDepth() > 0) return; // 等人类回答 → 不催
-    const open = todos.items.filter((it) => it.status === 'pending' || it.status === 'in_progress');
-    if (open.length === 0) return;
-    todoReminders += 1;
-    const list = open
-      .map((it) => (it.status === 'in_progress' ? `▶ ${it.content}` : `· ${it.content}`))
-      .join('\n');
-    const reminder = `<system-reminder>You stopped with unfinished todos (Reminder ${todoReminders}/${TODO_REMINDERS_MAX}):\n${list}\nContinue working on them before stopping, or call todo_write to update the list if they no longer apply.</system-reminder>`;
-    try {
-      await pi.sendUserMessage?.(reminder, { deliverAs: 'followUp' });
-    } catch {
-      /* 静默 */
-    }
+    cancelTodoReminder(); // 上一 settle 遗留、尚未走完宽限的定时器
+    const plan = planStopTodoReminder({
+      lastStopReason: lastAssistantStopReason,
+      reminders: todoReminders,
+      runningSubs: pollers.size,
+      blockedDepth: d.getBlockedDepth(),
+      items: todos.items,
+    });
+    if (!plan.due || plan.content == null) return;
+    const content = plan.content;
+    todoReminderTimer = setTimeout(() => {
+      todoReminderTimer = null;
+      void (async () => {
+        // 无 sendMessage 的 pi：宁可不提醒，也不回退 user 通道冒充用户
+        const send = pi.sendMessage;
+        if (typeof send !== 'function') return;
+        try {
+          await send(
+            { customType: TODO_REMINDER_CUSTOM_TYPE, content, display: true },
+            { deliverAs: 'followUp', triggerTurn: true },
+          );
+          todoReminders += 1; // 仅实际送达才计数（取消/失败不消耗封顶）
+        } catch {
+          /* 静默 */
+        }
+      })();
+    }, todoReminderGraceMs());
+    todoReminderTimer.unref?.(); // 不悬住进程（测试 / headless 场景）
   });
 
   /* ── 通道助手（M11：就绪 = 管道握手） ── */

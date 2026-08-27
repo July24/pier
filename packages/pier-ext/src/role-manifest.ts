@@ -38,7 +38,6 @@ export interface RoleManifest {
   services?: {
     todos?: {
       mode?: TodosMode;
-      reminderLimit?: number;
     };
   };
 }
@@ -153,9 +152,6 @@ export function validateRoleManifest(input: unknown): ValidateResult {
       } else {
         if (t.mode !== undefined && t.mode !== 'serial' && t.mode !== 'parallel') {
           issues.push(`services.todos.mode 必须是 serial/parallel，收到 ${JSON.stringify(t.mode)}`);
-        }
-        if (t.reminderLimit !== undefined && !isPosInt(t.reminderLimit)) {
-          issues.push(`services.todos.reminderLimit 必须是正整数，收到 ${JSON.stringify(t.reminderLimit)}`);
         }
       }
     }

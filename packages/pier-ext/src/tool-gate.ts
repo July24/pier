@@ -23,7 +23,6 @@ export interface RuntimeRoleManifest {
   services?: {
     todos?: {
       mode?: 'serial' | 'parallel';
-      reminderLimit?: number;
     };
   };
 }
