@@ -23,9 +23,10 @@ rm -rf /f/.tmp-ssh   # 立即删除 key 副本
 
 注：`ssh-keyscan -p 443 ssh.github.com` 在本机也会因 KEX 协商失败拿不到 host key（`unsupported KEX method sntrup761…`），用 `StrictHostKeyChecking=accept-new` 首连记录即可。用户自己的 WarpTerminal push 不受影响；永久修复可在 `~/.ssh/config` 为 `[ssh.github.com]:443` 显式写绝对路径的 `IdentityFile`/`UserKnownHostsFile`。
 
+
 ## pi 配置：权威文件是 `~/.pi/agent/settings.json`
 
-`~/.pi/` 下还有一个顶层 `settings.json`——**pi 不读它**（`PI_CODING_AGENT_DIR` 默认根是 `~/.pi/agent`）。改默认 provider/model 只改顶层文件会看到新 pi 会话仍用旧模型。当前默认：`zai-coding-cn / glm-5.3-highspeed`（2026-08-28 起；此前的 `opencode-go / ox-alpha-free` 已 401 失效）。两处文件已保持同步镜像。
+`~/.pi/` 下还有一个顶层 `settings.json`——**pi 不读它**（`PI_CODING_AGENT_DIR` 默认根是 `~/.pi/agent`）。改默认 provider/model 只改顶层文件会看到新 pi 会话仍用旧模型。当前默认：`zai-coding-cn / glm-5.3`（2026-08-28 定；此前的 `opencode-go / ox-alpha-free` 已 401 失效）。两处文件已保持同步镜像。
 
 ## 中转模型可靠性（本机网络）
 
