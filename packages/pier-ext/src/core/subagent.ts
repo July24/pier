@@ -16,16 +16,16 @@ import { Type } from 'typebox';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { basename, join, dirname } from 'node:path';
 import type { PiSurface } from '../pi-surface.ts';
 import type { HerdrClientLike, HerdrAgentState } from '../herdr-client.ts';
 import type { TodosService } from '../todos-service.ts';
 import { mountSubagentScope } from '../subagent-scope.ts';
-import { Semaphore, SUBS_CUSTOM_TYPE, agoText, buildAliveNotice, buildBlockedGateNotice, buildLaunchLine, buildLaunchParts, classifyWorktreeZone, foldSubsRegistry, formatSubagentResult, isAlive, isPathUnder, makeProgressUpdate, makeRegistry, planTabPlacement, psQuote, tabNameForTask, type AliveProbe, type SubEntry, type SubagentSpec, type TabPlacementPlan, type WorktreeZone } from '../subagent-core.ts';
+import { Semaphore, SUBS_CUSTOM_TYPE, agoText, buildAliveNotice, buildBlockedGateNotice, buildIsolatePreamble, buildLaunchLine, buildLaunchParts, classifyWorktreeZone, evaluateRelease, foldSubsRegistry, formatSubagentResult, formatWorktreeStat, isAlive, isPathUnder, makeProgressUpdate, makeRegistry, parseWorktreePorcelain, planIsolateWorktree, planTabPlacement, psQuote, tabNameForTask, type AliveProbe, type SubEntry, type SubagentSpec, type TabPlacementPlan, type WorktreeZone } from '../subagent-core.ts';
 import { hasAssistantAfter, hasPendingToolCall, lastAssistantText, listSessionFiles, readSessionFile, sessionFileById } from '../session-tail.ts';
 import { appendHistory, applyReportedSessionFile, historyFilePath, inheritOutcome, latestGeneration, normalizeEntryKind, readHistory, type HistoryEntry } from '../history-store.ts';
 import { execFile } from 'node:child_process';
-import { stat as statCb } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, rmSync, stat as statCb } from 'node:fs';
 import { resolve as pathResolve } from 'node:path';
 import { promisify } from 'node:util';
 const statAsync = promisify(statCb);
@@ -47,6 +47,8 @@ export interface SubagentSlots {
   reconcileOnReply: ((paneId: string) => string[]) | null;
   /** D96：running 后台 subagent 列表（master settled 时检查用；worker 侧为 null）。 */
   listRunningSubs: (() => Array<{ paneId: string; description: string }>) | null;
+  /** D98：结算通知附 worktree/git stat 行（pipe 快路径用；查 subs 表算 entry）。 */
+  settleStatLine: ((paneId: string) => Promise<string | null>) | null;
 }
 
 export interface SubagentDeps {
@@ -81,6 +83,7 @@ const SUBAGENT_DESCRIPTION = [
   '`run_in_background` (default false): when true, the call returns immediately with an agentId; the subagent keeps running in its pane. Use list_agents to see its state, send_message to give it follow-up work, interrupt_agent to stop it. When it settles, you receive a notification message with its closing output.',
   '`tab` (optional): name of a task tab to place the subagent into (join if a tab with this name exists, otherwise create it). Overrides the default placement. Default placement groups by git worktree: a subagent working in your checkout shares your tab; one working in a separate worktree (pass its path via `cwd`; create worktrees with `git worktree add`) gets its own tab named after the worktree directory.',
   '`role` + `allowed_tools`: when role matches a profile (searched: workspace .pi-herdr/roles/ → user-global ~/.pi/agent/herdr-pi/roles/ → builtin), the worker toolset becomes the composed manifest — baseline ∪ allowed_tools minus role-deny tools (deny always wins). Custom roles: drop a JSON profile into .pi-herdr/roles/ (master/worker-default reserved). Unknown role names remain display labels only.',
+  '`isolate` (default false): creates a FRESH git worktree for this subagent and runs it there (branch pier/<slug> from your HEAD under ~/.herdr/worktrees/<repo>/). Three-way choice: heavy independent writing in parallel with your own edits or other workers, or work needing its own clean reviewable diff → isolate; read-mostly or sequential helper work → omit (shared checkout, writes guarded by the write-lock); targeting an existing directory/worktree → cwd. In isolate mode the subagent\'s writes cannot conflict with your checkout; its panes group into a tab named after the worktree; its prompt is prefixed with commit discipline (commit to its own branch, NEVER push); when it settles you get a diff summary (commits since base, files changed, uncommitted count). Review with git log/diff HEAD..<branch>, merge with git merge --no-ff <branch>; once merged and clean, the worktree auto-removes (the branch is kept for audit). Mutually exclusive with cwd.',
 ].join(' ');
 
 /** 子代理并发上限（D10）。 */
@@ -132,6 +135,8 @@ export default function subagentPlugin(ctx: Context): void {
   const lastMachineInjectAt = new Map<string, number>();
   /* 子代理注册表（custom 条目持久化，分支正确；parent 重启后可从分支重建） */
   const subs = new Map<string, SubEntry>();
+  /** D98：isolate 创建中分支（worktree add → subs.set 窗口的孤儿扫描护栏）。 */
+  const pendingIsolateBranches = new Set<string>();
   const pollers = new Set<string>();
   const subScopes = new Map<string, { dispose: () => Promise<void> }>();
   /** D50：每 pane 最近一次机器请求 id（interrupt 按轮次占位、pollLoop 去重用）。 */
@@ -174,7 +179,11 @@ export default function subagentPlugin(ctx: Context): void {
       .filter((s) => s.background && s.status === 'running')
       .map((s) => ({ paneId: s.paneId, description: s.description }));
   };
-
+  // D98：pipe 快路径结算附 stat 行（entry 缺失/非 git → null，body 拼接侧静默省略）
+  slots.settleStatLine = async (paneId) => {
+    const entry = subs.get(paneId);
+    return entry ? await worktreeStatLine(entry) : null;
+  };
   function rebuildSubs(eventCtx: unknown): void {
     try {
       const entries = (eventCtx as { sessionManager?: { getBranch?: () => readonly unknown[] } })
@@ -448,6 +457,9 @@ export default function subagentPlugin(ctx: Context): void {
     // 被旧总墙钟 10min 误杀两次）。startedAt 保留供通知文案诊断。
     const startedAt = Date.now();
     let lastActivityAt = Date.now();
+    const pollTrace = process.env.PI_HERDR_TRACE
+      ? (msg: string) => { try { appendFileSync(process.env.PI_HERDR_TRACE!, `d98poll ${Date.now()} ${paneId} ${msg}\n`); } catch { /* 尽力 */ } }
+      : null;
     try {
       while (true) {
         const entry = subs.get(paneId);
@@ -520,6 +532,7 @@ export default function subagentPlugin(ctx: Context): void {
         if (state !== null) blockedGateNotified.delete(paneId); // 闸门解除（working/idle）
         if (state === 'idle' || state === 'done') {
           const s = await subSessionState(paneId, cwd, injectTs);
+          pollTrace?.(`state=${state} text=${s.text ? s.text.length : 'null'} pend=${s.pendingTool} act=${s.activity} obs=${String(entry.observationStartedAt ?? null)} takeover=${String(entry.userTakeover === true)}`);
           if (s.text || (!s.pendingTool && s.activity)) {
             // Settled
             const closing = s.text;
@@ -587,8 +600,10 @@ export default function subagentPlugin(ctx: Context): void {
             writeHistory(entry, { outcome: closing }, 'poll-settle');
             // M17：结算自动对账（先于通知；与 reply 快路径幂等双跑）
             const notes = d.reconcileOnSettlement(description, 'settled');
+            // D98：结算附 worktree/git stat 行（isolate 带基线 diff；非 isolate 小件轻量行）
+            const statLine = await worktreeStatLine(entry);
             const notice = d.withReconcileNotes(
-              formatSettlementNotice(`${paneId} (${description})`, closing),
+              formatSettlementNotice(`${paneId} (${description})`, closing) + (statLine ? `\n${statLine}` : ''),
               notes,
             );
             if (d.claimSettleNotice(`${paneId}:${requestId}`)) {
@@ -660,16 +675,23 @@ export default function subagentPlugin(ctx: Context): void {
     if (pollers.has(paneId)) return;
     pollers.add(paneId);
     void (async () => {
-      if (!subScopes.has(paneId)) {
-        const fiber = await mountSubagentScope(sessionRoot, paneId, {
-          onDispose: () => { pollers.delete(paneId); },
-        });
-        subScopes.set(paneId, fiber);
+      try {
+        if (!subScopes.has(paneId)) {
+          const fiber = await mountSubagentScope(sessionRoot, paneId, {
+            onDispose: () => { pollers.delete(paneId); },
+          });
+          subScopes.set(paneId, fiber);
+        }
+        await pollLoop(paneId, cwd, spawnedAt, injectTs, description, requestId);
+        const fiber = subScopes.get(paneId);
+        subScopes.delete(paneId);
+        try { await fiber?.dispose(); } catch { /* already gone */ }
+      } catch (err) {
+        // 回归加固（D98 活体实证）：mount/pollLoop 抛错若无此兜底，paneId 永留
+        // pollers（后续 startPoller 全 no-op）且无轮询在跑 → running 幽灵。
+        pollers.delete(paneId);
+        console.error(`pier: subagent poller ${paneId} crashed: ${(err as Error)?.message ?? err}`);
       }
-      await pollLoop(paneId, cwd, spawnedAt, injectTs, description, requestId);
-      const fiber = subScopes.get(paneId);
-      subScopes.delete(paneId);
-      try { await fiber?.dispose(); } catch { /* already gone */ }
     })();
   }
 
@@ -750,6 +772,44 @@ export default function subagentPlugin(ctx: Context): void {
     });
     worktreesCache = { at: Date.now(), list };
     return list;
+  }
+
+  /**
+   * D98：git 执行助手（execFile 'git'，timeout 10s；出错/超时 → null，与
+   * listWorktrees 同模式）。isolate 全部 git 操作的唯一出口——基础设施行为，
+   * 与 herdr 内部 execFile git 同构，不属模型面 bash 生态。
+   */
+  async function runGit(cwd: string, args: string[]): Promise<string | null> {
+    return await new Promise<string | null>((resolve) => {
+      execFile('git', ['-C', cwd, ...args], { timeout: 10000 }, (err, stdout) => {
+        resolve(err || stdout == null ? null : String(stdout));
+      });
+    });
+  }
+
+  /** `git diff --stat` 末行（"N files changed, +A/-B"）；空输出 → null。 */
+  function lastStatLine(out: string | null): string | null {
+    if (!out) return null;
+    const lines = out.replace(/\r/g, '').split('\n').map((l) => l.trim()).filter(Boolean);
+    return lines.length ? lines[lines.length - 1]! : null;
+  }
+
+  /**
+   * D98：结算通知附行（两条结算路径共用）。非 git cwd → null（静默省略）；
+   * isolate → 基线 diff stat + commit 计数；非 isolate → 对全部 git worker 的
+   * 轻量「小件」：working-tree diff stat + 未提交计数。
+   */
+  async function worktreeStatLine(entry: SubEntry): Promise<string | null> {
+    const porcelain = await runGit(entry.cwd, ['status', '--porcelain']);
+    if (porcelain === null) return null; // 非 git / git 不可用
+    const dirtyCount = porcelain.split('\n').filter((l) => l.trim() !== '').length;
+    if (entry.isolate) {
+      const statOut = await runGit(entry.cwd, ['diff', '--stat', `${entry.isolate.baseSha}...HEAD`]);
+      const commitsOut = await runGit(entry.cwd, ['rev-list', '--count', `${entry.isolate.baseSha}..HEAD`]);
+      const commits = commitsOut != null && /^\d+$/.test(commitsOut.trim()) ? Number(commitsOut.trim()) : null;
+      return formatWorktreeStat({ branch: entry.isolate.branch, commits, statLine: lastStatLine(statOut), dirtyCount });
+    }
+    return formatWorktreeStat({ branch: null, commits: null, statLine: lastStatLine(await runGit(entry.cwd, ['diff', '--stat', 'HEAD'])), dirtyCount });
   }
 
   /**
@@ -852,7 +912,9 @@ export default function subagentPlugin(ctx: Context): void {
     } catch {
       return;
     }
-    // D71：有活跃终端会话的 pane 豁免回收（tab 级与 pane 级两处）
+    // pane→herdr agentStatus 快照（pane 级回收判定用；缺项 = pane 已消失 → 补记 closed。
+    // 回归修复：statuses 原本未定义——ReferenceError 被 runGcSafely 静默吞，pane 级 GC 长期失效）
+    const statuses = new Map(panesList.map((p) => [p.paneId, p.agentStatus]));
     const termPaneIds = terminalState.activePaneIds();
     // B2：结算通知未送达的 pane 豁免（先送达再回收）——pD/pC 实证被 GC 抢关。
     const pendingNoticeIds = d.noticePending?.() ?? new Set<string>();
@@ -937,6 +999,102 @@ export default function subagentPlugin(ctx: Context): void {
     persistSubs();
   }
 
+  /* ── D98：isolate worktree 条件自动回收（gcPass 尾挂；master-only 已由挂载门保证） ── */
+
+  /**
+   * 候选 = ① subs 中 isolate && !releasedAt && status!=='running' 的 entry
+   *      + ② 孤儿：refs/heads/pier/* 分支在 `git worktree list --porcelain`
+   *        中仍有对应 wt（master 重启后注册表不含旧 entry，靠 ② 兜崩溃残留）。
+   * 判定：merged = merge-base --is-ancestor；dirty = wt 下 status --porcelain。
+   * release：不带 --force（git 自带 dirty 拒绝，双保险）；失败 2s 重试一次，
+   * 再失败保留待下轮 ticker（无通知轰炸）。retain：注册 entry 一次性通知，
+   * 孤儿静默（git worktree list 可见）。分支永不自动删除。
+   */
+  async function isolateSweep(): Promise<void> {
+    const trace = process.env.PI_HERDR_TRACE
+      ? (msg: string) => { try { appendFileSync(process.env.PI_HERDR_TRACE!, `d98sweep ${Date.now()} ${msg}\n`); } catch { /* 尽力 */ } }
+      : null;
+    const masterCwd = process.cwd();
+    // 候选键：分支短名。注册分支全集先行（含 running/released——孤儿扫描要排除它们，
+    // 否则新建未结算的 isolate 分支（=HEAD 祖先 + 干净）会被孤儿路径误回收）。
+    const registeredBranches = new Set<string>();
+    for (const e of subs.values()) {
+      if (e.isolate) registeredBranches.add(e.isolate.branch);
+    }
+    // ② 孤儿候选：pier/* 分支 ↔ porcelain worktree 配对（master 重启后注册表
+    // 不含旧 entry 的崩溃残留兜底）；注册分支一律走 ① 语义。
+    const wtPorcelain = await runGit(masterCwd, ['worktree', 'list', '--porcelain']);
+    if (wtPorcelain === null) return;
+    const wtByBranch = parseWorktreePorcelain(wtPorcelain);
+    const pierBranchOut = await runGit(masterCwd, ['for-each-ref', '--format=%(refname:short)', 'refs/heads/pier/']);
+    const pierBranches = (pierBranchOut ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
+    type Cand = { branch: string; wtPath: string; entry: SubEntry | null };
+    const byBranch = new Map<string, Cand>();
+    for (const branch of pierBranches) {
+      if (registeredBranches.has(branch) || pendingIsolateBranches.has(branch)) continue;
+      const wtPath = wtByBranch.get(branch);
+      if (wtPath) byBranch.set(branch, { branch, wtPath, entry: null });
+    }
+    // ① 注册候选（running/released 除外；同分支多代 → 取最新 entry）
+    for (const e of subs.values()) {
+      if (!e.isolate || e.isolate.releasedAt != null || e.status === 'running') continue;
+      const prev = byBranch.get(e.isolate.branch);
+      byBranch.set(e.isolate.branch, { branch: e.isolate.branch, wtPath: prev?.wtPath ?? e.isolate.worktreePath, entry: e });
+    }
+    trace?.(`cands=${[...byBranch.keys()].join(',') || 'none'} subs=${[...subs.values()].map((s) => `${s.status}${s.isolate ? '/iso' : ''}`).join(',') || 'none'}`);
+    let persisted = false;
+    for (const cand of byBranch.values()) {
+      const { branch, wtPath, entry } = cand;
+      // 注册 entry 的 wt 已不在 git 登记中（人工 remove/prune，或 worktree remove 被
+      // Windows 文件锁半途打断——git 先注销、目录残留）→ 物理清除残留后才闭账
+      //（分支照旧保留；rm 失败（锁未释放）→ 不闭账，下轮 ticker 再试）。
+      if (entry && !wtByBranch.has(branch)) {
+        if (existsSync(wtPath)) {
+          try { rmSync(wtPath, { recursive: true, force: true }); } catch { continue; /* 锁未释放 → 下轮 */ }
+          if (existsSync(wtPath)) continue;
+        }
+        entry.isolate!.releasedAt = Date.now();
+        persisted = true;
+        continue;
+      }
+      const mergedOut = await runGit(masterCwd, ['merge-base', '--is-ancestor', branch, 'HEAD']);
+      const merged = mergedOut !== null ? true : null; // is-ancestor：exit 0=是，非 0/null=否/未知
+      // 精确区分「确证非祖先」与「命令失败」：失败时 merged=null（retain-unknown）
+      let mergedFinal = merged;
+      if (merged === null) {
+        const sha = await runGit(masterCwd, ['rev-parse', branch]);
+        const headSha = await runGit(masterCwd, ['rev-parse', 'HEAD']);
+        if (sha != null && headSha != null) mergedFinal = false;
+      }
+      const dirtyOut = await runGit(wtPath, ['status', '--porcelain']);
+      const dirtyCount = dirtyOut === null ? null : dirtyOut.split('\n').filter((l) => l.trim() !== '').length;
+      const decision = evaluateRelease({ merged: mergedFinal, dirtyCount });
+      if (decision.action === 'release') {
+        const removed = await runGit(masterCwd, ['worktree', 'remove', wtPath]);
+        let ok = removed !== null;
+        if (!ok) {
+          const { promise: retryDelay, resolve: retryNow } = Promise.withResolvers<void>();
+          setTimeout(retryNow, 2000);
+          await retryDelay;
+          ok = (await runGit(masterCwd, ['worktree', 'remove', wtPath])) !== null; // 重试一次
+        }
+        if (ok) {
+          worktreesCache = null; // 让放置分类立即看到 wt 消失
+          if (entry) { entry.isolate!.releasedAt = Date.now(); persisted = true; }
+        } // 仍失败 → 保留，下轮 ticker 重试（无通知轰炸）
+      } else if (entry && !entry.isolate!.retainNotified) {
+        entry.isolate!.retainNotified = true;
+        persisted = true;
+        try {
+          await injectNotice(`worktree ${branch} retained (${decision.reason}) — merge it (git merge --no-ff ${branch}) or remove manually (git worktree remove --force ${wtPath})`);
+        } catch {
+          /* 注入失败静默（retainNotified 已置，避免轰炸；下轮 list_agents/台账可见） */
+        }
+      } // 孤儿 retain → 静默
+    }
+    if (persisted) persistSubs();
+  }
+
   /** GC 互斥 + 双驱动：turn_start 与周期 ticker。 */
   let gcRunning = false;
   async function runGcSafely(): Promise<void> {
@@ -946,6 +1104,13 @@ export default function subagentPlugin(ctx: Context): void {
       await gcPass();
     } catch {
       /* GC 失败静默，下轮/tick 重试 */
+    }
+    // D98：isolate 回收不进 gcPass（其 subs 空 early-return 会吞掉孤儿扫描）；
+    // 独立 try——tab/pane GC 失败不阻断 worktree 回收，反之亦然。
+    try {
+      await isolateSweep();
+    } catch {
+      /* sweep 失败静默，下轮/tick 重试 */
     } finally {
       gcRunning = false;
     }
@@ -987,6 +1152,10 @@ export default function subagentPlugin(ctx: Context): void {
 
   /** 复活已关闭任务（resume 工具与 send_message 自动复活共用）。 */
   async function reviveEntry(entry: SubEntry): Promise<SubEntry> {
+    // D98：已回收的 isolate worktree 不复活（目录已删，cwd 无效）
+    if (entry.isolate?.releasedAt != null) {
+      throw new Error(`isolate worktree ${entry.isolate.branch} was released (merged) — delegate a new subagent instead`);
+    }
     const latest = latestGeneration(readHistory(histFile(entry.cwd)), entry.taskId) ?? entry;
     const resumeFile = latest.sessionFile && /\.jsonl$/.test(latest.sessionFile) ? latest.sessionFile : null;
     // D86 信任旗标同 spawn：master 检出/worktree 才 -a（revive 无 toolCtx，用进程 cwd 代 master 检出）
@@ -1020,10 +1189,8 @@ export default function subagentPlugin(ctx: Context): void {
       description: Type.String({ description: 'Short label for this subtask (pane title)' }),
       prompt: Type.String({ description: 'The complete self-contained task for the subagent' }),
       run_in_background: Type.Optional(Type.Boolean({ description: 'Return immediately with an agentId; the subagent keeps running in its own pane (default false)' })),
-      cwd: Type.Optional(Type.String({ description: 'Working directory for the subagent (absolute, or relative to this workspace). Use it to delegate into a git worktree: panes group by worktree — same checkout as you share your tab; a separate worktree gets its own tab named after the worktree directory. Create worktrees yourself with git worktree add' })),
-      role: Type.Optional(Type.String({ description: 'Role for this pane. Role profiles are searched in this order: workspace .pi-herdr/roles/<name>.json → user-global ~/.pi/agent/herdr-pi/roles/<name>.json → builtin src/roles/. Builtins: worker-default [default, read+write; omit role = this]. Custom roles: add a JSON profile in .pi-herdr/roles/ (fields: role/version/manifest{tools,rules,unknownTools}); names master/worker-default are reserved. A matching profile governs the toolset (deny rules cannot be bypassed); unknown role names remain display labels only' })),
-      allowed_tools: Type.Optional(Type.Array(Type.String(), { description: 'Extra tools the task needs beyond the role baseline (union; role deny rules always win). Only meaningful with a role profile' })),
-      tab: Type.Optional(Type.String({ description: 'Task tab name: join the existing tab with this name, or create a new tab named this. Overrides the default worktree-based placement; omit for automatic placement (same checkout = your tab, separate worktree = its own tab)' })),
+      cwd: Type.Optional(Type.String({ description: 'Working directory for the subagent (absolute, or relative to this workspace). Use it to delegate into a git worktree: panes group by worktree — same checkout as you share your tab; a separate worktree gets its own tab named after the worktree directory. Create worktrees yourself with git worktree add. Use isolate:true instead when you want a FRESH worktree created for this task rather than targeting an existing one' })),
+      isolate: Type.Optional(Type.Boolean({ description: 'Create a fresh git worktree and run the subagent there. Use when the task writes files heavily and independently — in parallel with your own edits or other workers\' — or needs its own clean, reviewable diff. For read-mostly or sequential helper work omit it (shared checkout, writes guarded by the write-lock); use `cwd` only to target an existing directory/worktree (e.g. a retained pier worktree). Mechanics: branch pier/<slug> from your HEAD under ~/.herdr/worktrees/<repo>/; its writes cannot conflict with your checkout; panes group into a tab named after the worktree; the prompt is prefixed with commit discipline (commit to its branch, never push); on settle you get a diff summary. Review with git log/diff HEAD..<branch>, merge with git merge --no-ff <branch>; once merged and clean the worktree auto-removes (branch kept). Mutually exclusive with cwd' })),
     }),
     async execute(toolCallId, params, signal, onUpdate, toolCtx) {
       void toolCallId;
@@ -1053,8 +1220,59 @@ export default function subagentPlugin(ctx: Context): void {
       // D86 R5：cwd 参数 = 跨 worktree 委派的事实键（目录是事实，worktree 是分组推论）。
       // 相对路径相对 master cwd 解析；不存在的目录拒绝（spawn 进无效目录只会白开 pane）。
       const cwdParam = typeof params?.cwd === 'string' && params.cwd.trim() ? params.cwd.trim() : null;
+      const isolate = params?.isolate === true;
+      if (isolate && cwdParam) {
+        return {
+          content: [{ type: 'text', text: 'Error: `isolate` and `cwd` are mutually exclusive — isolate creates a new worktree, cwd delegates into an existing one' }],
+          details: {},
+        };
+      }
+      // taskId 上移（原 spawn 段）：isolate 规划需要 taskHex；纯移动，无行为耦合。
+      const taskId = randomUUID();
+      // D98 2c：isolate 创建块——pier execFile git 创建托管 worktree（决策 1，非 herdr
+      // socket worktree.create：bootstrap 竞态 / root_pane 无 env / worker 散离 master
+      // workspace / linked_worktree_source 拒绝四因）。判定归模型（不自动推断）。
+      let isolateMeta: SubEntry['isolate'] | null = null;
       let cwd = masterCwd;
-      if (cwdParam) {
+      if (isolate) {
+        const baseSha = await runGit(masterCwd, ['rev-parse', 'HEAD']);
+        if (!baseSha) {
+          return {
+            content: [{ type: 'text', text: 'Error: isolate requires a git repository with at least one commit' }],
+            details: {},
+          };
+        }
+        const pierBranches = new Set(
+          ((await runGit(masterCwd, ['for-each-ref', '--format=%(refname:short)', 'refs/heads/pier/'])) ?? '')
+            .split('\n').filter(Boolean),
+        );
+        const worktrees = await listWorktrees(masterCwd);
+        const repoName = basename(worktrees[0] ?? masterCwd);
+        const plan = planIsolateWorktree({
+          description: spec.description,
+          taskHex: taskId.slice(0, 6),
+          existingPierBranches: pierBranches,
+        });
+        const wtPath = join(homedir(), '.herdr', 'worktrees', repoName, plan.worktreeDirName);
+        try {
+          mkdirSync(dirname(wtPath), { recursive: true }); // git worktree add 不建父目录（首跑 ~/.herdr/worktrees 不存在即失败）
+        } catch { /* 目录已存在/无权限 → worktree add 的报错兜底 */ }
+        // 竞态护栏：worktree add → subs.set 之间（就绪等待 2-3s）ticker 的孤儿扫描
+        // 会把「=HEAD 祖先 + 干净」的新 wt 当孤儿回收——pending 集先行排除（活体实证）。
+        pendingIsolateBranches.add(plan.branch);
+        const added = await runGit(masterCwd, ['worktree', 'add', '-b', plan.branch, wtPath, baseSha.trim()]);
+        if (added === null) {
+          pendingIsolateBranches.delete(plan.branch);
+          return {
+            content: [{ type: 'text', text: `Error: failed to create worktree ${wtPath} (branch ${plan.branch}) — run \`git worktree prune\` and retry if it reports stale entries` }],
+            details: {},
+          };
+        }
+        worktreesCache = null; // 失效 5s 缓存，让下方 zone 分类立即看到新 wt
+        cwd = wtPath;
+        isolateMeta = { worktreePath: wtPath, branch: plan.branch, baseSha: baseSha.trim(), releasedAt: null, retainNotified: false };
+        spec.prompt = `${buildIsolatePreamble({ worktreePath: wtPath, branch: plan.branch, baseShort: baseSha.trim().slice(0, 7) })}\n\n${spec.prompt}`;
+      } else if (cwdParam) {
         cwd = pathResolve(masterCwd, cwdParam);
         try {
           const st = await statAsync(cwd);
@@ -1109,7 +1327,6 @@ export default function subagentPlugin(ctx: Context): void {
       let paneId = '';
       try {
         const spawnedAt = Date.now();
-        const taskId = randomUUID();
         const spawned = await spawnPaneInTaskTab(
           { desiredTab: typeof params?.tab === 'string' ? params.tab : null, description: spec.description, zone },
           cwd,
@@ -1131,6 +1348,7 @@ export default function subagentPlugin(ctx: Context): void {
           launchCommand: [launchLine(null, roleModel, approve)],
           createdAt: Date.now(),
           revivedFrom: null,
+          ...(isolateMeta ? { isolate: isolateMeta } : {}),
         };
         const ready = await waitSubReady(cwd, paneId);
         if (!ready) throw new Error(`subagent pane ${paneId} pipe not ready within ${SUB_READY_TIMEOUT_MS}ms`);
@@ -1235,6 +1453,13 @@ export default function subagentPlugin(ctx: Context): void {
           persistSubs();
           void client.closePane(paneId).catch(() => { /* 尽力而为 */ });
         }
+        // D98 2d：isolate 从未就绪 → 尽力回收刚建的 worktree + 新分支（无工作成果，
+        // 可删；失败静默——分支留着无害，git worktree list 可见）。
+        if (isolateMeta) {
+          void runGit(masterCwd, ['worktree', 'remove', '--force', isolateMeta.worktreePath])
+            .then(() => runGit(masterCwd, ['branch', '-D', isolateMeta!.branch]))
+            .catch(() => { /* 尽力而为 */ });
+        }
         return {
           content: [{
             type: 'text',
@@ -1247,6 +1472,7 @@ export default function subagentPlugin(ctx: Context): void {
         };
       } finally {
         release();
+        if (isolateMeta) pendingIsolateBranches.delete(isolateMeta.branch); // D98：创建窗护栏解除（成功/失败全路径）
       }
     },
   });
@@ -1377,8 +1603,10 @@ export default function subagentPlugin(ctx: Context): void {
       const lines: string[] = [];
       for (const sub of byTask.values()) {
         const tabTag = sub.tabName ? ` [tab: ${sub.tabName}]` : '';
+        // D98：isolate 条目附 worktree 分支（closed 同样带；不现算 merged——结算 stat 行已覆盖）
+        const wtTag = sub.isolate ? ` [wt: ${sub.isolate.branch}]` : '';
         if (sub.status === 'closed') {
-          lines.push(`${sub.taskId.slice(0, 8)} [idle] (${sub.kind}, closed; send_message revives)${tabTag} ${sub.description}`);
+          lines.push(`${sub.taskId.slice(0, 8)} [idle] (${sub.kind}, closed; send_message revives)${tabTag}${wtTag} ${sub.description}`);
           continue;
         }
         // 注册表状态即权威：settled = idle，其余 = running（含 blocked 人类闸门，对齐 DSH 映射）
@@ -1394,7 +1622,7 @@ export default function subagentPlugin(ctx: Context): void {
           const q = await readAskFlag(sub.paneId);
           gateTag = q ? ` — AWAITING HUMAN: "${q}"` : ' — AWAITING HUMAN decision';
         }
-        lines.push(`${sub.paneId} [${state}${takeoverMark}${statusTag}${activityTag}${gateTag}] (${sub.kind})${tabTag} ${sub.description}`);
+        lines.push(`${sub.paneId} [${state}${takeoverMark}${statusTag}${activityTag}${gateTag}] (${sub.kind})${tabTag}${wtTag} ${sub.description}`);
       }
       return { content: [{ type: 'text', text: lines.join('\n') }], details: {} };
     },
@@ -1442,10 +1670,19 @@ export default function subagentPlugin(ctx: Context): void {
           throw new Error(`pipe follow_up rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
         }
         lastMachineInjectAt.set(entry.paneId, Date.now()); // B4：观察窗内 working 归因判据
+        // 回归加固（D98 活体实证）：status='running' 与 startPoller 之间任何抛错都会
+        // 留下「running 且无 poller」的幽灵条目（永不结算、GC 跳过）——失败回滚原状态。
+        const prevStatus = entry.status;
         entry.status = 'running';
         persistSubs();
-        lastRequestIdByPane.set(entry.paneId, fuId);
-        startPoller(entry.paneId, entry.cwd, spawnedAt, Date.now(), entry.description, fuId);
+        try {
+          lastRequestIdByPane.set(entry.paneId, fuId);
+          startPoller(entry.paneId, entry.cwd, spawnedAt, Date.now(), entry.description, fuId);
+        } catch (inner) {
+          entry.status = prevStatus;
+          persistSubs();
+          throw inner;
+        }
         return { content: [{ type: 'text', text: `Message sent to subagent ${entry.paneId}.` }], details: { paneId: entry.paneId } };
       } catch (err) {
         return { content: [{ type: 'text', text: `Error: failed to reach subagent ${entry.paneId}: ${(err as Error).message}` }], details: {} };

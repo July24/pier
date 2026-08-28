@@ -196,6 +196,14 @@ export interface SubEntry {
   observationStartedAt?: number | null;
   /** D94：上次 agent 状态（用于检测 idle→working 的用户介入）。 */
   lastAgentStatus?: string | null;
+  /** D98：isolate worktree 元数据（spawn 时创建；releasedAt 非空 = 已回收，禁复活）。 */
+  isolate?: {
+    worktreePath: string;
+    branch: string;
+    baseSha: string;
+    releasedAt: number | null;
+    retainNotified: boolean;
+  };
 }
 
 export interface SubsRegistry {
@@ -240,6 +248,17 @@ export function foldSubsRegistry(entries: readonly BranchEntryLike2[]): SubsRegi
         userTakeover: s.userTakeover === true ? true : undefined,
         observationStartedAt: typeof s.observationStartedAt === 'number' ? s.observationStartedAt : null,
         lastAgentStatus: typeof s.lastAgentStatus === 'string' ? s.lastAgentStatus : null,
+        isolate: s.isolate && typeof s.isolate === 'object'
+          && typeof s.isolate.worktreePath === 'string' && typeof s.isolate.branch === 'string'
+          && typeof s.isolate.baseSha === 'string'
+          ? {
+            worktreePath: s.isolate.worktreePath,
+            branch: s.isolate.branch,
+            baseSha: s.isolate.baseSha,
+            releasedAt: typeof s.isolate.releasedAt === 'number' ? s.isolate.releasedAt : null,
+            retainNotified: s.isolate.retainNotified === true,
+          }
+          : undefined,
       }));
     found = { version: 2, subs };
   }
@@ -407,4 +426,107 @@ export function buildLaunchParts(
   if (opts.roleModel) parts.push('--provider', opts.roleModel.split('/')[0], '--model', opts.roleModel.split('/')[1] ?? opts.roleModel);
   if (opts.resumeFile) parts.push('--session', opts.resumeFile);
   return parts;
+}
+
+/* ── D98：worktree 隔离写并行（纯逻辑，可单测） ──────────────────── */
+
+/** isolate 规划产物：分支名 / slug / 托管目录名。 */
+export interface IsolatePlan {
+  branch: string;
+  slug: string;
+  worktreeDirName: string;
+}
+
+/** slug 上限（Windows 路径预算；分支名与目录名共用）。 */
+export const ISOLATE_SLUG_MAX = 40;
+
+/**
+ * D98：isolate worktree 规划。slug = description ascii-fold（小写、非字母数字
+ * 折叠单个 `-`、去首尾 `-`、截断 ≤ISOLATE_SLUG_MAX）；空（如纯中文）→
+ * `task-<taskHex>`；分支撞名加 -2/-3…（同 nextTaskTabName 惯例）。
+ * branch = `pier/<slug>`；worktreeDirName = `pier-<slug>`。
+ */
+export function planIsolateWorktree(opts: {
+  description: string;
+  taskHex: string;
+  existingPierBranches: ReadonlySet<string>;
+}): IsolatePlan {
+  const folded = String(opts.description ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, ISOLATE_SLUG_MAX)
+    .replace(/-+$/g, '');
+  const slug = folded || `task-${opts.taskHex}`;
+  let name = slug;
+  let n = 2;
+  while (opts.existingPierBranches.has(name)) {
+    name = `${slug}-${n}`;
+    n++;
+  }
+  return { branch: `pier/${name}`, slug: name, worktreeDirName: `pier-${name}` };
+}
+
+/**
+ * D98：纪律前导（前置于 prompt）。确定性拼接，非模型提供：圈定写入范围、
+ * 即时提交到自己的分支、禁 push、结算前提交干净并附摘要。
+ */
+export function buildIsolatePreamble(opts: { worktreePath: string; branch: string; baseShort: string }): string {
+  return [
+    `You are working in an isolated git worktree: ${opts.worktreePath} (branch ${opts.branch}, base ${opts.baseShort}).`,
+    'Every file you create or edit must stay inside this worktree.',
+    'Commit your work to your branch as you go (git add -A && git commit). NEVER push to any remote.',
+    'Do not touch the main checkout or other worktrees; if you find issues outside your task, report them in your final message instead of fixing them.',
+    'Before finishing: commit everything, then end with a short summary of what changed and why.',
+  ].join('\n');
+}
+
+/**
+ * D98：结算通知附行。任一必需输入缺失 → null（静默省略）。isolate（branch≠null）
+ * 行带基线 commit 计数与 diff stat；非 isolate = 全体 git worker 的轻量 stat 行。
+ */
+export function formatWorktreeStat(opts: {
+  branch: string | null;
+  commits: number | null;
+  statLine: string | null;
+  dirtyCount: number | null;
+}): string | null {
+  if (opts.dirtyCount == null) return null;
+  if (opts.branch != null) {
+    if (opts.commits == null || !opts.statLine) return null;
+    const dirty = opts.dirtyCount > 0
+      ? `${opts.dirtyCount} file(s) (worker should have committed)`
+      : `${opts.dirtyCount} file(s)`;
+    return `Worktree ${opts.branch}: ${opts.commits} commit(s) since base; ${opts.statLine}; uncommitted: ${dirty}`;
+  }
+  if (!opts.statLine) return null;
+  return `git: ${opts.statLine}; uncommitted: ${opts.dirtyCount} file(s)`;
+}
+
+/** D98：回收判定。merged/dirty 任一未知(null) → retain（fail toward keep，grok safety gate 原则）。 */
+export type ReleaseDecision = { action: 'release' } | { action: 'retain'; reason: 'unmerged' | 'dirty' | 'unknown' };
+
+export function evaluateRelease(opts: { merged: boolean | null; dirtyCount: number | null }): ReleaseDecision {
+  if (opts.merged === null || opts.dirtyCount === null) return { action: 'retain', reason: 'unknown' };
+  if (!opts.merged) return { action: 'retain', reason: 'unmerged' };
+  if (opts.dirtyCount > 0) return { action: 'retain', reason: 'dirty' };
+  return { action: 'release' };
+}
+
+/**
+ * D98：`git worktree list --porcelain` → 分支短名 → wt 路径 map。
+ * 跨平台锚点：CRLF 容忍（Windows git 输出）；detached HEAD 块无 branch 行 → 自然忽略
+ * （用户的裸 detached wt 不入表）；键剥 `refs/heads/` 前缀与 for-each-ref
+ * refname:short / SubEntry.isolate.branch 同形。路径原样保留（git 全平台输出正斜杠）。
+ */
+export function parseWorktreePorcelain(out: string): Map<string, string> {
+  const byBranch = new Map<string, string>();
+  let curPath: string | null = null;
+  for (const line of out.replace(/\r/g, '').split('\n')) {
+    const m = /^worktree (.+)$/.exec(line.trim());
+    if (m) { curPath = m[1]!; continue; }
+    const b = /^branch (.+)$/.exec(line.trim());
+    if (b && curPath) byBranch.set(b[1]!.replace(/^refs\/heads\//, ''), curPath);
+  }
+  return byBranch;
 }

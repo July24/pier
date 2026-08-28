@@ -550,7 +550,9 @@ export default async function (pi: ExtensionAPI) {
     reconcileOnReply: ((paneId: string) => string[]) | null;
     /** D96：处于 running 状态的后台 subagent 描述列表（master settled 时检查用）。 */
     listRunningSubs: (() => Array<{ paneId: string; description: string }>) | null;
-  } = { applyReplySession: null, reconcileOnReply: null, listRunningSubs: null };
+    /** D98：结算通知附 worktree/git stat 行（pipe 快路径用）。 */
+    settleStatLine: ((paneId: string) => Promise<string | null>) | null;
+  } = { applyReplySession: null, reconcileOnReply: null, listRunningSubs: null, settleStatLine: null };
   /** pipe server 盒（common 持有创建/关闭；core/subagent 的 root effect 也经盒关）。 */
   const pipeServerBox: { current: ReturnType<typeof startPipeServer> | null } = { current: null };
   /** 最近一次机器请求（结算时按它决定是否 push、push 给谁）。 */
@@ -646,8 +648,11 @@ export default async function (pi: ExtensionAPI) {
           if (claimSettleNotice(`${req.paneId}:${req.id}`)) {
             // M17：快路径结算 → 自动对账（幂等；与 pollLoop 兜底双跑无害）
             const notes = subagentSlots.reconcileOnReply?.(req.paneId) ?? [];
+            // D98：结算附 worktree/git stat 行（isolate 带基线 diff；非 isolate 小件轻量行）
+            const statLine = await subagentSlots.settleStatLine?.(req.paneId) ?? null;
             const head = formatSettlementNotice(`${req.paneId}`, req.text);
             const body = (req.sessionFile ? `${head}\nSession: ${req.sessionFile}` : head)
+              + (statLine ? `\n${statLine}` : '')
               + (notes.length ? `\n${notes.join('\n')}` : '');
             // D92：经缓冲注入（忙时 turn_end 折叠 steer，闲时直投）
             await deliverNotice(body, req.paneId);
