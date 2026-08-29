@@ -16,6 +16,7 @@ import { PiSurface } from '../src/pi-surface.ts';
 import { TodosService } from '../src/todos-service.ts';
 import type { HerdrClientLike } from '../src/herdr-client.ts';
 import { SUBS_CUSTOM_TYPE, type SubEntry } from '../src/subagent-core.ts';
+import { emptySubagentPortBox } from '../src/subagent-port.ts';
 
 interface FakePi {
   tools: Map<string, { execute?: (...a: unknown[]) => unknown }>;
@@ -92,7 +93,7 @@ test('pane 级 GC：statuses 修复——consumed pane 被 closePane；消失 pa
     env: { paneId: 'p0', tabId: 'tMAIN', workspaceId: 'w1' },
     extPath: 'F:/repo/pier/packages/pier-ext/src/index.ts',
     sessionRoot: root,
-    slots: { applyReplySession: null, reconcileOnReply: null, listRunningSubs: null, settleStatLine: null },
+    port: emptySubagentPortBox(),
     getSessionId: () => '',
     getBlockedDepth: () => 0,
     reconcileOnSettlement: () => [],

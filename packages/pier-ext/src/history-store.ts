@@ -7,7 +7,9 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { sessionDirName } from './session-tail.ts';
+import { historyFilePath } from './storage-layout.ts';
+
+export { historyFilePath };
 
 /** 旧 short/resident → task；空/缺省 → task；role 名原样。 */
 export function normalizeEntryKind(kind: string | null | undefined): string {
@@ -59,9 +61,7 @@ export function inheritOutcome(lastOutcome: string | null | undefined, patchOutc
   return lastOutcome ?? null;
 }
 
-export function historyFilePath(agentRoot: string, cwd: string): string {
-  return path.join(agentRoot, 'herdr-pi', 'history', sessionDirName(cwd), 'history.jsonl');
-}
+
 
 /** 容忍式逐行解析（损坏行跳过）。 */
 export function parseHistoryEntries(text: string): HistoryEntry[] {

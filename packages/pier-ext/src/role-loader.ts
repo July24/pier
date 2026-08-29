@@ -18,20 +18,17 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { homedir } from 'node:os';
 import { validateRoleManifest, type RoleManifest } from './role-manifest.ts';
+import { userRolesDir, workspaceRolesDir as layoutWorkspaceRolesDir } from './storage-layout.ts';
+
+export { userRolesDir };
 
 /** 内置档案目录（src/roles/）。 */
 export const ROLES_DIR = join(dirname(fileURLToPath(import.meta.url)), 'roles');
 
 /** workspace 级目录（相对基准默认 = 进程 cwd，即 master 的工作目录）。 */
 export function workspaceRolesDir(baseDir?: string): string {
-  return join(baseDir ?? process.cwd(), '.pi-herdr', 'roles');
-}
-
-/** 用户全局目录（~/.pi/agent/herdr-pi/roles/）。 */
-export function userRolesDir(): string {
-  return join(homedir(), '.pi', 'agent', 'herdr-pi', 'roles');
+  return layoutWorkspaceRolesDir(baseDir ?? process.cwd());
 }
 
 /** 内置保留名（不可被任何用户层覆盖）。 */

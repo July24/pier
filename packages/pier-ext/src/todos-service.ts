@@ -7,6 +7,7 @@ import { EventEmitter } from 'node:events';
 import {
   applyTodoEdits,
   foldLatestTodosMeta,
+  listsEqual,
   type TodoEdit,
   type TodoItem,
 } from './todo-core.ts';
@@ -19,7 +20,13 @@ export interface TodosConfig {
 }
 
 export class TodosService extends EventEmitter {
-  items: TodoItem[] = [];
+  private _items: TodoItem[] = [];
+  /**
+   * Live list (read-only). Mutations must go through replace/applyEdits/rebuild.
+   */
+  get items(): readonly TodoItem[] {
+    return this._items;
+  }
   /**
    * 列表最后一次真实变更时间（epoch ms）；分支重建取自条目时间戳，无则 null。
    * 陈旧度判定（stale-core）的时钟锚点；null → 保守永不判 stale。
@@ -40,21 +47,32 @@ export class TodosService extends EventEmitter {
     return { strict, allowParallelInProgress };
   }
 
-  replace(items: readonly TodoItem[]): void {
-    const before = this.items;
-    this.items = items.map((it) => ({ ...it }));
-    this.lastWriteAt = Date.now();
-    this.emitCompletedTransitions(before, this.items);
-    this.emit('todo.updated', { items: this.items });
+  /** Defensive copy for callers that must not mutate service state. */
+  getSnapshot(): TodoItem[] {
+    return this._items.map((it) => ({ ...it }));
   }
 
-  applyEdits(edits: readonly TodoEdit[]): void {
-    const before = this.items;
-    this.items = applyTodoEdits(this.items, edits);
+  replace(items: readonly TodoItem[]): { changed: boolean } {
+    const next = items.map((it) => ({ ...it }));
+    if (listsEqual(this._items, next)) return { changed: false };
+    const before = this._items;
+    this._items = next;
     this.lastWriteAt = Date.now();
-    this.emitCompletedTransitions(before, this.items);
-    this.emit('todo.edited', { edits, items: this.items });
-    this.emit('todo.updated', { items: this.items });
+    this.emitCompletedTransitions(before, this._items);
+    this.emit('todo.updated', { items: this._items });
+    return { changed: true };
+  }
+
+  applyEdits(edits: readonly TodoEdit[]): { changed: boolean } {
+    const before = this._items;
+    const next = applyTodoEdits(this._items, edits);
+    if (listsEqual(before, next)) return { changed: false };
+    this._items = next;
+    this.lastWriteAt = Date.now();
+    this.emitCompletedTransitions(before, this._items);
+    this.emit('todo.edited', { edits, items: this._items });
+    this.emit('todo.updated', { items: this._items });
+    return { changed: true };
   }
 
   /** M16：completed 转换数（所有编辑路径统一 diff；速率估算的原料）。 */
@@ -68,9 +86,9 @@ export class TodosService extends EventEmitter {
     //（重建失败不影响主流程；下次 todo_write 会重新锚定）。
     const folded = foldLatestTodosMeta(entries as Parameters<typeof foldLatestTodosMeta>[0]);
     if (folded) {
-      this.items = folded.items;
+      this._items = folded.items;
       this.lastWriteAt = folded.writtenAt;
     }
-    this.emit('todo.updated', { items: this.items, reason: 'rebuild' });
+    this.emit('todo.updated', { items: this._items, reason: 'rebuild' });
   }
 }

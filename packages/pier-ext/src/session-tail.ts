@@ -8,6 +8,9 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { sessionDirName } from './storage-layout.ts';
+
+export { sessionDirName };
 
 export interface SessionMessageLike {
   role?: string;
@@ -112,11 +115,7 @@ export function hasPendingToolCall(entries: readonly SessionEntryLike[], sinceTs
   return depth > 0;
 }
 
-/** pi 会话目录名：cwd → `--F--herdr-pi--` 形态（实测命名约定）。 */
-export function sessionDirName(cwd: string): string {
-  const flat = cwd.replace(/[\\/]/g, '-').replace(/:/g, '-');
-  return `--${flat}--`;
-}
+
 
 /** cwd 会话目录下按 mtime 倒序取最新 limit 个会话文件（v1.3 M7 候选定位）。 */
 export function listSessionFiles(cwd: string, agentDir: string, limit = 4): string[] {

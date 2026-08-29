@@ -114,14 +114,13 @@ export interface CleanupContext {
 
 /**
  * Creates a mock timer context using Node.js MockTimers.
- * 
+ */
 export function withMockTimers<T>(
   fn: (timers: MockTimersContext) => T | Promise<T>
 ): () => T | Promise<T> {
   return async () => {
     const timers = {
       advance: async (ms: number) => {
-        // Node.js MockTimers API (best-effort access to experimental API)
         const globalSetTimeout = global.setTimeout as typeof setTimeout & { clock?: { tick?: (ms: number) => Promise<void> } };
         const mockTimers = globalSetTimeout.clock;
         if (mockTimers?.tick) {
@@ -134,7 +133,8 @@ export function withMockTimers<T>(
         if (mockTimers?.setSystemTime) {
           mockTimers.setSystemTime(timestamp);
         }
-    
+      },
+    };
     return await fn(timers);
   };
 }

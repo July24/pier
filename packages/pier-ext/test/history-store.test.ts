@@ -46,6 +46,15 @@ test('parseHistoryEntries: 容忍损坏行', () => {
   assert.equal(entries[0].taskId, 't1');
 });
 
+test('parseHistoryEntries: object without taskId is skipped', () => {
+  const entries = parseHistoryEntries(JSON.stringify({ paneId: 'p', status: 'running' }));
+  assert.equal(entries.length, 0);
+});
+
+test('readHistory: missing file returns []', () => {
+  assert.deepEqual(readHistory(path.join(os.tmpdir(), 'pier-no-such-history.jsonl')), []);
+});
+
 test('append/read 往返 + 目录自动创建', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-'));
   const file = historyFilePath(tmp, 'F:\\herdr-pi');

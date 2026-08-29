@@ -24,6 +24,7 @@ import subagentPlugin from '../src/core/subagent.ts';
 import { PiSurface } from '../src/pi-surface.ts';
 import { TodosService } from '../src/todos-service.ts';
 import type { HerdrClientLike } from '../src/herdr-client.ts';
+import { emptySubagentPortBox } from '../src/subagent-port.ts';
 
 /* ── planIsolateWorktree ─────────────────────────────────────────── */
 
@@ -163,14 +164,14 @@ function fakeClient(): HerdrClientLike {
 
 async function mount(pi: FakePi): Promise<Context> {
   const surface = new PiSurface(pi as unknown as object);
-  const slots = { applyReplySession: null, reconcileOnReply: null, listRunningSubs: null, settleStatLine: null };
+  const port = emptySubagentPortBox();
   const root = new Context();
   const deps = {
     client: fakeClient(),
     env: { paneId: 'p0', tabId: 't0', workspaceId: 'w1' },
     extPath: 'F:/repo/pier/packages/pier-ext/src/index.ts',
     sessionRoot: root,
-    slots,
+    port,
     getSessionId: () => '',
     getBlockedDepth: () => 0,
     reconcileOnSettlement: () => [],

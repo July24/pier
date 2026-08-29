@@ -19,6 +19,7 @@ import { PiSurface } from '../src/pi-surface.ts';
 import { pipeNameFor, pipePathFor, type PipeRequest } from '../src/pipe-channel.ts';
 import { TodosService } from '../src/todos-service.ts';
 import type { HerdrClientLike } from '../src/herdr-client.ts';
+import { emptySubagentPortBox, type SubagentPortBox } from '../src/subagent-port.ts';
 
 const SUB_TEXT = 'REPORT: all channel-fee contact points mapped';
 const PROMPT = '你在 apnv3-backend 仓库探查渠道费用触点（只读）。输出完整报告。';
@@ -32,9 +33,7 @@ interface FakePi {
   appendEntry(customType: string, data: unknown): void;
 }
 
-interface Slots {
-  listRunningSubs: (() => Array<{ paneId: string; description: string }>) | null;
-}
+
 
 interface Harness {
   closePaneCalls: string[];
@@ -118,16 +117,16 @@ async function startPipeSim(cwd: string, h: Harness, opts: { rejectPrompt?: bool
   return server;
 }
 
-async function mountSpawn(pi: FakePi, sessionFile: string, h: Harness): Promise<{ root: Context; slots: Slots }> {
+async function mountSpawn(pi: FakePi, sessionFile: string, h: Harness): Promise<{ root: Context; port: SubagentPortBox }> {
   const surface = new PiSurface(pi as unknown as object);
-  const slots: Slots = { listRunningSubs: null };
+  const port = emptySubagentPortBox();
   const root = new Context();
   const deps = {
     client: fakeClient(sessionFile, h),
     env: { paneId: 'p0', tabId: 't0', workspaceId: 'w1' },
     extPath: new URL('../src/index.ts', import.meta.url).pathname,
     sessionRoot: root,
-    slots,
+    port,
     getSessionId: () => '',
     getBlockedDepth: () => 0,
     reconcileOnSettlement: () => [],
@@ -139,12 +138,12 @@ async function mountSpawn(pi: FakePi, sessionFile: string, h: Harness): Promise<
   root.provide('pi-herdr.surface', surface);
   root.provide('pi-herdr.subagent-deps', deps);
   await root.plugin(subagentPlugin);
-  return { root, slots };
+  return { root, port };
 }
 
 interface SpawnCtx {
   pi: FakePi;
-  slots: Slots;
+  port: SubagentPortBox;
   h: Harness;
   cwd: string;
 }
@@ -173,7 +172,7 @@ async function withSpawnEnv(fn: (ctx: SpawnCtx) => Promise<void>, opts: { reject
   const pi = fakePi();
   const mounted = await mountSpawn(pi, sessionFile, h);
   try {
-    await fn({ pi, slots: mounted.slots, h, cwd });
+    await fn({ pi, port: mounted.port, h, cwd });
   } finally {
     await mounted.root.fiber.dispose();
     const closed = Promise.withResolvers<void>();
@@ -185,7 +184,7 @@ async function withSpawnEnv(fn: (ctx: SpawnCtx) => Promise<void>, opts: { reject
 }
 
 test('spawn 回归（01a03bf0 缺陷 1）：prompt 必须注入 + 无 ReferenceError + 正常结算', async () => {
-  await withSpawnEnv(async ({ pi, slots, h, cwd }) => {
+  await withSpawnEnv(async ({ pi, port, h, cwd }) => {
     const tool = pi.tools.get('subagent');
     assert.ok(tool?.execute, 'subagent 工具已注册');
     const r = await tool.execute!('tc1', { description: '探查', prompt: PROMPT }, undefined, undefined, { cwd }) as {
@@ -198,12 +197,12 @@ test('spawn 回归（01a03bf0 缺陷 1）：prompt 必须注入 + 无 ReferenceE
     assert.equal(h.prompts.length, 1, 'prompt 恰好注入一次');
     assert.equal((h.prompts[0] as { text?: string }).text, PROMPT, 'prompt 全文注入');
     assert.equal((h.prompts[0] as { push?: boolean }).push, false, '前台 push=false');
-    assert.deepEqual(slots.listRunningSubs?.() ?? [], [], '无幽灵 running 条目');
+    assert.deepEqual(port.current?.listRunningSubs() ?? [], [], '无幽灵 running 条目');
   });
 });
 
 test('spawn 回归（01a03bf0 缺陷 2）：pipe 拒绝 → 台账回收 + 关 pane + spawn-failed 文案', async () => {
-  await withSpawnEnv(async ({ pi, slots, h, cwd }) => {
+  await withSpawnEnv(async ({ pi, port, h, cwd }) => {
     const tool = pi.tools.get('subagent');
     assert.ok(tool?.execute);
     const r = await tool.execute!('tc2', { description: '探查', prompt: PROMPT }, undefined, undefined, { cwd }) as {
@@ -213,7 +212,7 @@ test('spawn 回归（01a03bf0 缺陷 2）：pipe 拒绝 → 台账回收 + 关 p
     assert.match(text, /failed to spawn/);
     assert.match(text, /sim rejected/);
     assert.deepEqual(h.closePaneCalls, ['p2'], '失败 pane 必须关闭');
-    assert.deepEqual(slots.listRunningSubs?.() ?? [], [], '台账无幽灵条目');
+    assert.deepEqual(port.current?.listRunningSubs() ?? [], [], '台账无幽灵条目');
     const subsEntries = pi.entries.filter(([t]) => t === 'pi-herdr.subs');
     assert.ok(subsEntries.length > 0, '台账有写入');
     const last = subsEntries[subsEntries.length - 1][1] as { subs?: Array<{ paneId: string; status: string }> };

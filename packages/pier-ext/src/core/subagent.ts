@@ -1,21 +1,14 @@
 /**
- * 档1 core/subagent（subagent 族迁 loader entry —— D78 挂载树 / D81 融合核心）。
+ * core/subagent — master-only loader entry (tools, registry, poller, GC).
  *
- * 承接（master-only）：五工具（subagent/resume_subagent/list_agents/send_message/
- * interrupt_agent）+ 注册表（subs/pollers/持久化/重建）+ 扩展管道客户端（prompt/
- * follow_up/interrupt 注入）+ poller（结算观察/通知去重）+ 历史（history-store
- * 代际）+ 复活（revive）+ 任务 tab 放置（D25/D26）+ GC（tab 级 + pane 级 + ticker）。
- *
- * 依赖全经 `pi-herdr.subagent-deps`（client/env/extPath/sessionRoot/回调槽…）：
- * common 段的 pipe 消费者（applyReplySession/reconcileOnReply）经 slots 反向暴露。
- * reconcileOnSettlement（M17 对账）与 withReconcileNotes/claimSettleNotice 留在
- * index session 状态层，本插件回调消费（③ 的显式留守决策）。
+ * Inbound deps via `pi-herdr.subagent-deps`. Outbound pipe/settle queries bind
+ * atomically onto `port.current` (see subagent-port.ts). Settlement reconcile
+ * stays in index session state; this plugin consumes it through the port.
  */
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { homedir } from 'node:os';
 import { basename, join, dirname } from 'node:path';
 import type { PiSurface } from '../pi-surface.ts';
 import type { HerdrClientLike, HerdrAgentState } from '../herdr-client.ts';
@@ -23,10 +16,26 @@ import type { TodosService } from '../todos-service.ts';
 import { mountSubagentScope } from '../subagent-scope.ts';
 import { Semaphore, SUBS_CUSTOM_TYPE, agoText, buildAliveNotice, buildBlockedGateNotice, buildIsolatePreamble, buildLaunchLine, buildLaunchParts, classifyWorktreeZone, evaluateRelease, foldSubsRegistry, formatSubagentResult, formatWorktreeStat, isAlive, isPathUnder, makeProgressUpdate, makeRegistry, parseWorktreePorcelain, planIsolateWorktree, planTabPlacement, psQuote, tabNameForTask, type AliveProbe, type SubEntry, type SubagentSpec, type TabPlacementPlan, type WorktreeZone } from '../subagent-core.ts';
 import { hasAssistantAfter, hasPendingToolCall, lastAssistantText, listSessionFiles, readSessionFile, sessionFileById } from '../session-tail.ts';
-import { appendHistory, applyReportedSessionFile, historyFilePath, inheritOutcome, latestGeneration, normalizeEntryKind, readHistory, type HistoryEntry } from '../history-store.ts';
+import { appendHistory, applyReportedSessionFile, historyFilePath, inheritOutcome, latestGeneration, readHistory, type HistoryEntry } from '../history-store.ts';
 import { runtimePolicy } from '../runtime-policy.ts';
 import { platformPaths } from '../platform-paths.ts';
-import { execFile } from 'node:child_process';
+import { defaultGitAdapter } from '../git-adapter.ts';
+import {
+  OBSERVATION_TICK_MS,
+  TAKEOVER_RECHECK_MS,
+  planBlockedGate,
+  planObservationTick,
+  planTakeoverTick,
+  planVacuumTick,
+} from '../subagent-poller.ts';
+import type { SubagentPort, SubagentPortBox } from '../subagent-port.ts';
+import {
+  FOREGROUND_POLL_MS,
+  planForegroundTick,
+  planIsolateRepoGuard,
+  planLaunchValidation,
+  planPatienceExpiry,
+} from '../subagent-launch.ts';
 import { appendFileSync, existsSync, mkdirSync, rmSync, stat as statCb } from 'node:fs';
 import { resolve as pathResolve } from 'node:path';
 import { promisify } from 'node:util';
@@ -36,6 +45,7 @@ import { shouldClosePane, shouldCloseTaskTab } from '../gc-core.ts';
 import { composeForRole } from '../manifest-compose.ts';
 import { formatSettlementNotice } from '../vocab.ts';
 import { TODO_REMINDER_CUSTOM_TYPE, planStopTodoReminder, todoReminderGraceMs } from '../todo-reminder-core.ts';
+import type { TerminalStateSlot } from './terminal.ts';
 
 export interface SubagentEnv {
   paneId: string;
@@ -43,37 +53,28 @@ export interface SubagentEnv {
   workspaceId: string;
 }
 
-/** common 段 pipe 消费者槽（插件挂载时回填）。 */
-export interface SubagentSlots {
-  applyReplySession: ((paneId: string, sessionFile: string | null) => void) | null;
-  reconcileOnReply: ((paneId: string) => string[]) | null;
-  /** D96：running 后台 subagent 列表（master settled 时检查用；worker 侧为 null）。 */
-  listRunningSubs: (() => Array<{ paneId: string; description: string }>) | null;
-  /** D98：结算通知附 worktree/git stat 行（pipe 快路径用；查 subs 表算 entry）。 */
-  settleStatLine: ((paneId: string) => Promise<string | null>) | null;
-}
-
 export interface SubagentDeps {
   client: HerdrClientLike;
   env: SubagentEnv | null;
-  /** 本扩展入口（index.ts）路径——launchLine 的 -e 参数。 */
+  /** Extension entry (index.ts) path — launchLine `-e`. */
   extPath: string;
-  /** master 树根（scope 挂载）。 */
+  /** Master tree root (scope mount). */
   sessionRoot: Context;
-  slots: SubagentSlots;
+  port: SubagentPortBox;
   getSessionId: () => string;
   getBlockedDepth: () => number;
   reconcileOnSettlement: (description: string, outcome: 'settled' | 'failed') => string[];
   withReconcileNotes: (base: string, notes: readonly string[]) => string;
   claimSettleNotice: (key: string) => boolean;
   /**
-   * D92 结算通知注入器（index.ts 提供）：忙时入缓冲、turn_end 折叠 steer 批量注入。
-   * 缺省回退 pi.sendUserMessage(followUp)（旧路径——整个 run 结束才回填，测试桩用）。
+   * Settlement notice injector from index: buffer while busy, flush at turn_end.
+   * Tests may omit it and fall back to pi.sendUserMessage(followUp).
    */
   deliverNotice?: (content: string, paneId?: string) => Promise<void>;
-  /** B2：结算通知尚在缓冲未送达的 pane 集合（GC 豁免——先送达再回收）。 */
+  /** Panes whose settlement notice is still buffered (GC exemption). */
   noticePending?: () => ReadonlySet<string>;
-  /** terminal 族 GC 豁免槽。 */
+  /** Terminal-family GC exemption (live terminal panes are not collected). */
+  terminalState: TerminalStateSlot;
   todos: TodosService;
 }
 
@@ -95,10 +96,9 @@ const SUBAGENT_CONCURRENCY = 4;
  * Why: Working slice continues to refresh; healthy long tasks >10min no longer killed by mistake.
  */
 const SUBAGENT_TIMEOUT_MS = runtimePolicy.subagentTimeoutMs;
-/** Readiness wait limit (TUI startup + herdr detection) */
-const SUB_READY_TIMEOUT_MS = 30000;
+const SUB_READY_TIMEOUT_MS = runtimePolicy.readinessTimeoutMs;
 /** Settlement observation window (within this period, working defaults to user takeover) */
-const OBSERVE_WINDOW_MS = runtimePolicy.settlementWindowMs;
+const OBSERVE_WINDOW_MS = runtimePolicy.observationWindowMs;
 /**
  * Machine injection grace period.
  * Why: Working within observation window is not considered takeover if triggered by own prompt/follow_up.
@@ -119,7 +119,7 @@ function agentRootDir(): string {
 export default function subagentPlugin(ctx: Context): void {
   const surface = ctx.get('pi-herdr.surface') as PiSurface<object>;
   const d = ctx.get('pi-herdr.subagent-deps') as SubagentDeps;
-  const { client, env, sessionRoot, slots, terminalState, todos } = d;
+  const { client, env, sessionRoot, port, terminalState, todos } = d;
   const pi = surface.raw as {
     appendEntry?: (customType: string, data: unknown) => void;
     sendUserMessage?: (content: string, opts?: { deliverAs?: string }) => Promise<void>;
@@ -165,31 +165,34 @@ export default function subagentPlugin(ctx: Context): void {
   /** E2：已发过闸门通知的 pane（blocked 期间去重；解除后移除，二次 ask 可再通知）。 */
   const blockedGateNotified = new Set<string>();
 
-  // slots 回填：common 段 pipe reply 消费
-  slots.applyReplySession = (paneId, sessionFile) => {
-    const entry = subs.get(paneId);
-    if (!entry) return;
-    const next = applyReportedSessionFile(entry.sessionFile, sessionFile);
-    if (next === entry.sessionFile) return;
-    entry.sessionFile = next;
-    persistSubs();
-    writeHistory(entry, undefined, 'session-report');
+  const boundPort: SubagentPort = {
+    applyReplySession(paneId, sessionFile) {
+      const entry = subs.get(paneId);
+      if (!entry) return;
+      const next = applyReportedSessionFile(entry.sessionFile, sessionFile);
+      if (next === entry.sessionFile) return;
+      entry.sessionFile = next;
+      persistSubs();
+      writeHistory(entry, undefined, 'session-report');
+    },
+    reconcileOnReply(paneId) {
+      const entry = subs.get(paneId);
+      return entry ? d.reconcileOnSettlement(entry.description, 'settled') : [];
+    },
+    listRunningSubs() {
+      return [...subs.values()]
+        .filter((s) => s.background && s.status === 'running')
+        .map((s) => ({ paneId: s.paneId, description: s.description }));
+    },
+    async settleStatLine(paneId) {
+      const entry = subs.get(paneId);
+      return entry ? await worktreeStatLine(entry) : null;
+    },
   };
-  slots.reconcileOnReply = (paneId) => {
-    const entry = subs.get(paneId);
-    return entry ? d.reconcileOnSettlement(entry.description, 'settled') : [];
-  };
-  // D96：master settled 时检查还有哪些后台 subagent 在 running（防过早总结）
-  slots.listRunningSubs = () => {
-    return [...subs.values()]
-      .filter((s) => s.background && s.status === 'running')
-      .map((s) => ({ paneId: s.paneId, description: s.description }));
-  };
-  // D98：pipe 快路径结算附 stat 行（entry 缺失/非 git → null，body 拼接侧静默省略）
-  slots.settleStatLine = async (paneId) => {
-    const entry = subs.get(paneId);
-    return entry ? await worktreeStatLine(entry) : null;
-  };
+  port.current = boundPort;
+  ctx.effect(() => () => {
+    if (port.current === boundPort) port.current = null;
+  }, 'subagent-port');
   function rebuildSubs(eventCtx: unknown): void {
     try {
       const entries = (eventCtx as { sessionManager?: { getBranch?: () => readonly unknown[] } })
@@ -471,60 +474,49 @@ export default function subagentPlugin(ctx: Context): void {
         const entry = subs.get(paneId);
         if (!entry || entry.status === 'settled') return;
 
-        // D94：归还检测——若用户已接管且 idle 超 60s，自动归还控制权
         if (entry.userTakeover) {
           try {
             const agents = await client.listAgents();
             const agent = agents.find((a) => a.paneId === paneId);
-            if (agent) {
-              const currentStatus = agent.status;
-              const previousStatus = entry.lastAgentStatus;
-              
-              if (currentStatus === 'idle') {
-                // 状态刚变为 idle（从 working/blocked 转来）→ 记录 idle 起点
-                if (previousStatus !== 'idle') {
-                  entry.observationStartedAt = Date.now();
-                  entry.lastAgentStatus = 'idle';
-                  persistSubs();
-                } else if (entry.observationStartedAt) {
-                  // 持续 idle → 检查是否超过 60s
-                  if (Date.now() - entry.observationStartedAt > 60000) {
-                    // Idle 超 60s，归还控制权
-                    entry.userTakeover = false;
-                    entry.observationStartedAt = null;
-                    entry.lastAgentStatus = null;
-                    persistSubs();
-                    // 继续正常管理流程（下一轮会走正常 waitAgent 分支）
-                  }
-                }
-              } else {
-                // working/blocked → 重置 idle 计时（只记录状态，不记时间）
-                entry.lastAgentStatus = currentStatus;
-                entry.observationStartedAt = null; // 清除 idle 计时
-                persistSubs();
-              }
+            const tick = planTakeoverTick({
+              currentStatus: agent?.status ?? null,
+              previousStatus: entry.lastAgentStatus,
+              idleStartedAt: entry.observationStartedAt,
+              now: Date.now(),
+              idleMs: TAKEOVER_IDLE_MS,
+            });
+            if (tick.kind === 'start-idle') {
+              entry.observationStartedAt = Date.now();
+              entry.lastAgentStatus = 'idle';
+              persistSubs();
+            } else if (tick.kind === 'return-control') {
+              entry.userTakeover = false;
+              entry.observationStartedAt = null;
+              entry.lastAgentStatus = null;
+              persistSubs();
+            } else if (tick.kind === 'hold' && tick.clearIdleTimer) {
+              entry.lastAgentStatus = tick.lastAgentStatus;
+              entry.observationStartedAt = null;
+              persistSubs();
             }
           } catch {
             // listAgents 失败静默
           }
-          // 已接管，跳过正常管理逻辑，5s 后再检查
           if (entry.userTakeover) {
-            await new Promise((resolve) => setTimeout(resolve, 5000));
+            await new Promise((resolve) => setTimeout(resolve, TAKEOVER_RECHECK_MS));
             continue;
           }
         }
 
         let state: HerdrAgentState | null;
         try {
-          state = await client.waitAgent(paneId, ['idle', 'done', 'blocked'], 30000);
+          state = await client.waitAgent(paneId, ['idle', 'done', 'blocked'], runtimePolicy.pollIntervalMs);
         } catch {
           state = null;
         }
-        if (state === 'blocked') {
-          // E2（人类闸门）：blocked 时 master 对话流里也要知道（此前只有 herdr 系统
-          // 通知发给人类，master 毫不知情 → 可能自作主张揽活）。一次性 gate 通知注入；
-          // 解除（idle）后重置，二次 ask 新问题可再通知。
-          if (!blockedGateNotified.has(paneId)) {
+        const gate = planBlockedGate(state, blockedGateNotified.has(paneId));
+        if (gate.kind === 'stay-blocked') {
+          if (gate.notify) {
             blockedGateNotified.add(paneId);
             const question = await readAskFlag(paneId);
             try {
@@ -533,9 +525,9 @@ export default function subagentPlugin(ctx: Context): void {
               /* 注入失败静默（下次 turn 可 list_agents 自查） */
             }
           }
-          continue; // 人类闸门：保持 running
+          continue;
         }
-        if (state !== null) blockedGateNotified.delete(paneId); // 闸门解除（working/idle）
+        if (gate.kind === 'clear-gate') blockedGateNotified.delete(paneId);
         if (state === 'idle' || state === 'done') {
           const s = await subSessionState(paneId, cwd, injectTs);
           pollTrace?.(`state=${state} text=${s.text ? s.text.length : 'null'} pend=${s.pendingTool} act=${s.activity} obs=${String(entry.observationStartedAt ?? null)} takeover=${String(entry.userTakeover === true)}`);
@@ -543,56 +535,54 @@ export default function subagentPlugin(ctx: Context): void {
             // Settled
             const closing = s.text;
 
-            // D94：观察期逻辑——settled 后 30s 内检测用户介入
-            if (!entry.observationStartedAt) {
-              // 首次 settled → 启动 30s 观察期
+            const obs = planObservationTick({
+              observationStartedAt: entry.observationStartedAt,
+              now: Date.now(),
+              windowMs: OBSERVE_WINDOW_MS,
+              agentStatus: null,
+              machineInjectAgoMs: Date.now() - (lastMachineInjectAt.get(paneId) ?? 0),
+              machineInjectGraceMs: MACHINE_INJECT_GRACE_MS,
+            });
+            if (obs.kind === 'start-observation') {
               entry.observationStartedAt = Date.now();
               entry.lastAgentStatus = 'idle';
               persistSubs();
-              // 短暂等待后进入下一轮（观察期检测）
-              await new Promise((resolve) => setTimeout(resolve, 1000));
+              await new Promise((resolve) => setTimeout(resolve, OBSERVATION_TICK_MS));
               continue;
-            } else {
-              // 已在观察期
-              const elapsed = Date.now() - entry.observationStartedAt;
-
-              // 检测用户介入：查询当前状态是否变为 working。
-              // B4：观察窗内 working ≠ 必然用户接管——自己的 follow_up 注入也呈现
-              // working。距最近机器注入 < MACHINE_INJECT_GRACE_MS 的 working 视为
-              // 注入被处理（取消结算继续观察），否则才判接管（01a03c0d：契约消息
-              // 20min 后投递，恰好撞进观察窗）。
-              try {
-                const agents = await client.listAgents();
-                const agent = agents.find((a) => a.paneId === paneId);
-                if (agent && agent.status === 'working') {
-                  const injectedAgo = Date.now() - (lastMachineInjectAt.get(paneId) ?? 0);
-                  if (injectedAgo > MACHINE_INJECT_GRACE_MS) {
-                    // 用户介入！标记接管，取消结算
-                    entry.userTakeover = true;
-                    entry.observationStartedAt = Date.now();
-                    entry.lastAgentStatus = 'working';
-                    persistSubs();
-                    continue; // 跳过结算，进入用户接管模式
-                  }
-                  // 机器注入在处理中 → 归零观察窗，等这轮 run 收尾再判结算
-                  entry.observationStartedAt = Date.now();
-                  persistSubs();
-                  await new Promise((resolve) => setTimeout(resolve, 1000));
-                  continue;
-                }
-              } catch {
-                // listAgents 失败静默
-              }
-
-              if (elapsed < 30000) {
-                // 观察期未结束，继续等待
-                await new Promise((resolve) => setTimeout(resolve, 1000));
-                continue;
-              }
-
-              // 观察期结束（30s 无用户介入），正常结算
-              entry.observationStartedAt = null; // 清除观察期标记
             }
+            let agentStatus: string | null = null;
+            try {
+              const agents = await client.listAgents();
+              agentStatus = agents.find((a) => a.paneId === paneId)?.status ?? null;
+            } catch {
+              // listAgents 失败静默
+            }
+            const obs2 = planObservationTick({
+              observationStartedAt: entry.observationStartedAt,
+              now: Date.now(),
+              windowMs: OBSERVE_WINDOW_MS,
+              agentStatus,
+              machineInjectAgoMs: Date.now() - (lastMachineInjectAt.get(paneId) ?? 0),
+              machineInjectGraceMs: MACHINE_INJECT_GRACE_MS,
+            });
+            if (obs2.kind === 'user-takeover') {
+              entry.userTakeover = true;
+              entry.observationStartedAt = Date.now();
+              entry.lastAgentStatus = 'working';
+              persistSubs();
+              continue;
+            }
+            if (obs2.kind === 'machine-inject-reset') {
+              entry.observationStartedAt = Date.now();
+              persistSubs();
+              await new Promise((resolve) => setTimeout(resolve, OBSERVATION_TICK_MS));
+              continue;
+            }
+            if (obs2.kind === 'wait') {
+              await new Promise((resolve) => setTimeout(resolve, OBSERVATION_TICK_MS));
+              continue;
+            }
+            entry.observationStartedAt = null;
             // 正常结算逻辑
             // O6：reply 已写的 sessionFile 是权威；poll 只在缺失时用扫描补，绝不反向覆盖
             if (!entry.sessionFile) {
@@ -623,18 +613,23 @@ export default function subagentPlugin(ctx: Context): void {
           }
           // 挂起 toolCall（等人类输入）或还没开工 → 继续等
         }
-        // B1/O3：state=null（30s 切片超时）= working 中的心跳 → 续命无活动预算。
-        if (state === null) lastActivityAt = Date.now();
-        // 切片超时：检查 pane 存活与总预算
         let alive = false;
         try {
           alive = (await client.listAgents()).some((a) => a.paneId === paneId);
         } catch {
-          alive = true; // 查询失败不误判
+          alive = true;
         }
-        if (!alive) {
+        const vacuum = planVacuumTick({
+          waitState: state,
+          paneAlive: alive,
+          now: Date.now(),
+          lastActivityAt,
+          timeoutMs: SUBAGENT_TIMEOUT_MS,
+        });
+        if (vacuum.refreshActivity) lastActivityAt = Date.now();
+        if (vacuum.action === 'pane-closed') {
           entry.status = 'consumed';
-          entry.consumedAt = Date.now(); // O8：提前退出路径必须置消费时间，否则 tab TTL 被卡住
+          entry.consumedAt = Date.now();
           persistSubs();
           writeHistory(entry, { outcome: 'pane closed before settling' }, 'poll-pane-closed');
           const notes = d.reconcileOnSettlement(description, 'failed');
@@ -649,17 +644,12 @@ export default function subagentPlugin(ctx: Context): void {
           }
           return;
         }
-        // B1：无活动预算超时——working 心跳持续续命，此处只在「pane 活着但
-        // 既不 working、也无结算进展」真空期超预算时触发（旧总墙钟 10min 误杀
-        // 27min 健康长任务 ×2，01a03c0d 实证）。
-        if (Date.now() - lastActivityAt > SUBAGENT_TIMEOUT_MS) {
+        if (vacuum.action === 'timeout') {
           entry.status = 'consumed';
-          entry.consumedAt = Date.now(); // O8：observation timeout 同样置消费时间
+          entry.consumedAt = Date.now();
           persistSubs();
           writeHistory(entry, { outcome: 'observation timeout' }, 'poll-timeout');
           const notes = d.reconcileOnSettlement(description, 'failed');
-          // O2：给行动钩子——list_agents 看活态；真在跑就让它跑完（结算会自动通知），
-          // 别 sleep 盲等（01a03c0d 实证 master 收到旧文案后连 sleep 90/120/180）。
           const notice = d.withReconcileNotes(
             `Background subagent ${paneId} (${description}) has shown no progress for ${Math.round((Date.now() - lastActivityAt) / 1000)}s (observed since ${new Date(startedAt).toISOString()}). Run list_agents to check its live state; if it is working, let it run — its settlement notice will arrive automatically. Do not sleep-wait.`,
             notes,
@@ -765,32 +755,32 @@ export default function subagentPlugin(ctx: Context): void {
    */
   async function listWorktrees(cwd: string): Promise<string[]> {
     if (worktreesCache && Date.now() - worktreesCache.at < WORKTREES_CACHE_MS) return worktreesCache.list;
-    const list = await new Promise<string[]>((resolve) => {
-      execFile('git', ['-C', cwd, 'worktree', 'list', '--porcelain'], { timeout: 5000 }, (err, stdout) => {
-        if (err) return resolve([]);
-        const out: string[] = [];
-        for (const line of String(stdout).split('\n')) {
-          const m = /^worktree (.+)$/.exec(line.trim());
-          if (m) out.push(m[1]);
-        }
-        resolve(out);
-      });
-    });
+    let list: string[] = [];
+    try {
+      const { stdout } = await defaultGitAdapter.listWorktrees(cwd);
+      for (const line of String(stdout).split('\n')) {
+        const m = /^worktree (.+)$/.exec(line.trim());
+        if (m) list.push(m[1]);
+      }
+    } catch {
+      list = [];
+    }
     worktreesCache = { at: Date.now(), list };
     return list;
   }
 
   /**
-   * D98：git 执行助手（execFile 'git'，timeout 10s；出错/超时 → null，与
+   * D98：git 执行助手（git-adapter，timeout 由 runtimePolicy.gitTimeoutMs；出错/超时 → null，与
    * listWorktrees 同模式）。isolate 全部 git 操作的唯一出口——基础设施行为，
-   * 与 herdr 内部 execFile git 同构，不属模型面 bash 生态。
+   * 与 herdr 内部 git 调用同构，不属模型面 bash 生态。
    */
   async function runGit(cwd: string, args: string[]): Promise<string | null> {
-    return await new Promise<string | null>((resolve) => {
-      execFile('git', ['-C', cwd, ...args], { timeout: 10000 }, (err, stdout) => {
-        resolve(err || stdout == null ? null : String(stdout));
-      });
-    });
+    try {
+      const { stdout } = await defaultGitAdapter.run(cwd, args);
+      return stdout == null ? null : String(stdout);
+    } catch {
+      return null;
+    }
   }
 
   /** `git diff --stat` 末行（"N files changed, +A/-B"）；空输出 → null。 */
@@ -1201,38 +1191,12 @@ export default function subagentPlugin(ctx: Context): void {
     async execute(toolCallId, params, signal, onUpdate, toolCtx) {
       void toolCallId;
       void signal;
-      if (!client.available) {
-        return {
-          content: [{
-            type: 'text',
-            text: 'Error: subagent requires pi to run inside a herdr-managed pane (HERDR_ENV not set).',
-          }],
-          details: {},
-        };
+      const launch = planLaunchValidation(params, client.available);
+      if (launch.kind === 'error') {
+        return { content: [{ type: 'text', text: launch.text }], details: {} };
       }
-      const spec: SubagentSpec = {
-        description: String(params?.description ?? 'subagent'),
-        prompt: String(params?.prompt ?? ''),
-      };
-      if (!spec.prompt.trim()) {
-        return {
-          content: [{ type: 'text', text: 'Error: `prompt` must be a non-empty string' }],
-          details: {},
-        };
-      }
-      const background = params?.run_in_background === true;
-      const kind = normalizeEntryKind(typeof params?.role === 'string' ? params.role.trim() : undefined);
+      const { spec, background, isolate, cwdParam, roleKind: kind, suggested, manifestRole, tab } = launch;
       const masterCwd = (toolCtx as { cwd?: string }).cwd ?? process.cwd();
-      // D86 R5：cwd 参数 = 跨 worktree 委派的事实键（目录是事实，worktree 是分组推论）。
-      // 相对路径相对 master cwd 解析；不存在的目录拒绝（spawn 进无效目录只会白开 pane）。
-      const cwdParam = typeof params?.cwd === 'string' && params.cwd.trim() ? params.cwd.trim() : null;
-      const isolate = params?.isolate === true;
-      if (isolate && cwdParam) {
-        return {
-          content: [{ type: 'text', text: 'Error: `isolate` and `cwd` are mutually exclusive — isolate creates a new worktree, cwd delegates into an existing one' }],
-          details: {},
-        };
-      }
       // taskId 上移（原 spawn 段）：isolate 规划需要 taskHex；纯移动，无行为耦合。
       const taskId = randomUUID();
       // D98 2c：isolate 创建块——pier execFile git 创建托管 worktree（决策 1，非 herdr
@@ -1242,12 +1206,11 @@ export default function subagentPlugin(ctx: Context): void {
       let cwd = masterCwd;
       if (isolate) {
         const baseSha = await runGit(masterCwd, ['rev-parse', 'HEAD']);
-        if (!baseSha) {
-          return {
-            content: [{ type: 'text', text: 'Error: isolate requires a git repository with at least one commit' }],
-            details: {},
-          };
+        const isoGuard = planIsolateRepoGuard(baseSha);
+        if (isoGuard.kind === 'error') {
+          return { content: [{ type: 'text', text: isoGuard.text }], details: {} };
         }
+        const sha = isoGuard.sha.trim();
         const pierBranches = new Set(
           ((await runGit(masterCwd, ['for-each-ref', '--format=%(refname:short)', 'refs/heads/pier/'])) ?? '')
             .split('\n').filter(Boolean),
@@ -1259,14 +1222,14 @@ export default function subagentPlugin(ctx: Context): void {
           taskHex: taskId.slice(0, 6),
           existingPierBranches: pierBranches,
         });
-        const wtPath = join(homedir(), '.herdr', 'worktrees', repoName, plan.worktreeDirName);
+        const wtPath = join(platformPaths.worktreeBaseDir, repoName, plan.worktreeDirName);
         try {
-          mkdirSync(dirname(wtPath), { recursive: true }); // git worktree add 不建父目录（首跑 ~/.herdr/worktrees 不存在即失败）
+          mkdirSync(dirname(wtPath), { recursive: true }); // git worktree add 不建父目录（首跑 worktree 基目录不存在即失败）
         } catch { /* 目录已存在/无权限 → worktree add 的报错兜底 */ }
         // 竞态护栏：worktree add → subs.set 之间（就绪等待 2-3s）ticker 的孤儿扫描
         // 会把「=HEAD 祖先 + 干净」的新 wt 当孤儿回收——pending 集先行排除（活体实证）。
         pendingIsolateBranches.add(plan.branch);
-        const added = await runGit(masterCwd, ['worktree', 'add', '-b', plan.branch, wtPath, baseSha.trim()]);
+        const added = await runGit(masterCwd, ['worktree', 'add', '-b', plan.branch, wtPath, sha]);
         if (added === null) {
           pendingIsolateBranches.delete(plan.branch);
           return {
@@ -1276,8 +1239,8 @@ export default function subagentPlugin(ctx: Context): void {
         }
         worktreesCache = null; // 失效 5s 缓存，让下方 zone 分类立即看到新 wt
         cwd = wtPath;
-        isolateMeta = { worktreePath: wtPath, branch: plan.branch, baseSha: baseSha.trim(), releasedAt: null, retainNotified: false };
-        spec.prompt = `${buildIsolatePreamble({ worktreePath: wtPath, branch: plan.branch, baseShort: baseSha.trim().slice(0, 7) })}\n\n${spec.prompt}`;
+        isolateMeta = { worktreePath: wtPath, branch: plan.branch, baseSha: sha, releasedAt: null, retainNotified: false };
+        spec.prompt = `${buildIsolatePreamble({ worktreePath: wtPath, branch: plan.branch, baseShort: sha.slice(0, 7) })}\n\n${spec.prompt}`;
       } else if (cwdParam) {
         cwd = pathResolve(masterCwd, cwdParam);
         try {
@@ -1298,14 +1261,6 @@ export default function subagentPlugin(ctx: Context): void {
       });
       // D86 信任旗标：master 自己的检出/worktree 才 -a；外来目录留 Trust 对话框作闸门
       const approve = isPathUnder(cwd, masterCwd) || zone.zone === 'worktree';
-      // 档2（C7 v2）：role 命中档案 → 三态合成 manifest，env 下发 worker。
-      // roles-v1.0（V57/V58）：省略 role = worker-default manifest 生效
-      // （默认 executor：能写能执行、禁嵌套 spawn）——kind 历史分类不受影响。
-      const suggested = Array.isArray(params?.allowed_tools)
-        ? params.allowed_tools.filter((t): t is string => typeof t === 'string' && t.trim() !== '')
-        : [];
-      const manifestRole =
-        typeof params?.role === 'string' && params.role.trim() ? params.role.trim() : 'worker-default';
       let roleManifestEnv: Record<string, string> = {};
       let roleModel: string | null = null;
       try {
@@ -1334,7 +1289,7 @@ export default function subagentPlugin(ctx: Context): void {
       try {
         const spawnedAt = Date.now();
         const spawned = await spawnPaneInTaskTab(
-          { desiredTab: typeof params?.tab === 'string' ? params.tab : null, description: spec.description, zone },
+          { desiredTab: tab, description: spec.description, zone },
           cwd,
           { PI_HERDR_SUBAGENT: '1', ...roleManifestEnv },
           launchLine(null, roleModel, approve),
@@ -1388,8 +1343,11 @@ export default function subagentPlugin(ctx: Context): void {
         let settledKind: 'settled' | 'timeout' = 'timeout';
         while (Date.now() < Math.min(patienceDeadline, spawnedAt + SUBAGENT_TIMEOUT_MS)) {
           const state = await client.waitAgent(paneId, ['idle', 'done', 'blocked'], 30_000);
-          if (state === 'blocked') {
-            // 返回 gate 通知：不揽活、提醒用户去 pane 答题、授权例外经 send_message 转达。
+          const session = (state === 'idle' || state === 'done')
+            ? await subSessionState(paneId, cwd, injectTs)
+            : { text: null, pendingTool: false, activity: false };
+          const tick = planForegroundTick({ state, session });
+          if (tick.kind === 'blocked') {
             const question = await readAskFlag(paneId);
             entry.background = true;
             lastRequestIdByPane.set(paneId, `prompt-${taskId}`);
@@ -1401,27 +1359,25 @@ export default function subagentPlugin(ctx: Context): void {
               details: { paneId, taskId, background: true, blocked: true, role: kind },
             };
           }
-          if (state === 'idle' || state === 'done') {
-            // A1 内容闸：herdr idle 只是"可能是结算"——以会话内容定夺
-            const s = await subSessionState(paneId, cwd, injectTs);
-            if (s.text) { text = s.text; settledKind = 'settled'; break; }
-            if (s.pendingTool || (!s.text && !s.activity)) {
-              // 挂起 toolCall（等人类）或注入前瞬间的 idle → 不当结算，继续观察
-              await new Promise((r) => setTimeout(r, 2000));
-              continue;
-            }
-            // 有活动无文本（活动已停止）→ 再给 collectFinalText 的重试窗口
-            text = await collectFinalText(paneId, cwd, injectTs, 6);
-            if (text) { settledKind = 'settled'; break; }
-            await new Promise((r) => setTimeout(r, 2000));
+          if (tick.kind === 'settled') {
+            text = tick.text;
+            settledKind = 'settled';
+            break;
+          }
+          if (tick.kind === 'wait') {
+            await new Promise((r) => setTimeout(r, tick.delayMs));
             continue;
           }
-          // null = 30s 切片超时（working 中）→ 继续循环
+          if (tick.kind === 'collect-final') {
+            text = await collectFinalText(paneId, cwd, injectTs, 6);
+            if (text) { settledKind = 'settled'; break; }
+            await new Promise((r) => setTimeout(r, FOREGROUND_POLL_MS));
+            continue;
+          }
         }
-        // A2 耐心阈值到点仍在跑 → 探活；活着 → 转后台并返回统一存活通知
         if (!text && settledKind !== 'blocked') {
           const probe = await probeAlive(paneId, cwd);
-          if (isAlive(probe, Date.now())) {
+          if (planPatienceExpiry(isAlive(probe, Date.now())) === 'move-to-background') {
             entry.background = true;
             lastRequestIdByPane.set(paneId, `prompt-${taskId}`);
             startPoller(paneId, cwd, spawnedAt, injectTs, spec.description, `prompt-${taskId}`);
@@ -1435,7 +1391,6 @@ export default function subagentPlugin(ctx: Context): void {
               details: { paneId, taskId, background: true, movedToBackground: true, role: kind },
             };
           }
-          // 探活失败（pane 消失且会话沉寂）→ 保留原 timeout 语义
           settledKind = 'timeout';
         }
         const outcome =

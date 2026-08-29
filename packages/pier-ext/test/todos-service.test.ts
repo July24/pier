@@ -118,3 +118,40 @@ test('反冻结：lastWriteAt 三路径锚定（replace/applyEdits 写时钟，r
   ]);
   assert.equal(svc.lastWriteAt, 1234);
 });
+
+test('getSnapshot: defensive copy; mutating snapshot does not change service', () => {
+  const svc = new TodosService(TodosService.configFromRuntime(null, false));
+  svc.replace([{ content: 'A', status: 'pending' }]);
+  const snap = svc.getSnapshot();
+  snap[0].status = 'completed';
+  snap.push({ content: 'B', status: 'pending' });
+  assert.equal(svc.items.length, 1);
+  assert.equal(svc.items[0].status, 'pending');
+});
+
+test('replace/applyEdits: no-op skips clock and events', () => {
+  const svc = new TodosService(TodosService.configFromRuntime(null, false));
+  const updated: unknown[] = [];
+  const edited: unknown[] = [];
+  svc.on('todo.updated', (e) => updated.push(e));
+  svc.on('todo.edited', (e) => edited.push(e));
+  assert.deepEqual(svc.replace([{ content: 'A', status: 'pending' }]), { changed: true });
+  const t1 = svc.lastWriteAt as number;
+  assert.equal(updated.length, 1);
+  assert.deepEqual(svc.replace([{ content: 'A', status: 'pending' }]), { changed: false });
+  assert.equal(svc.lastWriteAt, t1);
+  assert.equal(updated.length, 1);
+  assert.deepEqual(svc.applyEdits([{ op: 'done', content: 'missing' }]), { changed: false });
+  assert.equal(edited.length, 0);
+  assert.equal(svc.lastWriteAt, t1);
+  assert.deepEqual(svc.applyEdits([{ op: 'done', content: 'A' }]), { changed: true });
+  assert.equal(edited.length, 1);
+  assert.ok((svc.lastWriteAt as number) >= t1);
+});
+
+test('items getter: same contents as snapshot; replace is the write path', () => {
+  const svc = new TodosService(TodosService.configFromRuntime(null, false));
+  svc.replace([{ content: 'A', status: 'pending' }]);
+  assert.equal(svc.items[0].content, 'A');
+  assert.deepEqual(svc.getSnapshot()[0], { content: 'A', status: 'pending' });
+});

@@ -73,6 +73,13 @@ export function detectHerdrEnv(env: NodeJS.ProcessEnv = process.env): HerdrEnv |
   };
 }
 
+/** Resolve herdr socket target (Windows named-pipe prefix vs Unix path). */
+export function herdrSocketTarget(socketPath: string, platform: NodeJS.Platform = process.platform): string {
+  if (platform !== 'win32') return socketPath;
+  return socketPath.startsWith('\\\\.\\pipe\\') ? socketPath : `\\\\.\\pipe\\${socketPath}`;
+}
+
+
 export interface HerdrClientLike {
   readonly available: boolean;
   reportAgent(state: PaneAgentState, message: string | null): Promise<void>;
@@ -203,13 +210,14 @@ export class NoopHerdrClient implements HerdrClientLike {
 export class HerdrClient implements HerdrClientLike {
   readonly available = true;
   private clearedStaleTokens = false;
+  private readonly env: HerdrEnv;
 
-  constructor(private readonly env: HerdrEnv) {}
+  constructor(env: HerdrEnv) {
+    this.env = env;
+  }
 
   private target(): string {
-    const p = this.env.socketPath;
-    if (process.platform !== 'win32') return p;
-    return p.startsWith('\\\\.\\pipe\\') ? p : `\\\\.\\pipe\\${p}`;
+    return herdrSocketTarget(this.env.socketPath);
   }
 
   /**

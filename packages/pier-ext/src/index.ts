@@ -18,20 +18,16 @@
  */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
-import {
-  formatSettlementNotice,
-} from './vocab.ts';
-import { collapseNotices } from './notice-buffer.ts';
+import { pipeNameFor, pipeRequest, startPipeServer } from './pipe-channel.ts';
 import {
   TODO_EDIT_CUSTOM_TYPE,
   currentActivity,
 } from './todo-core.ts';
-import { pipeNameFor, pipeRequest, startPipeServer } from './pipe-channel.ts';
 
 /** 档2：worker 会话内记录运行所依据的合成 manifest（D38 同构，分支可回放）。 */
 const ROLE_MANIFEST_CUSTOM_TYPE = 'pi-herdr.role-manifest';
 
-import { createHerdrClient, type HerdrClientLike, type HerdrAgentState } from './herdr-client.ts';
+import { createHerdrClient } from './herdr-client.ts';
 // subagent 族已迁 core/subagent.ts（loader entry，D78/D81）；subagent-core/history-store/
 // session-tail/gc-core 导入随迁（index 仅留 common 面用到的 lastAssistantText/readSessionFile）。
 import { lastAssistantText, readSessionFile } from './session-tail.ts';
@@ -44,21 +40,18 @@ import {
   planToolBadge,
   progressOf,
 } from './progress-core.ts';
-import {
-  WRITE_LOCK_ENV,
-  acquireTokensFor,
-  isLockTokenKey,
-  parseLockTokenValue,
-  planWriteGuard,
-  releaseTokensFor,
-  type LockAgentView,
-} from './lock-core.ts';
+import { WRITE_LOCK_ENV } from './lock-core.ts';
 import { ABORT_STOP_REASON, planSettleWake } from './settle-wake-core.ts';
 import { composeForRole } from './manifest-compose.ts';
 import { parseRuntimeManifest, planActiveTools, planToolGate, type RuntimeRoleManifest } from './tool-gate.ts';
-import { detectHerdrEnv } from './herdr-client.ts';
+
 import { formatPaneTitle } from './pane-title.ts';
 import { registerSlimFrame, updateSlimFrame } from './slim-frame.ts';
+import { planIndexMode } from './index-runtime.ts';
+import { emptySubagentPortBox } from './subagent-port.ts';
+import { createNoticeBuffer } from './index-notices.ts';
+import { handlePipeRequest } from './index-pipe.ts';
+import { installWriteLocks } from './index-locks.ts';
 
 /**
  * WS-D7：master pane 自应用 manifest——与 subagent 同一条强制链
@@ -89,12 +82,12 @@ function composeMasterRuntime(): RuntimeRoleManifest | null {
 // subagent 族常量/助手已随迁 core/subagent.ts。
 
 export default async function (pi: ExtensionAPI) {
-  // 档2（Week4-5）：worker 运行时 manifest（env 下发；显式 > master 自应用 > 无）
-  // WS-D7：herdr 内非 subagent pane = master → 自应用 master 档案（同一条强制链）
+  const mode = planIndexMode();
+  const isSubagent = mode.isSubagent;
   const runtimeManifest =
     parseRuntimeManifest(process.env.PI_HERDR_ROLE_MANIFEST) ??
-    (detectHerdrEnv() && process.env.PI_HERDR_SUBAGENT !== '1' ? composeMasterRuntime() : null);
-  const todos = new TodosService(TodosService.configFromRuntime(runtimeManifest, process.env.PI_HERDR_SUBAGENT === '1')); // D75 阶段 3
+    (mode.composeMaster ? composeMasterRuntime() : null);
+  const todos = new TodosService(TodosService.configFromRuntime(runtimeManifest, isSubagent));
   const { client, env } = createHerdrClient();
 
   let sessionId: string = process.env.PI_SESSION_FILE ?? process.env.PI_SESSION_ID ?? '';
@@ -232,94 +225,10 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  /* ── M18：文件级写锁（S2：默认软 veto；PI_HERDR_WRITE_LOCK=1 硬启） ──
-   * 登记 = report_metadata tokens（键 lock-<归一路径哈希>，值 paneId|path——schema 键模式
-   * ^[A-Za-z0-9_-]{1,32}$ 装不下路径）；检查 = agent.list 读全 pane tokens；
-   * 释放 = settled 置 null（pane 关闭 = agent 条目消失，锁自灭）。
-   * v1 范围：write/edit（bash 文件目标提取不可靠，声明为 seam）。 */
-
-  const writeLockHard = process.env[WRITE_LOCK_ENV] === '1';
-  /** 本 pane 当前持有的锁（归一路径；settled 时统一释放）。 */
-  const heldLocks = new Set<string>();
-  /** 软 veto 待附警告的 toolCall → 警告文本。 */
-  const lockWarnByToolCall = new Map<string, string>();
-
-  async function acquireLocks(paths: readonly string[]): Promise<void> {
-    for (const p of paths) heldLocks.add(p);
-    await client.reportLockTokens(acquireTokensFor(paths, env?.paneId ?? ''));
-  }
-
-  pi.on('tool_call', async (event: { toolName?: string; toolCallId?: string; input?: unknown }, ctx: { cwd?: string }) => {
-    if (!client.available || !env) return;
-    const cwd = (ctx as { cwd?: string }).cwd ?? process.cwd();
-    let agents: LockAgentView[];
-    try {
-      agents = (await client.listAgents()).map((a) => ({ paneId: a.paneId, tokens: a.tokens }));
-    } catch {
-      return; // 查询失败放行（fail-open：锁是协作性保护，不作单点故障）
-    }
-    const plan = planWriteGuard({
-      toolName: event.toolName ?? '',
-      input: event.input,
-      agents,
-      ownPaneId: env.paneId,
-      cwd,
-      hard: writeLockHard,
-    });
-    if (plan.kind === 'skip') return;
-    if (plan.kind === 'block') {
-      return { block: true, reason: plan.reason };
-    }
-    if (plan.kind === 'warn' && typeof event.toolCallId === 'string') {
-      lockWarnByToolCall.set(event.toolCallId, plan.warning);
-      // 软模式：写入照常进行，但本 pane 也成为编辑者 → 接管锁（对称可见）
-    }
-    await acquireLocks(plan.paths);
-  });
-
-  pi.on('tool_result', async (event: { toolCallId?: string; content?: Array<{ type: string; text: string }> }) => {
-    if (typeof event?.toolCallId !== 'string') return;
-    const warning = lockWarnByToolCall.get(event.toolCallId);
-    if (!warning) return;
-    lockWarnByToolCall.delete(event.toolCallId);
-    const content = Array.isArray(event.content) ? event.content : [];
-    return { content: [...content, { type: 'text', text: warning }] };
-  });
-
-  // 锁释放：settled（一轮结束）置 null；pane 关闭由 agent 条目消失兜底
-  pi.on('agent_settled', async () => {
-    if (heldLocks.size === 0) return;
-    const paths = [...heldLocks];
-    heldLocks.clear();
-    await client.reportLockTokens(releaseTokensFor(paths));
-  });
-
-  // 人类可读：/locks 查看本 pane 持有 + 全局锁视图
-  pi.registerCommand('locks', {
-    description: 'Show write locks held by this pane and all live panes (M18)',
-    handler: async (_args, ctx) => {
-      const ui = (ctx as { ui?: { notify?: (text: string, level?: string) => void } }).ui;
-      const mine = [...heldLocks];
-      const lines = [`held by this pane (${mine.length}):`];
-      lines.push(...(mine.length ? mine.map((p) => `  ${p}`) : ['  (none)']));
-      lines.push('all live locks:');
-      let any = false;
-      try {
-        for (const a of await client.listAgents()) {
-          for (const [k, v] of Object.entries(a.tokens)) {
-            if (!isLockTokenKey(k) || typeof v !== 'string' || !v) continue;
-            const parsed = parseLockTokenValue(v);
-            if (!parsed) continue;
-            any = true;
-            lines.push(`  ${parsed.path} → pane ${parsed.holderPaneId}`);
-          }
-        }
-      } catch {
-        lines.push('  (agent.list failed)');
-      }
-      if (!any && lines[lines.length - 1] !== '  (agent.list failed)') lines.push('  (none)');
-      ui?.notify?.(lines.join('\n'), 'info');
-    },
+  installWriteLocks(pi, {
+    client,
+    env,
+    hard: process.env[WRITE_LOCK_ENV] === '1',
   });
 
   /* ── todo 族槽（core/todo.ts 插件回填；widget 渲染已随族迁移） ── */
@@ -418,6 +327,7 @@ export default async function (pi: ExtensionAPI) {
   });
 
   let agentActive = false;
+  const subagentPort = emptySubagentPortBox();
   // D96 状态（settle-wake-core 去重/冷却的锚点）。
   let d96NoticeKey: string | null = null;
   let d96NoticeAt = 0;
@@ -443,7 +353,7 @@ export default async function (pi: ExtensionAPI) {
     reportAgent('idle', null);
     const plan = planSettleWake({
       lastStopReason,
-      running: subagentSlots.listRunningSubs?.() ?? [],
+      running: subagentPort.current?.listRunningSubs() ?? [],
       lastNoticeKey: d96NoticeKey,
       lastNoticeAt: d96NoticeAt,
       now: Date.now(),
@@ -455,10 +365,9 @@ export default async function (pi: ExtensionAPI) {
       // 待下次自然 run 的 turn_end steer / 自然 settled 再投。
       return;
     }
-    // D96：master settled（run 结束/想总结）时仍有后台 subagent running → 注入提醒。
-    // worker 侧 subagentSlots.listRunningSubs 为 null（不注入）。
+    // D96: master settled while background subagents still run → remind (worker port is unbound).
     if (plan.notice && !isSubagent) {
-      const running = subagentSlots.listRunningSubs?.() ?? [];
+      const running = subagentPort.current?.listRunningSubs() ?? [];
       const brief = running.map((s) => `${s.paneId} (${s.description})`).join('、');
       const notice = `注意：仍有 ${running.length} 个后台 subagent 在运行：${brief}。若你的任务依赖它们，请等待其结算（list_agents 查看状态）；若不等待，请说明放弃原因。`;
       void sendUserMessageIn(notice);
@@ -544,24 +453,11 @@ export default async function (pi: ExtensionAPI) {
     settleNoticeLatch.add(key);
     return true;
   }
-  /** O6：master 收到 worker reply 时回写 sessionFile（core/subagent 插件挂载时回填槽）。 */
-  const subagentSlots: {
-    applyReplySession: ((paneId: string, sessionFile: string | null) => void) | null;
-    reconcileOnReply: ((paneId: string) => string[]) | null;
-    /** D96：处于 running 状态的后台 subagent 描述列表（master settled 时检查用）。 */
-    listRunningSubs: (() => Array<{ paneId: string; description: string }>) | null;
-    /** D98：结算通知附 worktree/git stat 行（pipe 快路径用）。 */
-    settleStatLine: ((paneId: string) => Promise<string | null>) | null;
-  } = { applyReplySession: null, reconcileOnReply: null, listRunningSubs: null, settleStatLine: null };
-  /** pipe server 盒（common 持有创建/关闭；core/subagent 的 root effect 也经盒关）。 */
   const pipeServerBox: { current: ReturnType<typeof startPipeServer> | null } = { current: null };
-  /** 最近一次机器请求（结算时按它决定是否 push、push 给谁）。 */
   let pendingMachineRequest: { id: string; from: string | null; push: boolean; sinceTs: number } | null = null;
-  /** 缓存的扩展上下文（interrupt 用 ctx.abort()，D48）。 */
   let latestCtx: { abort?: () => void } | null = null;
 
-  // D96：triggerTurn:true——followUp 在 idle 时立即触发新 turn（否则通知只排队不唤醒，
-  // 用户实机：subagent 结算后 idle master 不醒来处理，任务丢失；extensions.md:1410）。
+  // triggerTurn:true — idle followUp must start a new turn or settlement is lost.
   const sendUserMessageIn = (content: string): Promise<void> =>
     (pi as { sendUserMessage?: (content: string, opts?: { deliverAs?: string; triggerTurn?: boolean }) => Promise<void> })
       .sendUserMessage?.(content, { deliverAs: 'followUp', triggerTurn: true }) ?? Promise.resolve();
@@ -569,43 +465,17 @@ export default async function (pi: ExtensionAPI) {
     (pi as { sendUserMessage?: (content: string, opts?: { deliverAs?: string; triggerTurn?: boolean }) => Promise<void> })
       .sendUserMessage?.(content, { deliverAs: mode, triggerTurn: true }) ?? Promise.resolve();
 
-  /* ── D92：结算通知缓冲（followup 堆积修复）─────────────────────────────
-   * 旧路径 pi.sendUserMessage(followUp) 的 pi 语义 =「agent 没有更多 tool call
-   * 时才投递」= 整个 run 结束才回填——master 长任务执行期 N 条结算全攒队列，
-   * 结束瞬间洪水灌入（用户实机红框实证）。
-   * 新路径：忙时（agentActive）入扩展缓冲；
-   *   - turn_end（LLM 迭代边界）折叠成一条以 steer 注入——pi 文档：steer =
-   *     「当前 assistant 的 tool call 执行完、下一次 LLM 调用前投递」，即 turn 间隙；
-   *   - agent_settled 兜底：run 真正结束后残余缓冲直投（触发新 run）。
-   * 折叠规则（notice-buffer.ts）：≤3 条原文逐条，>3 条前 3 + 尾行计数/全量指引。 */
-  const pendingSettleNotices: string[] = [];
-  /** B2：缓冲中尚未送达的结算通知所属 pane（GC 豁免判据——01a03c0d 实证：
-   * pD 结算 3s 后 pane 被 GC 关掉，通知 100s 后才经 turn 间隙送达，master 只好 revive）。 */
-  const pendingNoticePaneIds = new Set<string>();
-  const deliverNotice = async (content: string, paneId?: string): Promise<void> => {
-    // 反唤醒风暴：abort 后不直投（会触发新 run）——入缓冲，待下次自然 turn 投递。
-    // 结算内容本身持久在台账（list_agents / resume_subagent 可查），推送让位于用户意图。
-    if (content !== '' && paneId !== undefined) pendingNoticePaneIds.add(paneId);
-    if (agentActive || lastStopReason === ABORT_STOP_REASON) {
-      pendingSettleNotices.push(content);
-      return;
-    }
-    await sendUserMessageIn(content);
-    if (content !== '' && paneId !== undefined) pendingNoticePaneIds.delete(paneId);
-  };
-  const flushSettleNotices = async (mode: 'steer' | 'followUp'): Promise<void> => {
-    if (pendingSettleNotices.length === 0) return;
-    const collapsed = collapseNotices(pendingSettleNotices.splice(0));
-    pendingNoticePaneIds.clear(); // B2：折叠批次视为已送达（GC 恢复正常回收）
-    if (collapsed) await sendUserMessageAs(collapsed, mode);
-  };
+  const notices = createNoticeBuffer({
+    isBusy: () => agentActive || lastStopReason === ABORT_STOP_REASON,
+    send: sendUserMessageAs,
+  });
+  const deliverNotice = notices.deliverNotice;
   pi.on('turn_end', () => {
-    void flushSettleNotices('steer');
+    void notices.flush('steer');
   });
   pi.on('agent_settled', () => {
-    // abort 后不投缓冲（会触发新 run；缓冲保留待下次自然 turn）——见 settle-wake-core。
     if (lastStopReason === ABORT_STOP_REASON) return;
-    void flushSettleNotices('followUp');
+    void notices.flush('followUp');
   });
 
   pi.on('session_start', async (_event, ctx) => {
@@ -619,48 +489,16 @@ export default async function (pi: ExtensionAPI) {
       pipeServerBox.current = null;
     }
     try {
-      pipeServerBox.current = startPipeServer(name, async (req) => {
-        if (req.type === 'ping') return { type: 'ok', id: req.id, detail: paneId };
-        if (req.type === 'prompt' || req.type === 'follow_up') {
-          pendingMachineRequest = {
-            id: req.id,
-            from: req.from ?? null,
-            push: req.push === true,
-            sinceTs: Date.now(),
-          };
-          // B3：follow_up 带 steer → 以 steer 投递（pi 语义：当前 tool call 执行完、
-          // 下次 LLM 调用前到达）——长 run 中途的补充契约秒级生效，不再排队整个 run
-          // （01a03c0d：契约 20min 后才到，worker 按旧契约实现被迫返工）。
-          // 初始 prompt 不 steer：空闲 worker 上的 followUp 才触发新 run（D96 语义）。
-          if (req.steer === true) await sendUserMessageAs(req.text, 'steer');
-          else await sendUserMessageIn(req.text);
-          return { type: 'ok', id: req.id };
-        }
-        if (req.type === 'interrupt') {
-          // D48：进程内中止（ctx.abort()，pi 0.84.2 实测存在）；排队机器消息保持排队
-          latestCtx?.abort?.();
-          pendingMachineRequest = null; // 被中断的轮次不 push（请求方已知情）
-          return { type: 'ok', id: req.id };
-        }
-        if (req.type === 'reply') {
-          // D50 / O6：回写 sessionFile 与通知去重解耦——账本必须先纠正
-          subagentSlots.applyReplySession?.(req.paneId, req.sessionFile);
-          if (claimSettleNotice(`${req.paneId}:${req.id}`)) {
-            // M17：快路径结算 → 自动对账（幂等；与 pollLoop 兜底双跑无害）
-            const notes = subagentSlots.reconcileOnReply?.(req.paneId) ?? [];
-            // D98：结算附 worktree/git stat 行（isolate 带基线 diff；非 isolate 小件轻量行）
-            const statLine = await subagentSlots.settleStatLine?.(req.paneId) ?? null;
-            const head = formatSettlementNotice(`${req.paneId}`, req.text);
-            const body = (req.sessionFile ? `${head}\nSession: ${req.sessionFile}` : head)
-              + (statLine ? `\n${statLine}` : '')
-              + (notes.length ? `\n${notes.join('\n')}` : '');
-            // D92：经缓冲注入（忙时 turn_end 折叠 steer，闲时直投）
-            await deliverNotice(body, req.paneId);
-          }
-          return { type: 'ok', id: req.id };
-        }
-        return { type: 'error', id: req.id, message: `unknown type ${req.type}` };
-      });
+      pipeServerBox.current = startPipeServer(name, async (req) => handlePipeRequest(req, {
+        paneId,
+        port: subagentPort,
+        claimSettleNotice,
+        deliverNotice,
+        sendUserMessageIn,
+        sendUserMessageAs,
+        abort: () => { latestCtx?.abort?.(); },
+        setPendingMachineRequest: (next) => { pendingMachineRequest = next; },
+      }));
     } catch {
       /* 管道名占用（罕见）：本次会话不提供通道，调用方 ping 超时后报错 */
     }
@@ -695,124 +533,29 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  /* ── 工具：subagent / list_agents / send_message / interrupt_agent（v1.1 交互式子 pane；子代理侧不注册，深度限 1） ── */
-
-  const isSubagent = process.env.PI_HERDR_SUBAGENT === '1';
+  /* subagent tools are master-only (depth 1). C3: worker never loads bootstrap. */
   if (!isSubagent) {
-    // 档1：cordis 树根升级为 bootstrap（Loader + group builtin + 条件 hmr，D78/D80/D81）；
-    // subagent scope 挂载/拆除仍走 subagent-scope（worker 进程两模块都不加载，C3）。
-    const { disposeSessionRoot } = await import('./subagent-scope.ts');
-    const { createCordisApp } = await import('./bootstrap.ts');
-    const { PiSurface } = await import('./pi-surface.ts');
-    const cordisApp = await createCordisApp();
-    const sessionRoot = cordisApp.root;
-
-    // pipe server 关闭挂在树根（common 段创建、树根 LIFO 拆除）——不进任何 core
-    // 插件：hmr 重载插件不能误杀 index 拥有的跨属资源（d87 修）。
-    sessionRoot.effect(() => () => {
-      if (pipeServerBox.current) {
-        try { pipeServerBox.current.close(); } catch { /* 已关 */ }
-        pipeServerBox.current = null;
-      }
-    }, 'pipe-server');
-
-    // D79 pi 注册面：core 模块经 surface 注册（tombstone + ledger 咬合）；
-    // index 自身的注册仍走 pi 原面（逐模块迁移，本批 = terminal 族）。
-    const surface = new PiSurface(pi as unknown as object, cordisApp.ledger);
-    sessionRoot.provide('pi-herdr.surface', surface);
-    // terminal 依赖槽：client/env 直传 + state 槽回填（GC 豁免查询）
-    const terminalDeps = {
+    const { mountMasterPlugins } = await import('./index-master.ts');
+    await mountMasterPlugins({
+      pi,
       client,
       env,
-      state: { activePaneIds: (): Set<string> => new Set() },
-    };
-    sessionRoot.provide('pi-herdr.terminal-deps', terminalDeps);
-
-    // M14 terminal 族迁 loader entry（热换面 = core/terminal.ts；loader 降级 → 直接 root.plugin）
-    const terminalMod = await import('./core/terminal.ts');
-    if (cordisApp.loaderReady) {
-      const withLoader = sessionRoot as typeof sessionRoot & {
-        loader?: { create: (o: { name: string }) => Promise<unknown> };
-      };
-      await withLoader.loader?.create({ name: './core/terminal.ts' });
-    } else {
-      await sessionRoot.plugin(terminalMod.default);
-    }
-
-    // todo 族迁 loader entry（协调工具：master/worker 都挂；本分支 = master 走 loader）
-    sessionRoot.provide('pi-herdr.todo-deps', {
       todos,
-      allowParallelInProgress: todos.config.allowParallelInProgress,
-      maxItems: 15,
+      todoUi,
       mirrorTodos,
-      appendEntry: (customType: string, data: unknown) => {
-        (pi as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.(customType, data);
-      },
-      state: todoUi,
-    });
-    const todoMod = await import('./core/todo.ts');
-    if (cordisApp.loaderReady) {
-      const withLoader = sessionRoot as typeof sessionRoot & {
-        loader?: { create: (o: { name: string }) => Promise<unknown> };
-      };
-      await withLoader.loader?.create({ name: './core/todo.ts' });
-    } else {
-      await sessionRoot.plugin(todoMod.default);
-    }
-
-    // subagent 族迁 loader entry（master-only：五工具 + 注册表 + poller + 历史 + GC）
-    sessionRoot.provide('pi-herdr.subagent-deps', {
-      client,
-      env,
       extPath: fileURLToPath(import.meta.url),
-      sessionRoot,
-      slots: subagentSlots,
+      port: subagentPort,
+      pipeServerBox,
       deliverNotice,
-      noticePending: () => pendingNoticePaneIds,
+      noticePending: notices.noticePending,
       getSessionId: () => sessionId,
       getBlockedDepth: () => blockedDepth,
       reconcileOnSettlement,
       withReconcileNotes,
       claimSettleNotice,
-      terminalState: terminalDeps.state,
-      todos,
-    });
-    const subagentMod = await import('./core/subagent.ts');
-    if (cordisApp.loaderReady) {
-      const withLoader = sessionRoot as typeof sessionRoot & {
-        loader?: { create: (o: { name: string }) => Promise<unknown> };
-      };
-      await withLoader.loader?.create({ name: './core/subagent.ts' });
-    } else {
-      await sessionRoot.plugin(subagentMod.default);
-    }
-
-    // 档0 起的拆除链：session_shutdown → dispose 整树（scope/effect LIFO）
-    pi.on('session_shutdown', () => {
-      void disposeSessionRoot(sessionRoot);
     });
   } else {
-    // C3/D81：worker = 裸根 + 手动 mount（短命进程，无 loader/hmr/timer）。
-    // todo 族是协调工具（任何角色档案必有）→ worker 也挂同一 core/todo.ts 插件。
-    const { Context } = await import('@deepseek-ai/cordis');
-    const { PiSurface } = await import('./pi-surface.ts');
-    const workerRoot = new Context();
-    const workerSurface = new PiSurface(pi as unknown as object);
-    workerRoot.provide('pi-herdr.surface', workerSurface);
-    workerRoot.provide('pi-herdr.todo-deps', {
-      todos,
-      allowParallelInProgress: todos.config.allowParallelInProgress,
-      maxItems: 15,
-      mirrorTodos,
-      appendEntry: (customType: string, data: unknown) => {
-        (pi as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.(customType, data);
-      },
-      state: todoUi,
-    });
-    const todoMod = await import('./core/todo.ts');
-    await workerRoot.plugin(todoMod.default);
-    pi.on('session_shutdown', () => {
-      void workerRoot.fiber.dispose();
-    });
+    const { mountWorkerTodo } = await import('./index-worker.ts');
+    await mountWorkerTodo({ pi, todos, todoUi, mirrorTodos });
   }
 }
