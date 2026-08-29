@@ -10,8 +10,30 @@ export const READ_MAX_CHARS = 8000;
 export const READ_HARD_CAP_CHARS = 200;
 export const READINESS_TIMEOUT_MS = 30_000;
 export const SILENCE_IDLE_MS = 2000;
-/** Why: Preserve the established compatibility and safety behavior (T3). */
+/** POSIX / PowerShell / Nushell prompt tail. Why: herdr waitForOutput and local classify must share one pattern. */
 export const PROMPT_TAIL_RE = /[$>#❯]\s*$/;
+
+export interface PromptStrategy {
+  /** herdr waitForOutput regex source. */
+  readonly waitPattern: string;
+  readonly tailRe: RegExp;
+}
+
+export const POSIX_PROMPT: PromptStrategy = {
+  waitPattern: '[$>#❯]\\s*$',
+  tailRe: PROMPT_TAIL_RE,
+};
+
+/** cmd.exe / PowerShell: `>` still matches POSIX; this also accepts `PS C:\\>` without a trailing `$`. */
+export const POWERSHELL_PROMPT: PromptStrategy = {
+  waitPattern: '(PS [^\\n>]+|>)\\s*$',
+  tailRe: /(PS [^\n>]+|>)\s*$/,
+};
+
+/** `PIER_TERMINAL_PROMPT=powershell` selects the Windows strategy; default stays POSIX so existing panes do not flip. */
+export function promptStrategyFor(env: NodeJS.ProcessEnv = process.env): PromptStrategy {
+  return env.PIER_TERMINAL_PROMPT === 'powershell' ? POWERSHELL_PROMPT : POSIX_PROMPT;
+}
 /** Why: Preserve the established compatibility and safety behavior (T6). */
 export const SIGNAL_KEYS = ['ctrl+c', 'ctrl+d', 'ctrl+z', 'esc', 'enter'] as const;
 export type SignalKey = (typeof SIGNAL_KEYS)[number];
@@ -229,10 +251,11 @@ export type ReadinessTier = 'prompt' | 'silent' | 'busy';
 
 export function classifyReadiness(
   rawOrStripped: string,
-  opts: { silentMs: number; silenceThresholdMs?: number },
+  opts: { silentMs: number; silenceThresholdMs?: number; prompt?: PromptStrategy },
 ): ReadinessTier {
   const tail = rawOrStripped.trimEnd();
-  if (tail.length > 0 && PROMPT_TAIL_RE.test(tail)) return 'prompt';
+  const re = opts.prompt?.tailRe ?? PROMPT_TAIL_RE;
+  if (tail.length > 0 && re.test(tail)) return 'prompt';
   if (opts.silentMs >= (opts.silenceThresholdMs ?? SILENCE_IDLE_MS)) return 'silent';
   return 'busy';
 }

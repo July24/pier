@@ -47,13 +47,13 @@ import { formatSettlementNotice } from '../vocab.ts';
 import { TODO_REMINDER_CUSTOM_TYPE, planStopTodoReminder, todoReminderGraceMs } from '../todo-reminder-core.ts';
 import type { TerminalStateSlot } from './terminal.ts';
 
-export interface SubagentEnv {
+interface SubagentEnv {
   paneId: string;
   tabId: string;
   workspaceId: string;
 }
 
-export interface SubagentDeps {
+interface SubagentDeps {
   client: HerdrClientLike;
   env: SubagentEnv | null;
   /** Extension entry (index.ts) path — launchLine `-e`. */

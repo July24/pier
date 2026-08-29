@@ -4,3 +4,4 @@ packages/pier-workbench/scripts/boot-config.json
 !.github/
 !.github/**
 docs/research/
+reports/

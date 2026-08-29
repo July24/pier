@@ -21,6 +21,7 @@ import {
   detectFullscreenTUI,
   foldTerminalsRegistry,
   makeTerminalsRegistry,
+  promptStrategyFor,
   registerTerminal,
   stripAnsi,
   summarizeSessions,
@@ -35,7 +36,7 @@ export interface TerminalStateSlot {
   activePaneIds: () => Set<string>;
 }
 
-export interface TerminalDeps {
+interface TerminalDeps {
   client: HerdrClientLike;
   env: { paneId: string; tabId: string } | null;
   state: TerminalStateSlot;
@@ -130,14 +131,14 @@ export default function terminalPlugin(ctx: Context): void {
       r.entry.paneId = paneId;
       terminals = r.entries;
       persistTerminals();
-      // T3 rechecks locally after server-side PS1 matching times out to avoid false unreadiness.
+      const prompt = promptStrategyFor();
       let readiness: 'prompt' | 'silent' | 'busy' = 'busy';
       try {
-        const matched = await client.waitForOutput(paneId, { type: 'regex', value: '[$>#❯]\\s*$' }, READINESS_TIMEOUT_MS);
+        const matched = await client.waitForOutput(paneId, { type: 'regex', value: prompt.waitPattern }, READINESS_TIMEOUT_MS);
         if (matched) readiness = 'prompt';
         else {
           const read = await client.readPane(paneId, { stripAnsi: false });
-          readiness = classifyReadiness(stripAnsi(read.text), { silentMs: 0 });
+          readiness = classifyReadiness(stripAnsi(read.text), { silentMs: 0, prompt });
         }
       } catch {
         /* Readiness is advisory, so probe failures still leave a usable terminal. */

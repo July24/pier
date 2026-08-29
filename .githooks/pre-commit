@@ -1,0 +1,4 @@
+#!/bin/sh
+# Reject CJK in comments of staged pier-ext src files (English WHY only).
+root="$(git rev-parse --show-toplevel)"
+exec node "$root/.githooks/check-comment-lang.mjs"

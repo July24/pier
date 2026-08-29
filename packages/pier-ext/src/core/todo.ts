@@ -32,7 +32,7 @@ export interface TodoUiSlot {
   renderWidget: (ctx: unknown) => void;
 }
 
-export interface TodoDeps {
+interface TodoDeps {
   todos: TodosService;
   allowParallelInProgress: boolean;
   /** Warn above this size without rejecting otherwise valid plans. */

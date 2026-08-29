@@ -6,6 +6,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   MAX_TERMINALS,
+  POSIX_PROMPT,
+  POWERSHELL_PROMPT,
   PROMPT_TAIL_RE,
   SIGNAL_KEYS,
   TERMINALS_CUSTOM_TYPE,
@@ -16,6 +18,7 @@ import {
   foldTerminalsRegistry,
   makeTerminalsRegistry,
   nextTerminalId,
+  promptStrategyFor,
   registerTerminal,
   stripAnsi,
   summarizeSessions,
@@ -169,6 +172,12 @@ test('classifyReadiness：PS1 尾匹配 → prompt；静默期 → silent；否�
   assert.equal(classifyReadiness('compiling...', { silentMs: 3000 }), 'silent');
   assert.equal(classifyReadiness('compiling...', { silentMs: 100 }), 'busy');
   assert.equal(PROMPT_TAIL_RE.test('PS F:\\work> '), true);
+});
+
+test('promptStrategyFor: default posix; env selects powershell', () => {
+  assert.equal(promptStrategyFor({}).waitPattern, POSIX_PROMPT.waitPattern);
+  assert.equal(promptStrategyFor({ PIER_TERMINAL_PROMPT: 'powershell' }), POWERSHELL_PROMPT);
+  assert.equal(classifyReadiness('PS F:\\work> ', { silentMs: 100, prompt: POWERSHELL_PROMPT }), 'prompt');
 });
 
 /* ── 会话汇总（T6 跨重启边界） ─────────────────────────────────── */

@@ -8,6 +8,7 @@ import {
   applyReportedSessionFile,
   generationsByTask,
   historyFilePath,
+  inspectHistory,
   latestGeneration,
   normalizeEntryKind,
   parseHistoryEntries,
@@ -53,6 +54,35 @@ test('parseHistoryEntries: object without taskId is skipped', () => {
 
 test('readHistory: missing file returns []', () => {
   assert.deepEqual(readHistory(path.join(os.tmpdir(), 'pier-no-such-history.jsonl')), []);
+});
+
+test('parseHistoryEntries: invalid status is skipped', () => {
+  const entries = parseHistoryEntries(JSON.stringify({ taskId: 't1', status: 'nope' }));
+  assert.equal(entries.length, 0);
+});
+
+test('inspectHistory: missing vs unreadable (directory)', () => {
+  const missing = inspectHistory(path.join(os.tmpdir(), 'pier-no-such-history.jsonl'));
+  assert.equal(missing.status, 'missing');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-dir-'));
+  try {
+    const bad = inspectHistory(dir);
+    assert.equal(bad.status, 'unreadable');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('appendHistory: parent-is-file returns ok:false', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-block-'));
+  const blocker = path.join(tmp, 'notdir');
+  fs.writeFileSync(blocker, 'x');
+  try {
+    const r = appendHistory(path.join(blocker, 'history.jsonl'), mk({}));
+    assert.equal(r.ok, false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 test('append/read 往返 + 目录自动创建', () => {

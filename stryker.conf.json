@@ -16,14 +16,18 @@
   "thresholds": {
     "high": 80,
     "low": 60,
-    "break": null
+    "break": 50
   },
   "timeoutMS": 60000,
+  "concurrency": 4,
   "incremental": true,
   "incrementalFile": "reports/stryker-incremental.json",
-  "coverageAnalysis": "perTest",
-  "reporters": ["html", "clear-text", "progress"],
+  "coverageAnalysis": "off",
+  "reporters": ["html", "clear-text", "progress", "json"],
   "htmlReporter": {
-    "baseDir": "reports/mutation/html"
+    "fileName": "reports/mutation/html/index.html"
+  },
+  "jsonReporter": {
+    "fileName": "reports/mutation/mutation.json"
   }
 }

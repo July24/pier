@@ -65,18 +65,32 @@ export function inheritOutcome(lastOutcome: string | null | undefined, patchOutc
 
 
 
-/** Parse line by line tolerantly, skipping malformed records. */
+const HISTORY_STATUSES: Record<string, true> = {
+  running: true,
+  settled: true,
+  consumed: true,
+  closed: true,
+};
+
+function coerceHistoryEntry(obj: unknown): HistoryEntry | null {
+  if (obj === null || typeof obj !== 'object') return null;
+  const rec = obj as Record<string, unknown>;
+  if (typeof rec.taskId !== 'string' || rec.taskId.trim() === '') return null;
+  if (typeof rec.status !== 'string' || HISTORY_STATUSES[rec.status] !== true) return null;
+  if (rec.createdAt !== undefined && !Number.isFinite(rec.createdAt)) return null;
+  const raw = rec as unknown as HistoryEntry;
+  return { ...raw, kind: normalizeEntryKind(raw.kind) };
+}
+
+/** Parse line by line; skip junk JSON and records missing taskId/status. */
 export function parseHistoryEntries(text: string): HistoryEntry[] {
   const entries: HistoryEntry[] = [];
   for (const line of (text ?? '').split(/\r?\n/)) {
     const t = line.trim();
     if (!t) continue;
     try {
-      const obj = JSON.parse(t);
-      if (obj && typeof obj === 'object' && typeof obj.taskId === 'string') {
-        const raw = obj as HistoryEntry;
-        entries.push({ ...raw, kind: normalizeEntryKind(raw.kind) });
-      }
+      const next = coerceHistoryEntry(JSON.parse(t));
+      if (next) entries.push(next);
     } catch {
       /* Skip malformed records. */
     }
@@ -88,22 +102,40 @@ function serializeEntry(entry: HistoryEntry): string {
   return JSON.stringify(entry);
 }
 
-/** Read a history file; a missing or unreadable file yields []. */
-export function readHistory(file: string): HistoryEntry[] {
+export type HistoryReadResult =
+  | { status: 'ok'; entries: HistoryEntry[] }
+  | { status: 'missing' }
+  | { status: 'unreadable'; error: Error };
+
+/** Distinguish missing vs permission/IO failure. readHistory still returns [] for both. */
+export function inspectHistory(file: string): HistoryReadResult {
   try {
-    return parseHistoryEntries(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return [];
+    if (!fs.existsSync(file)) return { status: 'missing' };
+    return { status: 'ok', entries: parseHistoryEntries(fs.readFileSync(file, 'utf8')) };
+  } catch (error) {
+    const err = error instanceof Error ? error : new Error(String(error));
+    return { status: 'unreadable', error: err };
   }
 }
 
-/** Append one entry, creating its parent directory first. */
-export function appendHistory(file: string, entry: HistoryEntry): void {
+/** Read a history file; missing or unreadable yields []. */
+export function readHistory(file: string): HistoryEntry[] {
+  const r = inspectHistory(file);
+  return r.status === 'ok' ? r.entries : [];
+}
+
+export type HistoryWriteResult = { ok: true } | { ok: false; error: Error };
+
+/** Append one entry. Failures are logged and returned so the ledger is not silently lost. */
+export function appendHistory(file: string, entry: HistoryEntry): HistoryWriteResult {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.appendFileSync(file, serializeEntry(entry) + '\n');
-  } catch {
-    /* Best effort: history-write failures must not disrupt the main flow. */
+    return { ok: true };
+  } catch (error) {
+    const err = error instanceof Error ? error : new Error(String(error));
+    console.error(`[pi-herdr] history append failed: ${file}: ${err.message}`);
+    return { ok: false, error: err };
   }
 }
 
