@@ -29,7 +29,7 @@ import { appendFileSync, existsSync, mkdirSync, rmSync, stat as statCb } from 'n
 import { resolve as pathResolve } from 'node:path';
 import { promisify } from 'node:util';
 const statAsync = promisify(statCb);
-import { runtimePolicy } from '../runtime-policy.ts';
+import { platformPaths } from '../platform-paths.ts';
 import { pingUntilReady, pipeNameFor, pipeRequest } from '../pipe-channel.ts';
 import { shouldClosePane, shouldCloseTaskTab } from '../gc-core.ts';
 import { composeForRole } from '../manifest-compose.ts';
