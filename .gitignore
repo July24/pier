@@ -5,3 +5,4 @@ packages/pier-workbench/scripts/boot-config.json
 !.github/**
 docs/research/
 reports/
+.stryker-tmp/
