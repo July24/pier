@@ -8,10 +8,12 @@ import {
   pingUntilReady,
   pipeNameCandidates,
   pipeNameFor,
+  pipePathFor,
   pipeRequest,
   pipeRequestTo,
   startPipeServer,
 } from '../src/pipe-channel.ts';
+import * as net from 'node:net';
 
 test('pipeNameFor: collision-resistant workspace encoding + paneId', () => {
   assert.equal(
@@ -33,9 +35,14 @@ test('pipeNameCandidates: new encoding first, then legacy', () => {
 
 test('parsePipeLine: JSON 行解析与坏行容错', () => {
   assert.deepEqual(parsePipeLine('{"type":"ping","id":"1"}'), { type: 'ping', id: '1' });
+  assert.deepEqual(parsePipeLine('  {"type":"ok","id":"1"}  '), { type: 'ok', id: '1' });
   assert.equal(parsePipeLine('not json'), null);
   assert.equal(parsePipeLine(''), null);
+  assert.equal(parsePipeLine('   '), null);
   assert.equal(parsePipeLine('{"type":123}'), null);
+  assert.equal(parsePipeLine('[]'), null);
+  assert.equal(parsePipeLine('null'), null);
+  assert.equal(parsePipeLine('{"id":"1"}'), null);
 });
 
 test('pipeRequest/startPipeServer: 往返 + ping + 错误帧', async () => {
@@ -90,3 +97,78 @@ test('pipeRequestTo: reaches a server listening on the legacy name', async () =>
     server.close();
   }
 });
+
+async function waitListening(server: net.Server): Promise<void> {
+  if (server.listening) return;
+  const wait = Promise.withResolvers<void>();
+  server.once('listening', wait.resolve);
+  server.once('error', wait.reject);
+  await wait.promise;
+}
+
+test('startPipeServer: bad frame replies type=error message=bad frame', async () => {
+  const name = `pi-herdr-badframe-${process.pid}-${Date.now()}`;
+  const server = startPipeServer(name, async (req) => ({ type: 'ok', id: req.id }));
+  try {
+    await waitListening(server);
+    const sock = net.createConnection(pipePathFor(name));
+    sock.setEncoding('utf8');
+    const wait = Promise.withResolvers<string>();
+    let buf = '';
+    sock.on('data', (chunk) => { buf += chunk; });
+    sock.on('end', () => wait.resolve(buf));
+    sock.on('error', wait.reject);
+    sock.on('connect', () => sock.write('not-json\n'));
+    const parsed = parsePipeLine((await wait.promise).split('\n')[0] ?? '');
+    assert.equal(parsed?.type, 'error');
+    if (parsed?.type === 'error') assert.equal(parsed.message, 'bad frame');
+  } finally {
+    server.close();
+  }
+});
+
+test('startPipeServer: handler throw becomes error response with the message', async () => {
+  const name = `pi-herdr-throw-${process.pid}-${Date.now()}`;
+  const server = startPipeServer(name, async () => {
+    throw new Error('handler exploded');
+  });
+  try {
+    await waitListening(server);
+    const res = await pipeRequest(name, { type: 'ping', id: 't1' }, 2000);
+    assert.equal(res.type, 'error');
+    if (res.type === 'error') assert.match(res.message, /handler exploded/);
+  } finally {
+    server.close();
+  }
+});
+
+test('pingUntilReady: error ping is not ready', async () => {
+  const name = `pi-herdr-errping-${process.pid}-${Date.now()}`;
+  const server = startPipeServer(name, async (req) => ({ type: 'error', id: req.id, message: 'no' }));
+  try {
+    await waitListening(server);
+    // Deadline is wall-clock; one error ping then a short interval is enough.
+    const ok = await pingUntilReady(name, 50, 10);
+    assert.equal(ok, false);
+  } finally {
+    server.close();
+  }
+});
+
+test('pipeRequestTo: both names missing throws the last connection error', async () => {
+  await assert.rejects(
+    () => pipeRequestTo(`/no-such-${process.pid}`, 'w0:p0', { type: 'ping', id: 'x' }, 400),
+  );
+});
+
+test('pipePathFor: win32 does not double-prefix an already-namespaced pipe', () => {
+  const original = process.platform;
+  Object.defineProperty(process, 'platform', { value: 'win32', writable: true });
+  try {
+    assert.equal(pipePathFor('\\\\.\\pipe\\already'), '\\\\.\\pipe\\already');
+    assert.equal(pipePathFor('plain'), '\\\\.\\pipe\\plain');
+  } finally {
+    Object.defineProperty(process, 'platform', { value: original, writable: true });
+  }
+});
+

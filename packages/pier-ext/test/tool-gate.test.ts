@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { planActiveTools, planToolGate, type RuntimeRoleManifest } from '../src/tool-gate.ts';
+import { parseRuntimeManifest, planActiveTools, planToolGate, type RuntimeRoleManifest } from '../src/tool-gate.ts';
 
 const M: RuntimeRoleManifest = {
   role: 'worker-readonly',
@@ -113,3 +113,52 @@ test('可见层 D82：allow + 无 deny → changed:false（master 全量场景�
   assert.deepEqual(plan?.next, active);
   assert.equal(plan?.changed, false);
 });
+
+test('parseRuntimeManifest: missing/empty/invalid JSON → null (fail-open, no gate)', () => {
+  assert.equal(parseRuntimeManifest(undefined), null);
+  assert.equal(parseRuntimeManifest(''), null);
+  assert.equal(parseRuntimeManifest('not-json'), null);
+  assert.equal(parseRuntimeManifest('null'), null);
+  assert.equal(parseRuntimeManifest('[]'), null);
+  assert.equal(parseRuntimeManifest('{"tools":["bash"]}'), null, 'missing role');
+  assert.equal(parseRuntimeManifest('{"role":"w"}'), null, 'missing tools');
+  assert.equal(parseRuntimeManifest('{"role":1,"tools":["bash"]}'), null, 'role must be string');
+  assert.equal(parseRuntimeManifest('{"role":"w","tools":"bash"}'), null, 'tools must be array');
+});
+
+test('parseRuntimeManifest: valid env JSON; unknownTools garbage → deny', () => {
+  const ok = parseRuntimeManifest(JSON.stringify({
+    role: 'worker-readonly',
+    tools: ['bash', 'read'],
+    permissions: { '*': 'allow' },
+    unknownTools: 'allow',
+  }));
+  assert.equal(ok?.role, 'worker-readonly');
+  assert.deepEqual(ok?.tools, ['bash', 'read']);
+  assert.equal(ok?.unknownTools, 'allow');
+
+  const deny = parseRuntimeManifest(JSON.stringify({
+    role: 'w',
+    tools: ['bash'],
+    permissions: {},
+    unknownTools: 'deny',
+  }));
+  assert.equal(deny?.unknownTools, 'deny');
+
+  const garbage = parseRuntimeManifest(JSON.stringify({
+    role: 'w',
+    tools: ['bash'],
+    permissions: {},
+    unknownTools: 'maybe',
+  }));
+  assert.equal(garbage?.unknownTools, 'deny');
+  assert.equal(planToolGate('muse_deep_think', garbage).kind, 'deny');
+});
+
+test('planActiveTools: allow stance with every remaining tool denied → null (fail-open)', () => {
+  assert.equal(planActiveTools(['bash'], ['subagent', 'terminal_open'], {
+    unknownTools: 'allow',
+    permissions: { subagent: 'deny', terminal_open: 'deny' },
+  }), null);
+});
+

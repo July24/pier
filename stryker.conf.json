@@ -3,7 +3,7 @@
   "packageManager": "npm",
   "testRunner": "command",
   "commandRunner": {
-    "command": "npm test"
+    "command": "node --test packages/pier-ext/test/*.test.ts"
   },
   "mutate": [
     "packages/pier-ext/src/todo-core.ts",
@@ -18,7 +18,7 @@
     "low": 60,
     "break": 50
   },
-  "timeoutMS": 60000,
+  "timeoutMS": 12000,
   "concurrency": 4,
   "incremental": true,
   "incrementalFile": "reports/stryker-incremental.json",
