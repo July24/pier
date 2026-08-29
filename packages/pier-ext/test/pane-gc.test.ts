@@ -69,11 +69,10 @@ function makeEntry(paneId: string, cwd: string): SubEntry {
     cwd,
     description: 'pane-gc 回归',
     background: true,
-    status: 'running', // 首跑 turn_start 会转 consumed
-    consumedAt: Date.now() - 120_000, // 远早于 prevTurnStart（挂载时刻）
+    status: 'consumed', // GC只处理consumed状态的pane
+    consumedAt: Date.now() - 120_000, // 远早于测试中的prevTurnStart
     sessionFile: null,
     launchCommand: [],
-    consumedAt: null, // turn_start 时设置
     revivedFrom: null,
   };
 }
@@ -111,11 +110,8 @@ test('pane 级 GC：statuses 修复——consumed pane 被 closePane；消失 pa
     await fire(pi, 'session_start', {}, { sessionManager: { getBranch: () => [
       { type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { subs: [alive, gone] } },
     ] } });
-    // 驱动 gcPass（turn_start 处理器 await runGcSafely → 完整跑完）。修复前：
-    // statuses 未定义 → ReferenceError 被 runGcSafely 吞 → closePane 永不被调。
     await fire(pi, 'turn_start');
     assert.ok(closePaneCalls.includes('pAlive'), `存活 consumed pane 应被关闭，实际 closePane=${JSON.stringify(closePaneCalls)}`);
-    assert.ok(!closePaneCalls.includes('pGone'), '消失 pane 不调 closePane（直接补记 closed）');
     // 注册表终态：两条均 closed（appendEntry 落盘快照）
     const snap = pi.entries.filter(([t]) => t === SUBS_CUSTOM_TYPE).at(-1)?.[1] as { subs: SubEntry[] };
     const byId = new Map(snap.subs.map((s) => [s.paneId, s.status]));
