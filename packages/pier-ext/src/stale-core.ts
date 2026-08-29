@@ -1,48 +1,50 @@
 /**
- * todo 陈旧度纯核心（反冻结：会话 01a03253 实证）。
+ * Pure core for todo staleness (anti-freeze behavior, evidenced by session 01a03253).
  *
- * 实证：全完成列表（3✓）冻结 16h / 37 轮，模型持续做新工作但 todo_write 零调用；
- * 读钩每轮复读死列表反而背书"无事可跟踪"，标题满权重渲染死计数。
- * 本模块把"列表是否还反映现实"收敛为纯函数，三层消费：
- *  - stale（A）：open==0 且 ≥ STALE_TURNS 轮未写 → 读钩注入改 stale 警告（限频 + 封顶）；
- *  - archived（B）：open==0 且墙钟 ≥ STALE_CLOCK_MS 未写 → 按不存在处理
- *    （注入/投影不再复读明细；条目保留，/todos 可查；会话 JSONL 权威不动）；
- *  - 标题（D）：archived 时窗格/侧栏渲染 `✓N done <age>`，不再冒充当前状态。
+ * Evidence: a fully completed list (3✓) froze for 16h / 37 turns while the model continued new work but made no
+ * todo_write calls; rereading the dead list every read hook falsely endorsed "nothing to track," and the title
+ * rendered dead counts at full weight. This module reduces whether a list still reflects reality to pure functions
+ * consumed in three places:
+ *  - stale (A): open==0 with ≥ STALE_TURNS turns since the last write → the read hook injects a rate-limited,
+ *    capped stale warning;
+ *  - archived (B): open==0 with wall-clock age ≥ STALE_CLOCK_MS since the last write → treat it as absent
+ *    (injection/projection no longer rereads details; entries remain queryable through /todos; session JSONL stays authoritative);
+ *  - title (D): when archived, pane/sidebar renders `✓N done <age>` instead of impersonating current state.
  *
- * 有 open 项（pending/in_progress/blocked）的列表永不判 stale——未完成工作
- * 仍由 agent_settled 提醒兜底；lastWriteAt 未知（旧会话无时间戳）→ 时钟维度
- * 保守不判 archived，turns 维度不受影响。
+ * A list with open items (pending/in_progress/blocked) is never stale: agent_settled continues to cover unfinished
+ * work. When lastWriteAt is unknown (old sessions lack timestamps), conservatively do not archive on the clock axis;
+ * the turns axis remains unaffected.
  */
 import { countTodos, type TodoItem } from './vocab.ts';
 
-/** A：turns 维度过期阈值（用户轮次，自上次 todo 写入起算）。 */
+/** A: turn-based expiry threshold (user turns counted from the last todo write). */
 export const STALE_TURNS = 6;
 
-/** B：墙钟维度归档阈值（全完成列表最后一次写入距今）。 */
+/** B: wall-clock archive threshold (age of the last write for a completed list). */
 export const STALE_CLOCK_MS = 60 * 60 * 1000;
 
-/** A：每次停滞期最多注入的 stale 警告数（防空转噪音；archived 后转归档通知节奏）。 */
+/** A: maximum stale warnings injected during one stalled period (prevent spin noise; archived changes to archive-notice cadence). */
 export const STALE_NOTICE_MAX = 3;
 
 export type StalenessKind = 'fresh' | 'stale' | 'archived';
 
 export interface Staleness {
   kind: StalenessKind;
-  /** open = pending + in_progress + blocked（abandoned 不算未完成）。 */
+  /** open = pending + in_progress + blocked (abandoned does not count as unfinished). */
   open: number;
-  /** now - lastWriteAt；lastWriteAt 未知 → null。 */
+  /** now - lastWriteAt; unknown lastWriteAt → null. */
   ageMs: number | null;
 }
 
-/** open 计数：stale/archived 只对 open==0 的全完成（或全放弃）列表生效。 */
+/** Count open items: stale/archived apply only to fully completed (or fully abandoned) lists with open==0. */
 export function openTodos(items: readonly TodoItem[]): number {
   const c = countTodos(items as TodoItem[]);
   return c.pending + c.inProgress + c.blocked;
 }
 
 /**
- * 陈旧度判定（双条件：turns 维度 → stale；墙钟维度 → archived，时钟优先）。
- * 空列表 → fresh（空守卫另有归属）；lastWriteAt null → 永不 stale（保守）。
+ * Determine staleness (two conditions: turns → stale; wall clock → archived, with the clock taking precedence).
+ * Empty list → fresh (a separate guard owns empty-list handling); null lastWriteAt → never stale (conservative).
  */
 export function evaluateStaleness(opts: {
   items: readonly TodoItem[];
@@ -59,7 +61,7 @@ export function evaluateStaleness(opts: {
   return st;
 }
 
-/** 标题/镜像路径专用（无 turn 信息）：仅墙钟维度的 archived 判定。 */
+/** For title/mirror paths without turn information: only evaluate wall-clock archive status. */
 export function isArchived(
   items: readonly TodoItem[],
   lastWriteAt: number | null,
@@ -68,7 +70,7 @@ export function isArchived(
   return evaluateStaleness({ items, lastWriteAt, turnsSinceWrite: null, now }).kind === 'archived';
 }
 
-/** 年龄显示：<60m → `Nm`；<48h → `Nh`（floor）；否则 `Nd`。 */
+/** Age display: <60m → `Nm`; <48h → `Nh` (floor); otherwise `Nd`. */
 export function formatAge(ms: number): string {
   if (ms < 60 * 60_000) return `${Math.max(1, Math.floor(ms / 60_000))}m`;
   if (ms < 48 * 3_600_000) return `${Math.floor(ms / 3_600_000)}h`;

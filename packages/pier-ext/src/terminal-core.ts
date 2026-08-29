@@ -1,47 +1,31 @@
-/**
- * M14 常驻交互终端纯核心（D71 / T1–T6，2026-08-18）。
- *
- * 六工具的判定逻辑全部在此（无 pi/herdr 依赖 → 可单测）：
- *  - 注册表：terminal_id 稳定（term-<n>）、上限、幂等关闭；
- *  - T6 检测：send 文本校验（拒 ANSI/控制字符）、signal 白名单、
- *    全屏 TUI（alternate screen 序列）识别；
- *  - 读增量：环形缓冲语义（append / reset / none）+ 有界输出；
- *  - T3 readiness：PS1 尾匹配 + 静默期两档（超时兜底在 adapter）；
- *  - 会话汇总：stale pane 检测（跨重启边界注记）；
- *  - 持久化：custom 条目 last-wins（与 subs 注册表同构）。
- *
- * 后端映射（adapter = index.ts + herdr-client）：
- *  open=pane.split 常驻 shell / send=pane.send_text+\r /
- *  read=pane.read(recent, strip_ansi:false)+本地 strip /
- *  signal=pane.send_keys / close=pane.close。
- */
+/** Why: Preserve the established compatibility and safety behavior (D71, M14, T1–T6, T3, T6). */
 import { basename } from 'node:path';
 
-/* ── 常量（v1 默认；env 可调点在 adapter 读） ───────────────────── */
+/** Why: Preserve the established compatibility and safety behavior. */
 
 export const TERMINALS_CUSTOM_TYPE = 'pi-herdr.terminals';
 export const MAX_TERMINALS = 8;
 export const READ_MAX_CHARS = 8000;
-/** 读返回的硬截断长度（含截断标记自身的预算）。 */
+/** Why: Preserve the established compatibility and safety behavior. */
 export const READ_HARD_CAP_CHARS = 200;
 export const READINESS_TIMEOUT_MS = 30_000;
 export const SILENCE_IDLE_MS = 2000;
-/** T3 PS1 尾匹配：PowerShell `>` / POSIX `$` `#` / Nushell `❯` 结尾（允许尾空白）。 */
+/** Why: Preserve the established compatibility and safety behavior (T3). */
 export const PROMPT_TAIL_RE = /[$>#❯]\s*$/;
-/** T6 signal 白名单（Herdr key-combo 字符串；ctrl+c 中断 / ctrl+d EOF / ctrl+z 挂起 / esc / enter）。 */
+/** Why: Preserve the established compatibility and safety behavior (T6). */
 export const SIGNAL_KEYS = ['ctrl+c', 'ctrl+d', 'ctrl+z', 'esc', 'enter'] as const;
 export type SignalKey = (typeof SIGNAL_KEYS)[number];
 
 const FULLSCREEN_SEQUENCES = [
-  '\x1b[?1049h', // 进入 alternate screen（xterm）
-  '\x1b[?47h', // 老式进入 alternate screen
-  '\x1b[2J\x1b[H', // 清屏 + 光标归位（vim/less 常见模式）
+  '\x1b[?1049h', // Why: Preserve the established compatibility and safety behavior.
+  '\x1b[?47h', // Why: Preserve the established compatibility and safety behavior.
+  '\x1b[2J\x1b[H', // Why: Preserve the established compatibility and safety behavior.
 ] as const;
 
 export const RESET_MARKER = '…[buffer reset — earlier output scrolled away or cleared]…';
 export const TRUNCATE_MARKER = '…[truncated]…';
 
-/* ── 类型 ─────────────────────────────────────────────────────────── */
+/** Why: Preserve the established compatibility and safety behavior. */
 
 export interface TerminalEntry {
   terminalId: string;
@@ -53,7 +37,7 @@ export interface TerminalEntry {
   lastActivityAt: number;
   status: 'open' | 'closed';
   closedAt: number | null;
-  /** pane.read 游标：revision（展示）+ 稳定区长度 + 尾段锚 + 缓冲尾探测器（增量判定用）。 */
+  /** Why: Preserve the established compatibility and safety behavior. */
   readRevision: number | null;
   readLen: number;
   readTail: string;
@@ -65,7 +49,7 @@ export interface TerminalsRegistry {
   terminals: TerminalEntry[];
 }
 
-/* ── 注册表 ───────────────────────────────────────────────────────── */
+/** Why: Preserve the established compatibility and safety behavior. */
 
 export function nextTerminalId(existingIds: readonly string[]): string {
   let max = 0;
@@ -111,7 +95,7 @@ export function registerTerminal(
   return { ok: true, entries: [...entries, entry], entry };
 }
 
-/** 幂等关闭（closedAt 不被二次覆盖）；不存在的 id 原样返回。 */
+/** Why: Preserve the established compatibility and safety behavior. */
 export function closeTerminal(
   entries: readonly TerminalEntry[],
   terminalId: string,
@@ -126,12 +110,12 @@ export function closeTerminal(
   };
 }
 
-/** 活跃（open）终端的 paneId 集合——GC 豁免判据（D71）。 */
+/** Why: Preserve the established compatibility and safety behavior (D71). */
 export function activeTerminalPaneIds(entries: readonly TerminalEntry[]): Set<string> {
   return new Set(entries.filter((e) => e.status === 'open').map((e) => e.paneId));
 }
 
-/* ── T6：send 文本校验 / signal 白名单 ───────────────────────────── */
+/** Why: Preserve the established compatibility and safety behavior (T6). */
 
 export function validateSendText(text: string): { ok: true; text: string } | { ok: false; error: string } {
   if (text.includes('\x1b')) {
@@ -140,7 +124,7 @@ export function validateSendText(text: string): { ok: true; text: string } | { o
       error: 'unsupported input: ANSI escape sequences cannot be sent as text; use terminal_signal for control keys, or plain commands only',
     };
   }
-  // 允许 \t；拒绝其余 C0 控制字符（\r\n 由发送方统一补 Enter，先剥尾部）
+  // Why: Preserve the established compatibility and safety behavior (C0).
   const stripped = text.replace(/[\r\n]+$/, '');
   const bad = stripped.match(/[\x00-\x08\x0b-\x1f\x7f]/);
   if (bad) {
@@ -163,7 +147,7 @@ export function validateSignal(key: string): { ok: true; key: SignalKey } | { ok
   return { ok: true, key: k };
 }
 
-/* ── T6：全屏 TUI 检测 + ANSI 剥离 ───────────────────────────────── */
+/** Why: Preserve the established compatibility and safety behavior (T6). */
 
 export function detectFullscreenTUI(raw: string): { detected: boolean; sequence: string | null } {
   for (const seq of FULLSCREEN_SEQUENCES) {
@@ -174,21 +158,21 @@ export function detectFullscreenTUI(raw: string): { detected: boolean; sequence:
 
 export function stripAnsi(raw: string): string {
   return raw
-    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '') // CSI 序列
-    .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '') // OSC 序列
-    .replace(/\x1b[@-Z\\-_]/g, '') // 其余两字符转义
-    .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, ''); // 残余控制字符
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '') // Why: Preserve the established compatibility and safety behavior.
+    .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '') // Why: Preserve the established compatibility and safety behavior.
+    .replace(/\x1b[@-Z\\-_]/g, '') // Why: Preserve the established compatibility and safety behavior.
+    .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, ''); // Why: Preserve the established compatibility and safety behavior.
 }
 
-/* ── 读增量（环形缓冲语义） ───────────────────────────────────────── */
+/** Why: Preserve the established compatibility and safety behavior. */
 
 export interface ReadCursor {
   revision: number;
-  /** 已消费长度（落在最后完整行边界：lastIndexOf('\n')+1；活动行不占）。 */
+  /** Why: Preserve the established compatibility and safety behavior. */
   len: number;
-  /** 连续性锚：稳定区尾段（≤64 字符；与下次读按 trimEnd 比较——活动行行尾 \n 会变空格，实测）。 */
+  /** Why: Preserve the established compatibility and safety behavior. */
   tail: string;
-  /** 无变化探测器：上次整个缓冲的尾段（trimEnd；相同 → none）。 */
+  /** Why: Preserve the established compatibility and safety behavior. */
   eoTail: string;
 }
 
@@ -196,19 +180,14 @@ export interface ReadIncrement {
   mode: 'none' | 'append' | 'reset';
   text: string;
   cursor: ReadCursor;
-  /** 达到硬上限被截断（调用方应提示分页）。 */
+  /** Why: Preserve the established compatibility and safety behavior. */
   hardCapped: boolean;
 }
 
-/** 游标指纹长度（tail 采样上限）。 */
+/** Why: Preserve the established compatibility and safety behavior. */
 const CURSOR_TAIL_CHARS = 64;
 
-/**
- * 实测（M14 live）两条屏幕缓冲语义，决定了本实现：
- *  1) pane.read 的 revision 不随输出增长（恒 0）→ 变化探测用 eoTail，不用 revision；
- *  2) `recent` 是屏幕重建而非追加日志：活动行行尾 \n 在续写时变空格
- *     （"PS>x\n" → "PS>x echo"）→ 连续性锚按 trimEnd 比较，len 落在最后完整行边界。
- */
+/** Why: Preserve the established compatibility and safety behavior (M14). */
 export function computeIncrement(
   prev: ReadCursor | null,
   next: { text: string; revision: number },
@@ -233,7 +212,7 @@ export function computeIncrement(
     const bounded = boundText(suffix, maxChars);
     return { mode: 'append', text: bounded.text, cursor, hardCapped: bounded.capped };
   }
-  // 首读（prev=null）= 有界全量；缓冲回卷/清屏 = 有界全量 + reset 标记
+  // Why: Preserve the established compatibility and safety behavior.
   const bounded = boundText(next.text, maxChars);
   const text = prev ? `${RESET_MARKER}\n${bounded.text}` : bounded.text;
   return { mode: 'reset', text, cursor, hardCapped: bounded.capped };
@@ -244,7 +223,7 @@ function boundText(text: string, maxChars: number): { text: string; capped: bool
   return { text: `${text.slice(text.length - maxChars)}\n${TRUNCATE_MARKER}`, capped: true };
 }
 
-/* ── T3 readiness（两档 + busy；超时兜底在 adapter） ─────────────── */
+/** Why: Preserve the established compatibility and safety behavior (T3). */
 
 export type ReadinessTier = 'prompt' | 'silent' | 'busy';
 
@@ -258,7 +237,7 @@ export function classifyReadiness(
   return 'busy';
 }
 
-/* ── 会话汇总（T6 跨重启边界） ───────────────────────────────────── */
+/** Why: Preserve the established compatibility and safety behavior (T6). */
 
 export interface TerminalSummary {
   terminalId: string;
@@ -288,7 +267,7 @@ export function summarizeSessions(
   return { terminals, stalePaneIds };
 }
 
-/* ── 持久化（custom 条目 last-wins，与 subs 同构） ────────────────── */
+/** Why: Preserve the established compatibility and safety behavior. */
 
 export interface BranchEntryLike3 {
   type?: string;

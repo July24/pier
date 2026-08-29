@@ -1,15 +1,15 @@
 /**
- * 任务 tab GC 决策（D29 的判定规则抽成纯函数；M22 取消 resident 豁免）。
- * 无副作用、无 pi/herdr API 依赖 → 可单测。
+ * Task-tab GC decisions (D29 rules as a pure function; M22 dropped resident exemption).
+ * No I/O, no pi/herdr — unit-testable.
  */
 export type GcEntryKind = string;
 export type GcEntryStatus = 'running' | 'settled' | 'consumed' | 'closed';
 
 export interface GcEntryLike {
-  /** 'task' 或 role 名；旧值 short/resident 只作标签，不参与判定。 */
+  /** 'task' or a role name; legacy short/resident is a label only. */
   kind: GcEntryKind;
   status: GcEntryStatus;
-  /** 消费时间（GC 宽限期判据；closed 条目保留原值）。 */
+  /** Consume timestamp (GC grace); closed rows keep the original value. */
   consumedAt?: number | null;
 }
 
@@ -18,12 +18,12 @@ function isFinished(status: GcEntryStatus): boolean {
 }
 
 /**
- * D29 / M22：任务 tab 是否该关（全部条件同时成立）：
- *  - 含 ≥1 个工作 pane（主 tab 无委派条目 → 永不关）；
- *  - 全部工作 pane 已 settled/consumed/closed（kind 不再豁免）；
- *  - 宽限期已过（时间制 TTL；ttlMs=0 表示不自动关，由调用方把关）；
- *  - 无 blocked pane（人类闸门豁免）；
- *  - 其余 pane 全部 idle/done/unknown（非工作 pane 允许 unknown）。
+ * Close a task tab only when every condition holds:
+ *  - ≥1 work pane (the main tab with no delegated entries never closes);
+ *  - every work pane is settled/consumed/closed (kind is not an exemption);
+ *  - grace TTL elapsed (`ttlMs=0` means never auto-close);
+ *  - no blocked pane (human-gate exemption);
+ *  - remaining panes are idle/done/unknown (non-work panes may be unknown).
  */
 export function shouldCloseTaskTab(opts: {
   entries: readonly GcEntryLike[];
@@ -40,17 +40,17 @@ export function shouldCloseTaskTab(opts: {
 }
 
 /**
- * pane 级回收判定（孤儿/兼容路径，v1.2 语义）：
- *  - 消费于上一轮之前（宽限：结算通知那一轮人可看、模型可用）；
- *  - herdr 显式状态 idle/done（unknown/working/blocked → 下轮重试，#943 容错）；
- *  - pane 已消失（status undefined）→ 补记 closed（返回 true 由调用方处理）。
+ * Pane-level collection (orphan / compat path):
+ *  - consumed before the previous turn (grace so the settlement notice is still visible);
+ *  - herdr status idle/done (unknown/working/blocked retry next turn);
+ *  - missing pane (status undefined) → record closed (caller handles the write).
  */
 export function shouldClosePane(opts: {
   consumedAt: number | null;
   herdrStatus: string | undefined;
   prevTurnStart: number;
 }): boolean {
-  if (opts.herdrStatus === undefined) return true; // pane 没了 → 补记 closed
+  if (opts.herdrStatus === undefined) return true; // pane gone → record closed
   if (opts.herdrStatus !== 'idle' && opts.herdrStatus !== 'done') return false;
   return (opts.consumedAt ?? 0) > 0 && opts.consumedAt! < opts.prevTurnStart;
 }

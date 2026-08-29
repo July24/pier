@@ -36,7 +36,7 @@ const mk = (over: Partial<HistoryEntry>): HistoryEntry => ({
 test('historyFilePath: 按 cwd 分区（与 pi 会话分区同构）', () => {
   assert.equal(
     historyFilePath('C:\\home\\.pi\\agent', 'F:\\herdr-pi'),
-    path.join('C:\\home\\.pi\\agent', 'herdr-pi', 'history', '--F--herdr-pi--', 'history.jsonl'),
+    path.join('C:\\home\\.pi\\agent', 'herdr-pi', 'history', '--F%3A%5Cherdr-pi--', 'history.jsonl'),
   );
 });
 

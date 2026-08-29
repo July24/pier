@@ -1,47 +1,48 @@
 /**
- * D97 窄格静帧（slim frame）：pane 长宽放不下最小可用 TUI 时，用非捕获
- * 全屏 overlay 盖一张 pane title 同源静帧。
+ * D97 slim frame: when a pane is too narrow or short for the minimum usable TUI,
+ * cover it with a non-capturing full-screen overlay containing a static frame sourced from the pane title.
  *
- * 动机（用户实证）：热力把非焦点格压窄后，worker 的流式 thinking 在窄格
- * 里持续整屏重绘 → 闪烁。静帧只在 todo_write / 状态上报时更新（与
- * formatPaneTitle 同参同源），thinking token 碰不到它 → alt-screen 行级
- * 差分下 PTY 零输出，闪烁物理消失。
+ * Why (observed by the user): after the heat view compresses an unfocused pane, streaming worker thinking
+ * continuously repaints the entire screen in the narrow pane, causing flicker. The static frame updates only on
+ * todo_write/status reports (sharing arguments and source with formatPaneTitle), so thinking tokens cannot reach it;
+ * alt-screen row-level diffing then produces zero PTY output and physically eliminates the flicker.
  *
- * 前提：worker/master 以 --tui-mode fullscreen 运行（buildLaunchParts 默认
- * 注入）。regular 主屏的整屏 dump 路径（tui-main-screen firstChanged <
- * viewportTop → 全量重倒）overlay 盖不住——composite 在文档之上，dump 在
- * 文档之内。
+ * Prerequisite: worker/master run with --tui-mode fullscreen (injected by default by buildLaunchParts).
+ * The regular main-screen full dump path (tui-main-screen firstChanged < viewportTop → full redraw) cannot be
+ * covered by the overlay: composite is above the document, while the dump is inside the document.
  *
- * 注册闸：仅 herdr pane 内（index.ts 以 env 判定）——普通小终端窗口里盖住
- * 交互面是事故；herdr 窄格点击聚焦即被热力放大，visible 谓词随 SIGWINCH
- * 每帧重估，静帧自动消失、真 TUI 原样在底下（agent/会话/widget 从未停）。
+ * Registration gate: only inside a herdr pane (index.ts checks the environment), because covering an interactive
+ * normal terminal window would be hazardous. Clicking a narrow herdr pane focuses it and the heat view expands it;
+ * the visible predicate re-evaluates on every frame as SIGWINCH arrives, so the frame disappears automatically and
+ * the real TUI remains underneath (agent/session/widget execution never stops).
  *
- * 生命周期：进程内单例，session_start（非 resume）注册一次；overlay 常驻
- * （done() 永不调用 → Promise 永挂，吞 rejection，绝不 await）。pi 会话
- * 切换若拆掉 overlay（resetExtensionUI）则静帧自然退场，不影响主流程。
- * PI_HERDR_SLIM_FRAME=0 逃生口。
+ * Lifecycle: one process-local singleton, registered once on session_start (not resume); the overlay stays resident
+ * (done() is never called, leaving the Promise pending, swallowing rejection, and never awaiting it). If switching
+ * pi sessions removes the overlay (resetExtensionUI), the static frame naturally exits without affecting the main
+ * flow. PI_HERDR_SLIM_FRAME=0 is the escape hatch.
  */
 
-/** TUI 可用下限（pi interactive-mode 布局：editor 3 行 + footer 1 + transcript ≥3 + 间距）。
- * 任一轴低于此值 → 该格读不了 TUI，画 title 静帧。 */
+/** Minimum usable TUI dimensions (pi interactive-mode layout: editor 3 rows + footer 1 + transcript ≥3 + spacing).
+ * Below either threshold the pane cannot display a readable TUI, so it renders the title as a static frame. */
+
 export const SLIM_MIN_COLS = 24;
 export const SLIM_MIN_ROWS = 12;
 
-/** 静帧可见性谓词（overlayOptions.visible 每渲染帧回调）。 */
+/** Visibility predicate (overlayOptions.visible invokes it on every render frame). */
 export function isSlimFrame(cols: number, rows: number): boolean {
   return cols < SLIM_MIN_COLS || rows < SLIM_MIN_ROWS;
 }
 
-/* ── 宽度感知折行（保守 East Asian 宽度；▶○■✓ 等歧义宽字符按 1 记，仅影响折点位置） ── */
+/* ── Width-aware wrapping (conservative East Asian width; ambiguous glyphs such as ▶○■✓ count as 1, affecting only break positions) ── */
 
 function isWide(cp: number): boolean {
   return (
-    (cp >= 0x1100 && cp <= 0x115f) // 谚文兼容字母
-    || (cp >= 0x2e80 && cp <= 0xa4cf) // CJK 部首～彝文（含假名）
-    || (cp >= 0xac00 && cp <= 0xd7a3) // 谚文音节
-    || (cp >= 0xf900 && cp <= 0xfaff) // CJK 兼容表意
-    || (cp >= 0xfe30 && cp <= 0xfe4f) // CJK 兼容形式
-    || (cp >= 0xff00 && cp <= 0xff60) // 全角形式
+    (cp >= 0x1100 && cp <= 0x115f) // Hangul compatibility jamo
+    || (cp >= 0x2e80 && cp <= 0xa4cf) // CJK radicals through Yi (including kana)
+    || (cp >= 0xac00 && cp <= 0xd7a3) // Hangul syllables
+    || (cp >= 0xf900 && cp <= 0xfaff) // CJK compatibility ideographs
+    || (cp >= 0xfe30 && cp <= 0xfe4f) // CJK compatibility forms
+    || (cp >= 0xff00 && cp <= 0xff60) // Fullwidth forms
     || (cp >= 0xffe0 && cp <= 0xffe6)
   );
 }
@@ -53,8 +54,8 @@ export function displayWidth(s: string): number {
 }
 
 /**
- * 按可见宽度折行：词折行（行内有空格则退到最后一个空格断，英文短语不腰斩；
- * CJK 无空格自然硬折）。折行处吞掉断点空格。
+ * Wrap at visible width: prefer word breaks (retreat to the last space instead of cutting an English phrase);
+ * CJK text without spaces hard-wraps naturally. Consume the space at the break point.
  */
 export function wrapByWidth(text: string, width: number): string[] {
   const w = Math.max(1, Math.floor(width));
@@ -89,9 +90,9 @@ export function wrapByWidth(text: string, width: number): string[] {
 }
 
 /**
- * 静帧行：title 折行 → 垂直居中 → 钳到 rows。每行都补齐到满宽（可见宽度）：
- * overlay 的合成按行覆盖，空行会让底下的 TUI 透出来（漏 flicker），
- * 满宽空格行才是真正的不透明冻结。无 title → 居中一枚 `·`（活着、没计划）。
+ * Frame lines: wrap the title, center it vertically, and clamp to rows. Pad every line to full visible width:
+ * row-wise overlay compositing would let the TUI underneath show through blank lines (leaking flicker),
+ * while full-width spaces make the freeze genuinely opaque. Without a title, center one `·` (alive, no plan).
  */
 export function frameLines(
   text: string,
@@ -114,7 +115,7 @@ export function frameLines(
   return out;
 }
 
-/* ── overlay 组件 + 注册/更新（进程内单例） ─────────────────────────── */
+/* ── Overlay component plus registration/update (process-local singleton) ─────────────────────────── */
 
 interface FrameTui {
   requestRender(): void;
@@ -132,11 +133,11 @@ class SlimFrameComponent {
     this.colorize = colorize;
   }
 
-  /** visible 谓词每帧回调：顺手记录行数（render(width) 拿不到高度，居中布局靠它）。 */
+  /** The visible predicate runs each frame; record row count because render(width) lacks height for centered layout. */
   onViewport(cols: number, rows: number): boolean {
     if (this.lastRows !== rows) {
       this.lastRows = rows;
-      this.cache = null; // 行数变了 → 居中重排
+      this.cache = null; // A row-count change requires re-centering.
     }
     return isSlimFrame(cols, rows);
   }
@@ -159,14 +160,14 @@ class SlimFrameComponent {
     this.cache = null;
   }
 
-  /** pi 拆 overlay（会话切换/退出）时回收模块单例，重注册不被 no-op。 */
+  /** Reclaim the module singleton when pi tears down the overlay (session switch/exit), allowing re-registration. */
   dispose(): void {
     if (active === this) active = null;
   }
 }
 
 
-/** 测试注入点（module state 重置）。 */
+/** Test injection point (reset module state). */
 export function resetForTest(): void {
   active = null;
 }
@@ -174,8 +175,8 @@ export function resetForTest(): void {
 let active: SlimFrameComponent | null = null;
 
 /**
- * 注册静帧 overlay（幂等：进程一次）。eventCtx = pi 生命周期事件上下文
- * （session_start 的 ctx，与 todo widget 的 widgetUi 同来源）。
+ * Register the static-frame overlay (idempotent: once per process). eventCtx is the pi lifecycle event context
+ * (the session_start ctx, sourced from the same place as the todo widget's widgetUi).
  */
 export function registerSlimFrame(eventCtx: unknown): void {
   if (active) return;
@@ -187,8 +188,8 @@ export function registerSlimFrame(eventCtx: unknown): void {
     ? ui.custom
     : undefined;
   try {
-    // overlay: true = 浮层不清屏（pi ctx.ui.custom 默认替换编辑器区，必须显式盖）；
-    // nonCapturing = 键盘仍归编辑器（人点进窄格也能打字，热力放大后静帧自动消失）。
+    // overlay: true keeps the floating layer from clearing the screen (pi ctx.ui.custom replaces the editor area by default, so cover it explicitly);
+    // nonCapturing leaves the keyboard with the editor (typing in a focused narrow pane remains possible, and the expanded heat view hides the frame).
     const pending = custom(
       (tui, theme) => {
         const comp = new SlimFrameComponent(tui, (s) => theme.fg('accent', s));
@@ -206,14 +207,14 @@ export function registerSlimFrame(eventCtx: unknown): void {
         },
       },
     );
-    // done() 永不调用 → Promise 永挂（overlay 常驻）；吞 rejection，绝不 await。
+    // Never call done(), leaving the Promise pending so the overlay stays resident; swallow rejection and never await it.
     Promise.resolve(pending).catch(() => {});
   } catch {
-    /* 无 overlay 能力的 pi 版本静默降级 */
+    /* Silently degrade on pi versions without overlay support. */
   }
 }
 
-/** 静帧内容更新（title 与 pane 标题投影同参同源；null = 无计划）。 */
+/** Update static-frame content (same arguments/source as the pane-title projection; null means no plan). */
 export function updateSlimFrame(title: string | null): void {
   active?.setText(title ?? '');
 }

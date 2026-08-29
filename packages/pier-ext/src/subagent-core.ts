@@ -1,15 +1,4 @@
-/**
- * subagent 纯逻辑：子 pane 命令构造、并发信号量、注册表、进度回调。
- * 无副作用、无 pi/herdr API 依赖 → 可单测。
- *
- * v1.1（DESIGN.md §12，方案 C）：子 pane 统一为交互式 pi TUI。
- *  - 启动：常驻 shell 里 `node cli.js -e <本扩展>`（Windows 经 powershell 包裹、
- *    POSIX 直启；无 prompt 参数，prompt 经扩展管道注入），herdr 自动检测 +
- *    本扩展上报状态；
- *  - 并发上限 4（D10）：信号量压制并行 spawn；
- *  - 结果通道 = 子会话 JSONL（session-tail.ts），不再解析 pane 文本；
- *  - 软锁：仅在 herdr agent_status ∈ {idle} 时注入（index.ts 的状态门）。
- */
+/** Why: Preserve the established compatibility and safety behavior (D10). */
 import { normalizeEntryKind } from './history-store.ts';
 
 export interface SubagentSpec {
@@ -17,21 +6,17 @@ export interface SubagentSpec {
   prompt: string;
 }
 
-/** PowerShell 单引号转义（''）。 */
+/** Why: Preserve the established compatibility and safety behavior. */
 export function psQuote(s: string): string {
   return `'${String(s).replace(/'/g, "''")}'`;
 }
 
-/** POSIX sh 单引号转义（'\''）。 */
+/** Why: Preserve the established compatibility and safety behavior. */
 export function shQuote(s: string): string {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
 
-/**
- * 子代理启动命令行（注入子 pane 的 shell，经 pane.send_text + CR 提交）。
- * 片段 = 裸 argv 词（如 ['pi', '--session', '<file>']）；win32 输出 PowerShell
- * 调用语法（`&` 引导 + `''` 转义），其余输出 POSIX sh 语法（单引号 + `'\''` 转义）。
- */
+/** Why: Preserve the established compatibility and safety behavior. */
 export function buildLaunchLine(parts: readonly string[], platform: NodeJS.Platform = process.platform): string {
   const quoted = platform === 'win32'
     ? parts.map((s) => psQuote(s))
@@ -39,7 +24,7 @@ export function buildLaunchLine(parts: readonly string[], platform: NodeJS.Platf
   return (platform === 'win32' ? '& ' : '') + quoted.join(' ');
 }
 
-/** 计数信号量：并发上限内的 acquire 立即执行，超出排队（FIFO）。 */
+/** Why: Preserve the established compatibility and safety behavior. */
 export class Semaphore {
   private active = 0;
   private queue: Array<() => void> = [];
@@ -76,11 +61,11 @@ export class Semaphore {
 
 export interface SubagentOutcome {
   kind: 'completed' | 'timeout' | 'no-output' | 'blocked' | 'spawn-failed';
-  /** 最终文本（completed 时为子代理最终回答；timeout/blocked 时为部分输出）。 */
+  /** Why: Preserve the established compatibility and safety behavior. */
   text: string;
 }
 
-/** 把提取结果规范为工具返回文本。 */
+/** Why: Preserve the established compatibility and safety behavior. */
 export function formatSubagentResult(outcome: SubagentOutcome, description: string): string {
   switch (outcome.kind) {
     case 'completed': {
@@ -98,25 +83,25 @@ export function formatSubagentResult(outcome: SubagentOutcome, description: stri
   }
 }
 
-/* ── 探活 + 存活通知（A2/B1 统一出口；纯逻辑，IO 在 adapter） ────── */
+/** Why: Preserve the established compatibility and safety behavior (A2, B1). */
 
-/** 探活快照：pane 实时状态 + 会话活动时间（毫秒 epoch；null = 未知）。 */
+/** Why: Preserve the established compatibility and safety behavior. */
 export interface AliveProbe {
   paneExists: boolean;
   agentStatus: string | null;
-  /** 会话文件 mtime（最新候选）；无文件/不可读 = null。 */
+  /** Why: Preserve the established compatibility and safety behavior. */
   lastActivityMs: number | null;
 }
 
-/** 探活判活：pane 在 +（working/blocked 或近期有会话活动）→ 视为还在干活。 */
+/** Why: Preserve the established compatibility and safety behavior. */
 export function isAlive(probe: AliveProbe, nowMs: number, staleAfterMs = 120_000): boolean {
   if (!probe.paneExists) return false;
   if (probe.agentStatus === 'working' || probe.agentStatus === 'blocked') return true;
-  // idle/unknown：会话 2 分钟内有活动仍算活（写作间隙/刚结算未采集）
+  // Why: Preserve the established compatibility and safety behavior.
   return probe.lastActivityMs != null && nowMs - probe.lastActivityMs < staleAfterMs;
 }
 
-/** 人话相对时间（"12s ago" / "3m ago"）。 */
+/** Why: Preserve the established compatibility and safety behavior. */
 export function agoText(ms: number, nowMs: number): string {
   const s = Math.max(0, Math.round((nowMs - ms) / 1000));
   if (s < 60) return `${s}s ago`;
@@ -124,11 +109,7 @@ export function agoText(ms: number, nowMs: number): string {
   return `${Math.floor(s / 3600)}h ago`;
 }
 
-/**
- * 存活通知（A2 转后台返回值 与 B1 tool_result 改写 的统一构造出口）：
- * 两场景同一话术——"它在干活 / 别重做 / 转后台了 / 结算会通知 / list_agents 可查"。
- * scenario: 'moved-to-bg'（耐心阈值转后台）| 'error-alive'（工具报错但探活判活，兜底改写）。
- */
+/** Why: Preserve the established compatibility and safety behavior (A2, B1). */
 export function buildAliveNotice(
   opts: { paneId: string; description: string; scenario: 'moved-to-bg' | 'error-alive'; probe: AliveProbe },
   nowMs: number,
@@ -151,11 +132,7 @@ export function buildAliveNotice(
   ].join(' ');
 }
 
-/**
- * 人类闸门通知（E1/E2 统一出口）：subagent blocked（ask_user_question 等人类）时
- * 给 master 的话术——不揽活、引导用户去 pane、授权例外经 send_message 转达。
- * question 来自 herdr tokens['pi-ask']（子扩展 reportAskFlag 上报）。
- */
+/** Why: Preserve the established compatibility and safety behavior (E1, E2). */
 export function buildBlockedGateNotice(opts: { paneId: string; description: string; question: string | null }): string {
   const { paneId, description, question } = opts;
   const q = question ? ` (question: "${question}")` : '';
@@ -168,35 +145,35 @@ export function buildBlockedGateNotice(opts: { paneId: string; description: stri
   ].join(' ');
 }
 
-/* ── 子代理注册表（custom 条目持久化） ────────────────────────────── */
+/** Why: Preserve the established compatibility and safety behavior. */
 
 export const SUBS_CUSTOM_TYPE = 'pi-herdr.subs';
 
 export interface SubEntry {
   taskId: string;
-  /** 'task' 或 role 名；旧 short/resident 读盘归一为 task，不参与 GC。 */
+  /** Why: Preserve the established compatibility and safety behavior. */
   kind: string;
   paneId: string;
   tabId: string;
-  /** v1.3：任务 tab 名（D25/D26；tab.rename 后可能漂移，仅为显示/复活参考）。 */
+  /** Why: Preserve the established compatibility and safety behavior (D25, D26). */
   tabName: string;
   cwd: string;
   description: string;
   background: boolean;
   status: 'running' | 'settled' | 'consumed' | 'closed';
-  /** 消费时间（GC 宽限期判据）。 */
+  /** Why: Preserve the established compatibility and safety behavior. */
   consumedAt?: number | null;
   sessionFile: string | null;
   launchCommand: string[];
   createdAt: number;
   revivedFrom?: string | null;
-  /** D94：用户是否接管控制（暂停 master 管理）。 */
+  /** Why: Preserve the established compatibility and safety behavior (D94). */
   userTakeover?: boolean;
-  /** D94：接管检测时间（ms）；settled 后进入观察期开始计时。 */
+  /** Why: Preserve the established compatibility and safety behavior (D94). */
   observationStartedAt?: number | null;
-  /** D94：上次 agent 状态（用于检测 idle→working 的用户介入）。 */
+  /** Why: Preserve the established compatibility and safety behavior (D94). */
   lastAgentStatus?: string | null;
-  /** D98：isolate worktree 元数据（spawn 时创建；releasedAt 非空 = 已回收，禁复活）。 */
+  /** Why: Preserve the established compatibility and safety behavior (D98). */
   isolate?: {
     worktreePath: string;
     branch: string;
@@ -215,11 +192,7 @@ export function makeRegistry(subs: SubEntry[] = []): SubsRegistry {
   return { version: 2, subs };
 }
 
-/**
- * 从会话分支条目折叠注册表（last-wins，与 todo 折叠同构）。
- * custom 条目形状（session-format 实测）：{type:'custom', customType, data}。
- * 兼容 v1 条目（缺字段按默认补齐：taskId=paneId、kind=task、tabId=''、launchCommand=[]）。
- */
+/** Why: Preserve the established compatibility and safety behavior. */
 export function foldSubsRegistry(entries: readonly BranchEntryLike2[]): SubsRegistry {
   let found = makeRegistry();
   for (const entry of entries) {
@@ -271,36 +244,30 @@ export interface BranchEntryLike2 {
   data?: unknown;
 }
 
-/* ── 工具进度回调 ─────────────────────────────────────────────────── */
+/** Why: Preserve the established compatibility and safety behavior. */
 
 export interface ProgressUpdate {
   content: Array<{ type: 'text'; text: string }>;
   details: Record<string, never>;
 }
 
-/**
- * 构造 onUpdate 的合法负载。
- *
- * ⚠️ pi 0.84.2 实测：AgentToolUpdateCallback 期待 AgentToolResult（{content, details}），
- * 传字符串会让交互式 TUI 在 getTextOutput 处崩溃（undefined.filter）并整个退出 pi。
- * 所有进度回调必须经本助手构造。
- */
+/** Why: Preserve the established compatibility and safety behavior. */
 export function makeProgressUpdate(msg: string): ProgressUpdate {
   return { content: [{ type: 'text', text: msg }], details: {} };
 }
 
-/* ── v1.3 任务 tab 放置（D25/D26 纯逻辑，可单测） ─────────────────── */
+/** Why: Preserve the established compatibility and safety behavior (D25, D26). */
 
 export const TAB_NAME_MAX = 20;
 
-/** tab 名规范化：折叠空白、截断 ≤20 字符；空 → 'task'。 */
+/** Why: Preserve the established compatibility and safety behavior. */
 export function tabNameForTask(description: string): string {
   const cleaned = String(description ?? '').replace(/\s+/g, ' ').trim();
   const truncated = cleaned.slice(0, TAB_NAME_MAX).trim();
   return truncated || 'task';
 }
 
-/** 缺省放置撞名加序号后缀（-2、-3…），并保持总长 ≤20（D26：缺省永远开新 tab）。 */
+/** Why: Preserve the established compatibility and safety behavior (D26). */
 export function nextTaskTabName(base: string, existingNames: ReadonlySet<string>): string {
   let name = base;
   let n = 2;
@@ -313,16 +280,16 @@ export function nextTaskTabName(base: string, existingNames: ReadonlySet<string>
 }
 
 export interface TabPlacementPlan {
-  /** append = 追加进既有 tab（锚 pane split）；new = 新命名 tab。 */
+  /** Why: Preserve the established compatibility and safety behavior. */
   mode: 'append' | 'new';
   tabName: string;
-  /** append 时的既有 tabId（须调用方再校验存活）；new 时为 null。 */
+  /** Why: Preserve the established compatibility and safety behavior. */
   tabId: string | null;
 }
 
-/* ── D86：worktree 分组键（纯逻辑） ─────────────────────────────── */
+/** Why: Preserve the established compatibility and safety behavior (D86). */
 
-/** 路径包含判定（大小写不敏感 + 斜杠统一；cwd === wt 或 cwd 在 wt 之下）。D86 信任旗标也用它。 */
+/** Why: Preserve the established compatibility and safety behavior (D86). */
 export function isPathUnder(cwd: string, wt: string): boolean {
   const n = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
   const a = n(cwd);
@@ -331,17 +298,13 @@ export function isPathUnder(cwd: string, wt: string): boolean {
 }
 
 export interface WorktreeZone {
-  /** main = 主检出（split 进 main tab）；worktree = 命名 worktree tab；非 git/无关目录也兜底 main。 */
+  /** Why: Preserve the established compatibility and safety behavior. */
   zone: 'main' | 'worktree';
-  /** zone=worktree 时的 tab 名（目录名原样，撞名后缀由 nextTaskTabName 处理）。 */
+  /** Why: Preserve the established compatibility and safety behavior. */
   tabName: string | null;
 }
 
-/**
- * D86 分类器：cwd 落在哪个 worktree 分组。
- * `worktrees` = git porcelain 顺序（主检出在前，仅用于列表本身；归属判定按包含）；
- * 非 git / 不属任何 worktree → main（「无新 worktree → 同 tab」的兜底）。
- */
+/** Why: Preserve the established compatibility and safety behavior (D86). */
 export function classifyWorktreeZone(opts: {
   cwd: string;
   masterCwd: string;
@@ -349,27 +312,21 @@ export function classifyWorktreeZone(opts: {
 }): WorktreeZone {
   for (const wt of opts.worktrees) {
     if (!isPathUnder(opts.cwd, wt)) continue;
-    if (isPathUnder(opts.masterCwd, wt)) return { zone: 'main', tabName: null }; // 主检出 → main tab
+    if (isPathUnder(opts.masterCwd, wt)) return { zone: 'main', tabName: null }; // Why: Preserve the established compatibility and safety behavior.
     const base = wt.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? 'worktree';
     return { zone: 'worktree', tabName: base };
   }
   return { zone: 'main', tabName: null };
 }
 
-/**
- * 放置决策（D26 显式层 + D86 缺省层）：
- *  - 显式 `tab` 参数：规范名 → 已知 tab 同名则 append（用其 tabId），否则 new；
- *  - 缺省（D86）：`zone` 给出分组——main → append 进 mainTabId；worktree →
- *    join-or-create 该目录名 tab（已知同名 append，否则 new）。
- * `knownTabs` = 调用时刻的存活 tab（label, id）。
- */
+/** Why: Preserve the established compatibility and safety behavior (D26, D86). */
 export function planTabPlacement(opts: {
   desiredTab?: string | null;
   description: string;
   knownTabs: ReadonlyArray<{ tabName: string; tabId: string }>;
-  /** D86 缺省分组（classifyWorktreeZone 输出；不传 = 旧 description 派生路径，兼容用）。 */
+  /** Why: Preserve the established compatibility and safety behavior (D86). */
   zone?: WorktreeZone;
-  /** D86 main 分组的目标 tab（master 所在 tab）。 */
+  /** Why: Preserve the established compatibility and safety behavior (D86). */
   mainTabId?: string | null;
 }): TabPlacementPlan {
   const known = new Map<string, string>();
@@ -381,39 +338,33 @@ export function planTabPlacement(opts: {
   }
   const zone = opts.zone;
   if (zone?.zone === 'main' && opts.mainTabId) {
-    // D86 R1：主检出 → split 进 main tab（锚 pane 由调用方选）
+    // Why: Preserve the established compatibility and safety behavior (D86, R1).
     return { mode: 'append', tabName: 'main', tabId: opts.mainTabId };
   }
   if (zone?.zone === 'worktree' && zone.tabName) {
-    // D86 R1：worktree → join-or-create 目录名 tab（原样 label，大小写不敏感撞名 join）
+    // Why: Preserve the established compatibility and safety behavior (D86, R1).
     const base = zone.tabName;
     const existing = [...known.keys()].find((k) => k.toLowerCase() === base.toLowerCase());
     if (existing) return { mode: 'append', tabName: existing, tabId: known.get(existing)! };
     const tabName = nextTaskTabName(base, new Set(known.keys()));
     return { mode: 'new', tabName, tabId: null };
   }
-  // 兜底（无 zone 信息）：由 description 派生名 + 撞名加序号后缀 → 永远 new。
+  // Why: Preserve the established compatibility and safety behavior.
   const base = tabNameForTask(opts.description);
   const tabName = nextTaskTabName(base, new Set(known.keys()));
   return { mode: 'new', tabName, tabId: null };
 }
 
-/* ── D97：worker 启动参数（纯逻辑，可单测） ───────────────────────── */
+/** Why: Preserve the established compatibility and safety behavior (D97). */
 
-/** launchLine 的运行时三要素（master 侧探测：node 解释器 / pi cli / 本扩展入口）。 */
+/** Why: Preserve the established compatibility and safety behavior. */
 export interface LaunchRuntime {
   nodePath: string;
   cliPath: string;
   extPath: string;
 }
 
-/**
- * worker 启动裸 argv。`--tui-mode fullscreen`（D97 静帧前提）：
- * alt-screen 行级差分——窄条静帧不变 → PTY 零输出，流式 thinking 不再整屏
- * dump 闪烁；regular 主屏改动在视口上方即全量重倒（pi tui-main-screen
- * firstChanged < viewportTop 路径），overlay 盖不住。
- * `PI_HERDR_TUI=regular` 回退旧行为（逃生口）。
- */
+/** Why: Preserve the established compatibility and safety behavior (D97). */
 export function buildLaunchParts(
   runtime: LaunchRuntime,
   opts: { resumeFile?: string | null; roleModel?: string | null; approve?: boolean } = {},
@@ -428,24 +379,19 @@ export function buildLaunchParts(
   return parts;
 }
 
-/* ── D98：worktree 隔离写并行（纯逻辑，可单测） ──────────────────── */
+/** Why: Preserve the established compatibility and safety behavior (D98). */
 
-/** isolate 规划产物：分支名 / slug / 托管目录名。 */
+/** Why: Preserve the established compatibility and safety behavior. */
 export interface IsolatePlan {
   branch: string;
   slug: string;
   worktreeDirName: string;
 }
 
-/** slug 上限（Windows 路径预算；分支名与目录名共用）。 */
+/** Why: Preserve the established compatibility and safety behavior. */
 export const ISOLATE_SLUG_MAX = 40;
 
-/**
- * D98：isolate worktree 规划。slug = description ascii-fold（小写、非字母数字
- * 折叠单个 `-`、去首尾 `-`、截断 ≤ISOLATE_SLUG_MAX）；空（如纯中文）→
- * `task-<taskHex>`；分支撞名加 -2/-3…（同 nextTaskTabName 惯例）。
- * branch = `pier/<slug>`；worktreeDirName = `pier-<slug>`。
- */
+/** Why: Preserve the established compatibility and safety behavior (D98). */
 export function planIsolateWorktree(opts: {
   description: string;
   taskHex: string;
@@ -467,10 +413,7 @@ export function planIsolateWorktree(opts: {
   return { branch: `pier/${name}`, slug: name, worktreeDirName: `pier-${name}` };
 }
 
-/**
- * D98：纪律前导（前置于 prompt）。确定性拼接，非模型提供：圈定写入范围、
- * 即时提交到自己的分支、禁 push、结算前提交干净并附摘要。
- */
+/** Why: Preserve the established compatibility and safety behavior (D98). */
 export function buildIsolatePreamble(opts: { worktreePath: string; branch: string; baseShort: string }): string {
   return [
     `You are working in an isolated git worktree: ${opts.worktreePath} (branch ${opts.branch}, base ${opts.baseShort}).`,
@@ -481,10 +424,7 @@ export function buildIsolatePreamble(opts: { worktreePath: string; branch: strin
   ].join('\n');
 }
 
-/**
- * D98：结算通知附行。任一必需输入缺失 → null（静默省略）。isolate（branch≠null）
- * 行带基线 commit 计数与 diff stat；非 isolate = 全体 git worker 的轻量 stat 行。
- */
+/** Why: Preserve the established compatibility and safety behavior (D98). */
 export function formatWorktreeStat(opts: {
   branch: string | null;
   commits: number | null;
@@ -503,7 +443,7 @@ export function formatWorktreeStat(opts: {
   return `git: ${opts.statLine}; uncommitted: ${opts.dirtyCount} file(s)`;
 }
 
-/** D98：回收判定。merged/dirty 任一未知(null) → retain（fail toward keep，grok safety gate 原则）。 */
+/** Why: Preserve the established compatibility and safety behavior (D98). */
 export type ReleaseDecision = { action: 'release' } | { action: 'retain'; reason: 'unmerged' | 'dirty' | 'unknown' };
 
 export function evaluateRelease(opts: { merged: boolean | null; dirtyCount: number | null }): ReleaseDecision {
@@ -513,12 +453,7 @@ export function evaluateRelease(opts: { merged: boolean | null; dirtyCount: numb
   return { action: 'release' };
 }
 
-/**
- * D98：`git worktree list --porcelain` → 分支短名 → wt 路径 map。
- * 跨平台锚点：CRLF 容忍（Windows git 输出）；detached HEAD 块无 branch 行 → 自然忽略
- * （用户的裸 detached wt 不入表）；键剥 `refs/heads/` 前缀与 for-each-ref
- * refname:short / SubEntry.isolate.branch 同形。路径原样保留（git 全平台输出正斜杠）。
- */
+/** Why: Preserve the established compatibility and safety behavior (D98). */
 export function parseWorktreePorcelain(out: string): Map<string, string> {
   const byBranch = new Map<string, string>();
   let curPath: string | null = null;

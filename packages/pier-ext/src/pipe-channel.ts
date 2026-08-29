@@ -1,49 +1,58 @@
 /**
- * M11 人机通道分离（D45–D47）：pi 扩展自建 Windows 命名管道。
+ * M11 separates the human/machine channels (D45–D47) by having the pi extension
+ * create its own Windows named pipe.
  *
- *  - 主控（客户端）：一连接一请求（与 herdr 客户端同风格）；
- *  - 子 pane（服务端）：PI_HERDR_SUBAGENT=1 的扩展在 session_start 起 server，
- *    收到 prompt/follow_up 后经 pi.sendUserMessage(followUp) 注入会话本身（TUI 可见）；
- *  - 完成信息不回传（权威路径 = herdr 状态 + 会话 JSONL + history，D47）。
+ *  - Controller (client): one connection per request, matching the herdr client;
+ *  - Child pane (server): when PI_HERDR_SUBAGENT=1, the extension starts a server at
+ *    session_start and injects prompt/follow_up through pi.sendUserMessage (visible in TUI);
+ *  - Completion data is not sent back; authoritative state lives in herdr, session JSONL,
+ *    and history (D47).
  *
- * 本文件只含传输层纯逻辑（可单测，不依赖 pi API）；
- * pi 注入由 index.ts 的服务端回调完成。
+ * This file contains only pure transport-layer logic for isolated tests; index.ts
+ * performs pi injection in the server callback.
  */
 import * as net from 'node:net';
-import { sessionDirName } from './session-tail.ts';
+import { sessionDirCandidates, sessionDirName } from './storage-layout.ts';
 
-/** 管道名：workspace 作用域（与 history.jsonl 目录命名同约定）+ paneId 编码。 */
-export function pipeNameFor(cwd: string, paneId: string): string {
-  const dir = sessionDirName(cwd);
-  const encoded = String(paneId).replace(/[^A-Za-z0-9_-]/g, '-');
-  return `pi-herdr-${dir}-${encoded}`;
+function encodePaneId(paneId: string): string {
+  return String(paneId).replace(/[^A-Za-z0-9_-]/g, '-');
 }
 
-/** Windows 命名管道完整地址（内核命名空间，非文件系统路径）。 */
+/** Pipe name: workspace-scoped (same encoding as history dirs) + paneId. */
+export function pipeNameFor(cwd: string, paneId: string): string {
+  return `pi-herdr-${sessionDirName(cwd)}-${encodePaneId(paneId)}`;
+}
+
+/** New encoding first, then legacy — client retries so mixed-version peers still connect. */
+export function pipeNameCandidates(cwd: string, paneId: string): string[] {
+  return sessionDirCandidates(cwd).map((dir) => `pi-herdr-${dir}-${encodePaneId(paneId)}`);
+}
+
+/** Windows named-pipe address in the kernel namespace, not a filesystem path. */
 export function pipePathFor(name: string): string {
   return process.platform === 'win32'
     ? (name.startsWith('\\\\.\\pipe\\') ? name : `\\\\.\\pipe\\${name}`)
     : `/tmp/${name}.sock`;
 }
 
-/** 管道消息（JSON 行协议；一连接一请求 = 一个请求一个响应）。 */
+/** Pipe message in the JSON-lines protocol; one connection carries one request and response. */
 export type PipeRequest =
   | { type: 'ping'; id: string }
   | {
       type: 'prompt' | 'follow_up';
       id: string;
       text: string;
-      /** 发送方管道名（D49：回复随 from 走；无主从硬编码）。 */
+      /** D49: reply follows the sender's pipe name, avoiding hard-coded controller/child roles. */
       from?: string | null;
-      /** D50：结算时是否 push reply（后台 true、前台 false——前台由调用方同步取结果）。 */
+      /** D50: whether settlement pushes a reply (background true, foreground false because the caller reads synchronously). */
       push?: boolean;
-      /** B3：follow_up 以 steer 投递（tool-call 间隙即达，秒级）。缺省/ false =
-       * followUp 队列语义（run 结束才投）——初始 prompt 保持队列语义，续作指令走 steer。 */
+      /** B3: deliver follow_up as steer so it arrives between tool calls within seconds. Missing/false keeps
+       * queue semantics (delivered when the run ends); the initial prompt stays queued while continuations steer. */
       steer?: boolean;
     }
   | { type: 'interrupt'; id: string }
   | {
-      /** D50：结算快路径回信（子 → 请求方；带摘要 + 会话路径，渐进式披露）。 */
+      /** D50: fast-path settlement reply from child to requester, with summary and session path for progressive disclosure. */
       type: 'reply';
       id: string;
       paneId: string;
@@ -55,7 +64,7 @@ export type PipeResponse =
   | { type: 'ok'; id: string; detail?: string }
   | { type: 'error'; id: string; message: string };
 
-/** 解析一行 JSON（坏行返回 null）。 */
+/** Parse one JSON line, returning null for malformed input. */
 export function parsePipeLine(line: string): PipeRequest | PipeResponse | null {
   const t = (line ?? '').trim();
   if (!t) return null;
@@ -63,14 +72,14 @@ export function parsePipeLine(line: string): PipeRequest | PipeResponse | null {
     const obj = JSON.parse(t);
     if (obj && typeof obj === 'object' && typeof obj.type === 'string') return obj as PipeRequest | PipeResponse;
   } catch {
-    /* 坏行 */
+    /* Malformed line. */
   }
   return null;
 }
 
 /**
- * 一连接一请求：连接 → 写一行 JSON → 等一行 JSON 响应 → 断开。
- * 超时/连接失败/坏响应 → 抛错（调用方决定重试）。
+ * One connection, one request: connect → write JSON line → wait for JSON line → close.
+ * Timeout / connect failure / bad frame throw (caller retries).
  */
 export function pipeRequest(
   pipeName: string,
@@ -117,19 +126,43 @@ export function pipeRequest(
   });
 }
 
-/** 带重试的 ping（就绪探测；D47 取代 waitSubReady 的 agent 状态门）。 */
+/**
+ * Try new then legacy pipe names so a new client can still reach an old server.
+ */
+export async function pipeRequestTo(
+  cwd: string,
+  paneId: string,
+  payload: PipeRequest,
+  timeoutMs = 8000,
+): Promise<PipeResponse> {
+  const names = pipeNameCandidates(cwd, paneId);
+  let lastErr: unknown;
+  for (const name of names) {
+    try {
+      return await pipeRequest(name, payload, timeoutMs);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(`pipe ${names[0] ?? paneId}: unreachable`);
+}
+
+/** Ping with retry (readiness probe). Accepts one name or new+legacy candidates. */
 export async function pingUntilReady(
-  pipeName: string,
+  pipeName: string | readonly string[],
   timeoutMs: number,
   intervalMs = 1000,
 ): Promise<boolean> {
+  const names = typeof pipeName === 'string' ? [pipeName] : pipeName;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    try {
-      const res = await pipeRequest(pipeName, { type: 'ping', id: `ping-${Date.now()}` }, 3000);
-      if (res.type === 'ok') return true;
-    } catch {
-      /* 未就绪，继续 */
+    for (const name of names) {
+      try {
+        const res = await pipeRequest(name, { type: 'ping', id: `ping-${Date.now()}` }, 3000);
+        if (res.type === 'ok') return true;
+      } catch {
+        /* not ready on this name */
+      }
     }
     await new Promise((r) => setTimeout(r, intervalMs));
   }
@@ -139,8 +172,8 @@ export async function pingUntilReady(
 export type PipeMessageHandler = (req: PipeRequest) => Promise<PipeResponse>;
 
 /**
- * 服务端：每连接读一行 → 分发 handler → 回一行 → 断开。
- * 返回 server 实例（调用方管理 close）。
+ * Server: one line in → handler → one line out → close.
+ * Returns the server (caller closes it).
  */
 export function startPipeServer(
   pipeName: string,
@@ -173,11 +206,11 @@ export function startPipeServer(
         });
     });
     sock.on('error', () => {
-      /* 客户端断开等：静默 */
+      /* client disconnect: silent */
     });
   });
   server.on('error', () => {
-    /* 地址占用等：由调用方观察（listen 抛错由 startPipeServer 调用方处理） */
+    /* address in use: caller observes listen errors */
   });
   server.listen(pipePathFor(pipeName));
   return server;

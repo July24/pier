@@ -1,32 +1,32 @@
 /**
- * D69：todo 阅读钩子规划（before_agent_start + display:false）。
- * 反冻结（stale-core）：全完成列表过期后不再复读——
- *  - stale（turns 维度）→ 警告 + 旧条目（供改写参照），每 N 轮一次、封顶；
- *  - archived（墙钟维度）→ 按不存在处理，归档通知与空列表共用守卫节奏。
+ * D69: Plan the todo read hook (before_agent_start + display:false).
+ * Stale-core prevents a fully completed list from being recited forever:
+ *  - stale (turn-based) → warn with old entries for rewriting, rate-limited and capped;
+ *  - archived (wall-clock based) → treat it as absent, sharing the guard cadence with empty lists.
  */
 import { boundedView, currentActivity, type TodoItem } from './todo-core.ts';
 import { countTodos } from './vocab.ts';
 import { STALE_NOTICE_MAX, evaluateStaleness, formatAge } from './stale-core.ts';
 
-/** 空守卫 / stale 警告 / 归档通知共用的注入节奏（每 N 轮）。 */
+/** Share one injection cadence across empty-list guards, stale warnings, and archive notices. */
 export const EMPTY_GUARD_EVERY_N = 4;
 export const TODO_READ_CUSTOM_TYPE = 'pi-herdr.todo-read';
 
 export type TodoReadEffect =
-  | 'recite' // 正常复读（列表新鲜）
-  | 'empty-guard' // 空列表守卫
-  | 'stale-notice' // A：turns 维度过期警告
-  | 'archive-notice' // B：墙钟维度归档通知
-  | 'none'; // 限频/封顶跳过
+  | 'recite' // Recite normally while the list is fresh.
+  | 'empty-guard' // Guard against an empty list.
+  | 'stale-notice' // A: warn when the list is stale by turns.
+  | 'archive-notice' // B: notify when the list is archived by wall-clock age.
+  | 'none'; // Skip because of rate limits or caps.
 
 export interface TodoReadPlan {
   inject: boolean;
   effect: TodoReadEffect;
-  /** 当前归档态（与 inject 无关；调用方据此刷新 widget/title 投影）。 */
+  /** Current archive state, independent of injection, so callers can refresh widget/title projections. */
   archived: boolean;
-  /** R1：归档通知本次注入即清空内存列表（调用方执行 todos.replace([]) + rm 全量
-   * 落 JSONL——死列表挡住空守卫的 before-stopping 驱动，01a03c0d 实证归档后
-   * 2h 多步工作零跟踪）。 */
+  /** R1: Clear the in-memory list when injecting the archive notice; callers persist the empty JSONL
+   * so a dead list cannot block the before-stopping empty guard (01a03c0d observed 2h of untracked
+   * multi-step work after archiving). */
   clearArchived: boolean;
   message: {
     customType: string;
@@ -47,12 +47,12 @@ export function planTodoReadHook(opts: {
   items: readonly TodoItem[];
   turn: number;
   lastEmptyGuardTurn: number | null;
-  /** stale-core 时钟锚点（TodosService.lastWriteAt）。 */
+  /** stale-core clock anchor (TodosService.lastWriteAt). */
   lastWriteAt: number | null;
-  /** 距上次 todo 写入的轮数（本进程内已知时）。 */
+  /** Turns since the last todo write, when known in this process. */
   turnsSinceWrite: number | null;
   now: number;
-  /** 本停滞期已注入的 stale 警告数。 */
+  /** Number of stale warnings injected during the current idle period. */
   staleNotices: number;
   lastStaleGuardTurn: number | null;
 }): TodoReadPlan {
@@ -88,9 +88,12 @@ export function planTodoReadHook(opts: {
   if (st.kind === 'archived') {
     const c = countTodos(opts.items as TodoItem[]);
     const age = st.ageMs == null ? '' : ` ${formatAge(st.ageMs)} ago`;
-    // R2：重写窗口——本停滞期还没给过任何 stale 警告时，先给一次带旧条目参照的
-    // 重写机会（idle 期不消耗 turn，墙钟先到 1h 而 turns 警告从未触发，
-    // 01a03c0d 实证：回来后直接吃终态通知，todo_write 5 次被无视）。
+    // R2: Preserve one rewrite window with old entries as a reference before archiving.
+    // Idle periods do not consume turns, so the wall clock can reach one hour before a turns-based
+    // warning fires; 01a03c0d showed that the final notice then caused five todo_write calls to be ignored.
+    // B + R1/R3: The terminal notice no longer injects details and clears the list in the same
+    // injection; removing the [] escape hatch ensures multi-step work gets tracked while single-step
+    // Q&A remains explicitly allowed.
     if (opts.staleNotices === 0 && guardDue) {
       const lines = opts.items.map((it) => `  ${MARKS[it.status]} ${it.content}`);
       const head = `todos ✓${c.completed} (all completed, last updated${age}) — about to be archived`;
@@ -103,8 +106,9 @@ export function planTodoReadHook(opts: {
         message: msg([head, ...lines, warn].join('\n')),
       };
     }
-    // B + R1/R3：终态通知——明细不再注入，本次注入即清空；去掉 [] 豁免出口，
-    // 多步工作必须建清单（单步问答明确放行）。
+    // B + R1/R3: The terminal notice no longer injects details and clears the list in the same
+    // injection; removing the [] escape hatch ensures multi-step work gets tracked while single-step
+    // Q&A remains explicitly allowed.
     return {
       inject: guardDue,
       effect: 'archive-notice',
@@ -119,7 +123,7 @@ export function planTodoReadHook(opts: {
   }
 
   if (st.kind === 'stale') {
-    // A：复读改警告；保留旧条目行供模型改写参照。封顶 STALE_NOTICE_MAX。
+    // A: Turn recitation into a warning while retaining old entries as rewrite references; cap at STALE_NOTICE_MAX.
     const staleDue = opts.lastStaleGuardTurn == null
       || opts.turn - opts.lastStaleGuardTurn >= EMPTY_GUARD_EVERY_N;
     if (!staleDue || opts.staleNotices >= STALE_NOTICE_MAX) {
@@ -139,7 +143,7 @@ export function planTodoReadHook(opts: {
     };
   }
 
-  // fresh：原有每轮复读。
+  // Fresh lists are recited every turn to keep current work visible.
   const c = countTodos(opts.items);
   const view = boundedView(opts.items, 6);
   const lines = view.visible.map((it) => `${MARKS[it.status]} ${it.content}`);

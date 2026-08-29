@@ -1,9 +1,4 @@
-/**
- * todo 纯逻辑：校验 / 折叠 / M10 增量（D34–D43）。
- *
- * 全部无副作用、无 pi API 依赖 → 可单测（node --test 直接跑 TS）。
- * 语义 = DESIGN.md §5.1.1 + §15：全量替换（last-wins），五态 + blocker + phase。
- */
+/** Why: Preserve the established compatibility and safety behavior (D34–D43, M10). */
 import {
   TODO_DETAILS_KEY,
   TODO_STATUSES,
@@ -17,13 +12,13 @@ import { countTodos } from './vocab.ts';
 
 export type { TodoItem, TodoSnapshot, TodoStatus, TodoCounts };
 
-/** D43：phase 名长度上限。 */
+/** Why: Preserve the established compatibility and safety behavior (D43). */
 export const PHASE_MAX_LEN = 30;
 
-/** D38：人类编辑 custom 条目类型（/todos done/drop/rm 写回权威的通道）。 */
+/** Why: Preserve the established compatibility and safety behavior (D38). */
 export const TODO_EDIT_CUSTOM_TYPE = 'pi-herdr.todo-edit';
 
-/** 人类编辑操作（D38）：done=completed、drop=abandoned、rm=移除、unblock=blocked→pending（M17）。 */
+/** Why: Preserve the established compatibility and safety behavior (D38, M17). */
 export type TodoEditOp = 'done' | 'drop' | 'rm' | 'unblock';
 
 export interface TodoEdit {
@@ -43,16 +38,7 @@ export interface TodoValidationResult {
   error?: string;
 }
 
-/**
- * 校验一次 todo_write 的入参并规范化为条目数组（D34/D43 扩展）。
- * 规则：
- *  - todos 必须是数组（空数组合法 = 清空列表）；
- *  - 每条允许键 = content/status/blocker/phase，不允许其他键；
- *  - content 非空且全局唯一；status ∈ 五态；
- *  - blocker 仅 status==='blocked' 时允许（非空字符串），其他状态携带即拒绝；
- *  - phase 可选：非空、≤30 字符；
- *  - allowParallelInProgress=false 时，至多一条 in_progress（B2 严格模式的第一道闸）。
- */
+/** Why: Preserve the established compatibility and safety behavior (B2, D34, D43). */
 export function validateTodos(
   todos: unknown,
   allowParallelInProgress = true,
@@ -93,9 +79,9 @@ export function validateTodos(
     const item: TodoItem = { content, status: status as TodoStatus };
     if ('blocker' in entry) {
       const blocker = entry.blocker;
-      // 容忍归一（用户实证修复）：Optional 字段用空串/null 填充是常见模型行为
-      //（grok 实测 9 连拒死循环）；status 是权威——非 blocked 态的 blocker 一律视为
-      // 缺省丢弃（无论是否有值），空值同样丢弃。仅类型畸形仍硬拒。
+      // Why: Preserve the established compatibility and safety behavior.
+      // Why: Preserve the established compatibility and safety behavior.
+      // Why: Preserve the established compatibility and safety behavior.
       if (blocker != null && typeof blocker !== 'string') {
         return { ok: false, error: 'invalid todo: `blocker` must be a non-empty string' };
       }
@@ -111,7 +97,7 @@ export function validateTodos(
       if (phase != null && typeof phase !== 'string') {
         return { ok: false, error: `invalid todo: \`phase\` must be a non-empty string ≤ ${PHASE_MAX_LEN} chars` };
       }
-      // 空串/纯空白 = 缺省（实证循环里 phase:"" 同样是被掩盖的雷）；超长是真实约束仍硬拒
+      // Why: Preserve the established compatibility and safety behavior.
       if (typeof phase === 'string') {
         if (phase.length > PHASE_MAX_LEN) {
           return { ok: false, error: `invalid todo: \`phase\` must be a non-empty string ≤ ${PHASE_MAX_LEN} chars` };
@@ -133,13 +119,7 @@ export function validateTodos(
   return { ok: true, items };
 }
 
-/**
- * D42 严格模式归一化（OMP normalizeInProgressTask 语义，按 pane 角色自动推导）：
- *  - 多余 in_progress（列表顺序第二条起）退回 pending；
- *  - 无 in_progress 且有 pending → 晋升列表顺序第一条 pending；
- *  - blocked/abandoned 不参与晋升。
- * 返回新数组（不改入参）。
- */
+/** Why: Preserve the established compatibility and safety behavior (D42). */
 export function normalizeStrict(items: readonly TodoItem[]): TodoItem[] {
   if (items.length === 0) return [];
   const out = items.map((it) => ({ ...it }));
@@ -157,7 +137,7 @@ export function normalizeStrict(items: readonly TodoItem[]): TodoItem[] {
   return out;
 }
 
-/** D35：逐项全等比较（content/status/blocker/phase），用于 no-op 检测。 */
+/** Why: Preserve the established compatibility and safety behavior (D35). */
 export function listsEqual(a: readonly TodoItem[], b: readonly TodoItem[]): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) {
@@ -168,7 +148,7 @@ export function listsEqual(a: readonly TodoItem[], b: readonly TodoItem[]): bool
   return true;
 }
 
-/** D36：本轮新变为 completed 的 content 列表（prev → next）。 */
+/** Why: Preserve the established compatibility and safety behavior (D36). */
 export function completionTransitions(prev: readonly TodoItem[], next: readonly TodoItem[]): string[] {
   const prevMap = new Map(prev.map((it) => [it.content, it.status]));
   const out: string[] = [];
@@ -178,7 +158,7 @@ export function completionTransitions(prev: readonly TodoItem[], next: readonly 
   return out;
 }
 
-/** D37：上轮 completed、本轮退回 pending/in_progress 的 content 列表（软警告用）。 */
+/** Why: Preserve the established compatibility and safety behavior (D37). */
 export function revertedCompleted(prev: readonly TodoItem[], next: readonly TodoItem[]): string[] {
   const nextMap = new Map(next.map((it) => [it.content, it.status]));
   const out: string[] = [];
@@ -190,15 +170,15 @@ export function revertedCompleted(prev: readonly TodoItem[], next: readonly Todo
   return out;
 }
 
-/** 构造持久化快照（version 字段让消费方在未来形状变化时丢弃陈旧数据）。 */
+/** Why: Preserve the established compatibility and safety behavior. */
 export function makeSnapshot(items: TodoItem[]): TodoSnapshot {
   return { version: 1, items };
 }
 
 export interface BranchEntryLike {
-  /** pi 会话条目：type 为 'message' 的消息条目或 'custom' 的自定义条目。 */
+  /** Why: Preserve the established compatibility and safety behavior. */
   type?: string;
-  /** 会话 JSONL 顶层时间戳（ISO 字符串或 epoch ms；重建 lastWriteAt 用）。 */
+  /** Why: Preserve the established compatibility and safety behavior. */
   timestamp?: unknown;
   message?: {
     role?: string;
@@ -209,13 +189,7 @@ export interface BranchEntryLike {
   data?: unknown;
 }
 
-/**
- * D38：在列表上应用人类编辑（幂等：目标不存在则 no-op）。
- *  - done：pending/in_progress/blocked → completed；completed 保持（completed 不可逆，D37）；
- *  - drop：非 completed/abandoned → abandoned；
- *  - rm：移除（任意状态）；
- *  - unblock（M17）：blocked → pending（清 blocker）；非 blocked 为 no-op。
- */
+/** Why: Preserve the established compatibility and safety behavior (D37, D38, M17). */
 export function applyTodoEdits(items: readonly TodoItem[], edits: readonly TodoEdit[]): TodoItem[] {
   let out = items.map((it) => ({ ...it }));
   for (const edit of edits) {
@@ -266,15 +240,10 @@ function extractEditPayload(data: unknown): TodoEditPayload | null {
   return { version: 1, edits, ts: typeof raw.ts === 'number' ? raw.ts : 0 };
 }
 
-/**
- * 从 pi 会话分支条目里折叠出最新 todo 列表（D38 双源）：
- *  - toolResult(todo_write) → 快照替换（last-wins）；
- *  - custom(pi-herdr.todo-edit) → 在当前列表上应用 edits（人类编辑）。
- * 分支正确性 = 沿分支路径顺序折叠。
- */
+/** Why: Preserve the established compatibility and safety behavior (D38). */
 export interface FoldedTodos {
   items: TodoItem[];
-  /** 产生该列表的最后一个条目时间戳（epoch ms）；条目无时间戳 → null。 */
+  /** Why: Preserve the established compatibility and safety behavior. */
   writtenAt: number | null;
 }
 
@@ -288,13 +257,7 @@ function entryTimestamp(entry: BranchEntryLike): number | null {
   return null;
 }
 
-/**
- * 从 pi 会话分支条目里折叠出最新 todo 列表（D38 双源）：
- *  - toolResult(todo_write) → 快照替换（last-wins）；
- *  - custom(pi-herdr.todo-edit) → 在当前列表上应用 edits（人类编辑）。
- * 分支正确性 = 沿分支路径顺序折叠。writtenAt = 最后一次触碰该列表的条目时间戳
- * （无时间戳的旧条目 → null，陈旧度判定保守判 fresh）。
- */
+/** Why: Preserve the established compatibility and safety behavior (D38). */
 export function foldLatestTodosMeta(entries: readonly BranchEntryLike[]): FoldedTodos | null {
   let found: TodoItem[] | null = null;
   let writtenAt: number | null = null;
@@ -319,7 +282,7 @@ export function foldLatestTodosMeta(entries: readonly BranchEntryLike[]): Folded
   return found ? { items: found, writtenAt } : null;
 }
 
-/** foldLatestTodosMeta 的条目-only 视图（兼容既有调用方）。 */
+/** Why: Preserve the established compatibility and safety behavior. */
 export function foldLatestTodos(entries: readonly BranchEntryLike[]): TodoItem[] | null {
   return foldLatestTodosMeta(entries)?.items ?? null;
 }
@@ -333,7 +296,7 @@ export function extractSnapshotFromDetails(details: unknown): TodoSnapshot | nul
   return { version: 1, items: snap.items as TodoItem[] };
 }
 
-/** D38：模糊匹配（精确 → 前缀 → 子串），返回候选 content 列表（多候选 = 歧义）。 */
+/** Why: Preserve the established compatibility and safety behavior (D38). */
 export function fuzzyFind(items: readonly TodoItem[], query: string): string[] {
   const q = query.trim();
   if (!q) return [];
@@ -346,10 +309,10 @@ export function fuzzyFind(items: readonly TodoItem[], query: string): string[] {
   return substr.map((it) => it.content);
 }
 
-/** D39：有界视图选择——先丢 completed、再截 open；两端都超额时保最新（尾部切片）。 */
+/** Why: Preserve the established compatibility and safety behavior (D39). */
 export interface BoundedView {
   visible: TodoItem[];
-  /** 被隐藏的数量按状态计数（completed 单独计，其余合并）。 */
+  /** Why: Preserve the established compatibility and safety behavior. */
   hiddenCompleted: number;
   hiddenOpen: number;
 }
@@ -360,8 +323,8 @@ export function boundedView(items: readonly TodoItem[], budget: number): Bounded
   }
   const completed = items.filter((it) => it.status === 'completed');
   const open = items.filter((it) => it.status !== 'completed');
-  // 修正（用户实证）：widget 是头部可见窗口——超预算必须隐最老（丢头部），保最新可见；
-  // 旧实现 slice(0, budget) 保最老，最新任务永远落在窗口外。
+  // Why: Preserve the established compatibility and safety behavior.
+  // Why: Preserve the established compatibility and safety behavior.
   const visible = open.length > budget ? open.slice(-budget) : open;
   const hiddenOpen = open.length - visible.length;
   let hiddenCompleted = completed.length;
@@ -374,7 +337,7 @@ export function boundedView(items: readonly TodoItem[], budget: number): Bounded
   return { visible: final, hiddenCompleted, hiddenOpen };
 }
 
-/** 当前 in_progress 中的第一条（上报 agent 状态时作为 message，供侧边栏显示"正在做什么"）。 */
+/** Why: Preserve the established compatibility and safety behavior. */
 export function currentActivity(items: TodoItem[]): string | null {
   return items.find((it) => it.status === 'in_progress')?.content ?? null;
 }

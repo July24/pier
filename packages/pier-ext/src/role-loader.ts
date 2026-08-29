@@ -1,19 +1,19 @@
 /**
- * 档2 Week1：role 档案加载器（2026-08-18）；v1.1（2026-08-22）两层用户目录。
+ * Layer 2 Week 1: load role manifests (2026-08-18); v1.1 (2026-08-22) adds two user-directory layers.
  *
- * 查找序（v1.1，用户拍板）：
- *  1. workspace 级 `<cwd>/.pi-herdr/roles/<name>.json`（随 clone 走，团队共享）
- *  2. 用户全局 `~/.pi/agent/herdr-pi/roles/<name>.json`（跨仓库个人偏好）
- *  3. 内置 `src/roles/`（本包随附）兜底
+ * Lookup order (v1.1, user-approved):
+ *  1. Workspace-level `<cwd>/.pi-herdr/roles/<name>.json` (travels with the clone and is team-shared)
+ *  2. User-global `~/.pi/agent/herdr-pi/roles/<name>.json` (personal preference across repositories)
+ *  3. Bundled `src/roles/` as the fallback shipped with this package
  *
- * 内置名保留（master / worker-default）：用户/工作区层撞名直接拒绝——D83 镜像
- * 单测与 D82 姿态锚在内置档案上，被覆盖会破坏这些保证。
+ * Built-in names remain reserved (master / worker-default): reject collisions in user/workspace layers—D83 mirror.
+ * Tests and the D82 stance are anchored to bundled manifests; allowing overrides would break those guarantees.
  *
- * 角色名白名单 [a-z0-9-]+ —— 防路径穿越（不合法名不触盘）。
- * 档案 role 字段必须与文件名一致（防错挂）。
- * 校验失败分类：读不到 = ROLE_NOT_FOUND（逐层尝试后才报）；读到了但
- * JSON/校验/名字不符 = INVALID_ROLE_CONFIG（**在命中层立即报**，不静默落到
- * 下一层——静默会掩盖用户改了档案却写错的问题）。
+ * Role names are restricted to [a-z0-9-]—this prevents path traversal and avoids touching disk for invalid names.
+ * The manifest role field must match the filename to prevent attaching the wrong manifest.
+ * Validation failures are classified as: unreadable = ROLE_NOT_FOUND (reported only after trying every layer);
+ * parsed but invalid JSON/validation/name = INVALID_ROLE_CONFIG (report immediately at the hit layer rather than
+ * silently falling through, because silence would hide a user editing a manifest incorrectly).
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -23,15 +23,15 @@ import { userRolesDir, workspaceRolesDir as layoutWorkspaceRolesDir } from './st
 
 export { userRolesDir };
 
-/** 内置档案目录（src/roles/）。 */
+/** Bundled manifest directory (`src/roles/`). */
 export const ROLES_DIR = join(dirname(fileURLToPath(import.meta.url)), 'roles');
 
-/** workspace 级目录（相对基准默认 = 进程 cwd，即 master 的工作目录）。 */
+/** Workspace-level directory (the default base is the process cwd, i.e. the master's working directory). */
 export function workspaceRolesDir(baseDir?: string): string {
   return layoutWorkspaceRolesDir(baseDir ?? process.cwd());
 }
 
-/** 内置保留名（不可被任何用户层覆盖）。 */
+/** Reserved built-in names (no user layer may override them). */
 export const RESERVED_ROLE_NAMES: readonly string[] = ['master', 'worker-default'];
 
 const ROLE_NAME_RE = /^[a-z0-9-]+$/;
@@ -53,7 +53,7 @@ export class RoleLoaderError extends Error {
 
 export type RoleReader = (fileName: string) => string;
 
-/** 单层读取器（注入式；生产 = existsSync + readFileSync 该目录）。 */
+/** Single-layer reader (injectable; production uses existsSync + readFileSync for that directory). */
 export type LayerReader = (dir: string, fileName: string) => string | null;
 
 const defaultLayerRead: LayerReader = (dir, fileName) => {
@@ -63,21 +63,21 @@ const defaultLayerRead: LayerReader = (dir, fileName) => {
 };
 
 export interface LoadRoleOptions {
-  /** 单 reader 注入（旧形态：仅命中内置层——测试兼容用）。 */
+  /** Inject one reader (legacy shape: only the bundled layer is hit, for test compatibility). */
   read?: RoleReader;
-  /** 多层 reader 注入（v1.1）。 */
+  /** Inject layered readers (v1.1). */
   layerRead?: LayerReader;
-  /** workspace 层基准目录（默认 process.cwd()）。 */
+  /** Base directory for the workspace layer (defaults to process.cwd()). */
   baseDir?: string;
   /**
-   * 内置名直读：master 自应用（WS-D7）专用——保留名跳过用户层与撞名检查，
-   * 永远加载内置档案。否则 workspace 放 master.json 会让自应用 fail-open，
-   * master 静默丢失 manifest（d11 活体抓到的边界）。
+   * Direct built-in lookup: used by master's self-application (WS-D7). Reserved names skip user layers and
+   * collision checks and always load the bundled manifest. Otherwise, a workspace master.json could cause
+   * self-application to fail open and silently lose master's manifest (the boundary caught by d11 live testing).
    */
   builtinDirect?: boolean;
 }
 
-/** 解析查找层序：workspace → 用户全局 → 内置（每层 {label, dir}）。 */
+/** Resolve lookup layers in order: workspace → user-global → bundled (each layer has {label, dir}). */
 export function roleLayers(opts?: { baseDir?: string }): Array<{ label: string; dir: string }> {
   const base = opts?.baseDir && isAbsolute(opts.baseDir) ? opts.baseDir
     : resolve(opts?.baseDir ?? process.cwd());
@@ -94,7 +94,7 @@ export function loadRoleConfig(name: string, opts?: LoadRoleOptions): RoleManife
   }
   const fileName = `${name}.json`;
 
-  // 旧形态单 reader：直接按内置层语义（既有单测/合成器注入路径不破）
+  // Legacy single reader: use bundled-layer semantics so existing tests/composer injection paths remain intact.
   if (opts?.read && !opts.layerRead) {
     let text: string;
     try {
@@ -109,11 +109,11 @@ export function loadRoleConfig(name: string, opts?: LoadRoleOptions): RoleManife
   const layerRead = opts?.layerRead ?? defaultLayerRead;
   let layers = roleLayers({ baseDir: opts?.baseDir });
 
-  // 内置名直读（自应用）：只查内置层，不受用户层诱饵/撞名影响
+  // Direct built-in lookup (self-application): inspect only the bundled layer, ignoring user-layer bait/collisions.
   if (opts?.builtinDirect && RESERVED_ROLE_NAMES.includes(name)) {
     layers = [layers[2]];
   } else if (RESERVED_ROLE_NAMES.includes(name)) {
-    // 内置名保留：workspace/用户层撞名 → 拒绝（spawn 侧响亮报错，不静默覆盖内置语义）
+    // Reserved built-in name: reject workspace/user collisions instead of silently overriding built-in semantics.
     for (const layer of layers.slice(0, 2)) {
       if (layerRead(layer.dir, fileName) != null) {
         throw new RoleLoaderError(
@@ -126,8 +126,8 @@ export function loadRoleConfig(name: string, opts?: LoadRoleOptions): RoleManife
 
   for (const layer of layers) {
     const text = layerRead(layer.dir, fileName);
-    if (text == null) continue; // 本层无此档案 → 下一层
-    return parseAndValidate(name, fileName, text, layer.label); // 命中层：错误立即报
+    if (text == null) continue; // No manifest in this layer; try the next layer.
+    return parseAndValidate(name, fileName, text, layer.label); // At the hit layer, report errors immediately.
   }
   throw new RoleLoaderError(
     'ROLE_NOT_FOUND',

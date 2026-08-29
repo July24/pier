@@ -1,40 +1,41 @@
 /**
- * settled 唤醒决策纯核心（反唤醒风暴；session 01a03bf0 实证）。
+ * Pure core for the settled-wake decision (prevents wake storms; evidenced by session 01a03bf0).
  *
- * 实证链：ESC 中止 → agent_settled → D96「仍有后台 subagent」提醒
- * sendUserMessage(followUp)（空闲时必触发新 run）→ master 重启 → 用户再 ESC → …
- * 30 连 abort，ESC 永远打不断，Ctrl+C 杀进程才停。
- * 且自然 settle 也有自激励环：settle → 提醒 → 新 run → settle → 提醒……
+ * Evidence chain: ESC abort → agent_settled → D96 "background subagents still running" notice
+ * → sendUserMessage(followUp) (always starts a new run while idle) → master restarts → user presses ESC again → …
+ * After 30 aborts, ESC never breaks the cycle; only Ctrl+C stops the process.
+ * Natural settlement also forms a self-triggering loop: settle → notice → new run → settle → notice …
  *
- * 规则：
- *  - abort 抑制：上次 assistant stopReason === 'aborted' → 本次 settled 不做任何
- *    唤醒型注入（用户显式叫停；结算缓冲保留待下次自然 turn 投递）；
- *  - D96 去重：同一组 running paneId 只提醒一次；集合变化（新 sub / 结算）重置；
- *  - D96 冷却：同集合重提醒至少间隔 REPEAT_NOTICE_MS（集合没变却再提醒 = 噪音）。
+ * Rules:
+ *  - Abort suppression: when the previous assistant stopReason === 'aborted', this settled event injects no
+ *    wake-up message (the user explicitly stopped it; settlement-buffered content waits for the next natural turn);
+ *  - D96 deduplication: notify once for a given running paneId set; any set change (new subagent/settlement) resets it;
+ *  - D96 cooldown: repeat a notice for the same set only after REPEAT_NOTICE_MS (otherwise the unchanged set is noise).
  */
+
 export const ABORT_STOP_REASON = 'aborted';
 
-/** D96：同一 running 集合的重提醒冷却。 */
+/** D96: cooldown before repeating a notice for the same running set. */
 export const D96_REPEAT_NOTICE_MS = 10 * 60_000;
 
 export interface SettleWakeInput {
-  /** 本次 settled 前最后一次 assistant turn 的 stopReason（未知 = null，视作自然结束）。 */
+  /** stopReason of the last assistant turn before this settlement (unknown = null, treated as natural completion). */
   lastStopReason: string | null;
-  /** 仍在 running 的后台 subagent（空数组 = 无）。 */
+  /** Background subagents still running (empty means none). */
   running: ReadonlyArray<{ paneId: string }>;
-  /** 上次 D96 提醒时的集合键（无 = null）。 */
+  /** Set key recorded for the previous D96 notice (none = null). */
   lastNoticeKey: string | null;
-  /** 上次 D96 提醒时间（epoch ms）。 */
+  /** Timestamp of the previous D96 notice (epoch ms). */
   lastNoticeAt: number;
   now: number;
 }
 
 export interface SettleWakePlan {
-  /** false = 本次 settled 静默：不投任何唤醒型消息。 */
+  /** false means this settlement stays silent and emits no wake-up message. */
   wake: boolean;
-  /** 是否注入 D96「仍在运行」提醒。 */
+  /** Whether to inject the D96 "still running" notice. */
   notice: boolean;
-  /** 新的集合键（提醒时更新；running 空 → null）。 */
+  /** New set key (updated when notifying; empty running set → null). */
   noticeKey: string | null;
   noticeAt: number;
 }

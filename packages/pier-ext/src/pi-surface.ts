@@ -1,31 +1,23 @@
 /**
- * 档1 pi-surface（D79）：包住 pi ExtensionAPI 的注册面。
+ * Proxy the pi ExtensionAPI registration surface (D79).
  *
- * 背景（源码实证 pi dist/core/extensions/loader.js）：
- *  - `registerTool(...): void`、`on(...): void` —— **pi 不提供反注册函数**；
- *  - `extension.tools.set(tool.name, …)` —— 工具表按名覆盖：同名重注册 = 覆盖
- *    （hmr 热换后新版本自然顶掉旧条目）；
- *  - 事件监听是列表 —— 重注册会**双触发**（热换泄漏面）。
+ * pi exposes registration without unregister APIs: tools overwrite by name, but event
+ * listeners accumulate. HMR therefore needs tombstoned, generation-scoped wrappers so
+ * old listeners become inert while the latest generation remains active.
  *
- * 补偿策略（tombstone，世代化）：每个 core 模块经 `forModule(key)` 拿到scoped 面，
- * 其 registerTool/on 都包 alive 旗标。**世代规则**（d87 修，源读 cordis-plugin-hmr）：
- * hmr partialReload 真实时序 = 重挂新插件**之后**才 emit('hmr/reload') → bootstrap
- * hook 才 disposeKey——若按「翻当前组」实现，翻掉的是新版本正引用的组（死到货）。
- * 故：挂载即自翻同 key 更旧世代（新插件体执行 = 旧版本确定已死）；账本 disposer
- * 只收割「登记世代及之前」，登记后新挂的豁免；disposeModule（显式）翻全部。
- *
- * 与 dispose 账本（D80⑤ 修正后定位）咬合：构造时传入 ledger，forModule
- * 自动登记 `disposeModule(key)`——hmr/reload 按文件名补偿即翻旗。
+ * Because HMR emits reload after mounting the replacement (d87), mounting a key retires
+ * older generations immediately. The ledger then collects only generations registered
+ * through the reload boundary; explicit disposal retires every generation.
  */
 import type { DisposeLedger } from './ledger.ts';
 
-/** pi 的 ToolResult 最小形态（inert 返回用）。 */
+/** Minimal pi ToolResult shape used when a disposed tool is invoked. */
 const INERT_TOOL_RESULT = {
   content: [{ type: 'text' as const, text: 'Error: tool module disposed (hot-reloaded away); the new version has re-registered it.' }],
   details: {},
 };
 
-/** 模块级 scoped 面：registerTool/on 都带 alive 墓碑；registerCommand 走 Map 覆盖（pi 实测语义，无需墓碑）。 */
+/** Module-scoped surface: tombstone tools and events, while command replacement is safe because pi stores commands in a Map. */
 export interface ScopedSurface {
   registerTool(def: Record<string, unknown> & { name: string }): void;
   registerCommand(name: string, options: Record<string, unknown>): void;
@@ -34,17 +26,17 @@ export interface ScopedSurface {
 
 interface Group {
   alive: boolean;
-  /** 挂载世代号（单射递增；账本 disposer 按此判定收割范围）。 */
+  /** Monotonic mount generation used by the ledger disposer to determine its collection boundary. */
   epoch: number;
 }
 
-/** pi 注册面代理（D79）。raw 直通非注册方法（append/exec/setActiveTools…）。 */
+/** Proxy for pi's registration surface (D79); non-registration methods (append/exec/setActiveTools, etc.) pass through raw. */
 export class PiSurface<P extends object> {
   private groups = new Map<string, Group>();
-  /** 每 key 的世代列表（挂载即自翻更旧 → 活口至多 1 个，死口待账本回收）。 */
+  /** Generation history per key; mounting retires older generations so at most one stays alive until ledger collection. */
   private generations = new Map<string, Group[]>();
   private epochCounter = 0;
-  /** 账本登记世代（disposer 只收割 epoch ≤ 此值；消费即删，下次挂载补登）。 */
+  /** Ledger generation boundary; disposal collects epochs up to this value, then the next mount registers again. */
   private ledgerEntryEpoch = new Map<string, number>();
   private readonly pi: P;
   private readonly ledger?: DisposeLedger;
@@ -54,15 +46,15 @@ export class PiSurface<P extends object> {
     this.ledger = ledger;
   }
 
-  /** 原始 pi（不经包装的直通面；已迁移模块不应再用其注册）。 */
+  /** Raw pi surface, bypassing wrappers; migrated modules must not use it for registration. */
   get raw(): P {
     return this.pi;
   }
 
   /**
-   * 拿一个模块的 scoped 注册面。**每次调用 = 新世代**：挂载即自翻同 key 旧世代
-   * （新插件体执行意味着旧版本已死——hmr registry.delete 与手动重挂两态统一）。
-   * 账本登记按 key 单例（消费后下次挂载补登）。
+   * Get a module-scoped registration surface. Each call creates a new generation, retiring older
+   * generations for the same key so HMR replacement and manual remounting share one lifecycle.
+   * The ledger registers each key once and registers it again only after its entry is consumed.
    */
   forModule(key: string): ScopedSurface {
     this.epochCounter += 1;
@@ -102,8 +94,9 @@ export class PiSurface<P extends object> {
         );
       },
       registerCommand: (name, options) => {
-        // pi 的 commands 是 Map<name>（dist 实测 .set）——同名重注册覆盖，热换安全；
-        // handler 包墓碑仅为对称保险（覆盖语义下旧 handler 不会再被调）。
+        // pi stores commands as Map<name> (verified in the dist implementation), so same-name
+        // registration replaces safely; the handler tombstone is a symmetry safeguard even though
+        // replacement means the old handler will no longer be called.
         const handler = options.handler as ((...a: unknown[]) => unknown) | undefined;
         const wrapped = handler
           ? (...a: unknown[]) => (group!.alive ? handler(...a) : undefined)
@@ -118,7 +111,7 @@ export class PiSurface<P extends object> {
     };
   }
 
-  /** 翻墓碑（显式拆除，hmr 补偿不走这里）：翻该 key 全部世代；组不存在返回 false。 */
+  /** Retire all generations for a key during explicit disposal; return false when the key is absent. */
   disposeModule(key: string): boolean {
     const had = this.groups.has(key);
     for (const g of this.generations.get(key) ?? []) g.alive = false;
@@ -128,7 +121,7 @@ export class PiSurface<P extends object> {
     return had;
   }
 
-  /** 组数（测试/诊断）。 */
+  /** Number of live module groups, for tests and diagnostics. */
   get moduleCount(): number {
     return this.groups.size;
   }

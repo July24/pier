@@ -1,54 +1,58 @@
 /**
- * stop 未完成提醒决策纯核心（D41 二修；session 01a040cc 实证）。
+ * Pure decision core for reminders about unfinished todos when stopping (D41 revision 2;
+ * evidenced by session 01a040cc).
  *
- * 实证链：模型收尾 prose 写「待 push、建议随车发布」（= 有意留给用户决定），
- * 但 todo 列表残留 `[pending] push 到仓库`；旧版 D41 在 agent_settled 后
- * 116ms 以 user-role sendUserMessage 注入「Continue working on them before
- * stopping」——通道权威高于模型 20s 前的判断，12s 内 git push 执行了不在
- * 授权范围内的操作。
+ * Evidence: the model's closing prose said that pushing should be left to the user,
+ * yet the todo list still contained `[pending] push to repository`. The old D41 injected
+ * “Continue working on them before stopping” as a user-role message 116 ms after agent_settled;
+ * that channel overrode the model's judgment from 20 seconds earlier, and git push ran within
+ * 12 seconds without authorization.
  *
- * 三修（决策与文案全在本模块，时序宽限在 core/subagent 接线）：
- *  - 通道：sendMessage(custom)（非 user 角色）——提醒来源可辨，不冒充用户；
- *  - 措辞：祈使「继续干」→ 对账请求——「等人工的条目标 blocked / 问用户」
- *    升为一等出口，与「继续已授权工作」「删除失效条目」并列；
- *  - 守卫矩阵不变：abort 抑制 / 封顶 / 在途 subagent / blocked 深度 / 无 open 项。
+ * Revision 3 keeps the decision and wording here while the timing grace period is wired in
+ * core/subagent:
+ *  - use sendMessage(custom), not the user role, so the reminder source is identifiable rather than impersonating the user;
+ *  - replace “keep working” with a reconciliation request, making human-blocked items a first-class
+ *    outcome alongside continuing authorized work and deleting obsolete entries;
+ *  - preserve the guard matrix: suppress on abort, cap reminders, and skip while a subagent is
+ *    running, a human gate is blocked, or no open items remain.
  */
 import { ABORT_STOP_REASON } from './settle-wake-core.ts';
 
-/** 提醒封顶（整个进程生命周期；与旧版一致）。 */
+/** Cap reminders for the lifetime of the process, matching the previous behavior. */
 export const TODO_REMINDERS_MAX = 3;
 
-/** 提醒注入的 custom 消息类型（registerMessageRenderer 可按此定制 TUI 外观）。 */
+/** Custom message type for reminder injection (registerMessageRenderer can customize its TUI appearance). */
 export const TODO_REMINDER_CUSTOM_TYPE = 'pi-herdr.todo-reminder';
 
 /**
- * B3 宽限窗（毫秒）：settled → 实际注入的延迟——用户反制窗口（收尾答案先被
- * 人读到；期间任何 agent 启动即取消）。对齐 MACHINE_INJECT_GRACE_MS 模式；
- * PI_HERDR_TODO_GRACE_MS 可调（测试用小值）。逐次读取（非模块加载时定格）。
+ * B3 grace window (milliseconds): delay from settled to injection, giving the user a chance to
+ * read the closing answer and intervene; starting any agent during the window cancels it. This
+ * follows the MACHINE_INJECT_GRACE_MS pattern; PI_HERDR_TODO_GRACE_MS is read per call so tests
+ * can use a small value rather than freezing configuration at module load.
  */
 export function todoReminderGraceMs(): number {
   return Number(process.env.PI_HERDR_TODO_GRACE_MS ?? 30_000) || 30_000;
 }
 
 export interface TodoReminderInput {
-  /** 本次 settled 前最后一次 assistant turn 的 stopReason（未知 = null，视作自然结束）。 */
+  /** Stop reason of the last assistant turn before this settlement (null means treat it as natural completion). */
   lastStopReason: string | null;
-  /** 已注入的提醒次数。 */
+  /** Number of reminders already injected. */
   reminders: number;
-  /** 在途后台 subagent 数（>0 = 主控本就在等，不催）。 */
+  /** Number of running background subagents; a positive value means the master is already waiting. */
   runningSubs: number;
-  /** ask_user_question 等待深度（>0 = 等人类回答，不催）。 */
+  /** ask_user_question wait depth; a positive value means the master is waiting for a human response. */
   blockedDepth: number;
-  /** 当前 todo 列表。 */
+  /** Current todo list. */
   items: ReadonlyArray<{ content: string; status: string }>;
 }
 
 export interface TodoReminderPlan {
-  /** 是否应注入。 */
+  /** Whether a reminder should be injected. */
   due: boolean;
-  /** 注入的完整 content（due=false 时 null）。 */
+  /** Complete injected content, or null when due is false. */
   content: string | null;
-  /** 注入成功后的新计数（due=false 时原样返回）。 */
+  /** New count after successful injection, or the original count when due is false. */
   nextReminders: number;
 }
 
@@ -57,9 +61,10 @@ function noInject(reminders: number): TodoReminderPlan {
 }
 
 /**
- * stop 提醒决策：全部守卫通过且存在 open（pending/in_progress）条目时 due。
- * blocked / abandoned / completed 均不算未完成——等人工的条目正确建模后
- * 不应再被催（这正是 01a040cc 事故里缺失的一步）。
+ * A stop reminder is due only when every guard passes and at least one open (pending/in_progress)
+ * item exists. blocked, abandoned, and completed items are not unfinished: once human-waiting work
+ * is modeled correctly, reminding again would only pressure the model to act without authorization
+ * (the missing guard in the 01a040cc incident).
  */
 export function planStopTodoReminder(input: TodoReminderInput): TodoReminderPlan {
   if (input.lastStopReason === ABORT_STOP_REASON) return noInject(input.reminders);

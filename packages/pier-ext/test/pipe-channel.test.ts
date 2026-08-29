@@ -6,20 +6,29 @@ import assert from 'node:assert/strict';
 import {
   parsePipeLine,
   pingUntilReady,
+  pipeNameCandidates,
   pipeNameFor,
   pipeRequest,
+  pipeRequestTo,
   startPipeServer,
 } from '../src/pipe-channel.ts';
 
-test('pipeNameFor: workspace 作用域命名（与 history 目录命名同约定）+ paneId 编码', () => {
+test('pipeNameFor: collision-resistant workspace encoding + paneId', () => {
   assert.equal(
     pipeNameFor('F:\\herdr-pi', 'w6:p2C'),
-    'pi-herdr---F--herdr-pi---w6-p2C',
+    'pi-herdr---F%3A%5Cherdr-pi---w6-p2C',
   );
   assert.equal(
     pipeNameFor('/home/u/proj', 'w1:p9'),
-    'pi-herdr----home-u-proj---w1-p9',
+    'pi-herdr---%2Fhome%2Fu%2Fproj---w1-p9',
   );
+});
+
+test('pipeNameCandidates: new encoding first, then legacy', () => {
+  assert.deepEqual(pipeNameCandidates('F:\\herdr-pi', 'w6:p2C'), [
+    'pi-herdr---F%3A%5Cherdr-pi---w6-p2C',
+    'pi-herdr---F--herdr-pi---w6-p2C',
+  ]);
 });
 
 test('parsePipeLine: JSON 行解析与坏行容错', () => {
@@ -61,4 +70,23 @@ test('pipeRequest: 连接不存在 → 抛错（调用方重试）', async () =>
 test('pingUntilReady: 一直不在 → false', async () => {
   const ok = await pingUntilReady(`pi-herdr-never-${process.pid}-${Date.now()}`, 1200, 300);
   assert.equal(ok, false);
+});
+
+test('pipeRequestTo: reaches a server listening on the legacy name', async () => {
+  const cwd = 'F:\\herdr-pi';
+  const paneId = `w-test:${process.pid}`;
+  const names = pipeNameCandidates(cwd, paneId);
+  assert.equal(names.length, 2);
+  const server = startPipeServer(names[1], async (req) => {
+    if (req.type === 'ping') return { type: 'ok', id: req.id, detail: 'legacy' };
+    return { type: 'error', id: req.id, message: `unknown ${req.type}` };
+  });
+  try {
+    await new Promise((r) => setTimeout(r, 300));
+    const res = await pipeRequestTo(cwd, paneId, { type: 'ping', id: 'mig' }, 2000);
+    assert.equal(res.type, 'ok');
+    if (res.type === 'ok') assert.equal(res.detail, 'legacy');
+  } finally {
+    server.close();
+  }
 });

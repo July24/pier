@@ -1,7 +1,7 @@
 /**
- * 档 0：master 进程内每个 subagent 一个 cordis fiber。
- * pipe / poller / history 的清理走 ctx.effect，dispose LIFO。
- * C3：worker 进程不引入本模块。
+ * One Cordis fiber per subagent in the master process.
+ * pipe / poller / history cleanup uses ctx.effect (LIFO dispose).
+ * C3: workers must not import this module.
  */
 import { Context } from '@deepseek-ai/cordis';
 
@@ -34,6 +34,6 @@ export async function disposeSessionRoot(root: Context): Promise<void> {
   try {
     await root.fiber.dispose();
   } catch {
-    /* 二次 dispose 是 no-op */
+    /* second dispose is a no-op */
   }
 }

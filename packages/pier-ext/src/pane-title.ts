@@ -1,37 +1,38 @@
 /**
- * pane todo → herdr 窗格头 / 侧栏投影（M22，D62/D68）。
+ * Projects the pane todo snapshot into a herdr pane header/sidebar (M22, D62/D68).
  *
- * 权威仍在 pi 会话 JSONL；这里只把快照收成 title + blocked 徽标。
- * herdr 把 title / state_label 截到 80 字符——本地先裁，避免半截 emoji。
+ * The pi session JSONL remains authoritative; this layer only condenses the snapshot into a title and blocked badge.
+ * herdr truncates title/state_label to 80 characters, so truncate locally to avoid cutting an emoji in half.
  */
 import { countTodos, PI_HERDR_META_KEY, type TodoItem } from './vocab.ts';
 import { formatAge, isArchived } from './stale-core.ts';
 
-/** herdr 对 title / state_label 的字符上限（官方文档 + schema 实测）。 */
+/** herdr's character limit for title/state_label (from official documentation and schema measurements). */
 export const TITLE_MAX = 80;
-/** 空列表：调用方发 clear_title，不写空串。 */
+/** Empty list: callers send clear_title rather than an empty string. */
 export const TITLE_EMPTY = null;
 /**
- * state_labels 合法键只有 idle|working|blocked|done|unknown
- * （herdr socket-api；WIRE 早期 `todo` 被拒 invalid_state_label）。
+ * Valid state_labels keys are only idle|working|blocked|done|unknown
+ * (herdr socket-api; the early WIRE `todo` value was rejected as invalid_state_label).
  */
 export const BLOCKED_LABEL_KEY = 'blocked';
 
 /**
- * D93：todo 摘要的侧边栏 custom token 名（herdr `[ui.sidebar.agents]` 里以 `$pi-todo` 引用）。
- * 值与 pane title 同源同格式（`▶i ○p ■b ✓c (N/M) · activity`）。
+ * D93: custom sidebar token for the todo summary (referenced as `$pi-todo` by herdr `[ui.sidebar.agents]`).
+ * Keep its value in the same format and source as the pane title (`▶i ○p ■b ✓c (N/M) · activity`).
  */
 export const SIDEBAR_TODO_TOKEN = 'pi-todo';
-/** D95：ask_user_question 等待标志 token 名（workbench 热力分级读它区分 ask vs block）。 */
+/** D95: token marking an ask_user_question wait (the workbench heat scale uses it to distinguish ask from block). */
 export const SIDEBAR_ASK_TOKEN = 'pi-ask';
 
 /**
- * D93：构造 report_metadata 的 pi-todo token 补丁。
- * 有 title → 值 = title（侧边栏可排 `$pi-todo`）；无 todo → 空串（herdr patch 语义删除键，不留旧摘要）。
+ * D93: build the pi-todo token patch for report_metadata.
+ * A title becomes the token value so the sidebar can render `$pi-todo`; no todo becomes an empty string so herdr's
+ * patch semantics remove the key rather than retaining an old summary.
  *
- * D96 修正：**不再合并 stale**——stale（16 个 null）是一次性清理（reportMetadata 单独发），
- * 合并会使总数 17 > herdr tokens maxProperties=16 → 整个请求被拒 → title/tokens 全丢
- * （用户实机：pane title 消失 + 侧边栏 token 消失，D93 回归根因）。
+ * D96 correction: **do not merge stale**. Stale (16 nulls) is a one-time cleanup sent separately via reportMetadata;
+ * merging would make 17 entries exceed herdr's tokens maxProperties=16, rejecting the entire request and dropping
+ * both title and tokens (observed on the user's machine: pane title and sidebar token disappeared; D93 regression root cause).
  */
 export function sidebarTodoTokens(title: string | null): Record<string, string> {
   return { [SIDEBAR_TODO_TOKEN]: title ?? '' };
@@ -44,13 +45,13 @@ function clipTitle(s: string): string {
 }
 
 /**
- * `▶i ○p ■b ✓c (N/M [~eta]) · <activity>`（D91 图标统一：黑白字符四件套）。
- * activity = 第一条 in_progress，否则 fallbackDescription，再否则只报计数。
- * 空列表 → null。progressSuffix（M16）= formatProgressSuffix 产物。
+ * `▶i ○p ■b ✓c (N/M [~eta]) · <activity>` (D91 unifies the four black-and-white status glyphs).
+ * activity is the first in_progress item, then fallbackDescription, then only the counts.
+ * Empty list → null. progressSuffix (M16) is produced by formatProgressSuffix.
  *
- * 反冻结（stale-core D）：全完成 + 墙钟过期（archived）→ 死列表降权为
- * `✓N done <age>`，不再以 ▶○■✓ 满权重视窗冒充当前状态；"在干嘛"由
- * report_agent 的工具徽标/活动行承担，todo token 只报计划真实状态。
+ * Anti-freeze behavior (stale-core D): once all work is complete and the wall clock expires (archived), lower the
+ * dead list to `✓N done <age>` instead of presenting it as a fully weighted current-state view; report_agent's tool
+ * badge/activity line explains what is happening, while the todo token reports only the plan's actual state.
  */
 export function formatPaneTitle(
   items: readonly TodoItem[],
@@ -73,7 +74,7 @@ export function formatPaneTitle(
   return clipTitle(activity ? `${withProgress} · ${activity}` : withProgress);
 }
 
-/** 第一条 blocked 的 blocker（缺则用 content）；无 blocked → null。 */
+/** First blocked item's blocker (fall back to content); no blocked item → null. */
 export function formatBlockedLabel(items: readonly TodoItem[]): string | null {
   const blocked = items.find((it) => it.status === 'blocked');
   if (!blocked) return null;
@@ -82,8 +83,7 @@ export function formatBlockedLabel(items: readonly TodoItem[]): string | null {
 }
 
 /**
- * 升级后首次上报用来清掉旧 16-key 分块（herdr tokens 按 key 合并，
- * 不写 null 会残留——M13b）。
+ * The first post-upgrade report clears the old 16-key chunks (herdr merges tokens by key, so omitted nulls remain—M13b).
  */
 export function staleTokenClearance(): Record<string, null> {
   const tokens: Record<string, null> = { [PI_HERDR_META_KEY]: null };

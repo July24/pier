@@ -1,20 +1,21 @@
 /**
- * pi-herdr 扩展入口（v1.1：todo 闭环 + 交互式子代理，DESIGN.md §12 方案 C）。
+ * pi-herdr extension entry point (v1.1: closed-loop todos + interactive subagents,
+ * DESIGN.md §12 option C).
  *
- * 安装：pi package（package.json 的 pi.extensions）或 ~/.pi/agent/extensions/。
+ * Installation: `pi package` (package.json's pi.extensions) or ~/.pi/agent/extensions/.
  *
- * 能力：
- *  - 工具 `todo_write`：全量替换式 todo 列表（权威 = 本 pi 会话 JSONL，
- *    分支自动回滚；语义对齐 DSH）。
- *  - 工具 `subagent`：前台/后台委派。子 pane = 交互式 pi TUI（独立会话、
- *    独立上下文），人类可随时进入直接对话；主控经 herdr 通道派活
- *    （状态门：仅 idle 注入）、等待（agent.wait）、取结果（子会话 JSONL）。
- *  - 工具 `list_agents` / `send_message`（followUp 队列语义）/ `interrupt_agent`（esc）。
- *  - 命令 `/todos`、TUI widget、herdr 标题投影（无 herdr 环境优雅降级）。
+ * Capabilities:
+ *  - `todo_write`: replace the complete todo list; the current pi session JSONL is authoritative,
+ *    and branches automatically roll back in DSH-aligned semantics.
+ *  - `subagent`: foreground/background delegation. Each child pane is an interactive pi TUI
+ *    with an independent session/context that humans can enter directly; the controller uses
+ *    herdr for state-gated injection (idle only), waiting (agent.wait), and JSONL result reads.
+ *  - `list_agents` / `send_message` (followUp queue semantics) / `interrupt_agent` (esc).
+ *  - `/todos`, TUI widget, and herdr title projection with graceful degradation without herdr.
  *
- * ⚠️ pi 0.84.2 契约（实测）：
- *  - onUpdate 必须是 AgentToolResult 形状（字符串会让 TUI 崩溃退出 pi）；
- *  - 工具结果 details 随会话 JSONL 持久化、getBranch() 重放实现分支回滚。
+ * pi 0.84.2 contract (validated):
+ *  - onUpdate must have AgentToolResult shape; a string causes the TUI to crash and exit pi;
+ *  - tool-result details persist in session JSONL, and getBranch() replay implements branch rollback.
  */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
@@ -24,12 +25,12 @@ import {
   currentActivity,
 } from './todo-core.ts';
 
-/** 档2：worker 会话内记录运行所依据的合成 manifest（D38 同构，分支可回放）。 */
+/** Tier 2: record the synthesized manifest that governed a worker session (D38-compatible and branch-replayable). */
 const ROLE_MANIFEST_CUSTOM_TYPE = 'pi-herdr.role-manifest';
 
 import { createHerdrClient } from './herdr-client.ts';
-// subagent 族已迁 core/subagent.ts（loader entry，D78/D81）；subagent-core/history-store/
-// session-tail/gc-core 导入随迁（index 仅留 common 面用到的 lastAssistantText/readSessionFile）。
+// The subagent family moved to core/subagent.ts (loader entry, D78/D81); its history-store,
+// session-tail, and gc-core imports moved with it, leaving index.ts only the common readers.
 import { lastAssistantText, readSessionFile } from './session-tail.ts';
 import { fileURLToPath } from 'node:url';
 import { TodosService } from './todos-service.ts';
@@ -54,15 +55,15 @@ import { handlePipeRequest } from './index-pipe.ts';
 import { installWriteLocks } from './index-locks.ts';
 
 /**
- * WS-D7：master pane 自应用 manifest——与 subagent 同一条强制链
- * （闸门 + 可见层 + 徽标 + 会话记录），档案基线 = 自研核心 + 检视/执行工具。
- * 判别：herdr pane（HERDR_ENV=1）且非 subagent 且未被显式下发 manifest。
- * 独立 pi 会话（无 herdr env）不命中 → 保持全量（向后兼容）。
- * master.json 畸形 → fail-open 到无角色态（与 env 畸形同语义）。
+ * WS-D7: apply the master-pane manifest to itself through the same mandatory chain as subagents
+ * (gate, visible layer, badge, and session record); the baseline includes our core plus inspect/execute tools.
+ * Match only a herdr pane (HERDR_ENV=1) that is not a subagent and has no explicitly supplied manifest.
+ * Standalone pi sessions without herdr remain full-featured for backward compatibility.
+ * A malformed master.json fails open to no-role state, matching malformed env semantics.
  */
 function composeMasterRuntime(): RuntimeRoleManifest | null {
   try {
-    // v1.1：内置名直读——workspace 放 master.json 诱饵不影响自应用（保留名检查只对 spawn 响亮报错）
+    // v1.1: read the built-in name directly so a workspace master.json decoy cannot affect self-application; the reserved-name check remains for loud spawn errors.
     const { role, manifest } = composeForRole('master', [], { loadRoleOpts: { builtinDirect: true } });
     return {
       role: role.role,
@@ -77,9 +78,9 @@ function composeMasterRuntime(): RuntimeRoleManifest | null {
     return null;
   }
 }
-// C3：cordis 只进 master 进程——subagent-scope（内含 @deepseek-ai/cordis）
-// 在 master 分支内动态 import，worker 进程永不加载该模块。
-// subagent 族常量/助手已随迁 core/subagent.ts。
+// C3: cordis belongs only in the master process; subagent-scope includes @deepseek-ai/cordis.
+// Dynamically import it on the master branch so worker processes never load the module.
+// Subagent constants/helpers moved with the family to core/subagent.ts.
 
 export default async function (pi: ExtensionAPI) {
   const mode = planIndexMode();
@@ -91,10 +92,10 @@ export default async function (pi: ExtensionAPI) {
   const { client, env } = createHerdrClient();
 
   let sessionId: string = process.env.PI_SESSION_FILE ?? process.env.PI_SESSION_ID ?? '';
-  /** M16：todo 完成时间戳序列（速率估算原料；随 todo.completed 事件追加）。 */
+  /** M16: completion timestamps used as rate-estimation input, appended with todo.completed events. */
   const completedStamps: number[] = [];
 
-  /* ── 状态重建（分支正确性：取分支路径上最后一次 todo_write 快照）── */
+  /* ── State reconstruction (branch correctness comes from the last todo_write snapshot on the branch) ── */
 
   function rebuildFromBranch(ctx: unknown): void {
     try {
@@ -102,13 +103,13 @@ export default async function (pi: ExtensionAPI) {
         ?.sessionManager?.getBranch?.() ?? [];
       todos.rebuild(entries);
     } catch {
-      // 重建失败不影响主流程；下次 todo_write 会重新锚定。
+      // A reconstruction failure must not disrupt the main flow; the next todo_write re-anchors state.
     }
   }
 
-  /* ── herdr 上报（Noop 时零成本；失败静默，绝不影响 pi 主流程） ── */
+  /* ── herdr reporting (zero cost for Noop; silent failures never affect pi's main flow) ── */
 
-  /** 档2：worker 的 role 徽标（env 下发 manifest 解析出；idle 态粘性显示）。 */
+  /** Tier 2: worker role badge parsed from the env manifest and kept visible while idle. */
   let roleBadge: string | null = null;
 
   function reportAgent(state: 'working' | 'idle' | 'blocked', activity: string | null): void {
@@ -122,7 +123,7 @@ export default async function (pi: ExtensionAPI) {
     client.reportAgentSession(path).catch(() => {});
   }
 
-  /** session 标识：sessionManager 权威（print/rpc 模式下 env 可能未设），env 兜底。 */
+  /** Session identity: sessionManager is authoritative (env may be unset in print/RPC mode), with env as fallback. */
   function resolveSessionId(ctx: unknown): string {
     try {
       const sm = (ctx as {
@@ -146,16 +147,16 @@ export default async function (pi: ExtensionAPI) {
   function mirrorTodos(): void {
     if (!client.available) return;
     const label = sessionId || (env ? `pane:${env.paneId}` : '');
-    // M16：进度徽标（保守 N/M + 置信 ETA；估算不可信回退纯计数）
+    // M16: progress badge (conservative N/M plus confidence ETA; fall back to a plain count when estimates are unreliable).
     const p = progressOf(todos.items);
     const eta = estimateEta({ completedAt: completedStamps, total: p.total, now: Date.now() });
     const suffix = formatProgressSuffix({ completed: p.completed, total: p.total, eta });
-    // 反冻结：lastWriteAt 随行 → 标题侧 archived 判定（pane-title）
+    // Unfreeze by carrying lastWriteAt into the title-side archived check (pane-title).
     const title = formatPaneTitle(todos.items, null, {
       progressSuffix: suffix,
       lastWriteAt: todos.lastWriteAt,
     });
-    // D97：窄格静帧与 pane 标题同参同源（thinking token 碰不到 → 静帧即冻结）
+    // D97: narrow-frame static state shares inputs with the pane title; thinking tokens cannot reach it, so a static frame would freeze.
     updateSlimFrame(title);
     client.reportMetadata({
       session: label,
@@ -165,7 +166,7 @@ export default async function (pi: ExtensionAPI) {
     }).catch(() => {});
   }
 
-  /* ── M17：结算自动对账（纯规划器 + D38 权威路径；幂等，双路径双跑无害） ── */
+  /* ── M17: automatic settlement reconciliation (pure planner + D38 authority; idempotent and safe to run through both paths) ── */
 
   function reconcileOnSettlement(description: string, outcome: 'settled' | 'failed'): string[] {
     if (!description) return [];
@@ -178,7 +179,7 @@ export default async function (pi: ExtensionAPI) {
             { version: 1, edits: plan.edits, ts: Date.now() },
           );
         } catch {
-          /* 持久化尽力而为（内存态仍推进） */
+          /* Best effort persistence; in-memory state still advances. */
         }
         todos.applyEdits(plan.edits);
         mirrorTodos();
@@ -189,24 +190,24 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
-  /** M17：对账提示行拼进结算通知（空数组 = 原文返回）。 */
+  /** M17: append reconciliation note lines to settlement notices; an empty list returns the original text. */
   function withReconcileNotes(base: string, notes: readonly string[]): string {
     return notes.length ? `${base}\n${notes.join('\n')}` : base;
   }
 
-  /* ── M16：进度徽标 + 工具徽标（title 后缀 + report_agent.message；无新协议） ── */
+  /* ── M16: progress and tool badges (title suffix + report_agent.message; no new protocol) ── */
 
   todos.on('todo.completed', (e: { count: number; at: number }) => {
     for (let i = 0; i < e.count; i++) completedStamps.push(e.at);
     mirrorTodos();
   });
 
-  // 工具徽标：并行模式 start 源序 / end 完成序（pi docs 实测契约）→ Map 跟踪在途
+  // Tool badge: parallel mode starts in source order and ends in completion order (pi docs contract); track in-flight calls in a Map.
   const runningTools = new Map<string, string>(); // toolCallId → toolName
   let lastToolBadge: string | null = null;
   function reportToolBadge(): void {
     const badge = planToolBadge([...new Set(runningTools.values())]);
-    if (badge === lastToolBadge) return; // 幂等：变化才报（M13 渲染纪律）
+    if (badge === lastToolBadge) return; // Idempotent: report only changes (M13 rendering discipline).
     lastToolBadge = badge;
     if (badge) reportAgent('working', badge);
     else reportAgent(agentActive ? 'working' : 'idle', agentActive ? currentActivity(todos.items) : null);
@@ -231,35 +232,34 @@ export default async function (pi: ExtensionAPI) {
     hard: process.env[WRITE_LOCK_ENV] === '1',
   });
 
-  /* ── todo 族槽（core/todo.ts 插件回填；widget 渲染已随族迁移） ── */
+  /* ── todo family slot (core/todo.ts fills the plugin hook; widget rendering moved with the family) ── */
   const todoUi: { renderWidget: (ctx: unknown) => void } = {
-    renderWidget: () => { /* 插件挂载前 no-op（挂载后回填） */ },
+    renderWidget: () => { /* No-op before plugin mounting; filled after mounting. */ },
   };
 
-  /* ── 生命周期 ────────────────────────────────────────────────────── */
+  /* ── Lifecycle ────────────────────────────────────────────────────── */
 
   pi.on('session_start', async (event, ctx) => {
     sessionId = resolveSessionId(ctx);
     rebuildFromBranch(ctx);
-    // v1.3 M9 修复（实测）：resume 时 pi 会从会话恢复 widget 状态；
-    // 此时再 setWidget 会破坏 TUI 的 '/' 命令面板输入路由（'/' 被当消息文本送给模型）。
+    // v1.3 M9 fix (observed): on resume pi restores widget state from the session;
+    // calling setWidget again breaks the TUI '/' command-panel route ('/' would be sent to the model as message text).
     const reason = (event as { reason?: string } | undefined)?.reason;
     if (reason !== 'resume') todoUi.renderWidget(ctx);
-    // D97：窄格静帧 overlay（幂等注册；herdr pane 内才有意义——普通终端窄窗
-    // 盖住交互面是事故，且热力放大才提供退出路径。resume 也重注册：pi 会话
-    // 切换会 resetExtensionUI 拆掉 overlay）。
+    // D97: narrow-frame overlay is meaningful only inside herdr; covering an interactive narrow terminal is unsafe,
+    // and the heatmap amplification provides the exit path. Re-register on resume because session switching resets the overlay.
     if (env) registerSlimFrame(ctx);
     mirrorTodos();
     reportSession(sessionId);
-    // D93：侧边栏身份 = role 名（display_agent 优先于 agent 检测值，0.8.2 actions.rs:563）。
-    // master → 'master'；worker → manifest.role（worker-default 美化为 worker）。
-    // 无 manifest 的裸 pi（独立会话）不上报——不打扰普通 pi 使用。
+    // D93: sidebar identity is the role name (display_agent takes precedence over detected agent, actions.rs:563 in 0.8.2).
+    // master → 'master'; worker → manifest.role (prettify worker-default as worker).
+    // A bare pi without a manifest does not report, so ordinary pi sessions remain undisturbed.
     if (runtimeManifest) {
       const roleDisplay = runtimeManifest.role === 'worker-default' ? 'worker' : runtimeManifest.role;
       void client.reportDisplayAgent(roleDisplay);
     }
-    // 档2：worker role manifest（env，进程启动时已解析）→ 徽标 + 会话权威记录
-    // （custom 条目与 D38 todo-edit 同构：执行期强化的回放锚点）
+    // Tier 2: worker role manifest parsed at process start supplies the badge and authoritative session record.
+    // The custom entry mirrors D38 todo-edit and anchors execution-time replay.
     if (runtimeManifest) {
       roleBadge = `role ${runtimeManifest.role} v${runtimeManifest.version ?? '?'} (${runtimeManifest.tools.length} tools)`;
       try {
@@ -268,10 +268,10 @@ export default async function (pi: ExtensionAPI) {
           { version: 1, role: runtimeManifest.role, manifestVersion: runtimeManifest.version, tools: runtimeManifest.tools, permissions: runtimeManifest.permissions, unknownTools: runtimeManifest.unknownTools ?? 'deny', ts: Date.now() },
         );
       } catch {
-        /* 记录尽力而为 */
+        /* Best effort recording. */
       }
-      // D77 可见层：manifest 外的工具从模型视野移除（session_start = 所有插件已加载完）。
-      // 交集语义防清空；master 无 manifest 不动（全量）。底层 API 缺失则静默跳过（旧 pi 兼容）。
+      // D77 visible layer: remove tools outside the manifest from the model's view after all plugins load at session_start.
+      // Intersection semantics prevent clearing everything; master without a manifest stays full. Missing APIs are skipped for old pi compatibility.
       const piTools = pi as { getActiveTools?: () => string[]; setActiveTools?: (names: string[]) => void };
       if (typeof piTools.getActiveTools === 'function' && typeof piTools.setActiveTools === 'function') {
         try {
@@ -285,17 +285,17 @@ export default async function (pi: ExtensionAPI) {
             console.error(`[pi-herdr] D77 visible-layer: role ${runtimeManifest.role} tools ${active.length} → ${vis.next.length}`);
           }
         } catch {
-          /* 可见层尽力而为（强制层仍在） */
+          /* Best effort visible layer; the mandatory layer remains active. */
         }
       }
     }
     reportAgent('idle', null);
   });
 
-  /* ── 档2 Week4-5：worker 执行期强制（manifest 最后一道闸） ──
-   * deny / 不在 manifest → block（reason 给模型）；ask → v1 退化放行 + stderr 日志
-   * （V56 验收锚点）。master / 纯标签 worker 无 manifest = open。
-   * 限速已移除（WS-D6）：权限边界归我们，资源配额归插件引入者。 */
+  /* ── Tier 2 Weeks 4–5: worker execution enforcement (the manifest's final gate) ──
+   * deny / outside manifest → block (reason is given to the model); ask → v1 allows with stderr logging
+   * (V56 acceptance anchor). Master and label-only workers without a manifest remain open.
+   * Rate limiting was removed (WS-D6): we own the permission boundary; plugin integrators own resource quotas. */
   pi.on('tool_call', async (event: { toolName?: string }) => {
     if (!runtimeManifest) return;
     const tool = typeof event?.toolName === 'string' ? event.toolName : '';
@@ -305,20 +305,20 @@ export default async function (pi: ExtensionAPI) {
     }
     if (gate.kind === 'ask') {
       console.error(`${gate.notice} (v1 soft-approval: allowed, hard gate lands in v2)`);
-      // 持久留痕（V56 锚点）：stderr 会被 TUI 重绘刷掉，会话 custom 条目才是权威
+      // Durable trace (V56 anchor): TUI redraw erases stderr, so the session custom entry is authoritative.
       try {
         (pi as { appendEntry?: (customType: string, data: unknown) => void }).appendEntry?.(
           'pi-herdr.approval-needed',
           { role: runtimeManifest.role, tool, ts: Date.now() },
         );
       } catch {
-        /* 尽力而为 */
+        /* Best effort. */
       }
     }
   });
 
 
-  // 会话树跳转（/tree、/fork 后）：分支正确性靠重建。
+  // Session-tree navigation (/tree, /fork): reconstruction preserves branch correctness.
   pi.on('session_tree', async (_event, ctx) => {
     sessionId = resolveSessionId(ctx);
     rebuildFromBranch(ctx);
@@ -328,11 +328,11 @@ export default async function (pi: ExtensionAPI) {
 
   let agentActive = false;
   const subagentPort = emptySubagentPortBox();
-  // D96 状态（settle-wake-core 去重/冷却的锚点）。
+  // D96 state, anchoring settle-wake-core deduplication and cooldown.
   let d96NoticeKey: string | null = null;
   let d96NoticeAt = 0;
-  // 反唤醒风暴（settle-wake-core）：追踪最后一次 assistant turn 的 stopReason，
-  // 'aborted' = 用户 ESC 显式叫停 → settled 时不得注入任何唤醒型消息。
+  // Prevent wake-up storms by tracking the last assistant turn's stopReason;
+  // 'aborted' means the user explicitly pressed ESC, so settlement must inject no wake-up message.
   let lastStopReason: string | null = null;
   pi.on('turn_start', async () => {
     agentActive = true;
@@ -340,7 +340,7 @@ export default async function (pi: ExtensionAPI) {
   });
   pi.on('turn_end', async (event: unknown) => {
     if (event === null || typeof event !== 'object' || !('message' in event)) return;
-    const msg = (event as { message: unknown }).message; // 'message' in 已守卫
+    const msg = (event as { message: unknown }).message; // 'message' in has been guarded.
     if (msg === null || typeof msg !== 'object') return;
     const { role, stopReason } = msg as { role?: unknown; stopReason?: unknown };
     if (role === 'assistant' && typeof stopReason === 'string') {
@@ -361,8 +361,8 @@ export default async function (pi: ExtensionAPI) {
     d96NoticeKey = plan.noticeKey;
     d96NoticeAt = plan.noticeAt;
     if (!plan.wake) {
-      // 用户 abort 后静默：结算缓冲保留（pendingSettleNotices 不清空），
-      // 待下次自然 run 的 turn_end steer / 自然 settled 再投。
+      // Stay silent after a user abort while retaining the settlement buffer (do not clear pendingSettleNotices);
+      // deliver it on the next natural run's turn_end steer or natural settlement.
       return;
     }
     // D96: master settled while background subagents still run → remind (worker port is unbound).
@@ -374,21 +374,21 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  // v1.3 M8：blocked 自上报（D29 豁免依赖 blocked 可见）。
-  // 实测：pi 0.84.2 核心不发 "herdr:blocked"（官方集成的监听是死代码）→
-  // 本扩展自行管理：等待人类回答（ask_user_question）期间 enterBlocked/exitBlocked。
+  // v1.3 M8: report blocked state ourselves (D29's exemption relies on blocked visibility).
+  // Observed: pi 0.84.2 core emits no "herdr:blocked" (the official integration listener is dead code),
+  // so this extension manages enterBlocked/exitBlocked while ask_user_question waits for human input.
   let blockedDepth = 0;
   function enterBlocked(label: string | null): void {
     blockedDepth += 1;
     reportAgent('blocked', label);
-    // D95：人类闸门标志（workbench 热力分级区分 ask vs block）
+    // D95: human-gate marker lets the workbench heatmap distinguish ask from block.
     if (label) void client.reportAskFlag(label).catch(() => {});
   }
   function exitBlocked(): void {
     blockedDepth = Math.max(0, blockedDepth - 1);
     if (blockedDepth === 0) {
       reportAgent(agentActive ? 'working' : 'idle', agentActive ? currentActivity(todos.items) : null);
-      // D95：闸门解除 → 清标志
+      // D95: gate released → clear marker.
       void client.reportAskFlag(null).catch(() => {});
     }
   }
@@ -401,7 +401,7 @@ export default async function (pi: ExtensionAPI) {
     },
   );
 
-  /* ── 工具：ask_user_question（v1.3 M8 人类闸门，主控与子代理都有） ── */
+  /* ── Tool: ask_user_question (v1.3 M8 human gate, available to master and subagents) ── */
 
   pi.registerTool({
     name: 'ask_user_question',
@@ -424,8 +424,8 @@ export default async function (pi: ExtensionAPI) {
         ui?: { input?: (title: string, placeholder?: string) => Promise<string | undefined> };
       }).ui;
       enterBlocked(question);
-      // v1.3 M8 实测：等待人类期间 herdr 检测持续显示 working，会覆盖单次 blocked 上报
-      // → 5s 心跳重报，保证 pane 在 herdr 里呈 blocked（人类可见 + GC 豁免）。
+      // v1.3 M8 observed: herdr keeps detecting working while waiting for a human, overriding a one-shot blocked report;
+      // repeat it every 5s so the pane stays blocked and remains visible/GC-exempt.
       const hb = setInterval(() => { reportAgent('blocked', question); }, 5000);
       try {
         const answer = await ui?.input?.(question, 'your answer');
@@ -444,10 +444,10 @@ export default async function (pi: ExtensionAPI) {
     client.close();
   });
 
-  /* ── M12：双向消息通道（D49/D50/D48；每个 pane 都在自己名字上监听，无主从） ── */
+  /* ── M12: bidirectional message channel (D49/D50/D48; every pane listens on its own name, with no controller/child assumption) ── */
 
   const settleNoticeLatch = new Set<string>();
-  /** 结算通知去重（push 快路径与 pollLoop 兜底二选一；按 paneId+请求id 记轮次，每轮各一条）。 */
+  /** Deduplicate settlement notices: choose push fast path or pollLoop fallback; one notice per paneId+request ID per round. */
   function claimSettleNotice(key: string): boolean {
     if (settleNoticeLatch.has(key)) return false;
     settleNoticeLatch.add(key);
@@ -485,7 +485,7 @@ export default async function (pi: ExtensionAPI) {
     if (!paneId) return;
     const name = pipeNameFor(cwd, paneId);
     if (pipeServerBox.current) {
-      try { pipeServerBox.current.close(); } catch { /* 旧实例 */ }
+      try { pipeServerBox.current.close(); } catch { /* Previous instance. */ }
       pipeServerBox.current = null;
     }
     try {
@@ -500,17 +500,17 @@ export default async function (pi: ExtensionAPI) {
         setPendingMachineRequest: (next) => { pendingMachineRequest = next; },
       }));
     } catch {
-      /* 管道名占用（罕见）：本次会话不提供通道，调用方 ping 超时后报错 */
+      /* Pipe name collision (rare): this session has no channel; callers report an error after ping times out. */
     }
   });
   pi.on('session_shutdown', () => {
     if (pipeServerBox.current) {
-      try { pipeServerBox.current.close(); } catch { /* 已关 */ }
+      try { pipeServerBox.current.close(); } catch { /* Already closed. */ }
       pipeServerBox.current = null;
     }
   });
 
-  // D50：本 pane 自己的结算 → 若有待回信的机器请求，push 摘要+会话路径给请求方
+  // D50: when this pane settles, push a summary and session path to any machine request awaiting a reply.
   pi.on('agent_settled', async () => {
     const req = pendingMachineRequest;
     if (!req || !req.push || !req.from) return;
@@ -529,7 +529,7 @@ export default async function (pi: ExtensionAPI) {
         sessionFile: sessionId || null,
       }, 5000);
     } catch {
-      /* push 失败静默：请求方的 pollLoop 兜底 */
+      /* Push failed silently; the requester's pollLoop is the fallback. */
     }
   });
 

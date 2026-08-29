@@ -1,35 +1,35 @@
 /**
- * M17：todo↔subagent 自动对账纯规划器（开发方案.md §M17；P2 = 低置信度不勾+提示）。
+ * M17: pure planner for automatic todo↔subagent reconciliation (development plan §M17; P2 = do not check off low-confidence matches, only prompt).
  *
- * 时机（adapter）：主控收到结算 push（pollLoop / pipe reply）后、注入 followUp 前。
- * 语义（对齐 omp reconcileTodosWithSubagents）：
- *  - 匹配：description ↔ todo.content，norm（小写+空白折叠）后 exact → prefix（双向）
- *    → substring，与 D38 fuzzyFind 同族；
- *  - 自动勾：仅 settled 且最优档唯一且 ∈ {exact, prefix}，一次结算至多一条；
- *  - 解锁：blocker ↔ description 同档匹配（exact/prefix）的 blocked 条目回 pending
- *    （可多条；failed/低置信度不解锁）；
- *  - 低置信度/歧义/失败：不动列表，noteLines 随结算通知提示（P2 拍板）；
- *  - 落盘：edits 走 D38 权威路径（pi-herdr.todo-edit custom 条目，分支回放生效）。
+ * Timing (adapter): after the controller receives a settlement push (pollLoop / pipe reply), before injecting followUp.
+ * Semantics (aligned with omp reconcileTodosWithSubagents):
+ *  - Match description ↔ todo.content: normalize (lowercase + collapse whitespace), then exact → bidirectional prefix
+ *    → substring, in the same family as D38 fuzzyFind;
+ *  - Auto-complete only when settled and the unique best tier is in {exact, prefix}; at most one item per settlement;
+ *  - Unblock blocked items whose blocker ↔ description matches at any tier (exact/prefix)
+ *    (multiple allowed; failed/low-confidence matches do not unblock);
+ *  - Low confidence/ambiguity/failure: leave the list unchanged and add a noteLines prompt to the settlement notice (P2 decision);
+ *  - Persistence: edits use the D38 authoritative path (pi-herdr.todo-edit custom entry, effective during branch replay).
  */
+
 import { applyTodoEdits, type TodoEdit, type TodoItem } from './todo-core.ts';
 
 export type ReconcileOutcome = 'settled' | 'failed';
 export type MatchTier = 'exact' | 'prefix' | 'substring' | null;
-
 export interface ReconcilePlan {
-  /** 应用 edits 后的列表（无编辑 = 原引用）。 */
+  /** List after applying edits (original reference when there are no edits). */
   items: TodoItem[];
-  /** 经权威路径持久化的编辑（done 至多一条 + unblock 若干）。 */
+  /** Edits persisted through the authoritative path (at most one done plus any unblocks). */
   edits: TodoEdit[];
-  /** 被自动勾掉的条目（至多一条）。 */
+  /** Item automatically checked off (at most one). */
   completed: TodoItem | null;
-  /** 自动勾的匹配档位（candidates 存在时的最优档；无候选 null）。 */
+  /** Best matching tier for auto-completion (null when there are no candidates). */
   tier: MatchTier;
-  /** 被解锁的条目（blocker 匹配）。 */
+  /** Items unblocked by a blocker match. */
   unblocked: TodoItem[];
-  /** 随结算通知注入的提示行（对齐 D36 反馈语风；无提示 = 空数组）。 */
+  /** Prompt lines injected into the settlement notice (aligned with D36 feedback tone; empty when none). */
   noteLines: string[];
-  /** 匹配率指标（P2：采集用，随结算通知落会话 JSONL）。 */
+  /** Match-rate metric (P2: collected with the settlement notice in session JSONL). */
   metric: {
     description: string;
     outcome: ReconcileOutcome;
@@ -64,7 +64,7 @@ export function reconcileTodos(
   const edits: TodoEdit[] = [];
   const noteLines: string[] = [];
 
-  // 1) 勾选候选：pending / in_progress（completed/abandoned 永不参与）
+  // 1) Check-off candidates: pending / in_progress (completed/abandoned never participate).
   const matchable = prev.filter((t) => t.status === 'pending' || t.status === 'in_progress');
   const scored = matchable
     .map((t) => ({ item: t, tier: matchTier(description, t.content) }))
@@ -80,25 +80,26 @@ export function reconcileTodos(
       edits.push({ op: 'done', content: completed.content });
       noteLines.push(`Reconciled: completed "${completed.content}" (${bestTier} match with subagent description).`);
     } else if (best.length > 1) {
-      // 歧义：列候选，留给人
+      // Ambiguous match: list candidates and leave the decision to a person.
       noteLines.push(
         `Todo match ambiguous between: ${best.map((c) => `"${c.item.content}"`).join(', ')} — update todo_write yourself.`,
       );
     } else if (outcome === 'failed') {
-      // 高置信候选但子代理未成功结算 → 保持打开，提示
+      // High-confidence candidate, but the subagent did not settle successfully: keep it open and prompt.
       for (const c of best) {
         noteLines.push(`Todo kept open: "${c.item.content}" (subagent did not settle successfully).`);
       }
     }
   } else if (bestTier === 'substring') {
-    // 低置信度（P2）：不勾，提示候选
+    // Low-confidence match (P2): do not check it off; prompt with the candidate.
     for (const c of best) {
       noteLines.push(`Todo not auto-completed (low-confidence match): "${c.item.content}" — update todo_write if this work is done.`);
     }
   }
 
-  // 2) 解锁：blocker 任意档匹配（含 substring——真实 blocker 是「等 X 完成」短语，
-  //    描述嵌在中间，prefix 会漏；低置信度闸只管勾选，解锁回 pending 是软操作）且 settled（可多条）
+  // 2) Unblock on any blocker match, including substring—real blockers are phrases such as "waiting for X to finish",
+  //    so the description may be embedded in the middle and prefix would miss it. The low-confidence gate applies only
+  //    to check-offs; returning an unblocked item to pending is a soft operation. Only settled subagents can unblock (possibly multiple).
   const unblocked: TodoItem[] = [];
   if (outcome === 'settled') {
     for (const t of prev) {

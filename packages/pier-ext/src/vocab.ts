@@ -1,55 +1,54 @@
 /**
- * pi-herdr 桥接词汇（M22：标题即看板）。
+ * pi-herdr bridge vocabulary (M22: title is the board).
  *
- * 这是 DESIGN.md §4.2 定义的"词汇约定"：不发明新传输协议。
- * 传输层 = herdr socket API（NDJSON）；todo 权威 = pi 会话 JSONL。
- * 显示投影 = pane.report_metadata 的 title / state_labels（见 pane-title.ts）。
+ * DESIGN.md §4.2: no new transport. Wire = herdr NDJSON; todo authority = pi
+ * session JSONL; display = pane.report_metadata title / state_labels.
  */
 
-/** todo 条目五态（D34：三态 + blocked/abandoned，对齐 OMP）。 */
+/** Todo five-state (D34: three-state + blocked/abandoned, aligned with OMP). */
 export type TodoStatus = 'pending' | 'in_progress' | 'completed' | 'blocked' | 'abandoned';
 
 export const TODO_STATUSES: readonly TodoStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'abandoned'];
 
-/** todo 条目形状：content + 五态 status；可选 blocker（仅 blocked）、可选 phase（D43 分组）。无稳定 id（全量替换语义）。 */
+/** Todo item: content + status; optional blocker (blocked only) and phase (D43). No stable id (last-write-wins). */
 export interface TodoItem {
   content: string;
   status: TodoStatus;
-  /** 仅 status==='blocked' 时允许非空字符串（D34）。 */
+  /** Non-empty string only when status==='blocked' (D34). */
   blocker?: string;
-  /** 可选分组名（D43）；非空、≤30 字符。 */
+  /** Optional group name (D43); non-empty, ≤30 chars. */
   phase?: string;
 }
 
-/** 完整 todo 快照（每次 todo_write 提交的就是它，last-wins）。 */
+/** Full todo snapshot (each todo_write submits this; last-wins). */
 export interface TodoSnapshot {
-  /** 语义版本，形状变化时递增；消费方据此丢弃陈旧数据。 */
+  /** Shape version; consumers drop stale snapshots. */
   version: 1;
   items: TodoItem[];
 }
 
-/** 快照计数（反馈文案与标题投影都用它）。 */
+/** Snapshot counts (confirmation copy and title projection). */
 export interface TodoCounts {
   pending: number;
   inProgress: number;
   completed: number;
-  /** D91：blocked 单列（title 四件套 ▶○■✓）。 */
+  /** D91: blocked as its own column (title quartet ▶○■✓). */
   blocked: number;
 }
 
-/** pi 扩展经 `pane.report-agent` 上报语义状态时使用的 source 名。 */
+/** Source name for pane.report-agent. */
 export const REPORT_AGENT_SOURCE = 'pi-herdr';
 
-/** 升级后首次上报用来清掉旧 16-key 分块的头键（M13b 残留）。 */
+/** First-upgrade key used to clear the old 16-key chunked tokens (M13b leftover). */
 export const PI_HERDR_META_KEY = 'pi-herdr';
 
-/** todo 工具面向模型的名称（与 DSH 一致）。 */
+/** Model-facing todo tool name (DSH-compatible). */
 export const TODO_TOOL_NAME = 'todo_write';
 
-/** 工具结果 details 里存放快照的键（随 pi 会话 JSONL 持久化，分支正确）。 */
+/** Snapshot key in tool-result details (persisted in session JSONL). */
 export const TODO_DETAILS_KEY = 'pi-herdr.todo';
 
-/** 反馈文案（与 DSH 逐字一致，模型词汇可互迁移）。 */
+/** Confirmation copy (byte-aligned with DSH so model vocab transfers). */
 export function formatTodoConfirmation(items: TodoItem[]): string {
   const c = countTodos(items);
   return `Updated todo list: ${c.pending} pending, ${c.inProgress} in progress, ${c.completed} completed.`;
@@ -65,12 +64,12 @@ export function countTodos(items: TodoItem[]): TodoCounts {
     else if (it.status === 'in_progress') inProgress++;
     else if (it.status === 'completed') completed++;
     else if (it.status === 'blocked') blocked++;
-    // abandoned 不计入计数（D34）；blocked 单列（D91 图标四件套进 title）
+    // abandoned is omitted (D34); blocked is its own column (D91)
   }
   return { pending, inProgress, completed, blocked };
 }
 
-/** 子代理结算通知文案（对齐 DSH 的 settlement notice）。 */
+/** Subagent settlement notice (aligned with DSH). */
 export function formatSettlementNotice(
   agentId: string,
   closingMessage: string | null,

@@ -1,35 +1,33 @@
 /**
- * 档1 dispose 账本（D80⑤ + D79）。
+ * Disposal ledger shared by HMR and session shutdown (D80⑤ + D79).
  *
- * 背景：hmr partial reload **不跑旧 fiber 的 effect-disposers**（spike A 实证）——
- * 模块持有的进程级资源（setInterval / pipe server / watcher）在热换后泄漏。
- * 补偿：core 模块把进程级资源登记进账本（key = 模块文件）；hmr/reload 事件
- * 按文件名触发 disposeKey，拆掉旧版本登记的资源；session_shutdown 走 disposeAll。
+ * HMR partial reload can skip old fiber effect disposers, so process-level resources
+ * such as intervals, pipe servers, and watchers would leak without compensation.
+ * Core modules register those resources by module key; reload disposes matching keys,
+ * while session_shutdown disposes everything.
  *
- * D79 同构复用：未来 pi-surface proxy 的注册反清理（registerTool/on 的账本）
- * 与本账本同一机制（key 可用 'pi-surface' 等逻辑名，不必是文件）。
- *
- * 纯逻辑零依赖；接缝在 bootstrap（hmr 事件）与 index（session_shutdown）。
+ * D79 reuses this mechanism for pi-surface registration cleanup; logical keys need not
+ * be file paths. The ledger stays dependency-free and connects through bootstrap/index.
  */
 
 import { fileURLToPath } from 'node:url';
 
-/** 规范化 key：file:// URL 与普通路径统一为绝对路径（hmr filename 与 import.meta.url 可互比）。 */
+/** Normalize file URLs and paths to comparable absolute keys for HMR matching. */
 export function normalizeModuleKey(spec: string): string {
   let s = String(spec);
   try {
     if (s.startsWith('file://')) s = fileURLToPath(s);
   } catch {
-    /* 非法 URL 按原样使用 */
+    /* Keep malformed URLs unchanged so disposal can still use the caller's key. */
   }
   return s.replace(/\\/g, '/');
 }
 
 export class DisposeLedger {
-  /** 登记序（LIFO 拆除与 cordis effect 语义一致）。 */
+  /** LIFO order matches Cordis effect disposal semantics. */
   private order: Array<{ key: string; dispose: () => void }> = [];
 
-  /** 登记一个待拆资源；返回撤销函数（资源自拆后从账本移除，防二次拆）。 */
+  /** Register a resource and return cancellation so self-disposal cannot run twice. */
   add(spec: string, dispose: () => void): () => void {
     const entry = { key: normalizeModuleKey(spec), dispose };
     this.order.push(entry);
@@ -39,7 +37,7 @@ export class DisposeLedger {
     };
   }
 
-  /** hmr 补偿（D80⑤）：只拆匹配 key 的登记项（LIFO），返回拆除数。 */
+  /** HMR compensation disposes only matching keys in LIFO order. */
   disposeKey(spec: string | string[]): number {
     const keys = new Set((Array.isArray(spec) ? spec : [spec]).map(normalizeModuleKey));
     let n = 0;
@@ -47,19 +45,19 @@ export class DisposeLedger {
       if (keys.has(this.order[i].key)) {
         const { dispose } = this.order[i];
         this.order.splice(i, 1);
-        try { dispose(); } catch { /* 补偿拆除非致命 */ }
+        try { dispose(); } catch { /* Compensation failures are non-fatal. */ }
         n++;
       }
     }
     return n;
   }
 
-  /** 全量 LIFO（session_shutdown 路径），返回拆除数。 */
+  /** Dispose every entry in LIFO order during session_shutdown. */
   disposeAll(): number {
     let n = 0;
     while (this.order.length > 0) {
       const { dispose } = this.order.pop()!;
-      try { dispose(); } catch { /* 同上 */ }
+      try { dispose(); } catch { /* Compensation failures are non-fatal. */ }
       n++;
     }
     return n;

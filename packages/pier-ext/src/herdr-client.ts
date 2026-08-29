@@ -1,34 +1,34 @@
 /**
- * herdr socket API 最小客户端（pi 扩展内使用）。
+ * Minimal herdr socket API client used inside the pi extension.
  *
- * 已对 herdr 0.8.0-preview（protocol 19, Windows named pipe）逐项实测（见 WIRE.md）：
- *  - 传输：NDJSON；请求 {id, method, params} → 响应 {id, result} | {id, error:{code,message}}；
- *  - **控制请求 = 一连接一请求**（server 应答后即关连接）；
- *  - Windows 目标 = named pipe，名称为完整 socket_path 字符串，连接时前缀 \\.\pipe\；
- *  - pane.report_agent {pane_id, source, agent, state, message?, agent_session_id?, agent_session_path?}
- *    其中 state ∈ idle|working|blocked|unknown（'done' 是 server 派生状态，客户端不报）；
- *  - pane.report_metadata {pane_id, source, title?, state_labels?, clear_title?, clear_state_labels?}
- *    M22 起只报标题投影；升级首次附带把旧 pi-herdr 分块 token 写成 null；
- *  - agent.list {} → {type:'agent_list', agents: AgentInfo[]}；
- *  - agent.wait {target, until[], timeout_ms?} → 状态命中返回 agent，超时为错误（timeout 语义）；
- *  - agent.send_keys {target, keys[]} / pane.send_text {pane_id, text}。
+ * Validated against herdr 0.8.0-preview (protocol 19, Windows named pipe; see WIRE.md):
+ *  - Transport is NDJSON: request {id, method, params} → response {id, result} | {id, error:{code,message}};
+ *  - **Control requests use one connection per request**; the server closes it after replying;
+ *  - Windows targets are named pipes whose name is the complete socket_path with a \\.\pipe\ prefix;
+ *  - pane.report_agent reports {pane_id, source, agent, state, message?, agent_session_id?, agent_session_path?}
+ *    where state ∈ idle|working|blocked|unknown ('done' is server-derived and is not reported by the client);
+ *  - pane.report_metadata reports {pane_id, source, title?, state_labels?, clear_title?, clear_state_labels?}
+ *    M22 reports only the title projection; the first upgrade also clears legacy pi-herdr chunk tokens to null;
+ *  - agent.list {} → {type:'agent_list', agents: AgentInfo[]};
+ *  - agent.wait {target, until[], timeout_ms?} → the matching agent, or an error on timeout;
+ *  - agent.send_keys {target, keys[]} / pane.send_text {pane_id, text}.
  *
- * v1.1（DESIGN.md §12）接口面：
- *  报告 ×3、目录、spawn、注入（send_text）、按键（send_keys）、等待（agent.wait）、会话路径查询。
- *  已删除：waitSettled（标记版）、readPaneText（pane 文本解析）、onAgentState（订阅长连接）
- *  —— 结果通道改会话 JSONL（session-tail.ts），状态等待改 server 端 agent.wait。
+ * The v1.1 (DESIGN.md §12) surface reports three projections, lists, spawns, injects
+ * text, sends keys, waits via agent.wait, and queries session paths. Removed operations
+ * (waitSettled marker polling, readPaneText parsing, onAgentState long-lived subscriptions)
+ * are replaced by session JSONL results (session-tail.ts) and server-side agent.wait.
  *
- * 设计（DESIGN.md §4.1）：无 herdr 环境 → Noop 降级，pi 独立可用；
- * 上报类调用失败静默，绝不影响 pi 主流程。
+ * Design (DESIGN.md §4.1): without herdr, fall back to Noop so pi remains independent;
+ * failures in reporting calls stay silent and never affect the main pi flow.
  */
 import { REPORT_AGENT_SOURCE, type TodoItem } from './vocab.ts';
 import { BLOCKED_LABEL_KEY, SIDEBAR_ASK_TOKEN, formatBlockedLabel, formatPaneTitle, sidebarTodoTokens, staleTokenClearance } from './pane-title.ts';
 import { LOCK_BATCH_LIMIT, LOCK_TTL_MS } from './lock-core.ts';
 import * as net from 'node:net';
 
-/* ── 类型 ──────────────────────────────────────────────────────────── */
+/* ── Types ──────────────────────────────────────────────────────────── */
 
-/** herdr agent 语义状态（schema 实测五态；'done' 为 server 派生）。 */
+/** Herdr agent semantic state; schema has five observed states and 'done' is server-derived. */
 export type HerdrAgentState = 'idle' | 'working' | 'blocked' | 'done' | 'unknown';
 
 export interface HerdrEnv {
@@ -38,20 +38,20 @@ export interface HerdrEnv {
   tabId: string;
 }
 
-/** report_agent 可上报的状态（'done' 由 server 派生）。 */
+/** State reportable through report_agent; 'done' is derived by the server. */
 export type PaneAgentState = 'idle' | 'working' | 'blocked' | 'unknown';
 
 export interface AgentInfo {
   paneId: string;
   agent: string | null;
   status: HerdrAgentState;
-  /** agent_session.value（session id 或路径），供恢复/跳转。 */
+  /** agent_session.value (session ID or path), retained for recovery and navigation. */
   session: string | null;
   stateLabels: Record<string, string>;
   tokens: Record<string, string | null>;
 }
 
-/** TabInfo 投影（schema 实测：tab_id/workspace_id/number/label/focused/pane_count/agent_status）。 */
+/** TabInfo projection; fields mirror the observed tab schema. */
 export interface TabInfo {
   tabId: string;
   workspaceId: string;
@@ -85,59 +85,59 @@ export interface HerdrClientLike {
   reportAgent(state: PaneAgentState, message: string | null): Promise<void>;
   reportAgentSession(sessionPath: string | null): Promise<void>;
   reportMetadata(meta: { session: string; items: TodoItem[]; progressSuffix?: string | null; lastWriteAt?: number | null }): Promise<void>;
-  /** M18：写锁 token 上报（键 lock-<hash>，值 paneId|path；null = 释放；≤16 键/批自动分批）。 */
+  /** M18: report write-lock tokens (lock-<hash> → paneId|path); null releases, and batches stay within 16 keys. */
   reportLockTokens(tokens: Record<string, string | null>): Promise<void>;
   /**
-   * D93：侧边栏 agent 显示名（display_agent = role 名）。
-   * 一次上报持续生效（无 TTL）；null = 清除回检测值。尽力而为。
+   * D93: sidebar agent display name (display_agent is the role name).
+   * The report persists without a TTL; null clears it back to the detected value. Best effort.
    */
   reportDisplayAgent(name: string | null): Promise<void>;
   /**
-   * D95：ask_user_question 等待标志（tokens['pi-ask']；null 清空）。
-   * 侧边栏/热力分级用：blocked + pi-ask = 人类闸门（ask 级），纯 blocked = block 级。
+   * D95: ask_user_question waiting marker (tokens['pi-ask']; null clears it).
+   * Sidebar/heatmap grading distinguishes blocked + pi-ask (ask level) from plain blocked (block level).
    */
   reportAskFlag(text: string | null): Promise<void>;
   listAgents(): Promise<AgentInfo[]>;
-  /** 在新 tab 里以 argv 启动子 pane（layout.apply），返回 pane/tab id。 */
+  /** Start a child pane with argv in a new tab (layout.apply), returning pane/tab IDs. */
   spawnSubPane(opts: { label: string; command: string[]; cwd: string; env?: Record<string, string> }): Promise<{ tabId: string; paneId: string }>;
-  /** 向 pane 终端注入文本（pi 编辑器输入 + Enter；send_text+CR 实测可直达；仅用于 launchLine 起进程）。 */
+  /** Inject text into a pane terminal (pi editor input + Enter); send_text+CR reaches it directly and is used only to start launchLine. */
   sendPaneText(paneId: string, text: string): Promise<void>;
-  /** server 端等待 agent 状态；命中返回状态，超时返回 null，错误抛出。 */
+  /** Wait for an agent state server-side; return the matched state, null on timeout, and throw on error. */
   waitAgent(paneId: string, until: HerdrAgentState[], timeoutMs: number): Promise<HerdrAgentState | null>;
-  /** 查询子代理上报的会话路径（agent_session.value，kind=path）；无则 null。 */
+  /** Query the child-agent session path (agent_session.value, kind=path); return null when absent. */
   getAgentSessionPath(paneId: string): Promise<string | null>;
-  /** v1.2：聚焦 pane（组 tab 追加的前置）。 */
+  /** v1.2: Focus a pane before adding it to a group tab. */
   focusPane(paneId: string): Promise<void>;
-  /** v1.2：在当前 tab 拆分出新 shell pane（focus 后调用，落组 tab）。返回新 paneId。 */
+  /** v1.2: Split a new shell pane in the current tab after focus, placing it in the group tab; return its pane ID. */
   splitPane(opts: { direction?: 'left' | 'right' | 'up' | 'down'; cwd?: string; env?: Record<string, string>; targetPaneId?: string }): Promise<string>;
-  /** v1.2：关闭 pane（实测杀进程树；空 tab 由 herdr 自动关）。 */
+  /** v1.2: Close a pane; observed behavior kills its process tree and herdr closes an empty tab. */
   closePane(paneId: string): Promise<void>;
-  /** v1.2：创建 tab（含根 shell pane），返回 tabId/paneId（组 tab 基础设施）。 */
+  /** v1.2: Create a tab with a root shell pane, returning tabId/paneId for group-tab infrastructure. */
   createTab(opts: { workspaceId: string; label?: string; cwd?: string; env?: Record<string, string> }): Promise<{ tabId: string; paneId: string }>;
-  /** v1.2：列出全部 pane（含 tab 归属；组 tab 追加用）。 */
+  /** v1.2: List all panes with tab ownership for group-tab additions. */
   listPanes(): Promise<Array<{ paneId: string; tabId: string; workspaceId: string; agentStatus: string }>>;
-  /** D91：导出 tab 布局树（layout.export；paneId/tabId 二选一定位）。尽力而为：失败返回 null。 */
+  /** D91: Export the tab layout tree, locating it by paneId or tabId; best effort returns null on failure. */
   exportLayout(opts: { paneId?: string; tabId?: string }): Promise<{ tabId: string | null; zoomed: boolean; root: unknown } | null>;
-  /** v1.3：列出 tab（tab.list → {type:'tab_list', tabs:[TabInfo]}，schema 实测）。 */
+  /** v1.3: List tabs (tab.list); fields follow the observed schema. */
   tabList(): Promise<TabInfo[]>;
-  /** v1.3：查 tab 详情（tab.get → {type:'tab_info', tab}）；不存在返回 null。 */
+  /** v1.3: Get tab details (tab.get); return null when absent. */
   tabGet(tabId: string): Promise<TabInfo | null>;
-  /** v1.3：关闭 tab（tab.close → {type:'tab_closed', ...}；级联关闭其 pane）。 */
+  /** v1.3: Close a tab (tab.close), cascading to its panes. */
   tabClose(tabId: string): Promise<void>;
-  /** M14：发送按键组合（pane.send_keys；Herdr key-combo：ctrl+c / enter / esc …）。 */
+  /** M14: Send a key combination (pane.send_keys; Herdr key combos include ctrl+c, enter, and esc). */
   sendPaneKeys(paneId: string, keys: string[]): Promise<void>;
-  /** M14：读 pane 输出缓冲（pane.read；source=recent 近期缓冲，strip_ansi=false 保留 T6 检测原料）。 */
+  /** M14: Read the pane output buffer; recent preserves ANSI data for T6 detection by default. */
   readPane(paneId: string, opts?: {
     source?: 'visible' | 'recent' | 'recent_unwrapped';
     lines?: number;
     stripAnsi?: boolean;
   }): Promise<{ text: string; revision: number; truncated: boolean }>;
-  /** M14：等输出匹配（pane.wait_for_output；substring/regex）。超时返回 null，错误抛出。 */
+  /** M14: Wait for output to match a substring or regex; return null on timeout and throw on error. */
   waitForOutput(paneId: string, match: { type: 'substring' | 'regex'; value: string }, timeoutMs: number): Promise<boolean | null>;
   close(): void;
 }
 
-/** 深度优先在响应对象里找第一个字符串字段（herdr 信封形状多样，id 位置不一）。 */
+/** Find the first string field named key by depth-first search; herdr envelopes place IDs inconsistently. */
 function findIdIn(obj: unknown, key: string, depth = 0): string | null {
   if (!obj || depth > 6) return null;
   if (typeof obj === 'object') {
@@ -205,7 +205,7 @@ export class NoopHerdrClient implements HerdrClientLike {
   close(): void {}
 }
 
-/* ── 实现 ──────────────────────────────────────────────────────────── */
+/* ── Implementation ────────────────────────────────────────────────── */
 
 export class HerdrClient implements HerdrClientLike {
   readonly available = true;
@@ -221,8 +221,8 @@ export class HerdrClient implements HerdrClientLike {
   }
 
   /**
-   * 控制请求：一连接一请求（server 应答后关连接，实测协议行为）。
-   * 读满一行响应即完成；响应是 {id, result} | {id, error}。
+   * Control requests use one connection per request; the server closes it after replying, as observed in the protocol.
+   * Reading a complete response line finishes the request; responses are {id, result} or {id, error}.
    */
   private request(method: string, params: Record<string, unknown>, timeoutMs = 15000): Promise<unknown> {
     return new Promise((resolve, reject) => {
@@ -280,7 +280,7 @@ export class HerdrClient implements HerdrClientLike {
     });
   }
 
-  /* ── 上报类（失败静默：工作台镜像尽力而为，绝不影响 pi 主流程） ── */
+  /* ── Reporting (silent best effort: the workbench mirror must never affect pi's main flow) ── */
 
   async reportAgent(state: PaneAgentState, message: string | null): Promise<void> {
     try {
@@ -292,7 +292,7 @@ export class HerdrClient implements HerdrClientLike {
         ...(message ? { message } : {}),
       });
     } catch {
-      /* 静默 */
+      /* Silent best effort. */
     }
   }
 
@@ -306,7 +306,7 @@ export class HerdrClient implements HerdrClientLike {
         agent_session_path: sessionPath,
       });
     } catch {
-      /* 静默 */
+      /* Silent best effort. */
     }
   }
 
@@ -318,8 +318,8 @@ export class HerdrClient implements HerdrClientLike {
         lastWriteAt: meta.lastWriteAt,
       });
       const blocked = formatBlockedLabel(meta.items);
-      // D96：stale 清理与日常上报分离——stale(16) + pi-todo(1) = 17 > herdr tokens max=16
-      // → 整个请求被拒 → title/tokens 全丢（D93 回归根因）。stale 单独批次，成功后才置位。
+      // D96: separate stale cleanup from the daily report—stale(16) + pi-todo(1) exceeds herdr's 16-token limit,
+      // so one rejected request would lose both title and tokens (the D93 regression root cause). Set stale in its own batch first.
       if (!this.clearedStaleTokens) {
         await this.request('pane.report_metadata', {
           pane_id: this.env.paneId,
@@ -336,12 +336,12 @@ export class HerdrClient implements HerdrClientLike {
         ...(blocked
           ? { state_labels: { [BLOCKED_LABEL_KEY]: blocked } }
           : { clear_state_labels: true }),
-        // D93：todo 摘要进 custom token（空串 = 清键，无 todo 不留旧摘要）
+        // D93: put the todo summary in a custom token; an empty string clears the key so stale summaries do not remain.
         tokens: sidebarTodoTokens(title),
         ttl_ms: 86400000,
       });
     } catch {
-      /* 静默：标题投影尽力而为，绝不影响 pi 主流程 */
+      /* Silent best effort: the title projection must never affect pi's main flow. */
     }
   }
 
@@ -349,7 +349,7 @@ export class HerdrClient implements HerdrClientLike {
     const keys = Object.keys(tokens);
     if (keys.length === 0) return;
     try {
-      // schema maxProperties=16 → 分批（每批独立请求，全部尽力而为）
+      // schema maxProperties=16, so split into independent best-effort requests.
       for (let i = 0; i < keys.length; i += LOCK_BATCH_LIMIT) {
         const batch: Record<string, string | null> = {};
         for (const k of keys.slice(i, i + LOCK_BATCH_LIMIT)) batch[k] = tokens[k];
@@ -361,7 +361,7 @@ export class HerdrClient implements HerdrClientLike {
         });
       }
     } catch {
-      /* 锁登记尽力而为（软 veto 下失败 = 少一次警告，不阻断） */
+      /* Lock registration is best effort; under soft veto, failure only loses a warning and does not block. */
     }
   }
 
@@ -373,7 +373,7 @@ export class HerdrClient implements HerdrClientLike {
         ...(name ? { display_agent: name } : { clear_display_agent: true }),
       });
     } catch {
-      /* 静默：侧边栏标识尽力而为 */
+      /* Silent best effort: sidebar identity is supplementary. */
     }
   }
 
@@ -386,11 +386,11 @@ export class HerdrClient implements HerdrClientLike {
         ttl_ms: 86400000,
       });
     } catch {
-      /* 静默：人类闸门标志尽力而为 */
+      /* Silent best effort: the human-gate marker is supplementary. */
     }
   }
 
-  /* ── 查询与控制 ───────────────────────────────────────────────────── */
+  /* ── Queries and control ─────────────────────────────────────────── */
 
   async listAgents(): Promise<AgentInfo[]> {
     const result = (await this.request('agent.list', {})) as {
@@ -422,7 +422,7 @@ export class HerdrClient implements HerdrClientLike {
   }
 
   async sendPaneText(paneId: string, text: string): Promise<void> {
-    // 尾部 \r 即 Enter（实测：文本进入 pi 编辑器并提交）
+    // A trailing \r acts as Enter; observed behavior sends text to the pi editor and submits it.
     await this.request('pane.send_text', { pane_id: paneId, text: text + '\r' });
   }
 
@@ -497,7 +497,7 @@ export class HerdrClient implements HerdrClientLike {
         ...(opts.paneId ? { pane_id: opts.paneId } : {}),
         ...(opts.tabId ? { tab_id: opts.tabId } : {}),
       })) as Record<string, unknown> | null;
-      // 响应信封：{layout:{tab_id,zoomed,root}}；兼容 root 直接在顶层
+      // Observed envelope: {layout:{tab_id,zoomed,root}}; accept root directly at the top level for compatibility.
       const layout = (result?.layout ?? result) as Record<string, unknown> | null | undefined;
       if (!layout || typeof layout !== 'object' || !('root' in layout)) return null;
       return {
@@ -544,7 +544,7 @@ export class HerdrClient implements HerdrClientLike {
     lines?: number;
     stripAnsi?: boolean;
   } = {}): Promise<{ text: string; revision: number; truncated: boolean }> {
-    // 信封实测：{type:'pane_read', read:{text, revision, truncated, ...}}（payload 套在 read 下）
+    // Observed envelope: {type:'pane_read', read:{text, revision, truncated, ...}}; the payload is nested under read.
     const result = (await this.request('pane.read', {
       pane_id: paneId,
       source: opts.source ?? 'recent',
@@ -577,7 +577,7 @@ export class HerdrClient implements HerdrClientLike {
   }
 
   close(): void {
-    /* v1.1 无长驻连接；保留接口语义（Noop） */
+    /* v1.1 has no long-lived connection; retain the interface semantics as a no-op. */
   }
 }
 

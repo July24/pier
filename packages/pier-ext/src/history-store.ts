@@ -1,23 +1,24 @@
 /**
- * workspace 历史记录（v1.2，DESIGN.md §13.4）。
+ * Workspace history (v1.2, DESIGN.md §13.4).
  *
- * 任务历史 = append-only JSONL，按 cwd 分区（与 pi 会话分区同构）：
+ * Task history is append-only JSONL partitioned by cwd, mirroring pi session partitioning:
  *   <agentRoot>/herdr-pi/history/--<cwd>--/history.jsonl
- * 记录不可变：GC 只关 pane，绝不删历史。恢复双保险：sessionFile + launchCommand 快照。
+ * Records are immutable so GC can remove panes without deleting history. Recovery keeps
+ * both the sessionFile and launchCommand snapshots as fallbacks.
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { historyFilePath } from './storage-layout.ts';
+import { historyFilePath, preferredHistoryFile } from './storage-layout.ts';
 
-export { historyFilePath };
+export { historyFilePath, preferredHistoryFile };
 
-/** 旧 short/resident → task；空/缺省 → task；role 名原样。 */
+/** Legacy short/resident entries normalize to task; missing values do too, while role names pass through unchanged. */
 export function normalizeEntryKind(kind: string | null | undefined): string {
   if (!kind || kind === 'short' || kind === 'resident') return 'task';
   return kind;
 }
 
-/** 结算回写：只接受 .jsonl 路径，非法不覆盖（O6）。 */
+/** O6: only a .jsonl path is accepted during settlement, so invalid reports cannot overwrite a valid path. */
 export function applyReportedSessionFile(
   current: string | null,
   reported: string | null | undefined,
@@ -28,34 +29,35 @@ export function applyReportedSessionFile(
 
 export interface HistoryEntry {
   taskId: string;
-  /** 'task' 或 role 名；读盘时 short/resident 归一为 task。 */
+  /** 'task' or a role name; disk reads normalize short/resident to task for compatibility. */
   kind: string;
   paneId: string;
   tabId: string;
-  /** v1.3：任务 tab 名（历史回看/复活参考；旧条目缺省）。 */
+  /** v1.3: task tab name retained for history review and revival; omitted by older entries. */
   tabName?: string;
   workspaceId: string;
   cwd: string;
   description: string;
-  /** 子代理会话文件（resume 首选）。 */
+  /** Child-agent session file, preferred when resuming. */
   sessionFile: string | null;
-  /** 启动命令快照（sessionFile 丢失时重建空会话续接）。 */
+  /** Launch command snapshot, used to rebuild an empty continuation when sessionFile is missing. */
   launchCommand: string[];
   status: 'running' | 'settled' | 'consumed' | 'closed';
   outcome?: string | null;
   createdAt: number;
-  /** 消费时间（M13c 起随条目落盘；GC TTL 判据的 durable 记录）。 */
+  /** M13c: durable consumption time, which provides the GC TTL basis. */
   consumedAt?: number | null;
   closedAt?: number | null;
-  /** 打回重做/复活时的前代 paneId。 */
+  /** Previous-generation pane ID, retained when work is redone or revived. */
   revivedFrom?: string | null;
-  /** B5：写手标记（spawn / poll-settle / poll-timeout / gc / zombie-sweep …）——
-   * 同秒多行可审计（01a03c0d 台账 row#23/24 双写实证）。 */
+  /** B5: writer marker (spawn / poll-settle / poll-timeout / gc / zombie-sweep …), so
+   * multiple entries in one second remain auditable (ledger row#23/24 proves both writes). */
   via?: string;
 }
 
-/** B5：closed 行 outcome 继承——patch 未显式指定 outcome 时沿用该 taskId 最近非空值，
- * 「最新行即现状」语义下结算成果不因 GC 补记而丢失。 */
+/** B5: inherit outcome for a closed row—when patch omits it, use the latest non-empty value
+ * for that taskId, preventing GC bookkeeping from erasing settlement results under the
+ * “latest row is state” rule. */
 export function inheritOutcome(lastOutcome: string | null | undefined, patchOutcome: string | null | undefined): string | null {
   if (patchOutcome !== undefined) return patchOutcome;
   return lastOutcome ?? null;
@@ -63,7 +65,7 @@ export function inheritOutcome(lastOutcome: string | null | undefined, patchOutc
 
 
 
-/** 容忍式逐行解析（损坏行跳过）。 */
+/** Parse line by line tolerantly, skipping malformed records. */
 export function parseHistoryEntries(text: string): HistoryEntry[] {
   const entries: HistoryEntry[] = [];
   for (const line of (text ?? '').split(/\r?\n/)) {
@@ -76,7 +78,7 @@ export function parseHistoryEntries(text: string): HistoryEntry[] {
         entries.push({ ...raw, kind: normalizeEntryKind(raw.kind) });
       }
     } catch {
-      /* 跳过损坏行 */
+      /* Skip malformed records. */
     }
   }
   return entries;
@@ -86,7 +88,7 @@ function serializeEntry(entry: HistoryEntry): string {
   return JSON.stringify(entry);
 }
 
-/** 读取历史文件；不存在返回 []。 */
+/** Read a history file; a missing or unreadable file yields []. */
 export function readHistory(file: string): HistoryEntry[] {
   try {
     return parseHistoryEntries(fs.readFileSync(file, 'utf8'));
@@ -95,17 +97,17 @@ export function readHistory(file: string): HistoryEntry[] {
   }
 }
 
-/** 追加一条（确保目录存在）。 */
+/** Append one entry, creating its parent directory first. */
 export function appendHistory(file: string, entry: HistoryEntry): void {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.appendFileSync(file, serializeEntry(entry) + '\n');
   } catch {
-    /* 尽力而为：历史写入失败不影响主流程 */
+    /* Best effort: history-write failures must not disrupt the main flow. */
   }
 }
 
-/** 折叠：每个 taskId 的全部代际（按 createdAt 升序）。 */
+/** Group all generations of each taskId in ascending createdAt order for review. */
 export function generationsByTask(entries: readonly HistoryEntry[]): Map<string, HistoryEntry[]> {
   const map = new Map<string, HistoryEntry[]>();
   for (const e of entries) {
@@ -117,7 +119,7 @@ export function generationsByTask(entries: readonly HistoryEntry[]): Map<string,
   return map;
 }
 
-/** 取 taskId 的最新代（resume 用）。 */
+/** Return the newest generation for taskId, which is the one used for resume. */
 export function latestGeneration(entries: readonly HistoryEntry[], taskId: string): HistoryEntry | null {
   const gens = generationsByTask(entries).get(taskId);
   if (!gens || gens.length === 0) return null;

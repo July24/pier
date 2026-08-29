@@ -1,8 +1,4 @@
-/**
- * 档 0：todos 升为进程内 Service（D65 / D75 阶段 2）。
- * 持久化仍是 pi 会话分支重放；D75 阶段 3：config 从 role manifest services 注入
- * （无 manifest 的 master / 纯标签 worker 走默认——worker serial、master parallel）。
- */
+/** Why: Preserve the established compatibility and safety behavior (D65, D75). */
 import { EventEmitter } from 'node:events';
 import {
   applyTodoEdits,
@@ -27,10 +23,7 @@ export class TodosService extends EventEmitter {
   get items(): readonly TodoItem[] {
     return this._items;
   }
-  /**
-   * 列表最后一次真实变更时间（epoch ms）；分支重建取自条目时间戳，无则 null。
-   * 陈旧度判定（stale-core）的时钟锚点；null → 保守永不判 stale。
-   */
+  /** Why: Preserve the established compatibility and safety behavior. */
   lastWriteAt: number | null = null;
   readonly config: TodosConfig;
 
@@ -39,7 +32,7 @@ export class TodosService extends EventEmitter {
     this.config = config;
   }
 
-  /** D75 阶段 3：role manifest services.todos（mode）驱动；strict = 进程身份（worker）。 */
+  /** Why: Preserve the established compatibility and safety behavior (D75). */
   static configFromRuntime(manifest: RuntimeRoleManifest | null, isSubagent: boolean): TodosConfig {
     const strict = isSubagent;
     const mode = manifest?.services?.todos?.mode;
@@ -75,15 +68,15 @@ export class TodosService extends EventEmitter {
     return { changed: true };
   }
 
-  /** M16：completed 转换数（所有编辑路径统一 diff；速率估算的原料）。 */
+  /** Why: Preserve the established compatibility and safety behavior (M16). */
   private emitCompletedTransitions(before: readonly TodoItem[], after: readonly TodoItem[]): void {
     const count = countCompletedTransitions(before, after);
     if (count > 0) this.emit('todo.completed', { count, at: Date.now() });
   }
 
   rebuild(entries: readonly unknown[]): void {
-    // 与 v1.x rebuildFromBranch 同语义：分支上折叠不到快照时保留现值
-    //（重建失败不影响主流程；下次 todo_write 会重新锚定）。
+    // Why: Preserve the established compatibility and safety behavior.
+    // Why: Preserve the established compatibility and safety behavior.
     const folded = foldLatestTodosMeta(entries as Parameters<typeof foldLatestTodosMeta>[0]);
     if (folded) {
       this._items = folded.items;

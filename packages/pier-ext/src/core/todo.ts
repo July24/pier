@@ -1,15 +1,11 @@
 /**
- * 档1 core/todo（todo 族迁 loader entry —— D78 挂载树 / D81 融合核心）。
+ * D78/D81 todo loader entry.
  *
- * 形态：cordis 插件（master 经 loader.create 挂 = 热换面；worker 裸根手动 mount，
- * D81 one-shot 裁剪）。依赖全部经服务注入：
- *  - `pi-herdr.surface`：pi 注册面代理（D79 tombstone）；
- *  - `pi-herdr.todo-deps`：todos 服务（session 状态层，留在 index）+ options +
- *    mirrorTodos 回调 + appendEntry + state 槽（renderWidget 回填给 index 生命周期）。
- *
- * 本文件承接：todo_write 工具 + /todos 命令（查看/编辑）+ TUI widget（widgetLines/
- * renderWidget）+ 读钩（before_agent_start planTodoReadHook，
- * 轮次计数器内聚）。reconcile / 镜像 / reportAgent 仍在 index（session 状态层）。
+ * A Cordis plugin keeps the master surface hot-swappable while allowing workers to mount the
+ * one-shot subset directly. Injected services preserve the D79 registration boundary and keep
+ * session-owned todo state in index. This module owns the tool, command, widget, and read hook;
+ * reconciliation, mirroring, and agent reporting stay with the session state layer to avoid a
+ * dependency cycle.
  */
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
@@ -32,14 +28,14 @@ import {
 } from '../todo-core.ts';
 
 export interface TodoUiSlot {
-  /** index 的 session_start/session_tree 生命周期调用（plugin 回填）。 */
+  /** Lets index lifecycle events render through the currently mounted plugin. */
   renderWidget: (ctx: unknown) => void;
 }
 
 export interface TodoDeps {
   todos: TodosService;
   allowParallelInProgress: boolean;
-  /** 软上限提示（不硬拒）。 */
+  /** Warn above this size without rejecting otherwise valid plans. */
   maxItems: number;
   mirrorTodos: () => void;
   appendEntry: (customType: string, data: unknown) => void;
@@ -64,10 +60,10 @@ const TODO_MARKS: Record<TodoStatus, string> = {
   abandoned: '✗',
 };
 
-/** pi TUI widget 硬上限（interactive-mode MAX_WIDGET_LINES=10，头部截断；我们自己控制在限内）。 */
+/** Stay within pi interactive mode's ten-line widget cap instead of relying on head truncation. */
 export const WIDGET_MAX_LINES = 10;
 
-/** 分组渲染（phase 头 + 条目行；不设预算，widget 与 /todos 共用）。 */
+/** Share phase rendering between the widget and /todos so both views order entries identically. */
 function renderGroups(items: readonly TodoItem[]): string[] {
   const groups = new Map<string, TodoItem[]>();
   for (const it of items) {
@@ -88,18 +84,15 @@ function renderGroups(items: readonly TodoItem[]): string[] {
 }
 
 /**
- * widget 行（活动锚定窗口，用户实证二修）：
- *  - 全局预算 = WIDGET_MAX_LINES（含摘要行与 +N 行）；
- *  - 窗口锚定第一条 in_progress：可见的条目是它前后的连续区段（正在做的
- *    上下文——前因后果可见），不再是固定头部/尾部（旧实现超窗时只剩尾部，
- *    正在执行的条目滚出视窗，01a03c0d 实证"显示最后几条，不管当前执行到哪"）；
- *  - 无 in_progress → 锚定最后一条 open；全完成 → 尾部切片（刚完成的可见）；
- *  - +N 行指路 /todos（全量视图）。
+ * Keep the active task visible within WIDGET_MAX_LINES instead of truncating to a fixed head or
+ * tail. The window anchors on the first in-progress item, then the last open item, then recent
+ * completions. A +N line points to /todos when the full plan cannot fit. This fixes 01a03c0d,
+ * where active work scrolled out while only the final entries remained visible.
  */
 export function widgetLines(items: readonly TodoItem[], opts?: { archivedAgeMs?: number | null }): string[] {
   if (items.length === 0) return [];
   const c = countTodos(items);
-  // 反冻结：归档列表不逐条渲染，两行说明 + 指路 /todos（死计划不再占满视窗）。
+  // Collapse archived plans to two lines so stale work cannot monopolize the widget.
   if (opts?.archivedAgeMs != null) {
     return [
       `todo: ${c.inProgress}▶ ${c.pending}○ ${c.blocked}■ ${c.completed}✓ · archived ${formatAge(opts.archivedAgeMs)}`,
@@ -107,8 +100,7 @@ export function widgetLines(items: readonly TodoItem[], opts?: { archivedAgeMs?:
     ];
   }
 
-  // 条目预算 = 总预算 - 摘要行 -（隐藏时的）+N 行。phase 头也占行——按渲染行数
-  // 迭代收缩：锚定窗口切片 → 超行则两端各收一格（保锚点），直到装得下。
+  // Reserve summary and overflow lines, then shrink around the anchor because phase headers also consume the budget.
   const renderBudget = WIDGET_MAX_LINES - 1 - 1;
   const [start, end] = anchorRange(items, renderBudget);
   const kept = items.slice(start, end);
@@ -122,9 +114,8 @@ export function widgetLines(items: readonly TodoItem[], opts?: { archivedAgeMs?:
 }
 
 /**
- * 活动锚定窗口：锚点 = 第一条 in_progress（无则最后一条 open；全完成 → 尾部）。
- * 以渲染行数（含 phase 头）为预算，从锚点贪心扩张（尾部优先——后续工作先
- * 可见），装不下即停；锚点条目永远在窗内。
+ * Expand around the active anchor within the rendered-line budget, favoring upcoming work while
+ * guaranteeing that the anchor remains visible.
  */
 function anchorRange(items: readonly TodoItem[], renderBudget: number): [number, number] {
   if (renderGroups(items).length <= renderBudget) return [0, items.length];
@@ -133,7 +124,7 @@ function anchorRange(items: readonly TodoItem[], renderBudget: number): [number,
     ? anchor
     : items.reduce((acc, it, i) => (it.status !== 'completed' ? i : acc), -1);
   if (anchorIdx < 0) {
-    // 全完成：尾部切片（按行数从头收缩）
+    // Completed plans keep the most recent tail visible within the line budget.
     let end = items.length;
     while (renderGroups(items.slice(0, end)).length > renderBudget && end > 1) end -= 1;
     return [0, end];
@@ -155,7 +146,7 @@ function anchorRange(items: readonly TodoItem[], renderBudget: number): [number,
     } else {
       break;
     }
-    growTail = !growTail; // 严格交替：锚点前因与后果均衡可见（用户实证诉求）
+    growTail = !growTail; // Alternate sides so both context and upcoming work remain visible.
   }
   return [start, end];
 }
@@ -166,17 +157,17 @@ export default function todoPlugin(ctx: Context): void {
     ctx.get('pi-herdr.todo-deps') as TodoDeps;
   const scoped = surface.forModule(import.meta.url);
 
-  /** 归档年龄（非归档 → null）；widget / /todos 共用。 */
+  /** Share one archive-age decision between the widget and /todos. */
   function archivedAgeMs(now = Date.now()): number | null {
     return todos.lastWriteAt != null && isArchived(todos.items, todos.lastWriteAt, now)
       ? now - todos.lastWriteAt
       : null;
   }
 
-  /** 事件 ctx 里的 widget UI（有则 setWidget；守卫后具名使用，不做行内断言）。 */
+  /** Name the guarded event UI once so callers do not repeat unsafe inline assertions. */
   function widgetUi(eventCtx: unknown): { setWidget?: (id: string, lines: string[]) => void } | undefined {
     if (eventCtx === null || typeof eventCtx !== 'object' || !('ui' in eventCtx)) return undefined;
-    const ui = (eventCtx as { ui: unknown }).ui; // 'ui' in 已守卫
+    const ui = (eventCtx as { ui: unknown }).ui; // Safe after the property guard above.
     return ui !== null && typeof ui === 'object'
       ? (ui as { setWidget?: (id: string, lines: string[]) => void })
       : undefined;
@@ -186,23 +177,23 @@ export default function todoPlugin(ctx: Context): void {
     try {
       widgetUi(eventCtx)?.setWidget?.('todos', widgetLines(todos.items, { archivedAgeMs: archivedAgeMs() }));
     } catch {
-      /* 无 widget 能力的 pi 版本静默降级 */
+      /* Older pi versions may omit widget support without disabling todo tracking. */
     }
   }
 
-  // 槽回填：index 的 session_start/session_tree 调用
+  // Let index lifecycle hooks call the current plugin implementation.
   state.renderWidget = renderWidget;
 
-  /* ── 读钩（轮次计数器内聚；D39 提示注入 + 反冻结 stale-core） ── */
+  /* ── Read hook: D39 reminders and stale-plan thawing ────────────── */
   let todoReadTurn = 0;
   let lastEmptyGuardTurn: number | null = null;
-  // 反冻结状态：距上次写入轮数 / stale 警告计数与节奏 / 归档翻转检测
+  // Track writes and notice cadence so a stale plan cannot remain frozen indefinitely.
   let lastWriteTurn: number | null = null;
   let staleNotices = 0;
   let lastStaleGuardTurn: number | null = null;
   let lastArchivedMirror = false;
 
-  // 任何真实变更（todo_write / 人类编辑 / 对账 / 分支重建）都终结当前停滞期
+  // Any real edit ends the current stale period because the plan is active again.
   todos.on('todo.updated', () => {
     lastWriteTurn = todoReadTurn;
     staleNotices = 0;
@@ -223,20 +214,20 @@ export default function todoPlugin(ctx: Context): void {
       staleNotices += 1;
       lastStaleGuardTurn = todoReadTurn;
     }
-    // 空守卫 / 归档通知 / R2 重写窗口共用注入节奏（archived=true 的 stale 窗口同享，
-    // 否则终态通知会在窗口后紧跟一拍挤掉宽限）。
+    // Share cadence across empty, archive, and R2 rewrite notices so adjacent notices do not
+    // consume the grace window.
     if (plan.inject && (plan.effect === 'empty-guard' || plan.archived)) {
       lastEmptyGuardTurn = todoReadTurn;
     }
-    // R1：归档通知注入即清空——明细早已不再注入，保留死列表只会挡住空守卫的
-    // before-stopping 驱动（01a03c0d：归档后 2h 多步工作零跟踪）。rm 全量落
-    // JSONL，重启 rebuild 同样折叠得空表；历史明细仍在会话文件里。
+    // R1 clears archived entries after notice because retaining dead items suppresses the empty
+    // guard that restored tracking after the 01a03c0d two-hour gap. Persist removals for replay;
+    // the session log still retains history.
     if (plan.inject && plan.effect === 'archive-notice' && plan.clearArchived && todos.items.length > 0) {
       const edits = todos.items.map((it) => ({ op: 'rm' as const, content: it.content }));
       try {
         appendEntry(TODO_EDIT_CUSTOM_TYPE, { version: 1, edits, ts: Date.now() });
       } catch {
-        /* 尽力而为（内存清空照常） */
+        /* Persistence is best-effort because the in-memory clear must still proceed. */
       }
       todos.replace([]);
     }
@@ -251,7 +242,7 @@ export default function todoPlugin(ctx: Context): void {
     };
   });
 
-  /* ── 工具：todo_write ── */
+  /* ── todo_write tool ───────────────────────────────────────────── */
   scoped.registerTool({
     name: TODO_TOOL_NAME,
     label: 'Todo',
@@ -289,7 +280,7 @@ export default function todoPlugin(ctx: Context): void {
           details: {},
         };
       }
-      const strictMode = todos.config.strict; // D75 阶段 2：策略进 service config
+      const strictMode = todos.config.strict; // D75 phase 2 keeps policy in the service config.
       let next = result.items!;
       const strictNotes: string[] = [];
       if (strictMode) {
@@ -303,11 +294,11 @@ export default function todoPlugin(ctx: Context): void {
         if (promoted) strictNotes.push(`auto-promoted to in_progress: ${promoted}`);
         next = strict;
       }
-      // D35：no-op（与当前列表全等 → 不落盘不镜像）
+      // D35 avoids persistence and mirroring when the authoritative list is unchanged.
       if (listsEqual(todos.items, next)) {
         return { content: [{ type: 'text', text: 'No change: todo list already matches.' }], details: {} };
       }
-      // D36/D37：过渡信号与回退警告
+      // D36/D37 surface completion transitions and regressions to the caller.
       const completed = completionTransitions(todos.items, next);
       const reverted = revertedCompleted(todos.items, next);
       todos.replace(next);
@@ -332,7 +323,7 @@ export default function todoPlugin(ctx: Context): void {
     },
   });
 
-  /* ── 命令：/todos（查看 + done/drop/rm/unblock 人类编辑，D38）── */
+  /* ── /todos command: D38 human viewing and edits ───────────────── */
   scoped.registerCommand('todos', {
     description: 'Show the todo list, or edit it: /todos done|drop|rm|unblock <fuzzy content match>',
     handler: async (args: unknown, eventCtx: unknown) => {
@@ -365,11 +356,11 @@ export default function todoPlugin(ctx: Context): void {
           ui?.notify?.(`no change: "${content}" is already in that state`, 'info');
           return;
         }
-        // D38：人类编辑写回权威（custom 条目，重启后分支回放生效）
+        // D38 persists human edits so branch replay rebuilds the same authoritative state.
         try {
           appendEntry(TODO_EDIT_CUSTOM_TYPE, { version: 1, edits: [edit], ts: Date.now() });
         } catch {
-          /* 尽力而为 */
+          /* Persistence failure must not discard the live human edit. */
         }
         mirrorTodos();
         renderWidget(eventCtx);
@@ -380,7 +371,7 @@ export default function todoPlugin(ctx: Context): void {
         ui?.notify?.(`"${content}" ${verb}`, 'info');
         return;
       }
-      // 全量视图（/todos 不受 widget 行预算限制——"看整个列表"的正式入口）
+      // /todos is the unbounded view because the widget intentionally prioritizes active context.
       const body = renderGroups(todos.items);
       if (body.length === 0) {
         ui?.notify?.('todo list is empty', 'info');

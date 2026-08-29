@@ -1,13 +1,10 @@
 /**
- * 档1 core/terminal（M14 六工具迁 loader entry —— D78 挂载树 / D81 三分法）。
+ * M14 terminal loader entry for the D78 mount tree and D81 responsibility split.
  *
- * 形态：cordis 插件（loader entry，热换面 = 本文件）。依赖全部经服务注入：
- *  - `pi-herdr.surface`：pi 注册面代理（D79 tombstone —— hmr reload 翻墓碑，
- *    新版本同 key 重挂载、同重注册覆盖 pi 工具表 Map）；
- *  - `pi-herdr.terminal-deps`：client/env（外层 createHerdrClient 产物）+
- *    state 槽（index 的 GC 豁免查询 activePaneIds）。
- *
- * 本文件不 import index.ts（无环）；terminal-core 为纯逻辑层照旧。
+ * Keeping this as a Cordis loader plugin makes the terminal surface hot-swappable. Services
+ * provide the D79 tombstone-aware pi surface, herdr client/environment, and the state slot
+ * used by index GC. Avoiding an index.ts import preserves an acyclic dependency graph, while
+ * terminal-core remains independently testable pure logic.
  */
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
@@ -34,7 +31,7 @@ import {
 } from '../terminal-core.ts';
 
 export interface TerminalStateSlot {
-  /** index 的 GC 豁免查询（活跃终端 pane 不回收）。 */
+  /** Lets index GC preserve panes that host active terminals. */
   activePaneIds: () => Set<string>;
 }
 
@@ -50,13 +47,12 @@ export default function terminalPlugin(ctx: Context): void {
   const pi = surface.raw as {
     appendEntry?: (customType: string, data: unknown) => void;
   };
-  // 模块 key = 本文件（hmr/reload 的 filename 与 ledger.disposeKey 规范化互比）
+  // Keying the surface by this file lets HMR tombstone and replace exactly this registration.
   const scoped = surface.forModule(import.meta.url);
 
-  /* ── M14：常驻交互终端六工具（D71 / T1–T6；master 侧 v1，worker 不挂本 entry） ──
-   * 后端 = 独立 herdr pane（不复用 pi TUI pane）：open=pane.split 常驻 shell /
-   * send=pane.send_text+\r / read=pane.read(recent)+本地增量 / signal=pane.send_keys /
-   * close=pane.close。有活跃终端的 pane 豁免 GC（index gcPass 查 state.activePaneIds）。 */
+  /* ── M14 resident terminal tools (D71 / T1–T6) ────────────────────
+   * Dedicated herdr panes preserve shell state without reusing the pi TUI pane, and active
+   * terminal panes remain exempt from index GC. Workers omit this master-side entry. */
 
   let terminals: TerminalEntry[] = [];
 
@@ -64,7 +60,7 @@ export default function terminalPlugin(ctx: Context): void {
     try {
       pi.appendEntry?.(TERMINALS_CUSTOM_TYPE, makeTerminalsRegistry(terminals));
     } catch {
-      /* 持久化尽力而为 */
+      /* Persistence is best-effort because terminal operation must not depend on session logging. */
     }
   }
 
@@ -74,7 +70,7 @@ export default function terminalPlugin(ctx: Context): void {
         ?.sessionManager?.getBranch?.() ?? [];
       terminals = foldTerminalsRegistry(entries as Parameters<typeof foldTerminalsRegistry>[0]);
     } catch {
-      /* 重建失败不影响主流程 */
+      /* A malformed snapshot must not block the live terminal surface. */
     }
   }
 
@@ -88,7 +84,7 @@ export default function terminalPlugin(ctx: Context): void {
     persistTerminals();
   }
 
-  // GC 豁免槽回填（index gcPass 消费）
+  // Expose active panes so index GC does not collect resident terminal shells.
   state.activePaneIds = () => activeTerminalPaneIds(terminals);
 
   scoped.on('session_start', async (_event: unknown, eventCtx: unknown) => {
@@ -119,7 +115,7 @@ export default function terminalPlugin(ctx: Context): void {
       const cwd = typeof params?.cwd === 'string' && params.cwd ? params.cwd
         : (ctx as { cwd?: string }).cwd ?? process.cwd();
       const r = registerTerminal(terminals, {
-        paneId: env.paneId, // 占位：split 后回填真实 paneId
+        paneId: env.paneId, // Reserve a valid id until split returns the terminal pane.
         tabId: env.tabId,
         cwd,
         createdAt: Date.now(),
@@ -134,7 +130,7 @@ export default function terminalPlugin(ctx: Context): void {
       r.entry.paneId = paneId;
       terminals = r.entries;
       persistTerminals();
-      // T3 readiness：PS1 尾匹配（server 端等待）；超时 → 本地兜底再判一次
+      // T3 rechecks locally after server-side PS1 matching times out to avoid false unreadiness.
       let readiness: 'prompt' | 'silent' | 'busy' = 'busy';
       try {
         const matched = await client.waitForOutput(paneId, { type: 'regex', value: '[$>#❯]\\s*$' }, READINESS_TIMEOUT_MS);
@@ -144,7 +140,7 @@ export default function terminalPlugin(ctx: Context): void {
           readiness = classifyReadiness(stripAnsi(read.text), { silentMs: 0 });
         }
       } catch {
-        /* readiness 尽力而为 */
+        /* Readiness is advisory, so probe failures still leave a usable terminal. */
       }
       const text = [
         `terminal ${r.entry.terminalId} open (pane ${paneId})`,
@@ -204,7 +200,7 @@ export default function terminalPlugin(ctx: Context): void {
         if (!entry) return errText(`unknown or closed terminal "${params.terminal_id}" (see terminal_list)`);
         paneId = entry.paneId;
       } else if (typeof params?.pane_id === 'string') {
-        // T5 先窄：仅本任务 tab 的 pane 或自建终端 pane
+        // T5 limits direct reads to this task tab or owned terminals to prevent cross-task access.
         try {
           const panes = await client.listPanes();
           const target = panes.find((p) => p.paneId === params.pane_id);
@@ -228,7 +224,7 @@ export default function terminalPlugin(ctx: Context): void {
       } catch (e) {
         return errText(`read failed (pane may be closed): ${(e as Error).message}`);
       }
-      // T6 检测点1：全屏 TUI（alternate screen）——在 raw 上识别
+      // T6 inspects raw output because ANSI stripping would erase alternate-screen evidence.
       const tui = detectFullscreenTUI(read.text);
       if (tui.detected) {
         const head = stripAnsi(read.text).slice(0, 200);
@@ -310,7 +306,7 @@ export default function terminalPlugin(ctx: Context): void {
         try {
           await client.closePane(entry.paneId);
         } catch {
-          /* pane 已消失（人关/随 tab 关）→ 直接补记 */
+          /* The pane may have been closed by a person or with its tab; record the terminal as closed anyway. */
         }
       }
       terminals = closeTerminal(terminals, entry.terminalId, Date.now()).entries;
@@ -332,10 +328,10 @@ export default function terminalPlugin(ctx: Context): void {
       try {
         livePaneIds = (await client.listPanes()).map((p) => p.paneId);
       } catch {
-        /* 查询失败：全部按未知（不误标 closed）——live 集为空只影响 stale 判定 */
+        /* Treat a failed query as unknown rather than closed, because an empty live set only affects stale detection. */
       }
       const s = summarizeSessions(terminals, livePaneIds);
-      // T6 检测点3：pane 消失 → 补记 closed（跨重启边界：不复活，提示持久化）
+      // T6 check 3: record vanished panes as closed across restarts rather than reviving them; tell the user to persist state.
       if (s.stalePaneIds.length > 0) {
         terminals = terminals.map((t) =>
           s.stalePaneIds.includes(t.paneId)

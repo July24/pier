@@ -1,15 +1,13 @@
 /**
- * 档1 bootstrap：master 进程的 cordis 树根（D78 挂载树 / D80 生态采用 / D81 三分法）。
+ * Bootstrap the master Cordis tree (D78 mount topology, D80 ecosystem adoption, D81 split).
  *
- * 形态：Loader 作根插件 → builtins.group 注册（D80③ `cordis:group`）→
- *      timer（hmr 前置依赖，D80②）→ hmr（仅开发姿态：`--expose-internals` 且
- *      env PI_HERDR_HMR=1，缺一即跳过——生产路径零 watcher）。
+ * Load the group, timer, and HMR plugins in order so declarations resolve and HMR stays a
+ * development-only path (`--expose-internals` plus PI_HERDR_HMR=1); production has no watcher.
  *
- * worker 进程不走本模块（C3/D81：短命进程手动 mount，无 loader/hmr）——
- * 与 subagent-scope.ts 同为 master 分支动态 import。
+ * Workers bypass this module (C3/D81) because short-lived processes mount manually without
+ * loader or HMR; this module and subagent-scope.ts are master-only dynamic imports.
  *
- * 后续：core 模块（todo/subagent/terminal/approval/reconcile 族）逐个迁为
- * loader entry（热换面 = entry，D80③ 手动 mount 不热换）。
+ * Core modules will gradually become loader entries; manual mounts remain non-hot-reloaded (D80③).
  */
 import { Context } from '@deepseek-ai/cordis';
 import Loader from '@deepseek-ai/cordis-plugin-loader';
@@ -23,17 +21,17 @@ export interface BootstrapHooks {
 }
 
 export interface CordisApp {
-  /** 树根（subagent scope 与 lifecycle effect 都挂这里）。 */
+  /** Root owns subagent scopes and lifecycle effects. */
   root: Context;
-  /** loader service 是否就绪（false = 降级为裸树，行为同档0）。 */
+  /** False preserves the bare-tree fallback, matching the baseline behavior. */
   loaderReady: boolean;
-  /** hmr 是否激活（开发姿态才有）。 */
+  /** HMR is enabled only in the development posture. */
   hmrActive: boolean;
-  /** dispose 账本（D80⑤ hmr 补偿 + D79 反注册共用；session_shutdown 走 disposeAll）。 */
+  /** Shared ledger compensates HMR disposal and handles session_shutdown cleanup. */
   ledger: DisposeLedger;
 }
 
-/** node 是否带 --expose-internals（hmr 的硬前提，D80①）。 */
+/** HMR requires Node's --expose-internals flag (D80①). */
 export function detectExposeInternals(): boolean {
   return process.execArgv.some((a) => a === '--expose-internals' || a.startsWith('--expose-internals='));
 }
@@ -41,13 +39,12 @@ export function detectExposeInternals(): boolean {
 export async function createCordisApp(hooks: BootstrapHooks = {}): Promise<CordisApp> {
   const root = new Context();
   const ledger = new DisposeLedger();
-  // 服务注入（cordis 原生 DI）：core entry 用 ctx.get('pi-herdr.ledger') 取账本——
-  // （entry config 过不了活实例，loader 会变换 config；provide/get 是 hmr/timer 同款机制）
+  // Inject the ledger through Cordis DI because loader transforms entry config and cannot carry live instances.
   root.provide('pi-herdr.ledger', ledger);
   if (hooks.onDispose) {
     root.effect(() => () => { hooks.onDispose?.(); }, 'session-root');
   }
-  // 相对名 entry（./core/...）以本文件目录解析
+  // Resolve relative entry names (./core/...) from this module's directory.
   root.baseUrl = pathToFileURL(path.dirname(fileURLToPath(import.meta.url))).href + '/';
 
   let loaderReady = false;
@@ -56,7 +53,7 @@ export async function createCordisApp(hooks: BootstrapHooks = {}): Promise<Cordi
     await root.plugin(Loader);
     const withLoader = root as Context & { loader?: { builtins: Record<string, unknown> } };
     if (withLoader.loader) {
-      withLoader.loader.builtins.group = Group; // D80③：声明里用 cordis:group 引用
+      withLoader.loader.builtins.group = Group; // D80③: declarations resolve cordis:group through this builtin.
       loaderReady = true;
     }
   } catch (err) {
@@ -79,9 +76,8 @@ export async function createCordisApp(hooks: BootstrapHooks = {}): Promise<Cordi
       });
       hmrActive = true;
       console.error('[pi-herdr] hmr active (dev posture: --expose-internals + PI_HERDR_HMR=1)');
-      // D80⑤（修正后）：hmr reload **会**拆旧 fiber 的 effect-disposers（registry.delete）——
-      // ctx.effect 是 core entry 主拆除机制。本 hook 补的是账本侧：pi-surface 旧世代
-      // 收割（d87 世代化：重挂后的 disposeKey 只杀登记世代及之前，新世代豁免）。
+      // D80⑤: HMR already disposes old fiber effects; this hook additionally retires old pi-surface generations.
+      // d87 keeps generations registered after the reload boundary alive; disposeKey retires only older entries.
       root.on('hmr/reload', (reloads: unknown) => {
         try {
           const files: string[] = [];
@@ -93,11 +89,11 @@ export async function createCordisApp(hooks: BootstrapHooks = {}): Promise<Cordi
             if (n > 0) console.error(`[pi-herdr] ledger: compensated ${n} disposal(s) for ${files.join(', ')}`);
           }
         } catch {
-          /* 补偿尽力而为 */
+          /* Best-effort compensation; disposal failures are non-fatal. */
         }
       });
     } catch (err) {
-      // D80②：hmr 挂失败不致命——降级为零 watcher，树其余部分照常
+      // D80②: a failed HMR mount degrades to zero watchers while the rest of the tree remains usable.
       console.error(`[pi-herdr] hmr mount failed (degraded): ${err instanceof Error ? err.message : String(err)}`);
     }
   }

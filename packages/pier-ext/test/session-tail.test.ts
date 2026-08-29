@@ -73,9 +73,9 @@ test('hasPendingToolCall: 挂起工具调用 = 未结算（等人类输入）', 
   assert.equal(hasPendingToolCall([tc(3)], 5), false);
 });
 
-test('sessionDirName: cwd → pi 会话目录命名', () => {
-  assert.equal(sessionDirName('F:\\herdr-pi'), '--F--herdr-pi--');
-  assert.equal(sessionDirName('/home/u/proj'), '---home-u-proj--');
+test('sessionDirName: cwd → collision-resistant session dir', () => {
+  assert.equal(sessionDirName('F:\\herdr-pi'), '--F%3A%5Cherdr-pi--');
+  assert.equal(sessionDirName('/home/u/proj'), '--%2Fhome%2Fu%2Fproj--');
 });
 
 test('listSessionFiles/sessionFileById: 候选定位（v1.3 M7 结算串线修复）', () => {

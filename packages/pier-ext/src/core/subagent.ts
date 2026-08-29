@@ -16,7 +16,7 @@ import type { TodosService } from '../todos-service.ts';
 import { mountSubagentScope } from '../subagent-scope.ts';
 import { Semaphore, SUBS_CUSTOM_TYPE, agoText, buildAliveNotice, buildBlockedGateNotice, buildIsolatePreamble, buildLaunchLine, buildLaunchParts, classifyWorktreeZone, evaluateRelease, foldSubsRegistry, formatSubagentResult, formatWorktreeStat, isAlive, isPathUnder, makeProgressUpdate, makeRegistry, parseWorktreePorcelain, planIsolateWorktree, planTabPlacement, psQuote, tabNameForTask, type AliveProbe, type SubEntry, type SubagentSpec, type TabPlacementPlan, type WorktreeZone } from '../subagent-core.ts';
 import { hasAssistantAfter, hasPendingToolCall, lastAssistantText, listSessionFiles, readSessionFile, sessionFileById } from '../session-tail.ts';
-import { appendHistory, applyReportedSessionFile, historyFilePath, inheritOutcome, latestGeneration, readHistory, type HistoryEntry } from '../history-store.ts';
+import { appendHistory, applyReportedSessionFile, preferredHistoryFile, inheritOutcome, latestGeneration, readHistory, type HistoryEntry } from '../history-store.ts';
 import { runtimePolicy } from '../runtime-policy.ts';
 import { platformPaths } from '../platform-paths.ts';
 import { defaultGitAdapter } from '../git-adapter.ts';
@@ -40,7 +40,7 @@ import { appendFileSync, existsSync, mkdirSync, rmSync, stat as statCb } from 'n
 import { resolve as pathResolve } from 'node:path';
 import { promisify } from 'node:util';
 const statAsync = promisify(statCb);
-import { pingUntilReady, pipeNameFor, pipeRequest } from '../pipe-channel.ts';
+import { pingUntilReady, pipeNameCandidates, pipeNameFor, pipeRequestTo } from '../pipe-channel.ts';
 import { shouldClosePane, shouldCloseTaskTab } from '../gc-core.ts';
 import { composeForRole } from '../manifest-compose.ts';
 import { formatSettlementNotice } from '../vocab.ts';
@@ -136,33 +136,32 @@ export default function subagentPlugin(ctx: Context): void {
     extPath: d.extPath,
   };
   const subSemaphore = new Semaphore(SUBAGENT_CONCURRENCY);
-  /** B4：每 pane 最近一次机器注入（prompt/follow_up pipe 投递成功）时间——观察窗内的
-   * working 若发生在宽限期内，是自己的注入在被处理，不是用户接管。 */
+  /** B4 timestamps machine injection so grace-period working events are not mistaken for takeover. */
   const lastMachineInjectAt = new Map<string, number>();
-  /* 子代理注册表（custom 条目持久化，分支正确；parent 重启后可从分支重建） */
+  /* Persist the subagent registry as custom branch state so parent restarts can rebuild it. */
   const subs = new Map<string, SubEntry>();
-  /** D98：isolate 创建中分支（worktree add → subs.set 窗口的孤儿扫描护栏）。 */
+  /** D98 excludes branches during worktree-add-to-registry races from orphan collection. */
   const pendingIsolateBranches = new Set<string>();
   const pollers = new Set<string>();
   const subScopes = new Map<string, { dispose: () => Promise<void> }>();
-  /** D50：每 pane 最近一次机器请求 id（interrupt 按轮次占位、pollLoop 去重用）。 */
+  /** D50 tracks the latest machine request per pane for interrupt claims and poll deduplication. */
   const lastRequestIdByPane = new Map<string, string>();
 
-  /** O1：上次落盘快照（内容哈希门控——01a03c0d 实证 48% session 行是心跳期重复快照）。 */
+  /** O1 suppresses duplicate snapshots because 01a03c0d found 48% of session rows were heartbeat repeats. */
   let lastSubsSnapshot = '';
 
   function persistSubs(): void {
     try {
       const reg = makeRegistry([...subs.values()]);
       const snap = JSON.stringify(reg);
-      if (snap === lastSubsSnapshot) return; // 内容未变不落（1s 观察窗/5s 接管循环的重复心跳）
+      if (snap === lastSubsSnapshot) return; // Avoid duplicate writes from the 1s/5s observation loops.
       lastSubsSnapshot = snap;
       pi.appendEntry?.(SUBS_CUSTOM_TYPE, reg);
     } catch {
-      /* 持久化尽力而为 */
+      /* Persistence is best-effort so session logging cannot break delegation. */
     }
   }
-  /** E2：已发过闸门通知的 pane（blocked 期间去重；解除后移除，二次 ask 可再通知）。 */
+  /** E2 deduplicates gate notices while blocked but permits a later, distinct human question. */
   const blockedGateNotified = new Set<string>();
 
   const boundPort: SubagentPort = {
@@ -199,21 +198,21 @@ export default function subagentPlugin(ctx: Context): void {
         ?.sessionManager?.getBranch?.() ?? [];
       const reg = foldSubsRegistry(entries as Parameters<typeof foldSubsRegistry>[0]);
       for (const sub of reg.subs) subs.set(sub.paneId, sub);
-      lastSubsSnapshot = ''; // 分支回放改变了状态 → 下次 persistSubs 强制落盘
+      lastSubsSnapshot = ''; // Force persistence because branch replay replaced live state.
     } catch {
-      /* 重建失败不影响主流程 */
+      /* Registry recovery failure must not block the live session. */
     }
   }
 
-  /** B6：master 崩溃遗留的 running 行——按 herdr 实况补 closed（pane 没了才关，
-   * pane 还在的真在跑则保留）。01a03c0d 台账实证：p6/p7 永久 running 无回收。 */
+  /** B6 closes crash-stale running rows only after herdr confirms their pane is gone; 01a03c0d
+   * showed p6/p7 otherwise remained permanently running. */
   async function sweepZombieRunning(): Promise<void> {
     if (!client.available || subs.size === 0) return;
     let livePaneIds: ReadonlySet<string>;
     try {
       livePaneIds = new Set((await client.listPanes()).map((p) => p.paneId));
     } catch {
-      return; // 查询失败不误关
+      return; // Do not close agents when liveness lookup itself failed.
     }
     let changed = false;
     for (const [paneId, e] of subs) {
@@ -234,14 +233,13 @@ export default function subagentPlugin(ctx: Context): void {
     await sweepZombieRunning();
   });
 
-  /* ── B1（用户实证修复）：subagent isError 结果的探活改写 ──────────────
-   * 实测事故：前台误判 no-output → 模型读裸错误文案 → "failed, 我自己干" 抢活。
-   * pi 的 tool_result 事件官方语义 "Can modify result"——在文本进模型上下文前，
-   * 当场探活（agent.list + 会话 mtime）；判活则改写为统一存活通知（buildAliveNotice
-   * 与 A2 转后台同一出口）。hook 层硬保障，纯 prompt 防不住的自作主张在此物理拦截。 */
+  /* ── B1 liveness rewrite for subagent errors ─────────────────────
+   * A false no-output result caused the model to seize work from a healthy subagent. Probe
+   * agent.list and session mtime before the tool result enters model context; if alive, emit the
+   * same notice as A2 backgrounding. This hook enforces what prompting alone could not. */
   scoped.on('tool_result', async (event: { toolName?: string; toolCallId?: string; isError?: boolean; content?: Array<{ type: string; text?: string }> }) => {
     if (event?.toolName !== 'subagent' || !event.isError) return;
-    // 从错误文本里取 pane id（我们自己的错误文案都带 pane）；取不到则不改写
+    // Extract only pane ids carried by our own errors; leave unrelated errors untouched.
     const errText = (event.content ?? []).map((c) => c.text ?? '').join(' ');
     const paneId = [...subs.keys()].find((id) => errText.includes(id))
       ?? (errText.match(/\bw[A-Za-z0-9]+:p\d+\b/) ?? [])[0];
@@ -249,8 +247,8 @@ export default function subagentPlugin(ctx: Context): void {
     const entry = subs.get(paneId);
     if (!entry || entry.status === 'settled' || entry.status === 'consumed') return;
     const probe = await probeAlive(paneId, entry.cwd);
-    if (!isAlive(probe, Date.now())) return; // 真死了 → 保留原错误，模型可重做
-    // 活着 → 转 poller（若尚未在跑）并改写结果文本
+    if (!isAlive(probe, Date.now())) return; // Preserve the original error only when the agent is truly dead.
+    // Move a live agent to the poller so its eventual result can replace the false error.
     if (!pollers.has(paneId)) {
       entry.background = true;
       startPoller(paneId, entry.cwd, entry.createdAt, entry.createdAt, entry.description, lastRequestIdByPane.get(paneId) ?? `probe-${paneId}`);
@@ -263,15 +261,11 @@ export default function subagentPlugin(ctx: Context): void {
     return { content: [{ type: 'text', text: notice }] };
   });
 
-  /* ── D41：stop 未完成提醒（仅主控；子代理不注册本块）── 二修（01a040cc 实证）
-   * 事故：旧版在 settled 后 116ms 以 user-role sendUserMessage 注入
-   * 「Continue working on them before stopping」——通道权威压过模型收尾判断，
-   * 「待 push（留给用户决定）」12s 内被执行。三修：
-   *  - 通道：sendMessage(custom)（非 user 角色，来源可辨，不冒充用户）；
-   *  - 措辞：对账请求（继续已授权 / 等人工项标 blocked+blocker / 问用户一等出口）；
-   *  - 宽限：settled 后等 grace 再注入，期间任何 agent 启动即取消——
-   *    用户反制窗口（决策纯核心 todo-reminder-core）。
-   * 反唤醒风暴守卫保留：ESC 中止后的 settled 不催（01a03bf0 实证）。 */
+  /* ── D41 safe reminders for unfinished todos ─────────────────────
+   * 01a040cc showed that a user-role reminder overrode model judgment and executed work reserved
+   * for the user. Use a distinguishable custom message, request reconciliation rather than action,
+   * and delay delivery so any new agent start cancels it. Preserve the ESC guard from 01a03bf0 to
+   * avoid wake-up storms after explicit interruption. */
 
   let todoReminders = 0;
   let lastAssistantStopReason: string | null = null;
@@ -286,7 +280,7 @@ export default function subagentPlugin(ctx: Context): void {
 
   scoped.on('turn_end', async (event: unknown) => {
     if (event === null || typeof event !== 'object' || !('message' in event)) return;
-    const msg = (event as { message: unknown }).message; // 'message' in 已守卫
+    const msg = (event as { message: unknown }).message; // Safe after the property guard above.
     if (msg === null || typeof msg !== 'object') return;
     const { role, stopReason } = msg as { role?: unknown; stopReason?: unknown };
     if (role === 'assistant' && typeof stopReason === 'string') {
@@ -294,12 +288,12 @@ export default function subagentPlugin(ctx: Context): void {
     }
   });
 
-  // B3：宽限窗内 agent 被任何来源唤醒（用户输入 / 其他扩展）→ 本次提醒取消
+  // B3 cancels the reminder when any source resumes work during the grace window.
   scoped.on('agent_start', () => cancelTodoReminder());
   scoped.on('session_shutdown', () => cancelTodoReminder());
 
   scoped.on('agent_settled', async () => {
-    cancelTodoReminder(); // 上一 settle 遗留、尚未走完宽限的定时器
+    cancelTodoReminder(); // Cancel any timer left from the previous settlement.
     const plan = planStopTodoReminder({
       lastStopReason: lastAssistantStopReason,
       reminders: todoReminders,
@@ -312,7 +306,7 @@ export default function subagentPlugin(ctx: Context): void {
     todoReminderTimer = setTimeout(() => {
       todoReminderTimer = null;
       void (async () => {
-        // 无 sendMessage 的 pi：宁可不提醒，也不回退 user 通道冒充用户
+        // Without sendMessage, skip the reminder rather than impersonating the user channel.
         const send = pi.sendMessage;
         if (typeof send !== 'function') return;
         try {
@@ -320,28 +314,26 @@ export default function subagentPlugin(ctx: Context): void {
             { customType: TODO_REMINDER_CUSTOM_TYPE, content, display: true },
             { deliverAs: 'followUp', triggerTurn: true },
           );
-          todoReminders += 1; // 仅实际送达才计数（取消/失败不消耗封顶）
+          todoReminders += 1; // Count only delivered reminders so cancellation and failure do not consume the cap.
         } catch {
-          /* 静默 */
+          /* Delivery failure is non-fatal. */
         }
       })();
     }, todoReminderGraceMs());
-    todoReminderTimer.unref?.(); // 不悬住进程（测试 / headless 场景）
+    todoReminderTimer.unref?.(); // Do not keep tests or headless processes alive for a reminder.
   });
 
-  /* ── 通道助手（M11：就绪 = 管道握手） ── */
+  /* ── Pipe helpers: M11 readiness requires a handshake ──────────── */
 
-  /** 就绪等待：管道 ping（子扩展 session_start 起 server 即就绪；D47）。 */
+  /** D47 waits for the child extension's session-start pipe server before sending work. */
   async function waitSubReady(cwd: string, paneId: string): Promise<boolean> {
-    return pingUntilReady(pipeNameFor(cwd, paneId), SUB_READY_TIMEOUT_MS);
+    return pingUntilReady(pipeNameCandidates(cwd, paneId), SUB_READY_TIMEOUT_MS);
   }
 
   /**
-   * 子代理会话文件候选（v1.3 M7 修复结算文本串线，实测）：
-   *  1. 上报路径（本扩展 report_agent_session 的 .jsonl path）；
-   *  2. 上报 session id → 按 id 还原；
-   *  3. 目录内最新 4 个（排除主控自己的会话——父在写盘时其 mtime 常最新，
-   *     曾实测致结算文本取到父的回复）。
+   * M7 orders reported paths and ids before recent-file fallback to prevent settlement text from
+   * crossing sessions. The fallback excludes the parent's frequently newest file, which caused
+   * observed parent replies to be collected as child results.
    */
   async function resolveSessionFileCandidates(paneId: string, cwd: string): Promise<string[]> {
     const out: string[] = [];
@@ -355,7 +347,7 @@ export default function subagentPlugin(ctx: Context): void {
         }
       }
     } catch {
-      /* 走目录扫描 */
+      /* Fall back to scanning because reports may be unavailable during startup. */
     }
     const ownSession = d.getSessionId();
     for (const f of listSessionFiles(cwd, defaultAgentSessionsDir(), 4)) {
@@ -364,7 +356,7 @@ export default function subagentPlugin(ctx: Context): void {
     return out;
   }
 
-  /** 定位可解析的子代理会话文件（spawn/结算登记用）。 */
+  /** Resolve a parseable child session file so spawn and settlement share the same source. */
   async function resolveSessionFile(paneId: string, cwd: string): Promise<string | null> {
     for (const file of await resolveSessionFileCandidates(paneId, cwd)) {
       if (readSessionFile(file)) return file;
@@ -372,7 +364,7 @@ export default function subagentPlugin(ctx: Context): void {
     return null;
   }
 
-  /** 结算后（带重试）取注入时间点之后的最终回答。 */
+  /** Retry final-text collection because session persistence can lag settlement. */
   async function collectFinalText(
     paneId: string,
     cwd: string,
@@ -391,7 +383,7 @@ export default function subagentPlugin(ctx: Context): void {
     return null;
   }
 
-  /** E1/E2：读子 pane 的人类闸门问题（tokens['pi-ask']；子扩展 reportAskFlag 上报）。 */
+  /** E1/E2 reads the reported pi-ask token so blocked work remains with the human. */
   async function readAskFlag(paneId: string): Promise<string | null> {
     try {
       const a = (await client.listAgents()).find((x) => x.paneId === paneId);
@@ -402,7 +394,7 @@ export default function subagentPlugin(ctx: Context): void {
     }
   }
 
-  /** A2/B1 探活：pane 实时状态 + 会话候选最新 mtime（毫秒级，失败字段为 null）。 */
+  /** A2/B1 combines pane status with newest session mtime because either signal alone can be stale. */
   async function probeAlive(paneId: string, cwd: string): Promise<AliveProbe> {
     const probe: AliveProbe = { paneExists: false, agentStatus: null, lastActivityMs: null };
     try {
@@ -411,24 +403,23 @@ export default function subagentPlugin(ctx: Context): void {
       probe.paneExists = a != null;
       probe.agentStatus = a?.status ?? null;
     } catch {
-      /* agent.list 失败 → 状态未知，靠会话活动判定 */
+      /* Fall back to session activity when agent.list is unavailable. */
     }
     for (const file of await resolveSessionFileCandidates(paneId, cwd)) {
       try {
         const mtime = (await statAsync(file)).mtimeMs;
         if (probe.lastActivityMs == null || mtime > probe.lastActivityMs) probe.lastActivityMs = mtime;
       } catch {
-        /* 文件消失跳过 */
+        /* Session files can disappear during candidate scanning. */
       }
     }
     return probe;
   }
 
   /**
-   * 子会话结算状态（v1.3 M8 结算竞态修复）：
-   *  herdr 的 idle/done 在"注入瞬间"也是真，不能当结算信号；
-   *  以会话内容为准——定稿文本 = 已结算；挂起 toolCall = 未结算；
-   *  有 assistant 活动但无文本 = 真·无输出；无活动 = 还没开始。
+   * M8 treats session content as authoritative because herdr idle/done is also true at injection.
+   * Final text means settled, a pending tool call means active, assistant activity without text is
+   * genuine no-output, and no activity means the run has not started.
    */
   async function subSessionState(
     paneId: string,
@@ -446,12 +437,12 @@ export default function subagentPlugin(ctx: Context): void {
     return { text: null, pendingTool: false, activity: false };
   }
 
-  /** D92：结算通知统一出口——经 deps 缓冲（忙时 turn_end 折叠注入），缺省回退旧 followUp 直投。 */
+  /** D92 buffers settlement notices until turn_end, falling back to legacy followUp delivery. */
   const injectNotice = (content: string): Promise<void> =>
     d.deliverNotice ? d.deliverNotice(content)
       : (pi.sendUserMessage?.(content, { deliverAs: 'followUp' }) ?? Promise.resolve());
 
-  /** 后台子代理轮询器：结算→取文→followUp 通知；blocked 让位给人类；D94：用户接管检测。 */
+  /** Polls background settlement while yielding blocked panes to humans and detecting D94 takeover. */
   async function pollLoop(
     paneId: string,
     cwd: string,
@@ -461,13 +452,13 @@ export default function subagentPlugin(ctx: Context): void {
     requestId: string,
   ): Promise<void> {
     void spawnedAt;
-    // B1：无活动预算锚点——working 切片（waitAgent 超时 null）即心跳（O3）：每次续命；
-    // 只有「不 working 也无结算进展」的真空期才消耗预算（01a03c0d：27min 健康长任务
-    // 被旧总墙钟 10min 误杀两次）。startedAt 保留供通知文案诊断。
+    // B1/O3 refreshes inactivity on every working heartbeat; only periods with neither working nor
+    // settlement progress consume the budget. This avoids the 10-minute wall-clock false kills seen
+    // on healthy 27-minute jobs in 01a03c0d while retaining startedAt for diagnostics.
     const startedAt = Date.now();
     let lastActivityAt = Date.now();
     const pollTrace = process.env.PI_HERDR_TRACE
-      ? (msg: string) => { try { appendFileSync(process.env.PI_HERDR_TRACE!, `d98poll ${Date.now()} ${paneId} ${msg}\n`); } catch { /* 尽力 */ } }
+      ? (msg: string) => { try { appendFileSync(process.env.PI_HERDR_TRACE!, `d98poll ${Date.now()} ${paneId} ${msg}\n`); } catch { /* Tracing is best-effort. */ } }
       : null;
     try {
       while (true) {
@@ -500,7 +491,7 @@ export default function subagentPlugin(ctx: Context): void {
               persistSubs();
             }
           } catch {
-            // listAgents 失败静默
+            // A failed status probe should not stop the poller.
           }
           if (entry.userTakeover) {
             await new Promise((resolve) => setTimeout(resolve, TAKEOVER_RECHECK_MS));
@@ -522,7 +513,7 @@ export default function subagentPlugin(ctx: Context): void {
             try {
               await injectNotice(buildBlockedGateNotice({ paneId, description, question }));
             } catch {
-              /* 注入失败静默（下次 turn 可 list_agents 自查） */
+              /* A later turn can recover a missed notice through list_agents. */
             }
           }
           continue;
@@ -555,7 +546,7 @@ export default function subagentPlugin(ctx: Context): void {
               const agents = await client.listAgents();
               agentStatus = agents.find((a) => a.paneId === paneId)?.status ?? null;
             } catch {
-              // listAgents 失败静默
+              // A failed status probe should not stop observation.
             }
             const obs2 = planObservationTick({
               observationStartedAt: entry.observationStartedAt,
@@ -583,8 +574,8 @@ export default function subagentPlugin(ctx: Context): void {
               continue;
             }
             entry.observationStartedAt = null;
-            // 正常结算逻辑
-            // O6：reply 已写的 sessionFile 是权威；poll 只在缺失时用扫描补，绝不反向覆盖
+            // Settle only after the observation path has confirmed completion.
+            // O6 preserves a reply-reported sessionFile; scanning only fills a missing value.
             if (!entry.sessionFile) {
               entry.sessionFile = applyReportedSessionFile(
                 entry.sessionFile,
@@ -594,9 +585,9 @@ export default function subagentPlugin(ctx: Context): void {
             entry.status = 'consumed';
             entry.consumedAt = Date.now();
             writeHistory(entry, { outcome: closing }, 'poll-settle');
-            // M17：结算自动对账（先于通知；与 reply 快路径幂等双跑）
+            // M17 reconciles before notice and remains idempotent with the reply fast path.
             const notes = d.reconcileOnSettlement(description, 'settled');
-            // D98：结算附 worktree/git stat 行（isolate 带基线 diff；非 isolate 小件轻量行）
+            // D98 adds git context so isolate and small-task results expose their actual change scope.
             const statLine = await worktreeStatLine(entry);
             const notice = d.withReconcileNotes(
               formatSettlementNotice(`${paneId} (${description})`, closing) + (statLine ? `\n${statLine}` : ''),
@@ -606,12 +597,12 @@ export default function subagentPlugin(ctx: Context): void {
               try {
                 await injectNotice(notice);
               } catch {
-                /* 注入失败静默（下次 turn 可 list_agents 自查） */
+                /* A later turn can recover a missed notice through list_agents. */
               }
             }
             return;
           }
-          // 挂起 toolCall（等人类输入）或还没开工 → 继续等
+          // Pending human tool calls and not-yet-started sessions must continue waiting.
         }
         let alive = false;
         try {
@@ -640,7 +631,7 @@ export default function subagentPlugin(ctx: Context): void {
           try {
             await injectNotice(notice);
           } catch {
-            /* 静默 */
+            /* Notice delivery failure is non-fatal. */
           }
           return;
         }
@@ -657,7 +648,7 @@ export default function subagentPlugin(ctx: Context): void {
           try {
             await injectNotice(notice);
           } catch {
-            /* 静默 */
+            /* Notice delivery failure is non-fatal. */
           }
           return;
         }
@@ -683,21 +674,21 @@ export default function subagentPlugin(ctx: Context): void {
         subScopes.delete(paneId);
         try { await fiber?.dispose(); } catch { /* already gone */ }
       } catch (err) {
-        // 回归加固（D98 活体实证）：mount/pollLoop 抛错若无此兜底，paneId 永留
-        // pollers（后续 startPoller 全 no-op）且无轮询在跑 → running 幽灵。
+        // D98 removes crashed pollers so their pane ids can be restarted instead of remaining
+        // running ghosts with no active loop.
         pollers.delete(paneId);
         console.error(`pier: subagent poller ${paneId} crashed: ${(err as Error)?.message ?? err}`);
       }
     })();
   }
 
-  /* ── 工具：subagent（v1.3：任务 tab 放置 + 短/长 pane + 历史 + GC） ── */
+  /* ── subagent tool: task-tab placement, history, and GC ────────── */
 
-  /** 串行化 tab 创建/追加（同消息并行委派的读改写互斥；D26 放置决策在锁内做）。 */
+  /** D26 serializes tab placement so concurrent delegates cannot race the same read-modify-write. */
   const tabMutex = new Semaphore(1);
 
   function histFile(cwd: string): string {
-    return historyFilePath(agentRootDir(), cwd);
+    return preferredHistoryFile(agentRootDir(), cwd);
   }
 
   function toHistory(e: SubEntry, outcome: string | null): HistoryEntry {
@@ -721,8 +712,8 @@ export default function subagentPlugin(ctx: Context): void {
     };
   }
 
-  /** B5：每 taskId 最近非空 outcome（closed 补记行继承——latestGeneration 取最新行，
-   * 旧实现 closed 行恒 outcome:null → 结算成果在「最新行」语义下丢失）。 */
+  /** B5 retains the latest non-empty outcome because closed generations otherwise hid settled
+   * results behind outcome:null in latest-generation views. */
   const lastOutcomeByTask = new Map<string, string>();
 
   function writeHistory(e: SubEntry, patch?: Partial<HistoryEntry>, via?: string): void {
@@ -731,7 +722,7 @@ export default function subagentPlugin(ctx: Context): void {
     appendHistory(histFile(e.cwd), { ...toHistory(e, outcome), ...(patch ?? {}), ...(via ? { via } : {}) });
   }
 
-  /** 存活任务 tab（本 workspace；herdr 为权威，tab.rename/自动关后自动纠正）。 */
+  /** Trust herdr for live task tabs so renames and automatic closure correct cached registry data. */
   async function liveTabs(): Promise<Array<{ tabName: string; tabId: string }>> {
     try {
       const ws = env?.workspaceId ?? '';
@@ -743,15 +734,15 @@ export default function subagentPlugin(ctx: Context): void {
     }
   }
 
-  /* ── D86：git worktree 分组键 ─────────────────────────────────── */
+  /* ── D86 git-worktree grouping key ─────────────────────────────── */
 
-  /** worktree 列表缓存（spawn 时一次查询；TTL 短——放置只需近似新鲜度）。 */
+  /** Cache briefly because placement needs only approximate worktree freshness. */
   let worktreesCache: { at: number; list: string[] } | null = null;
   const WORKTREES_CACHE_MS = 5000;
 
   /**
-   * 列出 repo 的全部 git worktree（`git worktree list --porcelain`，主检出在前）。
-   * 非 git 目录 / git 不可用 → 空数组（分类器自然全兜底 main，规则退化不炸）。
+   * Return every repository worktree with the main checkout first. Non-git directories and missing
+   * git degrade to an empty list so placement naturally falls back to main.
    */
   async function listWorktrees(cwd: string): Promise<string[]> {
     if (worktreesCache && Date.now() - worktreesCache.at < WORKTREES_CACHE_MS) return worktreesCache.list;
@@ -770,9 +761,8 @@ export default function subagentPlugin(ctx: Context): void {
   }
 
   /**
-   * D98：git 执行助手（git-adapter，timeout 由 runtimePolicy.gitTimeoutMs；出错/超时 → null，与
-   * listWorktrees 同模式）。isolate 全部 git 操作的唯一出口——基础设施行为，
-   * 与 herdr 内部 git 调用同构，不属模型面 bash 生态。
+   * D98 centralizes isolate git calls behind the adapter and runtime timeout. Returning null on
+   * failure matches worktree discovery and keeps infrastructure git outside the model bash surface.
    */
   async function runGit(cwd: string, args: string[]): Promise<string | null> {
     try {
@@ -783,7 +773,7 @@ export default function subagentPlugin(ctx: Context): void {
     }
   }
 
-  /** `git diff --stat` 末行（"N files changed, +A/-B"）；空输出 → null。 */
+  /** Return only the summary line needed by notices; empty diffs have no useful annotation. */
   function lastStatLine(out: string | null): string | null {
     if (!out) return null;
     const lines = out.replace(/\r/g, '').split('\n').map((l) => l.trim()).filter(Boolean);
@@ -791,13 +781,12 @@ export default function subagentPlugin(ctx: Context): void {
   }
 
   /**
-   * D98：结算通知附行（两条结算路径共用）。非 git cwd → null（静默省略）；
-   * isolate → 基线 diff stat + commit 计数；非 isolate → 对全部 git worker 的
-   * 轻量「小件」：working-tree diff stat + 未提交计数。
+   * D98 gives both settlement paths a compact change summary: baseline diff and commits for isolates,
+   * or working-tree diff and dirty count for ordinary git workers. Non-git work omits the line.
    */
   async function worktreeStatLine(entry: SubEntry): Promise<string | null> {
     const porcelain = await runGit(entry.cwd, ['status', '--porcelain']);
-    if (porcelain === null) return null; // 非 git / git 不可用
+    if (porcelain === null) return null; // Omit stats when git or the repository is unavailable.
     const dirtyCount = porcelain.split('\n').filter((l) => l.trim() !== '').length;
     if (entry.isolate) {
       const statOut = await runGit(entry.cwd, ['diff', '--stat', `${entry.isolate.baseSha}...HEAD`]);
@@ -809,11 +798,11 @@ export default function subagentPlugin(ctx: Context): void {
   }
 
   /**
-   * 按放置计划在任务 tab 内新建子 pane（v1.3 D25/D26 + D86 worktree 分组）：
-   *  - new：tab.create{label}（focus 默认 false 不抢焦点）+ 根 pane 注入启动命令；
-   *  - append：校验既有 tab 存活 → split 追加（进程不重启）；
-   *    tab 已消失 → 降级为同名的 new。放置决策在互斥锁内做（同名竞态）。
-   * D86：placement.zone 由调用方算好传入（main → master 所在 tab；worktree → 目录名 tab）。
+   * Create a child pane in the task tab according to placement (v1.3 D25/D26 + D86 worktree grouping):
+   *  - new: create a tab without stealing focus, then inject the startup command into its root pane;
+   *  - append: verify the existing tab is alive, then split into it without restarting the process;
+   *    if the tab vanished, fall back to a same-named new tab. The mutex protects placement from name races.
+   * D86: callers compute placement.zone (main → the master's tab; worktree → a directory-named tab).
    */
   async function spawnPaneInTaskTab(
     placement: { desiredTab?: string | null; description: string; zone?: WorktreeZone },
@@ -823,7 +812,7 @@ export default function subagentPlugin(ctx: Context): void {
   ): Promise<{ tabId: string; paneId: string; tabName: string }> {
     const release = await tabMutex.acquire();
     try {
-      // D86：main tab = master pane 所在 tab（paneId 反查；HERDR_TAB_ID 注入不可依赖，实测可为空）
+      // D86: Resolve the main tab from the master's pane because HERDR_TAB_ID injection may be absent.
       const allPanes = await client.listPanes();
       const mainTabId = allPanes.find((p) => p.paneId === env?.paneId)?.tabId
         ?? (env?.tabId ? env.tabId : null);
@@ -835,8 +824,8 @@ export default function subagentPlugin(ctx: Context): void {
         mainTabId,
       });
       if (plan.mode === 'append' && plan.tabId) {
-        // D97 网格形态：目标格 = tab 内面积最大的格子，一律 down（全宽横条，title 静帧横读）；
-        // board 等无 agent 常驻 shell（agentStatus=unknown）不入候选，避免被 worker 蚕食。
+        // D97 grid layout: choose the largest target cell and always split down, yielding a full-width
+        // strip whose title remains readable; exclude board panes with unknown agent status so workers cannot consume them.
         const exclude = new Set(
           allPanes.filter((p) => p.tabId === plan.tabId && p.agentStatus === 'unknown').map((p) => p.paneId),
         );
@@ -845,8 +834,8 @@ export default function subagentPlugin(ctx: Context): void {
           const snapshot = await client.exportLayout({ tabId: plan.tabId });
           const tree = snapshot?.root ? parseShapeTree(snapshot.root) : null;
           if (tree) pick = pickGridSplit(tree, { exclude });
-        } catch { /* 布局导出失败 → 回退锚分裂（旧行为） */ }
-        // 锚兜底：agent 已知状态的工作 pane 优先（避开 board pane）
+        } catch { /* A layout export failure falls back to the legacy anchor split. */ }
+        // Anchor fallback: prefer a work pane with known agent status so the board pane is avoided.
         const anchorPaneId = pick?.targetPaneId
           ?? allPanes.find((p) => p.tabId === plan.tabId && p.agentStatus !== 'unknown')?.paneId
           ?? allPanes.find((p) => p.tabId === plan.tabId)?.paneId;
@@ -860,7 +849,7 @@ export default function subagentPlugin(ctx: Context): void {
           await client.sendPaneText(paneId, launch);
           return { tabId: plan.tabId!, paneId, tabName: plan.tabName };
         }
-        // 锚 pane 缺失（tab 已空/已关）→ 同名新 tab；main tab 消失（罕见）→ 兜底新 tab
+        // A missing anchor (empty or closed tab) or a vanished main tab falls back to a same-named new tab.
         plan = { mode: 'new', tabName: plan.tabName, tabId: null };
       }
       const created = await client.createTab({
@@ -877,15 +866,15 @@ export default function subagentPlugin(ctx: Context): void {
   }
 
   function launchLine(resumeFile?: string | null, roleModel?: string | null, approve = false): string {
-    // 裸 argv → 平台 shell 语法（win32=PowerShell `&`，POSIX=sh）；引号转义在 buildLaunchLine
-    // argv 构造在 buildLaunchParts（D97：默认 --tui-mode fullscreen，PI_HERDR_TUI=regular 逃生）
+    // Convert raw argv to platform shell syntax (PowerShell '&' on win32, sh on POSIX); buildLaunchLine handles escaping.
+    // buildLaunchParts constructs argv and applies D97's fullscreen default, with PI_HERDR_TUI=regular as the escape hatch.
     return buildLaunchLine(buildLaunchParts(runtime, { resumeFile, roleModel, approve }));
   }
 
   /**
-   * D86 信任旗标：委派即信任，但仅限 master 自己的检出与其 worktree（同 git 仓库 =
-   * 同一批项目文件，master 本就载着它们跑）。外来目录不加 -a —— pi 的 Trust 对话框
-   * 成为天然闸门（spawn 会在握手超时处失败，人不点头不执行未知项目扩展）。
+   * D86 trust: delegation is trusted only for the master's checkout and its worktrees (one git
+   * repository means the same project files); external directories omit -a so pi's Trust dialog
+   * remains a gate and a spawn fails at handshake timeout until a person approves the unknown extension.
    */
   async function approveFor(cwd: string, masterCwd: string): Promise<boolean> {
     if (isPathUnder(cwd, masterCwd)) return true;
@@ -893,13 +882,13 @@ export default function subagentPlugin(ctx: Context): void {
     return zone.zone === 'worktree';
   }
 
-  /* ── GC：turn_start 回收（v1.3 M8：tab 级为主 + pane 级兼容/孤儿路径） ── */
+  /* ── GC: turn_start collection (v1.3 M8: tab-first, with pane compatibility/orphan paths) ── */
 
   let prevTurnStart = Date.now();
 
   async function gcPass(): Promise<void> {
     if (subs.size === 0) return;
-    // D44：唯一用户可见开关——TTL 秒（默认 600）；0 = 不自动关（只由人关）
+    // D44: The only user-visible switch is the TTL in seconds (default 600); 0 disables automatic closure.
     const ttlMs = runtimePolicy.sessionTtlSeconds * 1000;
     const autoCloseTabs = ttlMs > 0;
     let panesList: Array<{ paneId: string; tabId: string; agentStatus: string }>;
@@ -908,14 +897,14 @@ export default function subagentPlugin(ctx: Context): void {
     } catch {
       return;
     }
-    // pane→herdr agentStatus 快照（pane 级回收判定用；缺项 = pane 已消失 → 补记 closed。
-    // 回归修复：statuses 原本未定义——ReferenceError 被 runGcSafely 静默吞，pane 级 GC 长期失效）
+    // Snapshot herdr agent status per pane for collection decisions; a missing pane is recorded as closed.
+    // This also fixes the regression where an undefined statuses map was swallowed by runGcSafely, disabling pane GC.
     const statuses = new Map(panesList.map((p) => [p.paneId, p.agentStatus]));
     const termPaneIds = terminalState.activePaneIds();
-    // B2：结算通知未送达的 pane 豁免（先送达再回收）——pD/pC 实证被 GC 抢关。
+    // B2: Exempt panes whose settlement notice is undelivered so notification is attempted before collection.
     const pendingNoticeIds = d.noticePending?.() ?? new Set<string>();
 
-    // 任务 tab 分组（含 closed 条目：closed 工作 pane 也算完成）
+    // Group task tabs, counting closed work panes as completed.
     const byTab = new Map<string, SubEntry[]>();
     for (const e of subs.values()) {
       if (!e.tabId) continue;
@@ -924,15 +913,15 @@ export default function subagentPlugin(ctx: Context): void {
       byTab.set(e.tabId, arr);
     }
     const taskTabIds = new Set(byTab.keys());
-    // D86 R4：main tab（master 所在）永不整关——它的 consumed 子代理走 pane 级回收
+    // D86 R4: Never close the main tab wholesale; consumed children there use pane-level collection.
     const mainTabId = env?.tabId ?? '';
 
-    // 1) tab 级（判定规则在 gc-core.shouldCloseTaskTab，纯函数单测覆盖）
+    // 1) Tab-level collection; gc-core.shouldCloseTaskTab contains the pure, unit-tested predicate.
     for (const [tabId, entries] of byTab) {
-      if (tabId === mainTabId) continue; // D86 R4：main tab 豁免（防 master 连坐）
+      if (tabId === mainTabId) continue; // D86 R4: exempt the main tab to prevent taking down the master.
       const tabPanes = panesList.filter((p) => p.tabId === tabId);
       if (tabPanes.length === 0) {
-        // tab 已消失（人关/自动关）→ 补记 closed
+        // A vanished tab (closed manually or automatically) is recorded as closed.
         for (const e of entries) {
           if (e.status !== 'closed') {
             e.status = 'closed';
@@ -948,12 +937,12 @@ export default function subagentPlugin(ctx: Context): void {
         now: Date.now(),
       });
       if (!autoCloseTabs || !should) continue;
-      // B2：结算通知未送达的 pane 豁免（先送达再回收）
+      // B2: Exempt panes whose settlement notice is undelivered so notification is attempted first.
       if (tabPanes.some((p) => termPaneIds.has(p.paneId) || pendingNoticeIds.has(p.paneId))) continue;
       try {
         await client.tabClose(tabId);
       } catch {
-        /* tab 已消失 */
+        /* The tab may already be gone. */
       }
       for (const e of entries) {
         if (e.status !== 'closed') {
@@ -961,24 +950,24 @@ export default function subagentPlugin(ctx: Context): void {
           writeHistory(e, { status: 'closed', closedAt: Date.now() }, 'gc');
         }
       }
-      await new Promise((r) => setTimeout(r, 300)); // 串行关闭（#1358 同类风险护栏）
+      await new Promise((r) => setTimeout(r, 300)); // Serialize closure to guard against #1358-style races.
     }
 
-    // 2) pane 级（v1.2 兼容路径 + 孤儿 + D86 main tab 回收）：
-    //    不属于任何「可整关任务 tab」的 consumed 短 pane（main tab 也算——R4）
+    // 2) Pane-level collection (v1.2 compatibility, orphan handling, and D86 main-tab collection):
+    //    consumed short-lived panes outside a closeable task tab, including panes in the main tab (R4).
     const closableTaskTabIds = new Set([...taskTabIds].filter((t) => t !== mainTabId));
     const candidates = [...subs.values()].filter(
       (e) => e.status === 'consumed' && !(e.tabId && closableTaskTabIds.has(e.tabId)),
     );
     for (const e of candidates) {
-      if (termPaneIds.has(e.paneId) || pendingNoticeIds.has(e.paneId)) continue; // 活跃终端（D71）/未送达通知（B2）豁免
+      if (termPaneIds.has(e.paneId) || pendingNoticeIds.has(e.paneId)) continue; // Exempt active terminals (D71) and undelivered notices (B2).
       if (!shouldClosePane({
         consumedAt: e.consumedAt ?? null,
         herdrStatus: statuses.get(e.paneId),
         prevTurnStart,
       })) continue;
       if (statuses.get(e.paneId) === undefined) {
-        // pane 已消失（随 tab 被关）→ 补记 closed
+        // A vanished pane (because its tab closed) is recorded as closed.
         e.status = 'closed';
         writeHistory(e, { status: 'closed', closedAt: Date.now() }, 'gc');
         continue;
@@ -986,7 +975,7 @@ export default function subagentPlugin(ctx: Context): void {
       try {
         await client.closePane(e.paneId);
       } catch {
-        /* pane 已消失 */
+        /* The pane may already be gone. */
       }
       e.status = 'closed';
       writeHistory(e, { status: 'closed', closedAt: Date.now() }, 'gc');
@@ -995,30 +984,30 @@ export default function subagentPlugin(ctx: Context): void {
     persistSubs();
   }
 
-  /* ── D98：isolate worktree 条件自动回收（gcPass 尾挂；master-only 已由挂载门保证） ── */
+  /* ── D98: Automatically collect isolate worktrees when conditions permit (appended to gcPass; mount gate already enforces master-only) ── */
 
   /**
-   * 候选 = ① subs 中 isolate && !releasedAt && status!=='running' 的 entry
-   *      + ② 孤儿：refs/heads/pier/* 分支在 `git worktree list --porcelain`
-   *        中仍有对应 wt（master 重启后注册表不含旧 entry，靠 ② 兜崩溃残留）。
-   * 判定：merged = merge-base --is-ancestor；dirty = wt 下 status --porcelain。
-   * release：不带 --force（git 自带 dirty 拒绝，双保险）；失败 2s 重试一次，
-   * 再失败保留待下轮 ticker（无通知轰炸）。retain：注册 entry 一次性通知，
-   * 孤儿静默（git worktree list 可见）。分支永不自动删除。
+   * Candidates: ① registered isolate entries that are not released and no longer running;
+   *            ② orphan refs/heads/pier/* branches whose worktree still appears in `git worktree list --porcelain`.
+   * The master may restart without the old registry, so ② recovers crash leftovers.
+   * Decide merged with merge-base --is-ancestor and dirty with status --porcelain in the worktree.
+   * Release without --force (git rejects dirty worktrees as a second guard), retry once after 2s,
+   * then leave it for the next ticker without notification spam. Notify registered retains once;
+   * keep orphan retains silent. Never delete branches automatically.
    */
   async function isolateSweep(): Promise<void> {
     const trace = process.env.PI_HERDR_TRACE
-      ? (msg: string) => { try { appendFileSync(process.env.PI_HERDR_TRACE!, `d98sweep ${Date.now()} ${msg}\n`); } catch { /* 尽力 */ } }
+      ? (msg: string) => { try { appendFileSync(process.env.PI_HERDR_TRACE!, `d98sweep ${Date.now()} ${msg}\n`); } catch { /* Best effort only. */ } }
       : null;
     const masterCwd = process.cwd();
-    // 候选键：分支短名。注册分支全集先行（含 running/released——孤儿扫描要排除它们，
-    // 否则新建未结算的 isolate 分支（=HEAD 祖先 + 干净）会被孤儿路径误回收）。
+    // Candidate key is the short branch name. Register every branch first, including running/released
+    // entries, so orphan scanning cannot reclaim a new clean isolate before it settles.
     const registeredBranches = new Set<string>();
     for (const e of subs.values()) {
       if (e.isolate) registeredBranches.add(e.isolate.branch);
     }
-    // ② 孤儿候选：pier/* 分支 ↔ porcelain worktree 配对（master 重启后注册表
-    // 不含旧 entry 的崩溃残留兜底）；注册分支一律走 ① 语义。
+    // ② Orphan candidates pair pier/* branches with porcelain worktrees; this covers crash leftovers
+    // absent from the registry after a master restart, while registered branches use ① semantics.
     const wtPorcelain = await runGit(masterCwd, ['worktree', 'list', '--porcelain']);
     if (wtPorcelain === null) return;
     const wtByBranch = parseWorktreePorcelain(wtPorcelain);
@@ -1031,7 +1020,7 @@ export default function subagentPlugin(ctx: Context): void {
       const wtPath = wtByBranch.get(branch);
       if (wtPath) byBranch.set(branch, { branch, wtPath, entry: null });
     }
-    // ① 注册候选（running/released 除外；同分支多代 → 取最新 entry）
+    // ① Registered candidates, excluding running/released entries; for duplicate generations, keep the newest.
     for (const e of subs.values()) {
       if (!e.isolate || e.isolate.releasedAt != null || e.status === 'running') continue;
       const prev = byBranch.get(e.isolate.branch);
@@ -1041,12 +1030,12 @@ export default function subagentPlugin(ctx: Context): void {
     let persisted = false;
     for (const cand of byBranch.values()) {
       const { branch, wtPath, entry } = cand;
-      // 注册 entry 的 wt 已不在 git 登记中（人工 remove/prune，或 worktree remove 被
-      // Windows 文件锁半途打断——git 先注销、目录残留）→ 物理清除残留后才闭账
-      //（分支照旧保留；rm 失败（锁未释放）→ 不闭账，下轮 ticker 再试）。
+      // A registered worktree missing from git's records may have been manually removed/pruned, or git
+      // may have unregistered it after a Windows file-lock interruption while leaving the directory behind.
+      // Remove that residue before closing the ledger; keep the branch, and retry next ticker if removal fails.
       if (entry && !wtByBranch.has(branch)) {
         if (existsSync(wtPath)) {
-          try { rmSync(wtPath, { recursive: true, force: true }); } catch { continue; /* 锁未释放 → 下轮 */ }
+          try { rmSync(wtPath, { recursive: true, force: true }); } catch { continue; /* Lock remains; retry next round. */ }
           if (existsSync(wtPath)) continue;
         }
         entry.isolate!.releasedAt = Date.now();
@@ -1054,8 +1043,8 @@ export default function subagentPlugin(ctx: Context): void {
         continue;
       }
       const mergedOut = await runGit(masterCwd, ['merge-base', '--is-ancestor', branch, 'HEAD']);
-      const merged = mergedOut !== null ? true : null; // is-ancestor：exit 0=是，非 0/null=否/未知
-      // 精确区分「确证非祖先」与「命令失败」：失败时 merged=null（retain-unknown）
+      const merged = mergedOut !== null ? true : null; // is-ancestor: exit 0 means yes; nonzero/null means no/unknown.
+      // Distinguish a confirmed non-ancestor from command failure: failure yields merged=null for retain-unknown.
       let mergedFinal = merged;
       if (merged === null) {
         const sha = await runGit(masterCwd, ['rev-parse', branch]);
@@ -1072,26 +1061,26 @@ export default function subagentPlugin(ctx: Context): void {
           const { promise: retryDelay, resolve: retryNow } = Promise.withResolvers<void>();
           setTimeout(retryNow, 2000);
           await retryDelay;
-          ok = (await runGit(masterCwd, ['worktree', 'remove', wtPath])) !== null; // 重试一次
+          ok = (await runGit(masterCwd, ['worktree', 'remove', wtPath])) !== null; // Retry once.
         }
         if (ok) {
-          worktreesCache = null; // 让放置分类立即看到 wt 消失
+          worktreesCache = null; // Invalidate the 5s cache so placement sees the removed worktree immediately.
           if (entry) { entry.isolate!.releasedAt = Date.now(); persisted = true; }
-        } // 仍失败 → 保留，下轮 ticker 重试（无通知轰炸）
+        } // A failed removal remains for the next ticker, without notification spam.
       } else if (entry && !entry.isolate!.retainNotified) {
         entry.isolate!.retainNotified = true;
         persisted = true;
         try {
           await injectNotice(`worktree ${branch} retained (${decision.reason}) — merge it (git merge --no-ff ${branch}) or remove manually (git worktree remove --force ${wtPath})`);
         } catch {
-          /* 注入失败静默（retainNotified 已置，避免轰炸；下轮 list_agents/台账可见） */
+          /* Injection failure stays silent; retainNotified prevents repeated alerts, while list_agents/ledger still expose it. */
         }
-      } // 孤儿 retain → 静默
+      } // Orphan retains remain silent.
     }
     if (persisted) persistSubs();
   }
 
-  /** GC 互斥 + 双驱动：turn_start 与周期 ticker。 */
+  /** Serialize GC and drive it from both turn_start and the periodic ticker. */
   let gcRunning = false;
   async function runGcSafely(): Promise<void> {
     if (gcRunning) return;
@@ -1099,14 +1088,14 @@ export default function subagentPlugin(ctx: Context): void {
     try {
       await gcPass();
     } catch {
-      /* GC 失败静默，下轮/tick 重试 */
+      /* GC failure stays silent so the next turn/tick can retry. */
     }
-    // D98：isolate 回收不进 gcPass（其 subs 空 early-return 会吞掉孤儿扫描）；
-    // 独立 try——tab/pane GC 失败不阻断 worktree 回收，反之亦然。
+    // D98: Isolate collection is separate from gcPass because gcPass's empty-subs early return would
+    // swallow orphan scans; independent try blocks keep tab/pane GC from blocking worktree collection.
     try {
       await isolateSweep();
     } catch {
-      /* sweep 失败静默，下轮/tick 重试 */
+      /* Sweep failure stays silent so the next turn/tick can retry. */
     } finally {
       gcRunning = false;
     }
@@ -1120,16 +1109,16 @@ export default function subagentPlugin(ctx: Context): void {
 
   const gcTickMs = runtimePolicy.gcTickMs;
   const gcTicker = gcTickMs > 0 ? setInterval(() => { void runGcSafely(); }, gcTickMs) : null;
-  // GC ticker 经 effect 拆（hmr 重载本模块 = 旧 ticker 拆、新 ticker 起，D80⑤ 语义）。
-  // 注意：pipe server 的关闭 effect **不在这里**——server 由 index common 段创建持有，
-  // 挂进本插件会被 hmr 重载误杀（跨属资源，d87 修）。
+  // The ticker is disposed through an effect so HMR removes the old ticker before starting a new one (D80⑤).
+  // The pipe server is intentionally not disposed here: index's common section owns it, and this plugin's
+  // HMR reload must not kill a cross-module resource (d87).
   ctx.effect(() => () => {
     if (gcTicker) clearInterval(gcTicker);
   }, 'gc-ticker');
 
   /**
-   * D94：查找已存在的同 session pane（resume 复用而非重复 spawn）。
-   * 返回 paneId + tabId，若无匹配或 agent 已死则 null。
+   * D94: Find an existing pane for the same session so resume reuses it instead of spawning a duplicate.
+   * Return paneId + tabId, or null when no match exists or the agent has died.
    */
   async function findExistingPaneWithSession(sessionFile: string | null): Promise<{ paneId: string; tabId: string } | null> {
     if (!sessionFile) return null;
@@ -1137,7 +1126,7 @@ export default function subagentPlugin(ctx: Context): void {
       const agents = await client.listAgents();
       const match = agents.find((a) => a.session === sessionFile && a.status !== 'unknown');
       if (!match) return null;
-      // listAgents 不带 tabId，需要 pane.list 补
+      // listAgents omits tabId, so fetch it from pane.list.
       const panes = await client.listPanes();
       const pane = panes.find((p) => p.paneId === match.paneId);
       return pane ? { paneId: match.paneId, tabId: pane.tabId } : null;
@@ -1146,15 +1135,15 @@ export default function subagentPlugin(ctx: Context): void {
     }
   }
 
-  /** 复活已关闭任务（resume 工具与 send_message 自动复活共用）。 */
+  /** Revive a closed task; resume and automatic send_message revival share this path. */
   async function reviveEntry(entry: SubEntry): Promise<SubEntry> {
-    // D98：已回收的 isolate worktree 不复活（目录已删，cwd 无效）
+    // D98: Do not revive a released isolate worktree because its directory is gone and cwd is invalid.
     if (entry.isolate?.releasedAt != null) {
       throw new Error(`isolate worktree ${entry.isolate.branch} was released (merged) — delegate a new subagent instead`);
     }
     const latest = latestGeneration(readHistory(histFile(entry.cwd)), entry.taskId) ?? entry;
     const resumeFile = latest.sessionFile && /\.jsonl$/.test(latest.sessionFile) ? latest.sessionFile : null;
-    // D86 信任旗标同 spawn：master 检出/worktree 才 -a（revive 无 toolCtx，用进程 cwd 代 master 检出）
+    // D86 trust matches spawn: pass -a only for the master's checkout/worktrees; revive has no tool context, so use process cwd.
     const approve = await approveFor(entry.cwd, process.cwd());
     const spawned = await spawnPaneInTaskTab(
       { desiredTab: entry.tabName || latest.tabName || null, description: entry.description },
@@ -1197,11 +1186,11 @@ export default function subagentPlugin(ctx: Context): void {
       }
       const { spec, background, isolate, cwdParam, roleKind: kind, suggested, manifestRole, tab } = launch;
       const masterCwd = (toolCtx as { cwd?: string }).cwd ?? process.cwd();
-      // taskId 上移（原 spawn 段）：isolate 规划需要 taskHex；纯移动，无行为耦合。
+      // Move taskId generation above the original spawn section because isolate planning needs taskHex; this is behavior-neutral.
       const taskId = randomUUID();
-      // D98 2c：isolate 创建块——pier execFile git 创建托管 worktree（决策 1，非 herdr
-      // socket worktree.create：bootstrap 竞态 / root_pane 无 env / worker 散离 master
-      // workspace / linked_worktree_source 拒绝四因）。判定归模型（不自动推断）。
+      // D98 2c: Create the isolate through pier's execFile git path (decision 1), not herdr's
+      // socket worktree.create, which has bootstrap races, missing root-pane env, worker/master
+      // workspace separation, and linked_worktree_source rejection. The model makes the decision; do not infer it.
       let isolateMeta: SubEntry['isolate'] | null = null;
       let cwd = masterCwd;
       if (isolate) {
@@ -1224,10 +1213,10 @@ export default function subagentPlugin(ctx: Context): void {
         });
         const wtPath = join(platformPaths.worktreeBaseDir, repoName, plan.worktreeDirName);
         try {
-          mkdirSync(dirname(wtPath), { recursive: true }); // git worktree add 不建父目录（首跑 worktree 基目录不存在即失败）
-        } catch { /* 目录已存在/无权限 → worktree add 的报错兜底 */ }
-        // 竞态护栏：worktree add → subs.set 之间（就绪等待 2-3s）ticker 的孤儿扫描
-        // 会把「=HEAD 祖先 + 干净」的新 wt 当孤儿回收——pending 集先行排除（活体实证）。
+          mkdirSync(dirname(wtPath), { recursive: true }); // git worktree add does not create its parent directory, so a first run would fail.
+        } catch { /* Existing directory or permissions failure is handled by worktree add. */ }
+        // Keep the branch pending between worktree add and subs.set: the 2–3s readiness wait lets the ticker
+        // scan, and without this guard it could reclaim a new clean =HEAD-ancestor worktree as an orphan.
         pendingIsolateBranches.add(plan.branch);
         const added = await runGit(masterCwd, ['worktree', 'add', '-b', plan.branch, wtPath, sha]);
         if (added === null) {
@@ -1237,7 +1226,7 @@ export default function subagentPlugin(ctx: Context): void {
             details: {},
           };
         }
-        worktreesCache = null; // 失效 5s 缓存，让下方 zone 分类立即看到新 wt
+        worktreesCache = null; // Invalidate the 5s cache so the zone classifier sees the new worktree immediately.
         cwd = wtPath;
         isolateMeta = { worktreePath: wtPath, branch: plan.branch, baseSha: sha, releasedAt: null, retainNotified: false };
         spec.prompt = `${buildIsolatePreamble({ worktreePath: wtPath, branch: plan.branch, baseShort: sha.slice(0, 7) })}\n\n${spec.prompt}`;
@@ -1253,13 +1242,13 @@ export default function subagentPlugin(ctx: Context): void {
           };
         }
       }
-      // D86 R1：分组键 = cwd 所属 git worktree（主检出 → main tab；其他 worktree → 目录名 tab）
+      // D86 R1: Group by the git worktree containing cwd (main checkout → main tab; other worktree → directory-named tab).
       const zone = classifyWorktreeZone({
         cwd,
         masterCwd,
         worktrees: await listWorktrees(masterCwd),
       });
-      // D86 信任旗标：master 自己的检出/worktree 才 -a；外来目录留 Trust 对话框作闸门
+      // D86 trust: pass -a only for the master's checkout/worktrees; external directories remain behind pi's Trust dialog.
       const approve = isPathUnder(cwd, masterCwd) || zone.zone === 'worktree';
       let roleManifestEnv: Record<string, string> = {};
       let roleModel: string | null = null;
@@ -1275,7 +1264,7 @@ export default function subagentPlugin(ctx: Context): void {
             services: role.services ?? {},
           }),
         };
-        // WS-D10：按角色路由模型；省略 = 进程默认
+        // WS-D10: Route the model by role; omission intentionally uses the process default.
         if (typeof role.model === 'string' && role.model.trim()) roleModel = role.model.trim();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1317,13 +1306,13 @@ export default function subagentPlugin(ctx: Context): void {
         subs.set(paneId, entry);
         persistSubs();
         onUpdate?.(makeProgressUpdate(`subagent ready in pane ${paneId}; injecting prompt via pipe…`));
-        // M11（D45/D46）：注入走扩展管道 → 子扩展 sendUserMessage(followUp)；
-        // PTY 键盘通道 100% 归人（无软锁窗口、无混行）。
-        // 回归修复（session 01a03bf0 实证）：ecc0bc4 重写前台等待时误删本块——
-        // prompt 永不注入 + injectTs 未定义（ReferenceError → spawn-failed，
-        // 台账留幽灵 running 条目）。任何后续重构不得把注入与 injectTs 拆开。
+        // M11 (D45/D46): Inject through the extension pipe to the child extension's sendUserMessage(followUp);
+        // reserve the PTY keyboard channel entirely for the person, with no soft-lock window or mixed input.
+        // Regression evidence (session 01a03bf0): ecc0bc4's foreground-wait rewrite once removed this block,
+        // leaving the prompt uninjected and injectTs undefined (ReferenceError → spawn-failed, with a ghost
+        // running ledger entry). Keep injection and injectTs together in future refactors.
         const injectTs = Date.now();
-        const injected = await pipeRequest(pipeNameFor(cwd, paneId), {
+        const injected = await pipeRequestTo(cwd, paneId, {
           type: 'prompt',
           id: `prompt-${taskId}`,
           text: spec.prompt,
@@ -1333,10 +1322,10 @@ export default function subagentPlugin(ctx: Context): void {
         if (injected.type !== 'ok') {
           throw new Error(`pipe prompt rejected: ${injected.type === 'error' ? injected.message : 'unknown response'}`);
         }
-        lastMachineInjectAt.set(paneId, injectTs); // B4：观察窗内 working 归因判据
-        // A1+A2（用户实证修复）：前台等待 = 内容闸 + 耐心阈值转后台。
-        // 旧实现的 idle 即结算 + 90s 硬窗口在真实任务（working 期 4-6 分钟）上必然误判
-        // no-output（实测：3 个健康子代理 101s 时被同时 consumed，成果 4 分钟后才产出）。
+        lastMachineInjectAt.set(paneId, injectTs); // B4: attribute working state during the observation window.
+        // A1+A2 (user-verified fix): foreground waiting uses a content gate plus a patience threshold before backgrounding.
+        // Treating idle as settled with a hard 90s window misclassified real 4–6 minute working periods as no-output;
+        // three healthy subagents were observed becoming consumed at 101s while producing results four minutes later.
         const PATIENCE_MS = runtimePolicy.foregroundPatienceMs;
         const patienceDeadline = Date.now() + PATIENCE_MS;
         let text: string | null = null;
@@ -1406,20 +1395,20 @@ export default function subagentPlugin(ctx: Context): void {
           details: { paneId, taskId, background, role: kind },
         };
       } catch (err) {
-        // 回归修复（session 01a03bf0）：spawn 中途失败必须回收台账 + 关 pane——
-        // 否则幽灵 running 条目永不结算 → D96 提醒风暴 + send_message 打到
-        // 无任务上下文的空会话。pane 关闭尽力而为（board pane 例外场景由 GC 兜底）。
+        // Regression fix (session 01a03bf0): a mid-spawn failure must remove the ledger entry and close its pane,
+        // otherwise a ghost running entry never settles, causing D96 reminder storms and send_message calls
+        // to land in an empty session with no task context. Pane closure is best effort; GC covers board exceptions.
         if (paneId) {
           subs.delete(paneId);
           persistSubs();
-          void client.closePane(paneId).catch(() => { /* 尽力而为 */ });
+          void client.closePane(paneId).catch(() => { /* Best effort only. */ });
         }
-        // D98 2d：isolate 从未就绪 → 尽力回收刚建的 worktree + 新分支（无工作成果，
-        // 可删；失败静默——分支留着无害，git worktree list 可见）。
+        // D98 2d: If isolate startup never becomes ready, best-effort remove the new worktree and branch (no work
+        // exists to preserve); failure stays silent because the branch is harmless and remains visible to git worktree list.
         if (isolateMeta) {
           void runGit(masterCwd, ['worktree', 'remove', '--force', isolateMeta.worktreePath])
             .then(() => runGit(masterCwd, ['branch', '-D', isolateMeta!.branch]))
-            .catch(() => { /* 尽力而为 */ });
+            .catch(() => { /* Best effort only. */ });
         }
         return {
           content: [{
@@ -1433,12 +1422,12 @@ export default function subagentPlugin(ctx: Context): void {
         };
       } finally {
         release();
-        if (isolateMeta) pendingIsolateBranches.delete(isolateMeta.branch); // D98：创建窗护栏解除（成功/失败全路径）
+        if (isolateMeta) pendingIsolateBranches.delete(isolateMeta.branch); // D98: release the creation-window guard on every success/failure path.
       }
     },
   });
 
-  /* ── 工具：resume_subagent（历史复活，v1.2） ── */
+  /* ── Tool: resume_subagent (historical revival, v1.2) ── */
 
   scoped.registerTool({
     name: 'resume_subagent',
@@ -1466,7 +1455,7 @@ export default function subagentPlugin(ctx: Context): void {
       }
       const release = await subSemaphore.acquire();
       try {
-        // D94：复用已存在的同 session pane（避免双 pi 冲突）
+        // D94: Reuse an existing pane for the same session to avoid competing pi processes.
         const existing = await findExistingPaneWithSession(latest.sessionFile);
         if (existing) {
           const entry: SubEntry = {
@@ -1496,7 +1485,7 @@ export default function subagentPlugin(ctx: Context): void {
             details: { paneId: entry.paneId, taskId },
           };
         }
-        // 无现成 pane，才创建新的
+        // Create a new pane only when no existing one can be reused.
         const entry: SubEntry = {
           taskId,
           kind: latest.kind,
@@ -1536,7 +1525,7 @@ export default function subagentPlugin(ctx: Context): void {
     },
   });
 
-  /* ── 工具：list_agents（仅后台/常驻子代理；前台短 pane 是瞬态 UI） ── */
+  /* ── Tool: list_agents (background/long-lived subagents only; foreground short panes are transient UI) ── */
 
   scoped.registerTool({
     name: 'list_agents',
@@ -1549,35 +1538,35 @@ export default function subagentPlugin(ctx: Context): void {
       if (listed.length === 0) {
         return { content: [{ type: 'text', text: 'No background subagents started (from this session branch).' }], details: {} };
       }
-      // 按 taskId 去重：只显示每任务的最新代（复活后旧 paneId 不重复出现）
+      // Deduplicate by taskId so only the newest generation appears after revival; old paneIds do not repeat.
       const byTask = new Map<string, SubEntry>();
       for (const sub of listed) {
         const prev = byTask.get(sub.taskId);
         if (!prev || sub.createdAt >= prev.createdAt) byTask.set(sub.taskId, sub);
       }
-      // C1：实时探活（pane 状态 + 会话活动时间）——master 能区分"在干活"vs"真卡死"
+      // C1: Probe liveness in real time (pane status and session activity) so the master can distinguish work from a true hang.
       const probes = new Map<string, AliveProbe>();
       await Promise.all([...byTask.values()].map(async (sub) => {
         if (sub.status === 'closed') return;
-        try { probes.set(sub.paneId, await probeAlive(sub.paneId, sub.cwd)); } catch { /* 显示层尽力 */ }
+        try { probes.set(sub.paneId, await probeAlive(sub.paneId, sub.cwd)); } catch { /* Best effort for display. */ }
       }));
       const lines: string[] = [];
       for (const sub of byTask.values()) {
         const tabTag = sub.tabName ? ` [tab: ${sub.tabName}]` : '';
-        // D98：isolate 条目附 worktree 分支（closed 同样带；不现算 merged——结算 stat 行已覆盖）
+        // D98: Include the worktree branch on isolate entries, including closed ones; settlement stats already report merge state.
         const wtTag = sub.isolate ? ` [wt: ${sub.isolate.branch}]` : '';
         if (sub.status === 'closed') {
           lines.push(`${sub.taskId.slice(0, 8)} [idle] (${sub.kind}, closed; send_message revives)${tabTag}${wtTag} ${sub.description}`);
           continue;
         }
-        // 注册表状态即权威：settled = idle，其余 = running（含 blocked 人类闸门，对齐 DSH 映射）
+        // The registry is authoritative: settled is idle, everything else is running, including blocked human gates (DSH mapping).
         const state = sub.status === 'settled' ? 'idle' : 'running';
-        // D94：用户接管标记
+        // D94: Mark when the user has taken over.
         const takeoverMark = sub.userTakeover ? ', user-controlled' : '';
         const probe = probes.get(sub.paneId);
         const statusTag = probe?.agentStatus ? ` ${probe.agentStatus}` : '';
         const activityTag = probe?.lastActivityMs != null ? `, active ${agoText(probe.lastActivityMs, Date.now())}` : '';
-        // E：blocked 时附上闸门问题摘要（提示 master 该叫用户去 pane，不是自己接手）
+        // E: For blocked agents, include the gate-question summary so the master sends the user to that pane instead of taking over.
         let gateTag = '';
         if (probe?.agentStatus === 'blocked') {
           const q = await readAskFlag(sub.paneId);
@@ -1589,7 +1578,7 @@ export default function subagentPlugin(ctx: Context): void {
     },
   });
 
-  /* ── 工具：send_message（steer 间隙投递） ── */
+  /* ── Tool: send_message (delivery during steer gaps) ── */
 
   scoped.registerTool({
     name: 'send_message',
@@ -1607,19 +1596,18 @@ export default function subagentPlugin(ctx: Context): void {
       }
       const spawnedAt = Date.now();
       try {
-        // 已关闭 → 自动复活（任务级可继续：pane 是临时宿主）
+        // A closed task is revived automatically because the pane is only a temporary host.
         if (entry.status === 'closed') {
           await reviveEntry(entry);
           subs.set(entry.paneId, entry);
           persistSubs();
         }
-        // M11（D46）：follow_up 走扩展管道。B3：带 steer——worker 长跑中途的补充
-        // 指令在 tool-call 间隙秒级到达（旧 followUp 队列语义 = 整个 run 结束才投，
-        // 01a03c0d 实证 20min 延迟致 worker 按旧契约返工）。
+        // M11 (D46): follow_up uses the extension pipe. B3 adds steering so supplemental instructions reach a long-running worker
+        // within seconds during a tool-call gap; the old followUp queue waited for the entire run and caused 20-minute rework (01a03c0d).
         const ready = await waitSubReady(entry.cwd, entry.paneId);
         if (!ready) throw new Error(`subagent pane ${entry.paneId} pipe not ready`);
         const fuId = `fu-${Date.now()}`;
-        const res = await pipeRequest(pipeNameFor(entry.cwd, entry.paneId), {
+        const res = await pipeRequestTo(entry.cwd, entry.paneId, {
           type: 'follow_up',
           id: fuId,
           text: String(params?.message ?? ''),
@@ -1630,9 +1618,9 @@ export default function subagentPlugin(ctx: Context): void {
         if (res.type !== 'ok') {
           throw new Error(`pipe follow_up rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
         }
-        lastMachineInjectAt.set(entry.paneId, Date.now()); // B4：观察窗内 working 归因判据
-        // 回归加固（D98 活体实证）：status='running' 与 startPoller 之间任何抛错都会
-        // 留下「running 且无 poller」的幽灵条目（永不结算、GC 跳过）——失败回滚原状态。
+        lastMachineInjectAt.set(entry.paneId, Date.now()); // B4: attribute working state during the observation window.
+        // Regression hardening (D98 liveness evidence): an exception between status='running' and startPoller could leave a ghost
+        // running entry without a poller, never settling and skipped by GC; roll back to the previous status on failure.
         const prevStatus = entry.status;
         entry.status = 'running';
         persistSubs();
@@ -1651,7 +1639,7 @@ export default function subagentPlugin(ctx: Context): void {
     },
   });
 
-  /* ── 工具：interrupt_agent（D48：管道 → 子扩展 ctx.abort() 进程内中止） ── */
+  /* ── Tool: interrupt_agent (D48: pipe → child extension ctx.abort(), in-process cancellation) ── */
 
   scoped.registerTool({
     name: 'interrupt_agent',
@@ -1667,18 +1655,18 @@ export default function subagentPlugin(ctx: Context): void {
         return { content: [{ type: 'text', text: `Error: unknown subagent id "${params?.agentId}" (see list_agents)` }], details: {} };
       }
       if (entry.status === 'closed') {
-        // DSH 对齐：空闲/已结束目标是幂等 no-op
+        // DSH alignment: an idle or finished target is an idempotent no-op.
         return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (already idle/closed; no-op).` }], details: {} };
       }
       try {
-        const res = await pipeRequest(pipeNameFor(entry.cwd, entry.paneId), {
+        const res = await pipeRequestTo(entry.cwd, entry.paneId, {
           type: 'interrupt',
           id: `int-${Date.now()}`,
         });
         if (res.type !== 'ok') {
           throw new Error(`pipe interrupt rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
         }
-        // 被中断的轮次不结算通知（请求方已知情）
+        // Do not send a settlement notice for an interrupted turn because the requester already knows.
         const lastId = lastRequestIdByPane.get(entry.paneId);
         if (lastId) d.claimSettleNotice(`${entry.paneId}:${lastId}`);
         return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (fire-and-return).` }], details: { paneId: entry.paneId } };

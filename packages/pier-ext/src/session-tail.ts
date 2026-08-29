@@ -1,14 +1,15 @@
 /**
- * pi 会话 JSONL 尾部解析（纯函数库，v1.1 结果通道）。
+ * Tail parsing for pi session JSONL (pure library, v1.1 result channel).
  *
- * v1.1（DESIGN.md §12）起，子代理的结果不再从 pane 文本解析，而是读子代理的
- * 会话文件（pi 会话 JSONL，权威、机器精确、无回声污染/滚动盲区）。
- * 本模块只依赖 pi 会话格式（session-format 文档实测形状）：
- *   行 = {type, id, parentId, message:{role, content:[{type:'text',text}...], timestamp, stopReason}}
+ * Since v1.1 (DESIGN.md §12), child-agent results come from the child session file
+ * rather than pane text, keeping the authoritative machine-readable source free of
+ * echo contamination and scrollback blind spots. This module depends only on the
+ * empirically observed pi session format (session-format documentation):
+ *   line = {type, id, parentId, message:{role, content:[{type:'text',text}...], timestamp, stopReason}}
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { sessionDirName } from './storage-layout.ts';
+import { sessionDirCandidates, sessionDirName } from './storage-layout.ts';
 
 export { sessionDirName };
 
@@ -24,8 +25,7 @@ export interface SessionEntryLike {
   message?: SessionMessageLike | unknown;
   [k: string]: unknown;
 }
-
-/** 容忍式逐行解析（损坏行/非 JSON 行跳过）。 */
+/** Parse line by line tolerantly, skipping malformed or non-JSON records. */
 export function parseSessionEntries(text: string): SessionEntryLike[] {
   const entries: SessionEntryLike[] = [];
   for (const line of (text ?? '').split(/\r?\n/)) {
@@ -35,7 +35,7 @@ export function parseSessionEntries(text: string): SessionEntryLike[] {
       const obj = JSON.parse(t);
       if (obj && typeof obj === 'object') entries.push(obj as SessionEntryLike);
     } catch {
-      /* 截断/损坏行跳过 */
+      /* Skip truncated or malformed records. */
     }
   }
   return entries;
@@ -61,10 +61,9 @@ function textOf(m: SessionMessageLike): string {
     .join('\n')
     .trim();
 }
-
 /**
- * 取最后一次"已定稿"的 assistant 文本（stopReason === 'stop'，排除 toolUse 中间态）。
- * sinceTs 用于过滤注入时间点之前的旧消息。
+ * Return the latest finalized assistant text (stopReason === 'stop'), excluding toolUse intermediates.
+ * sinceTs filters out messages that predate the injection point.
  */
 export function lastAssistantText(
   entries: readonly SessionEntryLike[],
@@ -81,8 +80,7 @@ export function lastAssistantText(
   }
   return best;
 }
-
-/** 会话是否出现注入时间点之后的 assistant 消息（任意 stopReason，探测活跃）。 */
+/** Return whether any assistant message occurs after the injection point, regardless of stopReason. */
 export function hasAssistantAfter(
   entries: readonly SessionEntryLike[],
   sinceTs: number,
@@ -92,10 +90,10 @@ export function hasAssistantAfter(
     return !!m && m.role === 'assistant' && (typeof m.timestamp === 'number' ? m.timestamp : 0) >= sinceTs;
   });
 }
-
 /**
- * 注入后是否存在"已发起但尚无结果"的 toolCall（工具执行中，如 ask_user_question
- * 等人类输入）→ 未真正结算（v1.3 M8 结算竞态修复）。并行调用按深度计数。
+ * Return whether an initiated toolCall still lacks a result after injection (for example,
+ * ask_user_question waiting on human input), meaning settlement has not actually completed
+ * (v1.3 M8 settlement-race fix). Parallel calls are tracked by depth.
  */
 export function hasPendingToolCall(entries: readonly SessionEntryLike[], sinceTs: number): boolean {
   let depth = 0;
@@ -117,23 +115,25 @@ export function hasPendingToolCall(entries: readonly SessionEntryLike[], sinceTs
 
 
 
-/** cwd 会话目录下按 mtime 倒序取最新 limit 个会话文件（v1.3 M7 候选定位）。 */
+/** Newest `limit` session files under cwd's session dir (new encoding, then legacy). */
 export function listSessionFiles(cwd: string, agentDir: string, limit = 4): string[] {
-  const dir = path.join(agentDir, sessionDirName(cwd));
-  let names: string[];
-  try {
-    names = fs.readdirSync(dir);
-  } catch {
-    return [];
-  }
   const files: Array<{ file: string; mtime: number }> = [];
-  for (const name of names) {
-    if (!name.endsWith('.jsonl')) continue;
-    const full = path.join(dir, name);
+  for (const name of sessionDirCandidates(cwd)) {
+    const dir = path.join(agentDir, name);
+    let names: string[];
     try {
-      files.push({ file: full, mtime: fs.statSync(full).mtimeMs });
+      names = fs.readdirSync(dir);
     } catch {
-      /* 跳过消失文件 */
+      continue;
+    }
+    for (const fileName of names) {
+      if (!fileName.endsWith('.jsonl')) continue;
+      const full = path.join(dir, fileName);
+      try {
+        files.push({ file: full, mtime: fs.statSync(full).mtimeMs });
+      } catch {
+        /* vanished between readdir and stat */
+      }
     }
   }
   files.sort((a, b) => b.mtime - a.mtime);
@@ -141,20 +141,22 @@ export function listSessionFiles(cwd: string, agentDir: string, limit = 4): stri
 }
 
 /**
- * 按 session id 定位会话文件（文件名形如 `<ts>_<id>.jsonl`，pi 实测命名）。
- * 官方 herdr 集成上报 agent_session 为 kind 'id' 时用它还原路径。
+ * Locate a session file by id (`<ts>_<id>.jsonl`).
+ * Searches the new encoding dir first, then the legacy flattened dir.
  */
 export function sessionFileById(cwd: string, agentDir: string, id: string): string | null {
-  const dir = path.join(agentDir, sessionDirName(cwd));
   const suffix = `_${id}.jsonl`;
-  let names: string[];
-  try {
-    names = fs.readdirSync(dir);
-  } catch {
-    return null;
-  }
-  for (const name of names) {
-    if (name.endsWith(suffix)) return path.join(dir, name);
+  for (const name of sessionDirCandidates(cwd)) {
+    const dir = path.join(agentDir, name);
+    let names: string[];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const fileName of names) {
+      if (fileName.endsWith(suffix)) return path.join(dir, fileName);
+    }
   }
   return null;
 }
