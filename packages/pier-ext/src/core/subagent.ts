@@ -29,6 +29,7 @@ import { appendFileSync, existsSync, mkdirSync, rmSync, stat as statCb } from 'n
 import { resolve as pathResolve } from 'node:path';
 import { promisify } from 'node:util';
 const statAsync = promisify(statCb);
+import { runtimePolicy } from '../runtime-policy.ts';
 import { pingUntilReady, pipeNameFor, pipeRequest } from '../pipe-channel.ts';
 import { shouldClosePane, shouldCloseTaskTab } from '../gc-core.ts';
 import { composeForRole } from '../manifest-compose.ts';
@@ -86,20 +87,24 @@ const SUBAGENT_DESCRIPTION = [
   '`isolate` (default false): creates a FRESH git worktree for this subagent and runs it there (branch pier/<slug> from your HEAD under ~/.herdr/worktrees/<repo>/). Three-way choice: heavy independent writing in parallel with your own edits or other workers, or work needing its own clean reviewable diff → isolate; read-mostly or sequential helper work → omit (shared checkout, writes guarded by the write-lock); targeting an existing directory/worktree → cwd. In isolate mode the subagent\'s writes cannot conflict with your checkout; its panes group into a tab named after the worktree; its prompt is prefixed with commit discipline (commit to its own branch, NEVER push); when it settles you get a diff summary (commits since base, files changed, uncommitted count). Review with git log/diff HEAD..<branch>, merge with git merge --no-ff <branch>; once merged and clean, the worktree auto-removes (the branch is kept for audit). Mutually exclusive with cwd.',
 ].join(' ');
 
-/** 子代理并发上限（D10）。 */
+/** Subagent concurrency limit (max parallel delegations) */
 const SUBAGENT_CONCURRENCY = 4;
-/** B1：观察超时 = 无活动时长预算（非总墙钟）——working 切片持续续命；marker
- * PI_HERDR_SUBAGENT_TIMEOUT_MS 沿用旧名，语义已从「poller 起算总墙钟」改为
- * 「距最近一次活动」——>10min 的健康长任务不再被误杀（session 01a03c0d 实证）。 */
-const SUBAGENT_TIMEOUT_MS = Number(process.env.PI_HERDR_SUBAGENT_TIMEOUT_MS ?? 600000) || 600000;
-/** 就绪等待上限（TUI 启动 + herdr 检测）。 */
+/**
+ * Observation timeout (inactivity budget, not wall-clock total).
+ * Why: Working slice continues to refresh; healthy long tasks >10min no longer killed by mistake.
+ */
+const SUBAGENT_TIMEOUT_MS = runtimePolicy.subagentTimeoutMs;
+/** Readiness wait limit (TUI startup + herdr detection) */
 const SUB_READY_TIMEOUT_MS = 30000;
-/** D94/B4：结算观察窗（此期内 working 默认视为用户接管）。 */
-const OBSERVE_WINDOW_MS = Number(process.env.PI_HERDR_OBSERVE_MS ?? 30000) || 30000;
-/** B4：机器注入宽限——观察窗内的 working 若由自己的 prompt/follow_up 触发，不算接管。 */
-const MACHINE_INJECT_GRACE_MS = Number(process.env.PI_HERDR_INJECT_GRACE_MS ?? 30000) || 30000;
-/** D94：接管态归还阈值（持续 idle 即归还）。 */
-const TAKEOVER_IDLE_MS = Number(process.env.PI_HERDR_TAKEOVER_IDLE_MS ?? 60000) || 60000;
+/** Settlement observation window (within this period, working defaults to user takeover) */
+const OBSERVE_WINDOW_MS = runtimePolicy.settlementWindowMs;
+/**
+ * Machine injection grace period.
+ * Why: Working within observation window is not considered takeover if triggered by own prompt/follow_up.
+ */
+const MACHINE_INJECT_GRACE_MS = runtimePolicy.settlementWindowMs;
+/** Takeover return threshold (sustained idle returns control) */
+const TAKEOVER_IDLE_MS = runtimePolicy.settlementWindowMs;
 
 function defaultAgentSessionsDir(): string {
   const base = process.env.PI_CODING_AGENT_DIR || platformPaths.agentDataDir;
@@ -904,7 +909,7 @@ export default function subagentPlugin(ctx: Context): void {
   async function gcPass(): Promise<void> {
     if (subs.size === 0) return;
     // D44：唯一用户可见开关——TTL 秒（默认 600）；0 = 不自动关（只由人关）
-    const ttlMs = Number(process.env.PI_HERDR_TASK_TAB_TTL ?? 600) * 1000;
+    const ttlMs = runtimePolicy.sessionTtlSeconds * 1000;
     const autoCloseTabs = ttlMs > 0;
     let panesList: Array<{ paneId: string; tabId: string; agentStatus: string }>;
     try {
@@ -1122,7 +1127,7 @@ export default function subagentPlugin(ctx: Context): void {
     prevTurnStart = now;
   });
 
-  const gcTickMs = Number(process.env.PI_HERDR_GC_TICK_MS ?? 30000);
+  const gcTickMs = runtimePolicy.gcTickMs;
   const gcTicker = gcTickMs > 0 ? setInterval(() => { void runGcSafely(); }, gcTickMs) : null;
   // GC ticker 经 effect 拆（hmr 重载本模块 = 旧 ticker 拆、新 ticker 起，D80⑤ 语义）。
   // 注意：pipe server 的关闭 effect **不在这里**——server 由 index common 段创建持有，
@@ -1376,7 +1381,7 @@ export default function subagentPlugin(ctx: Context): void {
         // A1+A2（用户实证修复）：前台等待 = 内容闸 + 耐心阈值转后台。
         // 旧实现的 idle 即结算 + 90s 硬窗口在真实任务（working 期 4-6 分钟）上必然误判
         // no-output（实测：3 个健康子代理 101s 时被同时 consumed，成果 4 分钟后才产出）。
-        const PATIENCE_MS = Number(process.env.PI_HERDR_FRONTIER_PATIENCE_MS ?? 300000) || 300000;
+        const PATIENCE_MS = runtimePolicy.foregroundPatienceMs;
         const patienceDeadline = Date.now() + PATIENCE_MS;
         let text: string | null = null;
         let settledKind: 'settled' | 'timeout' = 'timeout';
