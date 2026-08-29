@@ -69,11 +69,11 @@ function makeEntry(paneId: string, cwd: string): SubEntry {
     cwd,
     description: 'pane-gc 回归',
     background: true,
-    status: 'consumed',
+    status: 'running', // 首跑 turn_start 会转 consumed
     consumedAt: Date.now() - 120_000, // 远早于 prevTurnStart（挂载时刻）
     sessionFile: null,
     launchCommand: [],
-    createdAt: Date.now() - 300_000,
+    consumedAt: null, // turn_start 时设置
     revivedFrom: null,
   };
 }
