@@ -8,26 +8,14 @@
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
 import { randomUUID } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 import { basename, join, dirname } from 'node:path';
 import type { PiSurface } from '../pi-surface.ts';
-import type { HerdrClientLike, HerdrAgentState } from '../herdr-client.ts';
+import type { HerdrClientLike } from '../herdr-client.ts';
 import type { TodosService } from '../todos-service.ts';
-import { mountSubagentScope } from '../subagent-scope.ts';
-import { Semaphore, SUBS_CUSTOM_TYPE, agoText, buildAliveNotice, buildBlockedGateNotice, buildIsolatePreamble, buildLaunchLine, buildLaunchParts, classifyWorktreeZone, evaluateRelease, foldSubsRegistry, formatSubagentResult, formatWorktreeStat, isAlive, isPathUnder, makeProgressUpdate, makeRegistry, parseWorktreePorcelain, planIsolateWorktree, planTabPlacement, psQuote, tabNameForTask, type AliveProbe, type SubEntry, type SubagentSpec, type TabPlacementPlan, type WorktreeZone } from '../subagent-core.ts';
-import { hasAssistantAfter, hasPendingToolCall, lastAssistantText, listSessionFiles, readSessionFile, sessionFileById } from '../session-tail.ts';
-import { appendHistory, applyReportedSessionFile, preferredHistoryFile, inheritOutcome, latestGeneration, readHistory, type HistoryEntry } from '../history-store.ts';
+import { Semaphore, SUBS_CUSTOM_TYPE, agoText, buildAliveNotice, buildBlockedGateNotice, buildIsolatePreamble, classifyWorktreeZone, foldSubsRegistry, formatSubagentResult, isAlive, isPathUnder, makeProgressUpdate, makeRegistry, planIsolateWorktree, tabNameForTask, type AliveProbe, type SubEntry } from '../subagent-core.ts';
+import { applyReportedSessionFile, appendHistory, preferredHistoryFile, inheritOutcome, latestGeneration, readHistory, type HistoryEntry } from '../history-store.ts';
 import { runtimePolicy } from '../runtime-policy.ts';
 import { platformPaths } from '../platform-paths.ts';
-import { defaultGitAdapter } from '../git-adapter.ts';
-import {
-  OBSERVATION_TICK_MS,
-  TAKEOVER_RECHECK_MS,
-  planBlockedGate,
-  planObservationTick,
-  planTakeoverTick,
-  planVacuumTick,
-} from '../subagent-poller.ts';
 import type { SubagentPort, SubagentPortBox } from '../subagent-port.ts';
 import {
   FOREGROUND_POLL_MS,
@@ -36,16 +24,20 @@ import {
   planLaunchValidation,
   planPatienceExpiry,
 } from '../subagent-launch.ts';
-import { appendFileSync, existsSync, mkdirSync, rmSync, stat as statCb } from 'node:fs';
+import { mkdirSync, stat as statCb } from 'node:fs';
 import { resolve as pathResolve } from 'node:path';
 import { promisify } from 'node:util';
 const statAsync = promisify(statCb);
-import { pingUntilReady, pipeNameCandidates, pipeNameFor, pipeRequestTo } from '../pipe-channel.ts';
-import { shouldClosePane, shouldCloseTaskTab } from '../gc-core.ts';
+import { pipeNameFor, pipeRequestTo } from '../pipe-channel.ts';
 import { composeForRole } from '../manifest-compose.ts';
-import { formatSettlementNotice } from '../vocab.ts';
 import { TODO_REMINDER_CUSTOM_TYPE, planStopTodoReminder, todoReminderGraceMs } from '../todo-reminder-core.ts';
 import type { TerminalStateSlot } from './terminal.ts';
+import { createGitIo } from '../subagent-git-io.ts';
+import { createSessionIo } from '../subagent-session-io.ts';
+import { createSpawner } from '../subagent-spawn.ts';
+import { createPoller } from '../subagent-poll-loop.ts';
+import { createGcController } from '../subagent-gc.ts';
+
 
 interface SubagentEnv {
   paneId: string;
@@ -91,21 +83,8 @@ const SUBAGENT_DESCRIPTION = [
 
 /** Subagent concurrency limit (max parallel delegations) */
 const SUBAGENT_CONCURRENCY = 4;
-/**
- * Observation timeout (inactivity budget, not wall-clock total).
- * Why: Working slice continues to refresh; healthy long tasks >10min no longer killed by mistake.
- */
 const SUBAGENT_TIMEOUT_MS = runtimePolicy.subagentTimeoutMs;
 const SUB_READY_TIMEOUT_MS = runtimePolicy.readinessTimeoutMs;
-/** Settlement observation window (within this period, working defaults to user takeover) */
-const OBSERVE_WINDOW_MS = runtimePolicy.observationWindowMs;
-/**
- * Machine injection grace period.
- * Why: Working within observation window is not considered takeover if triggered by own prompt/follow_up.
- */
-const MACHINE_INJECT_GRACE_MS = runtimePolicy.settlementWindowMs;
-/** Takeover return threshold (sustained idle returns control) */
-const TAKEOVER_IDLE_MS = runtimePolicy.settlementWindowMs;
 
 function defaultAgentSessionsDir(): string {
   const base = process.env.PI_CODING_AGENT_DIR || platformPaths.agentDataDir;
@@ -142,8 +121,6 @@ export default function subagentPlugin(ctx: Context): void {
   const subs = new Map<string, SubEntry>();
   /** D98 excludes branches during worktree-add-to-registry races from orphan collection. */
   const pendingIsolateBranches = new Set<string>();
-  const pollers = new Set<string>();
-  const subScopes = new Map<string, { dispose: () => Promise<void> }>();
   /** D50 tracks the latest machine request per pane for interrupt claims and poll deduplication. */
   const lastRequestIdByPane = new Map<string, string>();
 
@@ -163,6 +140,7 @@ export default function subagentPlugin(ctx: Context): void {
   }
   /** E2 deduplicates gate notices while blocked but permits a later, distinct human question. */
   const blockedGateNotified = new Set<string>();
+  const git = createGitIo();
 
   const boundPort: SubagentPort = {
     applyReplySession(paneId, sessionFile) {
@@ -185,7 +163,7 @@ export default function subagentPlugin(ctx: Context): void {
     },
     async settleStatLine(paneId) {
       const entry = subs.get(paneId);
-      return entry ? await worktreeStatLine(entry) : null;
+      return entry ? await git.worktreeStatLine(entry) : null;
     },
   };
   port.current = boundPort;
@@ -323,370 +301,6 @@ export default function subagentPlugin(ctx: Context): void {
     todoReminderTimer.unref?.(); // Do not keep tests or headless processes alive for a reminder.
   });
 
-  /* ── Pipe helpers: M11 readiness requires a handshake ──────────── */
-
-  /** D47 waits for the child extension's session-start pipe server before sending work. */
-  async function waitSubReady(cwd: string, paneId: string): Promise<boolean> {
-    return pingUntilReady(pipeNameCandidates(cwd, paneId), SUB_READY_TIMEOUT_MS);
-  }
-
-  /**
-   * M7 orders reported paths and ids before recent-file fallback to prevent settlement text from
-   * crossing sessions. The fallback excludes the parent's frequently newest file, which caused
-   * observed parent replies to be collected as child results.
-   */
-  async function resolveSessionFileCandidates(paneId: string, cwd: string): Promise<string[]> {
-    const out: string[] = [];
-    try {
-      const reported = await client.getAgentSessionPath(paneId);
-      if (reported) {
-        if (/\.jsonl$/.test(reported)) out.push(reported);
-        else {
-          const byId = sessionFileById(cwd, defaultAgentSessionsDir(), reported);
-          if (byId) out.push(byId);
-        }
-      }
-    } catch {
-      /* Fall back to scanning because reports may be unavailable during startup. */
-    }
-    const ownSession = d.getSessionId();
-    for (const f of listSessionFiles(cwd, defaultAgentSessionsDir(), 4)) {
-      if (f !== ownSession && !out.includes(f)) out.push(f);
-    }
-    return out;
-  }
-
-  /** Resolve a parseable child session file so spawn and settlement share the same source. */
-  async function resolveSessionFile(paneId: string, cwd: string): Promise<string | null> {
-    for (const file of await resolveSessionFileCandidates(paneId, cwd)) {
-      if (readSessionFile(file)) return file;
-    }
-    return null;
-  }
-
-  /** Retry final-text collection because session persistence can lag settlement. */
-  async function collectFinalText(
-    paneId: string,
-    cwd: string,
-    sinceTs: number,
-    attempts = 12,
-  ): Promise<string | null> {
-    for (let i = 0; i < attempts; i++) {
-      for (const file of await resolveSessionFileCandidates(paneId, cwd)) {
-        const entries = readSessionFile(file);
-        if (!entries) continue;
-        const r = lastAssistantText(entries, { sinceTs });
-        if (r?.text) return r.text;
-      }
-      await new Promise((r) => setTimeout(r, 500));
-    }
-    return null;
-  }
-
-  /** E1/E2 reads the reported pi-ask token so blocked work remains with the human. */
-  async function readAskFlag(paneId: string): Promise<string | null> {
-    try {
-      const a = (await client.listAgents()).find((x) => x.paneId === paneId);
-      const v = a?.tokens?.['pi-ask'];
-      return typeof v === 'string' && v ? v : null;
-    } catch {
-      return null;
-    }
-  }
-
-  /** A2/B1 combines pane status with newest session mtime because either signal alone can be stale. */
-  async function probeAlive(paneId: string, cwd: string): Promise<AliveProbe> {
-    const probe: AliveProbe = { paneExists: false, agentStatus: null, lastActivityMs: null };
-    try {
-      const agents = await client.listAgents();
-      const a = agents.find((x) => x.paneId === paneId);
-      probe.paneExists = a != null;
-      probe.agentStatus = a?.status ?? null;
-    } catch {
-      /* Fall back to session activity when agent.list is unavailable. */
-    }
-    for (const file of await resolveSessionFileCandidates(paneId, cwd)) {
-      try {
-        const mtime = (await statAsync(file)).mtimeMs;
-        if (probe.lastActivityMs == null || mtime > probe.lastActivityMs) probe.lastActivityMs = mtime;
-      } catch {
-        /* Session files can disappear during candidate scanning. */
-      }
-    }
-    return probe;
-  }
-
-  /**
-   * M8 treats session content as authoritative because herdr idle/done is also true at injection.
-   * Final text means settled, a pending tool call means active, assistant activity without text is
-   * genuine no-output, and no activity means the run has not started.
-   */
-  async function subSessionState(
-    paneId: string,
-    cwd: string,
-    sinceTs: number,
-  ): Promise<{ text: string | null; pendingTool: boolean; activity: boolean }> {
-    for (const file of await resolveSessionFileCandidates(paneId, cwd)) {
-      const entries = readSessionFile(file);
-      if (entries.length === 0) continue;
-      const r = lastAssistantText(entries, sinceTs);
-      if (r?.text) return { text: r.text, pendingTool: false, activity: true };
-      if (hasPendingToolCall(entries, sinceTs)) return { text: null, pendingTool: true, activity: true };
-      if (hasAssistantAfter(entries, sinceTs)) return { text: null, pendingTool: false, activity: true };
-    }
-    return { text: null, pendingTool: false, activity: false };
-  }
-
-  /** D92 buffers settlement notices until turn_end, falling back to legacy followUp delivery. */
-  const injectNotice = (content: string): Promise<void> =>
-    d.deliverNotice ? d.deliverNotice(content)
-      : (pi.sendUserMessage?.(content, { deliverAs: 'followUp' }) ?? Promise.resolve());
-
-  /** Polls background settlement while yielding blocked panes to humans and detecting D94 takeover. */
-  async function pollLoop(
-    paneId: string,
-    cwd: string,
-    spawnedAt: number,
-    injectTs: number,
-    description: string,
-    requestId: string,
-  ): Promise<void> {
-    void spawnedAt;
-    // B1/O3 refreshes inactivity on every working heartbeat; only periods with neither working nor
-    // settlement progress consume the budget. This avoids the 10-minute wall-clock false kills seen
-    // on healthy 27-minute jobs in 01a03c0d while retaining startedAt for diagnostics.
-    const startedAt = Date.now();
-    let lastActivityAt = Date.now();
-    const pollTrace = process.env.PI_HERDR_TRACE
-      ? (msg: string) => { try { appendFileSync(process.env.PI_HERDR_TRACE!, `d98poll ${Date.now()} ${paneId} ${msg}\n`); } catch { /* Tracing is best-effort. */ } }
-      : null;
-    try {
-      while (true) {
-        const entry = subs.get(paneId);
-        if (!entry || entry.status === 'settled') return;
-
-        if (entry.userTakeover) {
-          try {
-            const agents = await client.listAgents();
-            const agent = agents.find((a) => a.paneId === paneId);
-            const tick = planTakeoverTick({
-              currentStatus: agent?.status ?? null,
-              previousStatus: entry.lastAgentStatus,
-              idleStartedAt: entry.observationStartedAt,
-              now: Date.now(),
-              idleMs: TAKEOVER_IDLE_MS,
-            });
-            if (tick.kind === 'start-idle') {
-              entry.observationStartedAt = Date.now();
-              entry.lastAgentStatus = 'idle';
-              persistSubs();
-            } else if (tick.kind === 'return-control') {
-              entry.userTakeover = false;
-              entry.observationStartedAt = null;
-              entry.lastAgentStatus = null;
-              persistSubs();
-            } else if (tick.kind === 'hold' && tick.clearIdleTimer) {
-              entry.lastAgentStatus = tick.lastAgentStatus;
-              entry.observationStartedAt = null;
-              persistSubs();
-            }
-          } catch {
-            // A failed status probe should not stop the poller.
-          }
-          if (entry.userTakeover) {
-            await new Promise((resolve) => setTimeout(resolve, TAKEOVER_RECHECK_MS));
-            continue;
-          }
-        }
-
-        let state: HerdrAgentState | null;
-        try {
-          state = await client.waitAgent(paneId, ['idle', 'done', 'blocked'], runtimePolicy.pollIntervalMs);
-        } catch {
-          state = null;
-        }
-        const gate = planBlockedGate(state, blockedGateNotified.has(paneId));
-        if (gate.kind === 'stay-blocked') {
-          if (gate.notify) {
-            blockedGateNotified.add(paneId);
-            const question = await readAskFlag(paneId);
-            try {
-              await injectNotice(buildBlockedGateNotice({ paneId, description, question }));
-            } catch {
-              /* A later turn can recover a missed notice through list_agents. */
-            }
-          }
-          continue;
-        }
-        if (gate.kind === 'clear-gate') blockedGateNotified.delete(paneId);
-        if (state === 'idle' || state === 'done') {
-          const s = await subSessionState(paneId, cwd, injectTs);
-          pollTrace?.(`state=${state} text=${s.text ? s.text.length : 'null'} pend=${s.pendingTool} act=${s.activity} obs=${String(entry.observationStartedAt ?? null)} takeover=${String(entry.userTakeover === true)}`);
-          if (s.text || (!s.pendingTool && s.activity)) {
-            // Settled
-            const closing = s.text;
-
-            const obs = planObservationTick({
-              observationStartedAt: entry.observationStartedAt,
-              now: Date.now(),
-              windowMs: OBSERVE_WINDOW_MS,
-              agentStatus: null,
-              machineInjectAgoMs: Date.now() - (lastMachineInjectAt.get(paneId) ?? 0),
-              machineInjectGraceMs: MACHINE_INJECT_GRACE_MS,
-            });
-            if (obs.kind === 'start-observation') {
-              entry.observationStartedAt = Date.now();
-              entry.lastAgentStatus = 'idle';
-              persistSubs();
-              await new Promise((resolve) => setTimeout(resolve, OBSERVATION_TICK_MS));
-              continue;
-            }
-            let agentStatus: string | null = null;
-            try {
-              const agents = await client.listAgents();
-              agentStatus = agents.find((a) => a.paneId === paneId)?.status ?? null;
-            } catch {
-              // A failed status probe should not stop observation.
-            }
-            const obs2 = planObservationTick({
-              observationStartedAt: entry.observationStartedAt,
-              now: Date.now(),
-              windowMs: OBSERVE_WINDOW_MS,
-              agentStatus,
-              machineInjectAgoMs: Date.now() - (lastMachineInjectAt.get(paneId) ?? 0),
-              machineInjectGraceMs: MACHINE_INJECT_GRACE_MS,
-            });
-            if (obs2.kind === 'user-takeover') {
-              entry.userTakeover = true;
-              entry.observationStartedAt = Date.now();
-              entry.lastAgentStatus = 'working';
-              persistSubs();
-              continue;
-            }
-            if (obs2.kind === 'machine-inject-reset') {
-              entry.observationStartedAt = Date.now();
-              persistSubs();
-              await new Promise((resolve) => setTimeout(resolve, OBSERVATION_TICK_MS));
-              continue;
-            }
-            if (obs2.kind === 'wait') {
-              await new Promise((resolve) => setTimeout(resolve, OBSERVATION_TICK_MS));
-              continue;
-            }
-            entry.observationStartedAt = null;
-            // Settle only after the observation path has confirmed completion.
-            // O6 preserves a reply-reported sessionFile; scanning only fills a missing value.
-            if (!entry.sessionFile) {
-              entry.sessionFile = applyReportedSessionFile(
-                entry.sessionFile,
-                await resolveSessionFile(paneId, cwd),
-              );
-            }
-            entry.status = 'consumed';
-            entry.consumedAt = Date.now();
-            writeHistory(entry, { outcome: closing }, 'poll-settle');
-            // M17 reconciles before notice and remains idempotent with the reply fast path.
-            const notes = d.reconcileOnSettlement(description, 'settled');
-            // D98 adds git context so isolate and small-task results expose their actual change scope.
-            const statLine = await worktreeStatLine(entry);
-            const notice = d.withReconcileNotes(
-              formatSettlementNotice(`${paneId} (${description})`, closing) + (statLine ? `\n${statLine}` : ''),
-              notes,
-            );
-            if (d.claimSettleNotice(`${paneId}:${requestId}`)) {
-              try {
-                await injectNotice(notice);
-              } catch {
-                /* A later turn can recover a missed notice through list_agents. */
-              }
-            }
-            return;
-          }
-          // Pending human tool calls and not-yet-started sessions must continue waiting.
-        }
-        let alive = false;
-        try {
-          alive = (await client.listAgents()).some((a) => a.paneId === paneId);
-        } catch {
-          alive = true;
-        }
-        const vacuum = planVacuumTick({
-          waitState: state,
-          paneAlive: alive,
-          now: Date.now(),
-          lastActivityAt,
-          timeoutMs: SUBAGENT_TIMEOUT_MS,
-        });
-        if (vacuum.refreshActivity) lastActivityAt = Date.now();
-        if (vacuum.action === 'pane-closed') {
-          entry.status = 'consumed';
-          entry.consumedAt = Date.now();
-          persistSubs();
-          writeHistory(entry, { outcome: 'pane closed before settling' }, 'poll-pane-closed');
-          const notes = d.reconcileOnSettlement(description, 'failed');
-          const notice = d.withReconcileNotes(
-            `Background subagent ${paneId} (${description}) stopped before settling (its pane closed).`,
-            notes,
-          );
-          try {
-            await injectNotice(notice);
-          } catch {
-            /* Notice delivery failure is non-fatal. */
-          }
-          return;
-        }
-        if (vacuum.action === 'timeout') {
-          entry.status = 'consumed';
-          entry.consumedAt = Date.now();
-          persistSubs();
-          writeHistory(entry, { outcome: 'observation timeout' }, 'poll-timeout');
-          const notes = d.reconcileOnSettlement(description, 'failed');
-          const notice = d.withReconcileNotes(
-            `Background subagent ${paneId} (${description}) has shown no progress for ${Math.round((Date.now() - lastActivityAt) / 1000)}s (observed since ${new Date(startedAt).toISOString()}). Run list_agents to check its live state; if it is working, let it run — its settlement notice will arrive automatically. Do not sleep-wait.`,
-            notes,
-          );
-          try {
-            await injectNotice(notice);
-          } catch {
-            /* Notice delivery failure is non-fatal. */
-          }
-          return;
-        }
-      }
-    } finally {
-      pollers.delete(paneId);
-    }
-  }
-
-  function startPoller(paneId: string, cwd: string, spawnedAt: number, injectTs: number, description: string, requestId: string): void {
-    if (pollers.has(paneId)) return;
-    pollers.add(paneId);
-    void (async () => {
-      try {
-        if (!subScopes.has(paneId)) {
-          const fiber = await mountSubagentScope(sessionRoot, paneId, {
-            onDispose: () => { pollers.delete(paneId); },
-          });
-          subScopes.set(paneId, fiber);
-        }
-        await pollLoop(paneId, cwd, spawnedAt, injectTs, description, requestId);
-        const fiber = subScopes.get(paneId);
-        subScopes.delete(paneId);
-        try { await fiber?.dispose(); } catch { /* already gone */ }
-      } catch (err) {
-        // D98 removes crashed pollers so their pane ids can be restarted instead of remaining
-        // running ghosts with no active loop.
-        pollers.delete(paneId);
-        console.error(`pier: subagent poller ${paneId} crashed: ${(err as Error)?.message ?? err}`);
-      }
-    })();
-  }
-
-  /* ── subagent tool: task-tab placement, history, and GC ────────── */
-
-  /** D26 serializes tab placement so concurrent delegates cannot race the same read-modify-write. */
-  const tabMutex = new Semaphore(1);
-
   function histFile(cwd: string): string {
     return preferredHistoryFile(agentRootDir(), cwd);
   }
@@ -722,418 +336,51 @@ export default function subagentPlugin(ctx: Context): void {
     appendHistory(histFile(e.cwd), { ...toHistory(e, outcome), ...(patch ?? {}), ...(via ? { via } : {}) });
   }
 
-  /** Trust herdr for live task tabs so renames and automatic closure correct cached registry data. */
-  async function liveTabs(): Promise<Array<{ tabName: string; tabId: string }>> {
-    try {
-      const ws = env?.workspaceId ?? '';
-      return (await client.tabList())
-        .filter((t) => !ws || t.workspaceId === ws)
-        .map((t) => ({ tabName: t.label, tabId: t.tabId }));
-    } catch {
-      return [];
-    }
-  }
+  const injectNotice = (content: string): Promise<void> =>
+    d.deliverNotice ? d.deliverNotice(content)
+      : (pi.sendUserMessage?.(content, { deliverAs: 'followUp' }) ?? Promise.resolve());
 
-  /* ── D86 git-worktree grouping key ─────────────────────────────── */
-
-  /** Cache briefly because placement needs only approximate worktree freshness. */
-  let worktreesCache: { at: number; list: string[] } | null = null;
-  const WORKTREES_CACHE_MS = 5000;
-
-  /**
-   * Return every repository worktree with the main checkout first. Non-git directories and missing
-   * git degrade to an empty list so placement naturally falls back to main.
-   */
-  async function listWorktrees(cwd: string): Promise<string[]> {
-    if (worktreesCache && Date.now() - worktreesCache.at < WORKTREES_CACHE_MS) return worktreesCache.list;
-    let list: string[] = [];
-    try {
-      const { stdout } = await defaultGitAdapter.listWorktrees(cwd);
-      for (const line of String(stdout).split('\n')) {
-        const m = /^worktree (.+)$/.exec(line.trim());
-        if (m) list.push(m[1]);
-      }
-    } catch {
-      list = [];
-    }
-    worktreesCache = { at: Date.now(), list };
-    return list;
-  }
-
-  /**
-   * D98 centralizes isolate git calls behind the adapter and runtime timeout. Returning null on
-   * failure matches worktree discovery and keeps infrastructure git outside the model bash surface.
-   */
-  async function runGit(cwd: string, args: string[]): Promise<string | null> {
-    try {
-      const { stdout } = await defaultGitAdapter.run(cwd, args);
-      return stdout == null ? null : String(stdout);
-    } catch {
-      return null;
-    }
-  }
-
-  /** Return only the summary line needed by notices; empty diffs have no useful annotation. */
-  function lastStatLine(out: string | null): string | null {
-    if (!out) return null;
-    const lines = out.replace(/\r/g, '').split('\n').map((l) => l.trim()).filter(Boolean);
-    return lines.length ? lines[lines.length - 1]! : null;
-  }
-
-  /**
-   * D98 gives both settlement paths a compact change summary: baseline diff and commits for isolates,
-   * or working-tree diff and dirty count for ordinary git workers. Non-git work omits the line.
-   */
-  async function worktreeStatLine(entry: SubEntry): Promise<string | null> {
-    const porcelain = await runGit(entry.cwd, ['status', '--porcelain']);
-    if (porcelain === null) return null; // Omit stats when git or the repository is unavailable.
-    const dirtyCount = porcelain.split('\n').filter((l) => l.trim() !== '').length;
-    if (entry.isolate) {
-      const statOut = await runGit(entry.cwd, ['diff', '--stat', `${entry.isolate.baseSha}...HEAD`]);
-      const commitsOut = await runGit(entry.cwd, ['rev-list', '--count', `${entry.isolate.baseSha}..HEAD`]);
-      const commits = commitsOut != null && /^\d+$/.test(commitsOut.trim()) ? Number(commitsOut.trim()) : null;
-      return formatWorktreeStat({ branch: entry.isolate.branch, commits, statLine: lastStatLine(statOut), dirtyCount });
-    }
-    return formatWorktreeStat({ branch: null, commits: null, statLine: lastStatLine(await runGit(entry.cwd, ['diff', '--stat', 'HEAD'])), dirtyCount });
-  }
-
-  /**
-   * Create a child pane in the task tab according to placement (v1.3 D25/D26 + D86 worktree grouping):
-   *  - new: create a tab without stealing focus, then inject the startup command into its root pane;
-   *  - append: verify the existing tab is alive, then split into it without restarting the process;
-   *    if the tab vanished, fall back to a same-named new tab. The mutex protects placement from name races.
-   * D86: callers compute placement.zone (main → the master's tab; worktree → a directory-named tab).
-   */
-  async function spawnPaneInTaskTab(
-    placement: { desiredTab?: string | null; description: string; zone?: WorktreeZone },
-    cwd: string,
-    envOver: Record<string, string>,
-    launch: string,
-  ): Promise<{ tabId: string; paneId: string; tabName: string }> {
-    const release = await tabMutex.acquire();
-    try {
-      // D86: Resolve the main tab from the master's pane because HERDR_TAB_ID injection may be absent.
-      const allPanes = await client.listPanes();
-      const mainTabId = allPanes.find((p) => p.paneId === env?.paneId)?.tabId
-        ?? (env?.tabId ? env.tabId : null);
-      let plan: TabPlacementPlan = planTabPlacement({
-        desiredTab: placement.desiredTab,
-        description: placement.description,
-        knownTabs: await liveTabs(),
-        zone: placement.zone,
-        mainTabId,
-      });
-      if (plan.mode === 'append' && plan.tabId) {
-        // D97 grid layout: choose the largest target cell and always split down, yielding a full-width
-        // strip whose title remains readable; exclude board panes with unknown agent status so workers cannot consume them.
-        const exclude = new Set(
-          allPanes.filter((p) => p.tabId === plan.tabId && p.agentStatus === 'unknown').map((p) => p.paneId),
-        );
-        let pick: { targetPaneId: string; direction: 'right' | 'down' } | null = null;
-        try {
-          const snapshot = await client.exportLayout({ tabId: plan.tabId });
-          const tree = snapshot?.root ? parseShapeTree(snapshot.root) : null;
-          if (tree) pick = pickGridSplit(tree, { exclude });
-        } catch { /* A layout export failure falls back to the legacy anchor split. */ }
-        // Anchor fallback: prefer a work pane with known agent status so the board pane is avoided.
-        const anchorPaneId = pick?.targetPaneId
-          ?? allPanes.find((p) => p.tabId === plan.tabId && p.agentStatus !== 'unknown')?.paneId
-          ?? allPanes.find((p) => p.tabId === plan.tabId)?.paneId;
-        if (anchorPaneId) {
-          const paneId = await client.splitPane({
-            direction: pick?.direction ?? 'down',
-            cwd,
-            env: envOver,
-            targetPaneId: anchorPaneId,
-          });
-          await client.sendPaneText(paneId, launch);
-          return { tabId: plan.tabId!, paneId, tabName: plan.tabName };
-        }
-        // A missing anchor (empty or closed tab) or a vanished main tab falls back to a same-named new tab.
-        plan = { mode: 'new', tabName: plan.tabName, tabId: null };
-      }
-      const created = await client.createTab({
-        workspaceId: env?.workspaceId ?? '',
-        label: plan.tabName,
-        cwd,
-        env: envOver,
-      });
-      await client.sendPaneText(created.paneId, launch);
-      return { tabId: created.tabId, paneId: created.paneId, tabName: plan.tabName };
-    } finally {
-      release();
-    }
-  }
-
-  function launchLine(resumeFile?: string | null, roleModel?: string | null, approve = false): string {
-    // Convert raw argv to platform shell syntax (PowerShell '&' on win32, sh on POSIX); buildLaunchLine handles escaping.
-    // buildLaunchParts constructs argv and applies D97's fullscreen default, with PI_HERDR_TUI=regular as the escape hatch.
-    return buildLaunchLine(buildLaunchParts(runtime, { resumeFile, roleModel, approve }));
-  }
-
-  /**
-   * D86 trust: delegation is trusted only for the master's checkout and its worktrees (one git
-   * repository means the same project files); external directories omit -a so pi's Trust dialog
-   * remains a gate and a spawn fails at handshake timeout until a person approves the unknown extension.
-   */
-  async function approveFor(cwd: string, masterCwd: string): Promise<boolean> {
-    if (isPathUnder(cwd, masterCwd)) return true;
-    const zone = classifyWorktreeZone({ cwd, masterCwd, worktrees: await listWorktrees(masterCwd) });
-    return zone.zone === 'worktree';
-  }
-
-  /* ── GC: turn_start collection (v1.3 M8: tab-first, with pane compatibility/orphan paths) ── */
-
-  let prevTurnStart = Date.now();
-
-  async function gcPass(): Promise<void> {
-    if (subs.size === 0) return;
-    // D44: The only user-visible switch is the TTL in seconds (default 600); 0 disables automatic closure.
-    const ttlMs = runtimePolicy.sessionTtlSeconds * 1000;
-    const autoCloseTabs = ttlMs > 0;
-    let panesList: Array<{ paneId: string; tabId: string; agentStatus: string }>;
-    try {
-      panesList = await client.listPanes();
-    } catch {
-      return;
-    }
-    // Snapshot herdr agent status per pane for collection decisions; a missing pane is recorded as closed.
-    // This also fixes the regression where an undefined statuses map was swallowed by runGcSafely, disabling pane GC.
-    const statuses = new Map(panesList.map((p) => [p.paneId, p.agentStatus]));
-    const termPaneIds = terminalState.activePaneIds();
-    // B2: Exempt panes whose settlement notice is undelivered so notification is attempted before collection.
-    const pendingNoticeIds = d.noticePending?.() ?? new Set<string>();
-
-    // Group task tabs, counting closed work panes as completed.
-    const byTab = new Map<string, SubEntry[]>();
-    for (const e of subs.values()) {
-      if (!e.tabId) continue;
-      const arr = byTab.get(e.tabId) ?? [];
-      arr.push(e);
-      byTab.set(e.tabId, arr);
-    }
-    const taskTabIds = new Set(byTab.keys());
-    // D86 R4: Never close the main tab wholesale; consumed children there use pane-level collection.
-    const mainTabId = env?.tabId ?? '';
-
-    // 1) Tab-level collection; gc-core.shouldCloseTaskTab contains the pure, unit-tested predicate.
-    for (const [tabId, entries] of byTab) {
-      if (tabId === mainTabId) continue; // D86 R4: exempt the main tab to prevent taking down the master.
-      const tabPanes = panesList.filter((p) => p.tabId === tabId);
-      if (tabPanes.length === 0) {
-        // A vanished tab (closed manually or automatically) is recorded as closed.
-        for (const e of entries) {
-          if (e.status !== 'closed') {
-            e.status = 'closed';
-            writeHistory(e, { status: 'closed', closedAt: Date.now() }, 'gc');
-          }
-        }
-        continue;
-      }
-      const should = shouldCloseTaskTab({
-        entries,
-        paneStatuses: tabPanes.map((p) => p.agentStatus),
-        ttlMs,
-        now: Date.now(),
-      });
-      if (!autoCloseTabs || !should) continue;
-      // B2: Exempt panes whose settlement notice is undelivered so notification is attempted first.
-      if (tabPanes.some((p) => termPaneIds.has(p.paneId) || pendingNoticeIds.has(p.paneId))) continue;
-      try {
-        await client.tabClose(tabId);
-      } catch {
-        /* The tab may already be gone. */
-      }
-      for (const e of entries) {
-        if (e.status !== 'closed') {
-          e.status = 'closed';
-          writeHistory(e, { status: 'closed', closedAt: Date.now() }, 'gc');
-        }
-      }
-      await new Promise((r) => setTimeout(r, 300)); // Serialize closure to guard against #1358-style races.
-    }
-
-    // 2) Pane-level collection (v1.2 compatibility, orphan handling, and D86 main-tab collection):
-    //    consumed short-lived panes outside a closeable task tab, including panes in the main tab (R4).
-    const closableTaskTabIds = new Set([...taskTabIds].filter((t) => t !== mainTabId));
-    const candidates = [...subs.values()].filter(
-      (e) => e.status === 'consumed' && !(e.tabId && closableTaskTabIds.has(e.tabId)),
-    );
-    for (const e of candidates) {
-      if (termPaneIds.has(e.paneId) || pendingNoticeIds.has(e.paneId)) continue; // Exempt active terminals (D71) and undelivered notices (B2).
-      if (!shouldClosePane({
-        consumedAt: e.consumedAt ?? null,
-        herdrStatus: statuses.get(e.paneId),
-        prevTurnStart,
-      })) continue;
-      if (statuses.get(e.paneId) === undefined) {
-        // A vanished pane (because its tab closed) is recorded as closed.
-        e.status = 'closed';
-        writeHistory(e, { status: 'closed', closedAt: Date.now() }, 'gc');
-        continue;
-      }
-      try {
-        await client.closePane(e.paneId);
-      } catch {
-        /* The pane may already be gone. */
-      }
-      e.status = 'closed';
-      writeHistory(e, { status: 'closed', closedAt: Date.now() }, 'gc');
-      await new Promise((r) => setTimeout(r, 300));
-    }
-    persistSubs();
-  }
-
-  /* ── D98: Automatically collect isolate worktrees when conditions permit (appended to gcPass; mount gate already enforces master-only) ── */
-
-  /**
-   * Candidates: ① registered isolate entries that are not released and no longer running;
-   *            ② orphan refs/heads/pier/* branches whose worktree still appears in `git worktree list --porcelain`.
-   * The master may restart without the old registry, so ② recovers crash leftovers.
-   * Decide merged with merge-base --is-ancestor and dirty with status --porcelain in the worktree.
-   * Release without --force (git rejects dirty worktrees as a second guard), retry once after 2s,
-   * then leave it for the next ticker without notification spam. Notify registered retains once;
-   * keep orphan retains silent. Never delete branches automatically.
-   */
-  async function isolateSweep(): Promise<void> {
-    const trace = process.env.PI_HERDR_TRACE
-      ? (msg: string) => { try { appendFileSync(process.env.PI_HERDR_TRACE!, `d98sweep ${Date.now()} ${msg}\n`); } catch { /* Best effort only. */ } }
-      : null;
-    const masterCwd = process.cwd();
-    // Candidate key is the short branch name. Register every branch first, including running/released
-    // entries, so orphan scanning cannot reclaim a new clean isolate before it settles.
-    const registeredBranches = new Set<string>();
-    for (const e of subs.values()) {
-      if (e.isolate) registeredBranches.add(e.isolate.branch);
-    }
-    // ② Orphan candidates pair pier/* branches with porcelain worktrees; this covers crash leftovers
-    // absent from the registry after a master restart, while registered branches use ① semantics.
-    const wtPorcelain = await runGit(masterCwd, ['worktree', 'list', '--porcelain']);
-    if (wtPorcelain === null) return;
-    const wtByBranch = parseWorktreePorcelain(wtPorcelain);
-    const pierBranchOut = await runGit(masterCwd, ['for-each-ref', '--format=%(refname:short)', 'refs/heads/pier/']);
-    const pierBranches = (pierBranchOut ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
-    type Cand = { branch: string; wtPath: string; entry: SubEntry | null };
-    const byBranch = new Map<string, Cand>();
-    for (const branch of pierBranches) {
-      if (registeredBranches.has(branch) || pendingIsolateBranches.has(branch)) continue;
-      const wtPath = wtByBranch.get(branch);
-      if (wtPath) byBranch.set(branch, { branch, wtPath, entry: null });
-    }
-    // ① Registered candidates, excluding running/released entries; for duplicate generations, keep the newest.
-    for (const e of subs.values()) {
-      if (!e.isolate || e.isolate.releasedAt != null || e.status === 'running') continue;
-      const prev = byBranch.get(e.isolate.branch);
-      byBranch.set(e.isolate.branch, { branch: e.isolate.branch, wtPath: prev?.wtPath ?? e.isolate.worktreePath, entry: e });
-    }
-    trace?.(`cands=${[...byBranch.keys()].join(',') || 'none'} subs=${[...subs.values()].map((s) => `${s.status}${s.isolate ? '/iso' : ''}`).join(',') || 'none'}`);
-    let persisted = false;
-    for (const cand of byBranch.values()) {
-      const { branch, wtPath, entry } = cand;
-      // A registered worktree missing from git's records may have been manually removed/pruned, or git
-      // may have unregistered it after a Windows file-lock interruption while leaving the directory behind.
-      // Remove that residue before closing the ledger; keep the branch, and retry next ticker if removal fails.
-      if (entry && !wtByBranch.has(branch)) {
-        if (existsSync(wtPath)) {
-          try { rmSync(wtPath, { recursive: true, force: true }); } catch { continue; /* Lock remains; retry next round. */ }
-          if (existsSync(wtPath)) continue;
-        }
-        entry.isolate!.releasedAt = Date.now();
-        persisted = true;
-        continue;
-      }
-      const mergedOut = await runGit(masterCwd, ['merge-base', '--is-ancestor', branch, 'HEAD']);
-      const merged = mergedOut !== null ? true : null; // is-ancestor: exit 0 means yes; nonzero/null means no/unknown.
-      // Distinguish a confirmed non-ancestor from command failure: failure yields merged=null for retain-unknown.
-      let mergedFinal = merged;
-      if (merged === null) {
-        const sha = await runGit(masterCwd, ['rev-parse', branch]);
-        const headSha = await runGit(masterCwd, ['rev-parse', 'HEAD']);
-        if (sha != null && headSha != null) mergedFinal = false;
-      }
-      const dirtyOut = await runGit(wtPath, ['status', '--porcelain']);
-      const dirtyCount = dirtyOut === null ? null : dirtyOut.split('\n').filter((l) => l.trim() !== '').length;
-      const decision = evaluateRelease({ merged: mergedFinal, dirtyCount });
-      if (decision.action === 'release') {
-        const removed = await runGit(masterCwd, ['worktree', 'remove', wtPath]);
-        let ok = removed !== null;
-        if (!ok) {
-          const { promise: retryDelay, resolve: retryNow } = Promise.withResolvers<void>();
-          setTimeout(retryNow, 2000);
-          await retryDelay;
-          ok = (await runGit(masterCwd, ['worktree', 'remove', wtPath])) !== null; // Retry once.
-        }
-        if (ok) {
-          worktreesCache = null; // Invalidate the 5s cache so placement sees the removed worktree immediately.
-          if (entry) { entry.isolate!.releasedAt = Date.now(); persisted = true; }
-        } // A failed removal remains for the next ticker, without notification spam.
-      } else if (entry && !entry.isolate!.retainNotified) {
-        entry.isolate!.retainNotified = true;
-        persisted = true;
-        try {
-          await injectNotice(`worktree ${branch} retained (${decision.reason}) — merge it (git merge --no-ff ${branch}) or remove manually (git worktree remove --force ${wtPath})`);
-        } catch {
-          /* Injection failure stays silent; retainNotified prevents repeated alerts, while list_agents/ledger still expose it. */
-        }
-      } // Orphan retains remain silent.
-    }
-    if (persisted) persistSubs();
-  }
-
-  /** Serialize GC and drive it from both turn_start and the periodic ticker. */
-  let gcRunning = false;
-  async function runGcSafely(): Promise<void> {
-    if (gcRunning) return;
-    gcRunning = true;
-    try {
-      await gcPass();
-    } catch {
-      /* GC failure stays silent so the next turn/tick can retry. */
-    }
-    // D98: Isolate collection is separate from gcPass because gcPass's empty-subs early return would
-    // swallow orphan scans; independent try blocks keep tab/pane GC from blocking worktree collection.
-    try {
-      await isolateSweep();
-    } catch {
-      /* Sweep failure stays silent so the next turn/tick can retry. */
-    } finally {
-      gcRunning = false;
-    }
-  }
-
-  scoped.on('turn_start', async () => {
-    const now = Date.now();
-    await runGcSafely();
-    prevTurnStart = now;
+  const session = createSessionIo({
+    client,
+    getSessionId: d.getSessionId,
+    sessionsDir: defaultAgentSessionsDir,
   });
+  const spawn = createSpawner({ client, env, runtime, git });
+  const poller = createPoller({
+    client,
+    sessionRoot,
+    subs,
+    persistSubs,
+    writeHistory,
+    blockedGateNotified,
+    lastMachineInjectAt,
+    session,
+    git,
+    injectNotice,
+    reconcileOnSettlement: d.reconcileOnSettlement,
+    withReconcileNotes: d.withReconcileNotes,
+    claimSettleNotice: d.claimSettleNotice,
+  });
+  const gc = createGcController({
+    client,
+    env,
+    subs,
+    persistSubs,
+    writeHistory,
+    terminalState,
+    noticePending: d.noticePending,
+    pendingIsolateBranches,
+    git,
+    injectNotice,
+  });
+  gc.startTicker(ctx);
+  scoped.on('turn_start', () => gc.onTurnStart());
 
-  const gcTickMs = runtimePolicy.gcTickMs;
-  const gcTicker = gcTickMs > 0 ? setInterval(() => { void runGcSafely(); }, gcTickMs) : null;
-  // The ticker is disposed through an effect so HMR removes the old ticker before starting a new one (D80⑤).
-  // The pipe server is intentionally not disposed here: index's common section owns it, and this plugin's
-  // HMR reload must not kill a cross-module resource (d87).
-  ctx.effect(() => () => {
-    if (gcTicker) clearInterval(gcTicker);
-  }, 'gc-ticker');
-
-  /**
-   * D94: Find an existing pane for the same session so resume reuses it instead of spawning a duplicate.
-   * Return paneId + tabId, or null when no match exists or the agent has died.
-   */
-  async function findExistingPaneWithSession(sessionFile: string | null): Promise<{ paneId: string; tabId: string } | null> {
-    if (!sessionFile) return null;
-    try {
-      const agents = await client.listAgents();
-      const match = agents.find((a) => a.session === sessionFile && a.status !== 'unknown');
-      if (!match) return null;
-      // listAgents omits tabId, so fetch it from pane.list.
-      const panes = await client.listPanes();
-      const pane = panes.find((p) => p.paneId === match.paneId);
-      return pane ? { paneId: match.paneId, tabId: pane.tabId } : null;
-    } catch {
-      return null;
-    }
-  }
+  const { resolveSessionFile, collectFinalText, readAskFlag, probeAlive, subSessionState } = session;
+  const { spawnPaneInTaskTab, launchLine, approveFor, waitSubReady, findExistingPane } = spawn;
+  const { startPoller, pollers } = poller;
+  const runGit = (...args: Parameters<typeof git.runGit>) => git.runGit(...args);
+  const listWorktrees = (...args: Parameters<typeof git.listWorktrees>) => git.listWorktrees(...args);
 
   /** Revive a closed task; resume and automatic send_message revival share this path. */
   async function reviveEntry(entry: SubEntry): Promise<SubEntry> {
@@ -1226,7 +473,7 @@ export default function subagentPlugin(ctx: Context): void {
             details: {},
           };
         }
-        worktreesCache = null; // Invalidate the 5s cache so the zone classifier sees the new worktree immediately.
+        git.invalidateWorktreesCache(); // Invalidate the 5s cache so the zone classifier sees the new worktree immediately.
         cwd = wtPath;
         isolateMeta = { worktreePath: wtPath, branch: plan.branch, baseSha: sha, releasedAt: null, retainNotified: false };
         spec.prompt = `${buildIsolatePreamble({ worktreePath: wtPath, branch: plan.branch, baseShort: sha.slice(0, 7) })}\n\n${spec.prompt}`;
@@ -1456,7 +703,7 @@ export default function subagentPlugin(ctx: Context): void {
       const release = await subSemaphore.acquire();
       try {
         // D94: Reuse an existing pane for the same session to avoid competing pi processes.
-        const existing = await findExistingPaneWithSession(latest.sessionFile);
+        const existing = await findExistingPane(latest.sessionFile);
         if (existing) {
           const entry: SubEntry = {
             taskId,
