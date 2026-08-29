@@ -1,0 +1,29 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "packageManager": "npm",
+  "testRunner": "command",
+  "commandRunner": {
+    "command": "npm test"
+  },
+  "mutate": [
+    "packages/pier-ext/src/todo-core.ts",
+    "packages/pier-ext/src/tool-gate.ts",
+    "packages/pier-ext/src/reconcile-core.ts",
+    "packages/pier-ext/src/lock-core.ts",
+    "packages/pier-ext/src/pipe-channel.ts",
+    "packages/pier-ext/src/gc-core.ts"
+  ],
+  "thresholds": {
+    "high": 80,
+    "low": 60,
+    "break": null
+  },
+  "timeoutMS": 60000,
+  "incremental": true,
+  "incrementalFile": "reports/stryker-incremental.json",
+  "coverageAnalysis": "perTest",
+  "reporters": ["html", "clear-text", "progress"],
+  "htmlReporter": {
+    "baseDir": "reports/mutation/html"
+  }
+}
