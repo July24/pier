@@ -102,7 +102,7 @@ const MACHINE_INJECT_GRACE_MS = Number(process.env.PI_HERDR_INJECT_GRACE_MS ?? 3
 const TAKEOVER_IDLE_MS = Number(process.env.PI_HERDR_TAKEOVER_IDLE_MS ?? 60000) || 60000;
 
 function defaultAgentSessionsDir(): string {
-  const base = process.env.PI_CODING_AGENT_DIR || join(homedir(), '.pi', 'agent');
+  const base = process.env.PI_CODING_AGENT_DIR || platformPaths.agentDataDir;
   return join(base, 'sessions');
 }
 
