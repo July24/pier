@@ -18,7 +18,7 @@ pier ships as **two halves**, installed separately:
 
 | Half | Package | Role |
 |---|---|---|
-| **pi extension** | `packages/pier-ext` (npm: [`pi-pier`](https://www.npmjs.com/package/pi-pier), [pi.dev gallery](https://pi.dev/packages/pi-pier)) | Injects `todo_write` / `subagent` / `list_agents` / `send_message` / `interrupt_agent` tools into a pi session, and reports pane state over the herdr socket API |
+| **pi extension** | `packages/pier-ext` (npm: [`pi-pier`](https://www.npmjs.com/package/pi-pier), [pi.dev gallery](https://pi.dev/packages/pi-pier)) | Injects `todo_write` / `subagent` / `terminal` / `ask_user_question` tools into a pi session, and reports pane state over the herdr socket API |
 | **herdr plugin** | `packages/pier-workbench` (`pier.workbench`) | Workspace bootstrap, blocked human-gate notifications, focus heat layout (focused pane grows in place) |
 
 ### Highlights
@@ -110,7 +110,7 @@ them automatically; manually, copy `packages/pier-workbench/scripts/boot-config.
 ### Usage
 
 1. Run pi inside a herdr workspace pane (`pi` in the pane); the extension detects `HERDR_ENV` and starts reporting
-2. The model can call `todo_write` (live pane-title projection), `subagent` (foreground / parallel / background), `list_agents` / `send_message` / `interrupt_agent`
+2. The model can call `todo_write` (live pane-title projection), `subagent` (spawn / list / send / interrupt / resume), `terminal` (open / send / read / signal / close / list)
 3. Every subagent = its own pane (observable, enterable, blocked notifies)
 4. Restart recovery: herdr session restore rebuilds panes automatically (subagent rpc session files are reported); resume the parent pi session with `/resume`
 

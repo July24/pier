@@ -83,8 +83,8 @@ copy packages\pier-workbench\scripts\boot-config.example.json <配置位置>\boo
 ## 4. 使用
 
 1. 在 herdr workspace 里开 pane 跑 pi（pane 内 `pi`），扩展自动检测 `HERDR_ENV` 并开始上报；
-2. 模型可调用 `todo_write`（窗格头实时投影）、`subagent`（前台/并行/后台）、
-   `list_agents` / `send_message` / `interrupt_agent`（后台子代理）；
+2. 模型可调用 `todo_write`（窗格头实时投影）、`subagent`（spawn / list / send / interrupt / resume）、
+   `terminal`（open / send / read / signal / close / list）；
 3. 每个子代理 = 独立 pane（可观察、可进入交互、blocked 时触发通知）；
 4. 重启恢复：herdr session 恢复自动重建 pane（`resume_agents_on_restore` 默认开，
    子代理的 rpc 会话文件已上报为 agent_session）；父 pi 会话用 `/resume` 恢复，

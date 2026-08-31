@@ -49,7 +49,7 @@ test('buildAliveNotice: moved-to-bg 场景——转后台 + 禁重做 + 通知�
   assert.match(text, /last session activity 12s ago/);
   assert.match(text, /Do NOT redo its work/);
   assert.match(text, /moved it to background/i);
-  assert.match(text, /list_agents/);
+  assert.match(text, /subagent\(action: "list"\)/);
 });
 
 test('buildAliveNotice: error-alive 场景——改写错误文案，明确"没失败"', () => {
@@ -61,7 +61,7 @@ test('buildAliveNotice: error-alive 场景——改写错误文案，明确"没�
   assert.match(text, /NOT that the task failed/);
   assert.match(text, /no readable output.*could not be read yet/s);
   assert.match(text, /Do NOT redo its work/);
-  assert.match(text, /list_agents/);
+  assert.match(text, /subagent\(action: "list"\)/);
 });
 
 test('buildAliveNotice: 会话活动未知时省略 activity 子句', () => {
@@ -73,14 +73,14 @@ test('buildAliveNotice: 会话活动未知时省略 activity 子句', () => {
 });
 
 
-test('buildBlockedGateNotice: 闸门话术——不揽活/引导用户/授权例外经 send_message', () => {
+test('buildBlockedGateNotice: 闸门话术——不揽活/引导用户/授权例外经 subagent send', async () => {
   const text = buildBlockedGateNotice({ paneId: 'wB:p3', description: 'Explore HR', question: '用哪个数据源？' });
   assert.match(text, /BLOCKED waiting for a HUMAN decision in pane wB:p3/);
   assert.match(text, /question: "用哪个数据源？"/);
   assert.match(text, /Do NOT take over its work/);
   assert.match(text, /Tell the user to open that pane/);
   assert.match(text, /explicitly authorizes/);
-  assert.match(text, /send_message/);
+  assert.match(text, /subagent\(action: "send"\)/);
   assert.match(text, /do not redo the work yourself/);
 });
 

@@ -82,12 +82,12 @@ test('S9 D82 姿态透传：unknownTools 缺省 deny；allow 透传；排除族 
   const w = composeManifest({
     roleBaseline: ['bash', 'read', 'todo_write'],
     modelSuggested: [],
-    rulePermissions: { subagent: 'deny', terminal_open: 'deny', '*': 'allow' },
+    rulePermissions: { subagent: 'deny', terminal: 'deny', '*': 'allow' },
     unknownTools: 'allow',
   });
   assert.equal(w.unknownTools, 'allow');
   assert.equal(w.permissions.subagent, 'deny');
-  assert.equal(w.permissions.terminal_open, 'deny');
+  assert.equal(w.permissions.terminal, 'deny');
   assert.ok(!w.tools.includes('subagent'));
 });
 

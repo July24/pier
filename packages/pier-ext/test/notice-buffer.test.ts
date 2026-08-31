@@ -28,12 +28,12 @@ test('超 3 条 → 前 3 条原文 + 尾行计数 + 全量指引', () => {
   const tail = out.split('\n\n').pop()!;
   assert.match(tail, /另有 2 条结算未逐条展示/);
   assert.match(tail, /history 台账/);
-  assert.match(tail, /list_agents/);
+  assert.match(tail, /subagent list/);
   // 原文第 4/5 条不出现
   assert.ok(!out.includes('\n\nn4') && !out.includes('\n\nn5'));
 });
 
 test('自定义 max', () => {
   const out = collapseNotices(['x', 'y'], 1)!;
-  assert.equal(out, 'x\n\n…另有 1 条结算未逐条展示。全量结果看 history 台账（路径公式见 resume_subagent 工具描述）；在跑代理用 list_agents 查看。');
+  assert.equal(out, 'x\n\n…另有 1 条结算未逐条展示。全量结果看 history 台账（路径公式见 subagent resume 工具描述）；在跑代理用 subagent list 查看。');
 });

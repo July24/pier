@@ -7,10 +7,10 @@
  * Capabilities:
  *  - `todo_write`: replace the complete todo list; the current pi session JSONL is authoritative,
  *    and branches automatically roll back in DSH-aligned semantics.
- *  - `subagent`: foreground/background delegation. Each child pane is an interactive pi TUI
- *    with an independent session/context that humans can enter directly; the controller uses
- *    herdr for state-gated injection (idle only), waiting (agent.wait), and JSONL result reads.
- *  - `list_agents` / `send_message` (followUp queue semantics) / `interrupt_agent` (esc).
+ *  - `subagent`: foreground/background delegation plus resume/list/send/interrupt actions.
+ *    Each child pane is an interactive pi TUI with an independent session/context that humans
+ *    can enter directly; the controller uses herdr for state-gated injection (idle only),
+ *    waiting (agent.wait), and JSONL result reads.
  *  - `/todos`, TUI widget, and herdr title projection with graceful degradation without herdr.
  *
  * pi 0.84.2 contract (validated):
@@ -374,7 +374,7 @@ export default async function (pi: ExtensionAPI) {
     if (plan.notice && !isSubagent) {
       const running = subagentPort.current?.listRunningSubs() ?? [];
       const brief = running.map((s) => `${s.paneId} (${s.description})`).join('、');
-      const notice = `注意：仍有 ${running.length} 个后台 subagent 在运行：${brief}。若你的任务依赖它们，请等待其结算（list_agents 查看状态）；若不等待，请说明放弃原因。`;
+      const notice = `注意：仍有 ${running.length} 个后台 subagent 在运行：${brief}。若你的任务依赖它们，请等待其结算（subagent list 查看状态）；若不等待，请说明放弃原因。`;
       void sendUserMessageIn(notice);
     }
   });

@@ -112,8 +112,8 @@ test('内置档案：worker-default / master 两份真实落盘可加载 + D83 �
   }
   // D83 继承制：worker-default.tools ≡ master.tools − subagent 族 − terminal 族（防漂移钉死）
   const EXCLUDED = new Set([
-    'subagent', 'resume_subagent', 'list_agents', 'send_message', 'interrupt_agent',
-    'terminal_open', 'terminal_send', 'terminal_read', 'terminal_signal', 'terminal_close', 'terminal_list',
+    'subagent',
+    'terminal',
   ]);
   const mt = load('master').manifest.tools;
   const wt = load('worker-default').manifest.tools;
@@ -123,7 +123,7 @@ test('内置档案：worker-default / master 两份真实落盘可加载 + D83 �
   const wr = load('worker-default').manifest.rules ?? {};
   for (const t of EXCLUDED) assert.equal(wr[t], 'deny', `${t} 应显式 deny`);
   // WS-D7：master 档案含自研核心全量（terminal 族 + subagent 族 + 协调 + 执行）
-  for (const need of ['todo_write', 'ask_user_question', 'subagent', 'send_message', 'terminal_open', 'terminal_read', 'pwsh', 'web_search']) {
+  for (const need of ['todo_write', 'ask_user_question', 'subagent', 'terminal', 'pwsh', 'web_search']) {
     assert.ok(mt.includes(need), `master.tools 应含 ${need}`);
   }
   // D82：master/worker 姿态 allow（用户装的扩展默认可见）

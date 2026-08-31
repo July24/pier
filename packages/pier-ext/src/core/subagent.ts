@@ -72,13 +72,18 @@ interface SubagentDeps {
 
 const SUBAGENT_DESCRIPTION = [
   'Delegate a self-contained subtask to an isolated subagent that runs in its own herdr pane as an interactive pi session (separate context window; it does NOT see this conversation). A human can also open that pane and talk to the subagent directly.',
-  '`description`: short display label for the pane; `prompt`: the COMPLETE task — include all needed context, since only the prompt reaches the subagent. The description also doubles as the todo-reconcile key: when delegating a todo entry, use the entry content WITHOUT its ` <sub>` marker as the description, and the entry is auto-completed when this subagent settles.',
-  'The subagent shares this workspace and works independently; the result is its final text answer.',
-  'Concurrent delegation is supported: several subagent calls in one message run in parallel (at most 4 at once). Use this for well-scoped, independent subtasks; do not delegate the current step itself.',
-  '`run_in_background` (default false): when true, the call returns immediately with an agentId; the subagent keeps running in its pane. Use list_agents to see its state, send_message to give it follow-up work, interrupt_agent to stop it. When it settles, you receive a notification message with its closing output.',
-  '`tab` (optional): name of a task tab to place the subagent into (join if a tab with this name exists, otherwise create it). Overrides the default placement. Default placement groups by git worktree: a subagent working in your checkout shares your tab; one working in a separate worktree (pass its path via `cwd`; create worktrees with `git worktree add`) gets its own tab named after the worktree directory.',
-  '`role` + `allowed_tools`: when role matches a profile (searched: workspace .pi-herdr/roles/ → user-global ~/.pi/agent/herdr-pi/roles/ → builtin), the worker toolset becomes the composed manifest — baseline ∪ allowed_tools minus role-deny tools (deny always wins). Custom roles: drop a JSON profile into .pi-herdr/roles/ (master/worker-default reserved). Unknown role names remain display labels only.',
-  '`isolate` (default false): creates a FRESH git worktree for this subagent and runs it there (branch pier/<slug> from your HEAD under ~/.herdr/worktrees/<repo>/). Three-way choice: heavy independent writing in parallel with your own edits or other workers, or work needing its own clean reviewable diff → isolate; read-mostly or sequential helper work → omit (shared checkout, writes guarded by the write-lock); targeting an existing directory/worktree → cwd. In isolate mode the subagent\'s writes cannot conflict with your checkout; its panes group into a tab named after the worktree; its prompt is prefixed with commit discipline (commit to its own branch, NEVER push); when it settles you get a diff summary (commits since base, files changed, uncommitted count). Review with git log/diff HEAD..<branch>, merge with git merge --no-ff <branch>; once merged and clean, the worktree auto-removes (the branch is kept for audit). Mutually exclusive with cwd.',
+  '`action` (optional, default "spawn"): spawn | resume | list | send | interrupt.',
+  '[spawn] `description`: short display label for the pane; `prompt`: the COMPLETE task — include all needed context, since only the prompt reaches the subagent. The description also doubles as the todo-reconcile key: when delegating a todo entry, use the entry content WITHOUT its ` <sub>` marker as the description, and the entry is auto-completed when this subagent settles.',
+  '[spawn] The subagent shares this workspace and works independently; the result is its final text answer.',
+  '[spawn] Concurrent delegation is supported: several spawn calls in one message run in parallel (at most 4 at once). Use this for well-scoped, independent subtasks; do not delegate the current step itself.',
+  '[spawn] `run_in_background` (default false): when true, the call returns immediately with an agentId; the subagent keeps running in its pane. Use action list to see its state, action send to give it follow-up work, action interrupt to stop it. When it settles, you receive a notification message with its closing output.',
+  '[spawn] `tab` (optional): name of a task tab to place the subagent into (join if a tab with this name exists, otherwise create it). Overrides the default placement. Default placement groups by git worktree: a subagent working in your checkout shares your tab; one working in a separate worktree (pass its path via `cwd`; create worktrees with `git worktree add`) gets its own tab named after the worktree directory.',
+  '[spawn] `role` + `allowed_tools`: when role matches a profile (searched: workspace .pi-herdr/roles/ → user-global ~/.pi/agent/herdr-pi/roles/ → builtin), the worker toolset becomes the composed manifest — baseline ∪ allowed_tools minus role-deny tools (deny always wins). Custom roles: drop a JSON profile into .pi-herdr/roles/ (master/worker-default reserved). Unknown role names remain display labels only.',
+  '[spawn] `isolate` (default false): creates a FRESH git worktree for this subagent and runs it there (branch pier/<slug> from your HEAD under ~/.herdr/worktrees/<repo>/). Three-way choice: heavy independent writing in parallel with your own edits or other workers, or work needing its own clean reviewable diff → isolate; read-mostly or sequential helper work → omit (shared checkout, writes guarded by the write-lock); targeting an existing directory/worktree → cwd. In isolate mode the subagent\'s writes cannot conflict with your checkout; its panes group into a tab named after the worktree; its prompt is prefixed with commit discipline (commit to its own branch, NEVER push); when it settles you get a diff summary (commits since base, files changed, uncommitted count). Review with git log/diff HEAD..<branch>, merge with git merge --no-ff <branch>; once merged and clean the worktree auto-removes (branch kept). Mutually exclusive with cwd.',
+  '[resume] `taskId`: revive a finished (collected) subagent from the delegation ledger — opens its saved conversation in a new pane (pi --session), then use action send to give it new work. The ledger is an append-only JSONL file, one row per status change (same taskId rows = generations, latest row is current): fields taskId, description, status (running|settled|consumed|closed), outcome (closing text), paneId, sessionFile, launchCommand, createdAt. It is per-checkout at ~/.pi/agent/herdr-pi/history/<flattened-cwd>/history.jsonl. Use action list for live panes from this session; for earlier sessions or closed panes, grep the ledger for the taskId.',
+  '[list] no extra parameters: list background subagents with live state (running / idle), pane ids, last activity, role, and descriptions. Foreground one-shot panes are not listed.',
+  '[send] `agentId` + `message`: follow-up to a background subagent. If working, delivered at next tool-call gap (steer, seconds); if idle, wakes a new turn. After settle, send to wake it; do not spawn a duplicate.',
+  '[interrupt] `agentId`: abort the current turn (fire-and-return). The pane stays; you can send again.',
 ].join(' ');
 
 /** Subagent concurrency limit (max parallel delegations) */
@@ -413,20 +418,248 @@ export default function subagentPlugin(ctx: Context): void {
     return entry;
   }
 
+
+  async function executeSubagentResume(params, toolCtx) {
+      if (!client.available) {
+        return {
+          content: [{ type: 'text', text: 'Error: requires a herdr-managed pane.' }],
+          details: {},
+        };
+      }
+      const cwd = (toolCtx as { cwd?: string }).cwd ?? process.cwd();
+      const taskId = String(params?.taskId ?? '');
+      const latest = latestGeneration(readHistory(histFile(cwd)), taskId);
+      if (!latest) {
+        return {
+          content: [{ type: 'text', text: `Error: no history for task "${taskId}" in this workspace.` }],
+          details: {},
+        };
+      }
+      const release = await subSemaphore.acquire();
+      try {
+        // D94: Reuse an existing pane for the same session to avoid competing pi processes.
+        const existing = await findExistingPane(latest.sessionFile);
+        if (existing) {
+          const entry: SubEntry = {
+            taskId,
+            kind: latest.kind,
+            paneId: existing.paneId,
+            tabId: existing.tabId,
+            tabName: latest.tabName ?? tabNameForTask(latest.description),
+            cwd,
+            description: latest.description,
+            background: true,
+            status: 'running',
+            sessionFile: latest.sessionFile,
+            launchCommand: latest.launchCommand,
+            createdAt: Date.now(),
+            revivedFrom: latest.paneId,
+            consumedAt: null,
+          };
+          subs.set(entry.paneId, entry);
+          persistSubs();
+          writeHistory(entry, undefined, 'resume');
+          return {
+            content: [{
+              type: 'text',
+              text: `resumed subagent ${entry.paneId} from task ${taskId} (reused existing pane with same session; pi still running there).`,
+            }],
+            details: { paneId: entry.paneId, taskId },
+          };
+        }
+        // Create a new pane only when no existing one can be reused.
+        const entry: SubEntry = {
+          taskId,
+          kind: latest.kind,
+          paneId: '',
+          tabId: '',
+          tabName: latest.tabName ?? tabNameForTask(latest.description),
+          cwd,
+          description: latest.description,
+          background: true,
+          status: 'running',
+          sessionFile: latest.sessionFile,
+          launchCommand: latest.launchCommand,
+          createdAt: Date.now(),
+          revivedFrom: latest.paneId,
+          consumedAt: null,
+        };
+        await reviveEntry(entry);
+        subs.set(entry.paneId, entry);
+        persistSubs();
+        return {
+          content: [{
+            type: 'text',
+            text: entry.sessionFile
+              ? `resumed subagent ${entry.paneId} from task ${taskId} (session restored).`
+              : `resumed subagent ${entry.paneId} from task ${taskId} (session file missing; fresh conversation).`,
+          }],
+          details: { paneId: entry.paneId, taskId },
+        };
+      } catch (err) {
+        return {
+          content: [{ type: 'text', text: `Error: failed to resume task "${taskId}": ${(err as Error).message}` }],
+          details: {},
+        };
+      } finally {
+        release();
+      }
+  }
+
+  async function executeSubagentList() {
+      const listed = [...subs.values()].filter((s) => s.background);
+      if (listed.length === 0) {
+        return { content: [{ type: 'text', text: 'No background subagents started (from this session branch).' }], details: {} };
+      }
+      // Deduplicate by taskId so only the newest generation appears after revival; old paneIds do not repeat.
+      const byTask = new Map<string, SubEntry>();
+      for (const sub of listed) {
+        const prev = byTask.get(sub.taskId);
+        if (!prev || sub.createdAt >= prev.createdAt) byTask.set(sub.taskId, sub);
+      }
+      // C1: Probe liveness in real time (pane status and session activity) so the master can distinguish work from a true hang.
+      const probes = new Map<string, AliveProbe>();
+      await Promise.all([...byTask.values()].map(async (sub) => {
+        if (sub.status === 'closed') return;
+        try { probes.set(sub.paneId, await probeAlive(sub.paneId, sub.cwd)); } catch { /* Best effort for display. */ }
+      }));
+      const lines: string[] = [];
+      for (const sub of byTask.values()) {
+        const tabTag = sub.tabName ? ` [tab: ${sub.tabName}]` : '';
+        // D98: Include the worktree branch on isolate entries, including closed ones; settlement stats already report merge state.
+        const wtTag = sub.isolate ? ` [wt: ${sub.isolate.branch}]` : '';
+        if (sub.status === 'closed') {
+          lines.push(`${sub.taskId.slice(0, 8)} [idle] (${sub.kind}, closed; action send revives)${tabTag}${wtTag} ${sub.description}`);
+          continue;
+        }
+        // The registry is authoritative: settled is idle, everything else is running, including blocked human gates (DSH mapping).
+        const state = sub.status === 'settled' ? 'idle' : 'running';
+        // D94: Mark when the user has taken over.
+        const takeoverMark = sub.userTakeover ? ', user-controlled' : '';
+        const probe = probes.get(sub.paneId);
+        const statusTag = probe?.agentStatus ? ` ${probe.agentStatus}` : '';
+        const activityTag = probe?.lastActivityMs != null ? `, active ${agoText(probe.lastActivityMs, Date.now())}` : '';
+        // E: For blocked agents, include the gate-question summary so the master sends the user to that pane instead of taking over.
+        let gateTag = '';
+        if (probe?.agentStatus === 'blocked') {
+          const q = await readAskFlag(sub.paneId);
+          gateTag = q ? ` — AWAITING HUMAN: "${q}"` : ' — AWAITING HUMAN decision';
+        }
+        lines.push(`${sub.paneId} [${state}${takeoverMark}${statusTag}${activityTag}${gateTag}] (${sub.kind})${tabTag}${wtTag} ${sub.description}`);
+      }
+      return { content: [{ type: 'text', text: lines.join('\n') }], details: {} };
+  }
+
+  async function executeSubagentSend(params) {
+      const entry = subs.get(String(params?.agentId ?? ''));
+      if (!entry) {
+        return { content: [{ type: 'text', text: `Error: unknown subagent id "${params?.agentId}" (see action list)` }], details: {} };
+      }
+      const spawnedAt = Date.now();
+      try {
+        // A closed task is revived automatically because the pane is only a temporary host.
+        if (entry.status === 'closed') {
+          await reviveEntry(entry);
+          subs.set(entry.paneId, entry);
+          persistSubs();
+        }
+        // M11 (D46): follow_up uses the extension pipe. B3 adds steering so supplemental instructions reach a long-running worker
+        // within seconds during a tool-call gap; the old followUp queue waited for the entire run and caused 20-minute rework (01a03c0d).
+        const ready = await waitSubReady(entry.cwd, entry.paneId);
+        if (!ready) throw new Error(`subagent pane ${entry.paneId} pipe not ready`);
+        const fuId = `fu-${Date.now()}`;
+        const res = await pipeRequestTo(entry.cwd, entry.paneId, {
+          type: 'follow_up',
+          id: fuId,
+          text: String(params?.message ?? ''),
+          from: pipeNameFor(entry.cwd, env?.paneId ?? ''),
+          push: true,
+          steer: true,
+        });
+        if (res.type !== 'ok') {
+          throw new Error(`pipe follow_up rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
+        }
+        lastMachineInjectAt.set(entry.paneId, Date.now()); // B4: attribute working state during the observation window.
+        // Regression hardening (D98 liveness evidence): an exception between status='running' and startPoller could leave a ghost
+        // running entry without a poller, never settling and skipped by GC; roll back to the previous status on failure.
+        const prevStatus = entry.status;
+        entry.status = 'running';
+        persistSubs();
+        try {
+          lastRequestIdByPane.set(entry.paneId, fuId);
+          startPoller(entry.paneId, entry.cwd, spawnedAt, Date.now(), entry.description, fuId);
+        } catch (inner) {
+          entry.status = prevStatus;
+          persistSubs();
+          throw inner;
+        }
+        return { content: [{ type: 'text', text: `Message sent to subagent ${entry.paneId}.` }], details: { paneId: entry.paneId } };
+      } catch (err) {
+        return { content: [{ type: 'text', text: `Error: failed to reach subagent ${entry.paneId}: ${(err as Error).message}` }], details: {} };
+      }
+  }
+
+  async function executeSubagentInterrupt(params) {
+      const entry = subs.get(String(params?.agentId ?? ''));
+      if (!entry) {
+        return { content: [{ type: 'text', text: `Error: unknown subagent id "${params?.agentId}" (see action list)` }], details: {} };
+      }
+      if (entry.status === 'closed') {
+        // DSH alignment: an idle or finished target is an idempotent no-op.
+        return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (already idle/closed; no-op).` }], details: {} };
+      }
+      try {
+        const res = await pipeRequestTo(entry.cwd, entry.paneId, {
+          type: 'interrupt',
+          id: `int-${Date.now()}`,
+        });
+        if (res.type !== 'ok') {
+          throw new Error(`pipe interrupt rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
+        }
+        // Do not send a settlement notice for an interrupted turn because the requester already knows.
+        const lastId = lastRequestIdByPane.get(entry.paneId);
+        if (lastId) d.claimSettleNotice(`${entry.paneId}:${lastId}`);
+        return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (fire-and-return).` }], details: { paneId: entry.paneId } };
+      } catch (err) {
+        return { content: [{ type: 'text', text: `Error: failed to reach subagent ${entry.paneId}: ${(err as Error).message}` }], details: {} };
+      }
+  }
+
   scoped.registerTool({
     name: 'subagent',
     label: 'Subagent',
     description: SUBAGENT_DESCRIPTION,
     parameters: Type.Object({
-      description: Type.String({ description: 'Short label for this subtask (pane title)' }),
-      prompt: Type.String({ description: 'The complete self-contained task for the subagent' }),
-      run_in_background: Type.Optional(Type.Boolean({ description: 'Return immediately with an agentId; the subagent keeps running in its own pane (default false)' })),
-      cwd: Type.Optional(Type.String({ description: 'Working directory for the subagent (absolute, or relative to this workspace). Use it to delegate into a git worktree: panes group by worktree — same checkout as you share your tab; a separate worktree gets its own tab named after the worktree directory. Create worktrees yourself with git worktree add. Use isolate:true instead when you want a FRESH worktree created for this task rather than targeting an existing one' })),
-      isolate: Type.Optional(Type.Boolean({ description: 'Create a fresh git worktree and run the subagent there. Use when the task writes files heavily and independently — in parallel with your own edits or other workers\' — or needs its own clean, reviewable diff. For read-mostly or sequential helper work omit it (shared checkout, writes guarded by the write-lock); use `cwd` only to target an existing directory/worktree (e.g. a retained pier worktree). Mechanics: branch pier/<slug> from your HEAD under ~/.herdr/worktrees/<repo>/; its writes cannot conflict with your checkout; panes group into a tab named after the worktree; the prompt is prefixed with commit discipline (commit to its branch, never push); on settle you get a diff summary. Review with git log/diff HEAD..<branch>, merge with git merge --no-ff <branch>; once merged and clean the worktree auto-removes (branch kept). Mutually exclusive with cwd' })),
+      action: Type.Optional(Type.Union([
+        Type.Literal('spawn'),
+        Type.Literal('resume'),
+        Type.Literal('list'),
+        Type.Literal('send'),
+        Type.Literal('interrupt'),
+      ], { description: 'Operation to perform (default: spawn)' })),
+      description: Type.Optional(Type.String({ description: '[spawn] Short label for this subtask (pane title)' })),
+      prompt: Type.Optional(Type.String({ description: '[spawn] The complete self-contained task for the subagent' })),
+      run_in_background: Type.Optional(Type.Boolean({ description: '[spawn] Return immediately with an agentId; the subagent keeps running in its own pane (default false)' })),
+      cwd: Type.Optional(Type.String({ description: '[spawn] Working directory for the subagent (absolute, or relative to this workspace). Use it to delegate into a git worktree: panes group by worktree — same checkout as you share your tab; a separate worktree gets its own tab named after the worktree directory. Create worktrees yourself with git worktree add. Use isolate:true instead when you want a FRESH worktree created for this task rather than targeting an existing one' })),
+      isolate: Type.Optional(Type.Boolean({ description: '[spawn] Create a fresh git worktree and run the subagent there. Use when the task writes files heavily and independently — in parallel with your own edits or other workers\' — or needs its own clean, reviewable diff. For read-mostly or sequential helper work omit it (shared checkout, writes guarded by the write-lock); use `cwd` only to target an existing directory/worktree (e.g. a retained pier worktree). Mechanics: branch pier/<slug> from your HEAD under ~/.herdr/worktrees/<repo>/; its writes cannot conflict with your checkout; panes group into a tab named after the worktree; the prompt is prefixed with commit discipline (commit to its branch, never push); on settle you get a diff summary. Review with git log/diff HEAD..<branch>, merge with git merge --no-ff <branch>; once merged and clean the worktree auto-removes (branch kept). Mutually exclusive with cwd' })),
+      role: Type.Optional(Type.String({ description: '[spawn] Role label or profile name. When role matches a profile (searched: workspace .pi-herdr/roles/ → user-global ~/.pi/agent/herdr-pi/roles/ → builtin), the worker toolset becomes the composed manifest. Unknown role names remain display labels only.' })),
+      tab: Type.Optional(Type.String({ description: '[spawn] Name of a task tab to place the subagent into (join if exists, otherwise create). Default placement groups by git worktree.' })),
+      allowed_tools: Type.Optional(Type.Array(Type.String(), { description: '[spawn] Additional tools for role composition (union with role baseline)' })),
+      taskId: Type.Optional(Type.String({ description: '[resume] The task id to revive from the delegation ledger' })),
+      agentId: Type.Optional(Type.String({ description: '[send|interrupt] The subagent id (herdr pane id)' })),
+      message: Type.Optional(Type.String({ description: '[send] The follow-up message' })),
     }),
     async execute(toolCallId, params, signal, onUpdate, toolCtx) {
       void toolCallId;
       void signal;
+      const action = typeof params?.action === 'string' && params.action.trim() ? params.action.trim() : 'spawn';
+      if (action === 'resume') return executeSubagentResume(params, toolCtx);
+      if (action === 'list') return executeSubagentList();
+      if (action === 'send') return executeSubagentSend(params);
+      if (action === 'interrupt') return executeSubagentInterrupt(params);
+      if (action !== 'spawn') {
+        return { content: [{ type: 'text', text: `Error: unknown action "${action}" (valid: spawn, resume, list, send, interrupt)` }], details: {} };
+      }
       const launch = planLaunchValidation(params, client.available);
       if (launch.kind === 'error') {
         return { content: [{ type: 'text', text: launch.text }], details: {} };
@@ -670,255 +903,6 @@ export default function subagentPlugin(ctx: Context): void {
       } finally {
         release();
         if (isolateMeta) pendingIsolateBranches.delete(isolateMeta.branch); // D98: release the creation-window guard on every success/failure path.
-      }
-    },
-  });
-
-  /* ── Tool: resume_subagent (historical revival, v1.2) ── */
-
-  scoped.registerTool({
-    name: 'resume_subagent',
-    label: 'Resume Subagent',
-    description:
-      'Revive a finished (collected) subagent from the delegation ledger: opens its saved conversation in a new pane (pi --session), then use send_message to give it new work. The ledger is an append-only JSONL file, one row per status change (same taskId rows = generations, latest row is current): fields taskId, description, status (running|settled|consumed|closed), outcome (closing text), paneId, sessionFile, launchCommand, createdAt. It is per-checkout at ~/.pi/agent/herdr-pi/history/<flattened-cwd>/history.jsonl (e.g. checkout F:\\repo -> --F--repo--), so each git worktree has its own volume. Use list_agents for live panes from this session; for tasks from earlier sessions or closed panes, read/grep the ledger file for the taskId, then pass it here.',
-    parameters: Type.Object({
-      taskId: Type.String({ description: 'The task id to revive' }),
-    }),
-    async execute(_tc, params, _sig, _upd, toolCtx) {
-      if (!client.available) {
-        return {
-          content: [{ type: 'text', text: 'Error: requires a herdr-managed pane.' }],
-          details: {},
-        };
-      }
-      const cwd = (toolCtx as { cwd?: string }).cwd ?? process.cwd();
-      const taskId = String(params?.taskId ?? '');
-      const latest = latestGeneration(readHistory(histFile(cwd)), taskId);
-      if (!latest) {
-        return {
-          content: [{ type: 'text', text: `Error: no history for task "${taskId}" in this workspace.` }],
-          details: {},
-        };
-      }
-      const release = await subSemaphore.acquire();
-      try {
-        // D94: Reuse an existing pane for the same session to avoid competing pi processes.
-        const existing = await findExistingPane(latest.sessionFile);
-        if (existing) {
-          const entry: SubEntry = {
-            taskId,
-            kind: latest.kind,
-            paneId: existing.paneId,
-            tabId: existing.tabId,
-            tabName: latest.tabName ?? tabNameForTask(latest.description),
-            cwd,
-            description: latest.description,
-            background: true,
-            status: 'running',
-            sessionFile: latest.sessionFile,
-            launchCommand: latest.launchCommand,
-            createdAt: Date.now(),
-            revivedFrom: latest.paneId,
-            consumedAt: null,
-          };
-          subs.set(entry.paneId, entry);
-          persistSubs();
-          writeHistory(entry, undefined, 'resume');
-          return {
-            content: [{
-              type: 'text',
-              text: `resumed subagent ${entry.paneId} from task ${taskId} (reused existing pane with same session; pi still running there).`,
-            }],
-            details: { paneId: entry.paneId, taskId },
-          };
-        }
-        // Create a new pane only when no existing one can be reused.
-        const entry: SubEntry = {
-          taskId,
-          kind: latest.kind,
-          paneId: '',
-          tabId: '',
-          tabName: latest.tabName ?? tabNameForTask(latest.description),
-          cwd,
-          description: latest.description,
-          background: true,
-          status: 'running',
-          sessionFile: latest.sessionFile,
-          launchCommand: latest.launchCommand,
-          createdAt: Date.now(),
-          revivedFrom: latest.paneId,
-          consumedAt: null,
-        };
-        await reviveEntry(entry);
-        subs.set(entry.paneId, entry);
-        persistSubs();
-        return {
-          content: [{
-            type: 'text',
-            text: entry.sessionFile
-              ? `resumed subagent ${entry.paneId} from task ${taskId} (session restored).`
-              : `resumed subagent ${entry.paneId} from task ${taskId} (session file missing; fresh conversation).`,
-          }],
-          details: { paneId: entry.paneId, taskId },
-        };
-      } catch (err) {
-        return {
-          content: [{ type: 'text', text: `Error: failed to resume task "${taskId}": ${(err as Error).message}` }],
-          details: {},
-        };
-      } finally {
-        release();
-      }
-    },
-  });
-
-  /* ── Tool: list_agents (background/long-lived subagents only; foreground short panes are transient UI) ── */
-
-  scoped.registerTool({
-    name: 'list_agents',
-    label: 'List Subagents',
-    description:
-      'List the background subagents you started, with their live state: running (working or blocked), idle (settled), plus pane ids, live agent status, last session activity time, role (task or a role label), and descriptions. Foreground one-shot panes are transient and not listed. Covers only this session branch — for tasks from earlier sessions or collected panes, read the delegation ledger (path and format in resume_subagent) and resume by taskId.',
-    parameters: Type.Object({}),
-    async execute() {
-      const listed = [...subs.values()].filter((s) => s.background);
-      if (listed.length === 0) {
-        return { content: [{ type: 'text', text: 'No background subagents started (from this session branch).' }], details: {} };
-      }
-      // Deduplicate by taskId so only the newest generation appears after revival; old paneIds do not repeat.
-      const byTask = new Map<string, SubEntry>();
-      for (const sub of listed) {
-        const prev = byTask.get(sub.taskId);
-        if (!prev || sub.createdAt >= prev.createdAt) byTask.set(sub.taskId, sub);
-      }
-      // C1: Probe liveness in real time (pane status and session activity) so the master can distinguish work from a true hang.
-      const probes = new Map<string, AliveProbe>();
-      await Promise.all([...byTask.values()].map(async (sub) => {
-        if (sub.status === 'closed') return;
-        try { probes.set(sub.paneId, await probeAlive(sub.paneId, sub.cwd)); } catch { /* Best effort for display. */ }
-      }));
-      const lines: string[] = [];
-      for (const sub of byTask.values()) {
-        const tabTag = sub.tabName ? ` [tab: ${sub.tabName}]` : '';
-        // D98: Include the worktree branch on isolate entries, including closed ones; settlement stats already report merge state.
-        const wtTag = sub.isolate ? ` [wt: ${sub.isolate.branch}]` : '';
-        if (sub.status === 'closed') {
-          lines.push(`${sub.taskId.slice(0, 8)} [idle] (${sub.kind}, closed; send_message revives)${tabTag}${wtTag} ${sub.description}`);
-          continue;
-        }
-        // The registry is authoritative: settled is idle, everything else is running, including blocked human gates (DSH mapping).
-        const state = sub.status === 'settled' ? 'idle' : 'running';
-        // D94: Mark when the user has taken over.
-        const takeoverMark = sub.userTakeover ? ', user-controlled' : '';
-        const probe = probes.get(sub.paneId);
-        const statusTag = probe?.agentStatus ? ` ${probe.agentStatus}` : '';
-        const activityTag = probe?.lastActivityMs != null ? `, active ${agoText(probe.lastActivityMs, Date.now())}` : '';
-        // E: For blocked agents, include the gate-question summary so the master sends the user to that pane instead of taking over.
-        let gateTag = '';
-        if (probe?.agentStatus === 'blocked') {
-          const q = await readAskFlag(sub.paneId);
-          gateTag = q ? ` — AWAITING HUMAN: "${q}"` : ' — AWAITING HUMAN decision';
-        }
-        lines.push(`${sub.paneId} [${state}${takeoverMark}${statusTag}${activityTag}${gateTag}] (${sub.kind})${tabTag}${wtTag} ${sub.description}`);
-      }
-      return { content: [{ type: 'text', text: lines.join('\n') }], details: {} };
-    },
-  });
-
-  /* ── Tool: send_message (delivery during steer gaps) ── */
-
-  scoped.registerTool({
-    name: 'send_message',
-    label: 'Send to Subagent',
-    description:
-      'Send a follow-up message to a background subagent. If it is working, the message is delivered at its next tool-call gap (steer, seconds); if it is idle, it wakes the subagent for a new turn. `agentId` is the id returned by the subagent tool or shown by list_agents.',
-    parameters: Type.Object({
-      agentId: Type.String({ description: 'The subagent id (herdr pane id)' }),
-      message: Type.String({ description: 'The follow-up message' }),
-    }),
-    async execute(_tc, params) {
-      const entry = subs.get(String(params?.agentId ?? ''));
-      if (!entry) {
-        return { content: [{ type: 'text', text: `Error: unknown subagent id "${params?.agentId}" (see list_agents)` }], details: {} };
-      }
-      const spawnedAt = Date.now();
-      try {
-        // A closed task is revived automatically because the pane is only a temporary host.
-        if (entry.status === 'closed') {
-          await reviveEntry(entry);
-          subs.set(entry.paneId, entry);
-          persistSubs();
-        }
-        // M11 (D46): follow_up uses the extension pipe. B3 adds steering so supplemental instructions reach a long-running worker
-        // within seconds during a tool-call gap; the old followUp queue waited for the entire run and caused 20-minute rework (01a03c0d).
-        const ready = await waitSubReady(entry.cwd, entry.paneId);
-        if (!ready) throw new Error(`subagent pane ${entry.paneId} pipe not ready`);
-        const fuId = `fu-${Date.now()}`;
-        const res = await pipeRequestTo(entry.cwd, entry.paneId, {
-          type: 'follow_up',
-          id: fuId,
-          text: String(params?.message ?? ''),
-          from: pipeNameFor(entry.cwd, env?.paneId ?? ''),
-          push: true,
-          steer: true,
-        });
-        if (res.type !== 'ok') {
-          throw new Error(`pipe follow_up rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
-        }
-        lastMachineInjectAt.set(entry.paneId, Date.now()); // B4: attribute working state during the observation window.
-        // Regression hardening (D98 liveness evidence): an exception between status='running' and startPoller could leave a ghost
-        // running entry without a poller, never settling and skipped by GC; roll back to the previous status on failure.
-        const prevStatus = entry.status;
-        entry.status = 'running';
-        persistSubs();
-        try {
-          lastRequestIdByPane.set(entry.paneId, fuId);
-          startPoller(entry.paneId, entry.cwd, spawnedAt, Date.now(), entry.description, fuId);
-        } catch (inner) {
-          entry.status = prevStatus;
-          persistSubs();
-          throw inner;
-        }
-        return { content: [{ type: 'text', text: `Message sent to subagent ${entry.paneId}.` }], details: { paneId: entry.paneId } };
-      } catch (err) {
-        return { content: [{ type: 'text', text: `Error: failed to reach subagent ${entry.paneId}: ${(err as Error).message}` }], details: {} };
-      }
-    },
-  });
-
-  /* ── Tool: interrupt_agent (D48: pipe → child extension ctx.abort(), in-process cancellation) ── */
-
-  scoped.registerTool({
-    name: 'interrupt_agent',
-    label: 'Interrupt Subagent',
-    description:
-      'Interrupt a background subagent (stops its current turn; fire-and-return). The subagent stays alive and can receive further send_message work.',
-    parameters: Type.Object({
-      agentId: Type.String({ description: 'The subagent id (herdr pane id)' }),
-    }),
-    async execute(_tc, params) {
-      const entry = subs.get(String(params?.agentId ?? ''));
-      if (!entry) {
-        return { content: [{ type: 'text', text: `Error: unknown subagent id "${params?.agentId}" (see list_agents)` }], details: {} };
-      }
-      if (entry.status === 'closed') {
-        // DSH alignment: an idle or finished target is an idempotent no-op.
-        return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (already idle/closed; no-op).` }], details: {} };
-      }
-      try {
-        const res = await pipeRequestTo(entry.cwd, entry.paneId, {
-          type: 'interrupt',
-          id: `int-${Date.now()}`,
-        });
-        if (res.type !== 'ok') {
-          throw new Error(`pipe interrupt rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
-        }
-        // Do not send a settlement notice for an interrupted turn because the requester already knows.
-        const lastId = lastRequestIdByPane.get(entry.paneId);
-        if (lastId) d.claimSettleNotice(`${entry.paneId}:${lastId}`);
-        return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (fire-and-return).` }], details: { paneId: entry.paneId } };
-      } catch (err) {
-        return { content: [{ type: 'text', text: `Error: failed to reach subagent ${entry.paneId}: ${(err as Error).message}` }], details: {} };
       }
     },
   });

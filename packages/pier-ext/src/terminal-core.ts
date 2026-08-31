@@ -96,7 +96,7 @@ export function registerTerminal(
   if (openCount >= MAX_TERMINALS) {
     return {
       ok: false,
-      error: `terminal limit reached (max ${MAX_TERMINALS} open terminals); close one with terminal_close before opening another`,
+      error: `terminal limit reached (max ${MAX_TERMINALS} open terminals); close one with terminal(action: "close") before opening another`,
     };
   }
   const entry: TerminalEntry = {
@@ -143,7 +143,7 @@ export function validateSendText(text: string): { ok: true; text: string } | { o
   if (text.includes('\x1b')) {
     return {
       ok: false,
-      error: 'unsupported input: ANSI escape sequences cannot be sent as text; use terminal_signal for control keys, or plain commands only',
+      error: 'unsupported input: ANSI escape sequences cannot be sent as text; use terminal(action: "signal") for control keys, or plain commands only',
     };
   }
   // Why: Preserve the established compatibility and safety behavior (C0).
@@ -152,7 +152,7 @@ export function validateSendText(text: string): { ok: true; text: string } | { o
   if (bad) {
     return {
       ok: false,
-      error: `unsupported input: control character 0x${bad[0].charCodeAt(0).toString(16)}; terminal_send accepts plain text commands only (use terminal_signal for ctrl+c etc.)`,
+      error: `unsupported input: control character 0x${bad[0].charCodeAt(0).toString(16)}; terminal send accepts plain text commands only (use terminal(action: "signal") for ctrl+c etc.)`,
     };
   }
   return { ok: true, text: stripped };

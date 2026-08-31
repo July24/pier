@@ -70,14 +70,14 @@ const STANCE: RuntimeRoleManifest = {
   role: 'worker-default',
   version: '1.3.0',
   tools: ['bash', 'read', 'todo_write'],
-  permissions: { subagent: 'deny', terminal_open: 'deny', '*': 'allow' },
+  permissions: { subagent: 'deny', terminal: 'deny', '*': 'allow' },
   unknownTools: 'allow',
 };
 
 test('gate D82：未知工具 + allow → 放行（用户装的扩展，* 兜底）；排除族 deny 仍拒', () => {
   assert.equal(planToolGate('muse_deep_think', STANCE).kind, 'allow'); // 未知工具流入
   assert.equal(planToolGate('subagent', STANCE).kind, 'deny'); // 排除族持禁令（D83）
-  assert.equal(planToolGate('terminal_open', STANCE).kind, 'deny');
+  assert.equal(planToolGate('terminal', STANCE).kind, 'deny');
   assert.equal(planToolGate('bash', STANCE).kind, 'allow'); // 已知工具不受影响
 });
 
@@ -95,7 +95,7 @@ test('gate D82：未知工具 + allow + *:ask → ask 标记（规则仍适用�
 });
 
 test('可见层 D82：allow → 只隐藏显式 deny，未知工具保持可见（不交集裁剪）', () => {
-  const active = ['read', 'bash', 'subagent', 'terminal_open', 'muse_deep_think', 'todo_write'];
+  const active = ['read', 'bash', 'subagent', 'terminal', 'muse_deep_think', 'todo_write'];
   const plan = planActiveTools(STANCE.tools, active, {
     unknownTools: STANCE.unknownTools,
     permissions: STANCE.permissions,
@@ -156,9 +156,9 @@ test('parseRuntimeManifest: valid env JSON; unknownTools garbage → deny', () =
 });
 
 test('planActiveTools: allow stance with every remaining tool denied → null (fail-open)', () => {
-  assert.equal(planActiveTools(['bash'], ['subagent', 'terminal_open'], {
+  assert.equal(planActiveTools(['bash'], ['subagent', 'terminal'], {
     unknownTools: 'allow',
-    permissions: { subagent: 'deny', terminal_open: 'deny' },
+    permissions: { subagent: 'deny', terminal: 'deny' },
   }), null);
 });
 

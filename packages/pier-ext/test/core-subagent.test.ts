@@ -1,6 +1,6 @@
 /**
- * 档1 core/subagent 插件接线：五工具注册 + slots 回填（common pipe 消费者）+
- * list_agents 空态 + 墓碑。重依赖全假件（client/env/sessionRoot）。
+ * 档1 core/subagent 插件接线：单工具注册 + slots 回填（common pipe 消费者）+
+ * list 空态 + 墓碑。重依赖全假件（client/env/sessionRoot）。
  */
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
@@ -63,7 +63,7 @@ function fakeClient(): HerdrClientLike {
   } as unknown as HerdrClientLike;
 }
 
-const TOOLS = ['subagent', 'resume_subagent', 'list_agents', 'send_message', 'interrupt_agent'];
+const TOOLS = ['subagent'];
 
 async function mount(pi: ReturnType<typeof fakePi>, ledger?: DisposeLedger) {
   const surface = new PiSurface(pi as unknown as object, ledger);
@@ -89,10 +89,12 @@ async function mount(pi: ReturnType<typeof fakePi>, ledger?: DisposeLedger) {
   return { root, port, deps };
 }
 
-test('core/subagent：五工具注册 + 生命周期钩子 + 槽回填', async () => {
+test('core/subagent：单工具注册 + 生命周期钩子 + 槽回填', async () => {
   const pi = fakePi();
   const { root, port } = await mount(pi);
   for (const n of TOOLS) assert.ok(pi.tools.has(n), `${n} 应注册`);
+  assert.ok(!pi.tools.has('list_agents'));
+  assert.ok(!pi.tools.has('resume_subagent'));
   assert.ok((pi.listeners.get('session_start') ?? []).length >= 1);
   assert.ok((pi.listeners.get('turn_start') ?? []).length >= 1, 'GC turn_start 钩子在');
   assert.ok(port.current, 'port bound at mount');
@@ -102,10 +104,10 @@ test('core/subagent：五工具注册 + 生命周期钩子 + 槽回填', async (
   assert.equal(typeof port.current.settleStatLine, 'function', 'D98 port bind');
   port.current.applyReplySession('unknown', null);
   assert.deepEqual(port.current.reconcileOnReply('unknown'), []);
-  assert.deepEqual(port.current.listRunningSubs(), []);
-
-  const r = await pi.tools.get('list_agents')?.execute?.() as { content: Array<{ text: string }> };
+  const r = await pi.tools.get('subagent')?.execute?.(null, { action: 'list' }) as { content: Array<{ text: string }> };
   assert.match(r.content[0].text, /No background subagents/);
+  const bad = await pi.tools.get('subagent')?.execute?.(null, { action: 'explode' }) as { content: Array<{ text: string }> };
+  assert.match(bad.content[0].text, /unknown action "explode"/);
   await root.fiber.dispose();
   assert.equal(port.current, null, 'port unbound on dispose');
 });
@@ -116,7 +118,7 @@ test('core/subagent：墓碑（ledger.disposeKey 本文件）→ 工具 inert + 
   const { root, port } = await mount(pi, ledger);
   const n = ledger.disposeKey(new URL('../src/core/subagent.ts', import.meta.url).href);
   assert.equal(n, 1);
-  const r = await pi.tools.get('list_agents')?.execute?.() as { content: Array<{ text: string }> };
+  const r = await pi.tools.get('subagent')?.execute?.(null, { action: 'list' }) as { content: Array<{ text: string }> };
   assert.match(r.content[0].text, /disposed/);
   assert.equal(typeof port.current?.reconcileOnReply, 'function');
   await root.fiber.dispose();

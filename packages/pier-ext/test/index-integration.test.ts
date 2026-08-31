@@ -90,8 +90,7 @@ test('index worker mode: todo + ask_user_question; no subagent tools; herdr no-o
   assert.ok(pi.commands.has('todos'));
   assert.ok(pi.commands.has('locks'));
   assert.ok(!pi.tools.has('subagent'), 'worker must not register subagent tools');
-  assert.ok(!pi.tools.has('list_agents'));
-  assert.ok(!pi.tools.has('terminal_open'));
+  assert.ok(!pi.tools.has('terminal'), 'worker must not register terminal tools');
 
   await fire(pi, 'session_start', { reason: 'new' }, { sessionManager: { getBranch: () => [] } });
   await fire(pi, 'turn_start');
@@ -114,8 +113,9 @@ test('index master mode: loader mounts subagent + terminal + todo', withCleanup(
 
   assert.ok(pi.tools.has('todo_write'), 'master mounts todo_write');
   assert.ok(pi.tools.has('subagent'), 'master mounts subagent via loader');
-  assert.ok(pi.tools.has('list_agents'));
-  assert.ok(pi.tools.has('terminal_open'), 'master mounts terminal via loader');
+  assert.ok(pi.tools.has('terminal'), 'master mounts terminal via loader');
+  assert.ok(!pi.tools.has('list_agents'));
+  assert.ok(!pi.tools.has('terminal_open'));
   assert.ok(pi.commands.has('todos'));
   assert.ok(pi.commands.has('locks'));
 

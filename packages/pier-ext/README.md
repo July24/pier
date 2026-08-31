@@ -43,10 +43,9 @@ The installer also verifies node / pi / herdr versions, probes local paths, and 
 | Tool | Purpose |
 |---|---|
 | `todo_write` | Full-replacement todo list. Session JSONL is the single source of truth; correct rollback on branch switches. Projected live onto the pane title (`▶i ○p ■b ✓c (N/M) · current task`). `/todos` command to view/edit/unblock |
-| `subagent` | Delegate self-contained subtasks to an isolated pi session in its own herdr pane (separate context window). Foreground / parallel / background modes |
-| `list_agents` | Live state of background subagents (running / idle + panes) |
-| `send_message` | Follow-up work for a subagent (queued if busy, wakes if idle) |
-| `interrupt_agent` | Stop a subagent's current turn; it stays alive for more messages |
+| `subagent` | Delegate self-contained subtasks to an isolated pi session in its own herdr pane. Actions: `spawn` (default; foreground / parallel / background), `list`, `send`, `interrupt`, `resume` |
+| `terminal` | Persistent interactive shells in dedicated herdr panes. Actions: `open`, `send`, `read`, `signal`, `close`, `list` |
+| `ask_user_question` | Human gate: pane shows blocked in herdr while waiting |
 
 ### Behaviors
 

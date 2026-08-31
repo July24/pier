@@ -245,7 +245,7 @@ export function createPoller(h: PollerHost): Poller {
           h.writeHistory(entry, { outcome: 'observation timeout' }, 'poll-timeout');
           const notes = h.reconcileOnSettlement(description, 'failed');
           const notice = h.withReconcileNotes(
-            `Background subagent ${paneId} (${description}) has shown no progress for ${Math.round((Date.now() - lastActivityAt) / 1000)}s (observed since ${new Date(startedAt).toISOString()}). Run list_agents to check its live state; if it is working, let it run — its settlement notice will arrive automatically. Do not sleep-wait.`,
+            `Background subagent ${paneId} (${description}) has shown no progress for ${Math.round((Date.now() - lastActivityAt) / 1000)}s (observed since ${new Date(startedAt).toISOString()}). Run subagent(action: "list") to check its live state; if it is working, let it run — its settlement notice will arrive automatically. Do not sleep-wait.`,
             notes,
           );
           try {

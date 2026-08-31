@@ -122,13 +122,13 @@ export function buildAliveNotice(
       `Subagent "${description}" is still running in pane ${paneId} (agent_status=${status}${activity}).`,
       'The foreground wait has moved it to background so this call returns now.',
       'Do NOT redo its work. When it settles you will receive a notification with its closing output.',
-      'Use list_agents to check its live state; send_message to give it follow-up work.',
+      'Use subagent(action: "list") to check its live state; subagent(action: "send") to give it follow-up work.',
     ].join(' ');
   }
   return [
     `The subagent "${description}" is ALIVE in pane ${paneId} (agent_status=${status}${activity}) — this "no readable output" result only means its final answer could not be read yet, NOT that the task failed.`,
     'Do NOT redo its work. It is being moved to background; you will be notified when it settles.',
-    'Use list_agents to check its live state.',
+    'Use subagent(action: "list") to check its live state.',
   ].join(' ');
 }
 
@@ -141,7 +141,7 @@ export function buildBlockedGateNotice(opts: { paneId: string; description: stri
     'It keeps running in background; once the human answers it resumes, and you will be notified when it settles.',
     'Do NOT take over its work and do NOT answer on the human\'s behalf.',
     'Tell the user to open that pane in herdr and answer directly.',
-    'Only if the user explicitly authorizes you: relay their decision to the subagent via send_message — do not redo the work yourself.',
+    'Only if the user explicitly authorizes you: relay their decision to the subagent via subagent(action: "send") — do not redo the work yourself.',
   ].join(' ');
 }
 

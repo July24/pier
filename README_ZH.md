@@ -18,7 +18,7 @@ pier 由**两个半区**组成，各装一处：
 
 | 半区 | 包 | 作用 |
 |---|---|---|
-| **pi 扩展** | `packages/pier-ext`（npm: [`pi-pier`](https://www.npmjs.com/package/pi-pier)，[pi.dev 市场](https://pi.dev/packages/pi-pier)） | 在 pi 会话里注入 `todo_write` / `subagent` / `list_agents` / `send_message` / `interrupt_agent` 工具 + 经 herdr socket API 上报 pane 状态 |
+| **pi 扩展** | `packages/pier-ext`（npm: [`pi-pier`](https://www.npmjs.com/package/pi-pier)，[pi.dev 市场](https://pi.dev/packages/pi-pier)） | 在 pi 会话里注入 `todo_write` / `subagent` / `terminal` / `ask_user_question` 工具 + 经 herdr socket API 上报 pane 状态 |
 | **herdr 插件** | `packages/pier-workbench`（`pier.workbench`） | 主 tab 引导、blocked 人类闸门通知、焦点热力布局（聚焦 pane 原地放大） |
 
 ### 核心能力
@@ -106,7 +106,7 @@ master 主 tab 引导需要本机 node / pi 路径：`node install.mjs` 自动�
 ### 使用
 
 1. 在 herdr workspace 里开 pane 跑 pi（pane 内 `pi`），扩展检测 `HERDR_ENV` 自动开始上报
-2. 模型可调用 `todo_write`（窗格头实时投影）、`subagent`（前台/并行/后台）、`list_agents` / `send_message` / `interrupt_agent`
+2. 模型可调用 `todo_write`（窗格头实时投影）、`subagent`（spawn / list / send / interrupt / resume）、`terminal`（open / send / read / signal / close / list）
 3. 每个子代理 = 独立 pane（可观察、可进入交互、blocked 时触发通知）
 4. 重启恢复：herdr session 恢复自动重建 pane（子代理 rpc 会话文件已上报）；父 pi 会话用 `/resume` 恢复
 
