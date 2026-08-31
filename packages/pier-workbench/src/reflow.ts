@@ -1,11 +1,9 @@
 /**
- * 档1 收尾：M23 热力 reflow 域逻辑插件化（自 scripts/heat-reflow.mjs 迁入）。
+ * M23 热力 reflow 域逻辑（自 scripts/heat-reflow.mjs 迁入）。
  *
- * 形态：cordis 插件（默认导出）+ 依赖全经服务注入（`workbench.deps`）——
- * env/socket/状态文件属宿主（进程边界），规划器在 heat-layout.ts（纯逻辑）。
- * runReflow 独立导出：无 cordis 也能直接单测（插件面只做接线）。
+ * 依赖全经 `ReflowDeps` 注入。规划器在 heat-layout.ts。
+ * 钩子进程不经过 cordis：user-mode GitHub checkout 没有 node_modules。
  */
-import { Context } from '@deepseek-ai/cordis';
 import {
   REFLOW_DEBOUNCE_MS,
   countPanes,
@@ -249,7 +247,6 @@ export async function runReflow(deps: ReflowDeps): Promise<void> {
   }
 }
 
-export default function reflowPlugin(ctx: Context): Promise<void> {
-  const deps = ctx.get('workbench.deps') as ReflowDeps;
-  return runReflow(deps);
+export default function reflowPlugin(ctx: { get: (k: string) => unknown }): Promise<void> {
+  return runReflow(ctx.get('workbench.deps') as ReflowDeps);
 }

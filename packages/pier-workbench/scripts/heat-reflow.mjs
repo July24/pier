@@ -1,15 +1,13 @@
 #!/usr/bin/env node
 /**
- * M23 档 1：pane.focused / pane.created → 焦点热力 reflow。
- * 档1 收尾：宿主瘦身——env/socket/状态文件（进程边界）留宿主，
- * 域逻辑在 ../src/reflow.ts（cordis 插件，经第二棵树挂载）。
+ * M23：pane.focused / created / closed / agent_status_changed → 焦点热力 reflow。
+ * 不经 cordis：user-mode plugin checkout 没有 @deepseek-ai/cordis。
  */
 import * as net from 'node:net';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { createWorkbenchApp } from '../src/app.ts';
-import reflowPlugin, { parseEventEnv } from '../src/reflow.ts';
+import { parseEventEnv, runReflow } from '../src/reflow.ts';
 
 const SOCKET = process.env.HERDR_SOCKET_PATH;
 const TARGET = process.platform === 'win32' && SOCKET
@@ -76,41 +74,32 @@ function parseEvent() {
 
 async function main() {
   const ev = parseEvent();
-  const app = await createWorkbenchApp();
-  try {
-    app.root.provide('workbench.deps', {
-      ev,
-      request,
-      loadState,
-      saveState,
-      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
-      // 档2 语义桥：事件时拉一次 agent 状态快照（D3 合规——事件驱动非轮询）
-      listAgentStatuses: async () => {
-        try {
-          const result = await request('pane.list', {});
-          const panes = result?.panes ?? [];
-          const map = {};
-          for (const p of panes) if (p?.pane_id && p?.agent_status) map[p.pane_id] = p.agent_status;
-          return map;
-        } catch {
-          return {};
-        }
-      },
-      // 收紧闸（场景 B 隔离）：含 pi pane 的 tab 集合——非 pi tab（claude code /
-      // codex / 纯 shell 的 tab）不 reflow，pier 只管 pi 工作台自己的 tab。
-      piTabIds: async () => {
-        const tabs = new Set();
-        try {
-          const result = await request('pane.list', {});
-          for (const p of result?.panes ?? []) if (p?.agent === 'pi' && p?.tab_id) tabs.add(p.tab_id);
-        } catch { /* 快照失败 = 空集合 → 保守不动 */ }
-        return tabs;
-      },
-    });
-    await app.root.plugin(reflowPlugin);
-  } finally {
-    await app.root.fiber.dispose();
-  }
+  await runReflow({
+    ev,
+    request,
+    loadState,
+    saveState,
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    listAgentStatuses: async () => {
+      try {
+        const result = await request('pane.list', {});
+        const panes = result?.panes ?? [];
+        const map = {};
+        for (const p of panes) if (p?.pane_id && p?.agent_status) map[p.pane_id] = p.agent_status;
+        return map;
+      } catch {
+        return {};
+      }
+    },
+    piTabIds: async () => {
+      const tabs = new Set();
+      try {
+        const result = await request('pane.list', {});
+        for (const p of result?.panes ?? []) if (p?.agent === 'pi' && p?.tab_id) tabs.add(p.tab_id);
+      } catch { /* 快照失败 = 空集合 → 保守不动 */ }
+      return tabs;
+    },
+  });
 }
 
 main().catch(() => process.exit(1));

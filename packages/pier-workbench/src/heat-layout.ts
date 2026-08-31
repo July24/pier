@@ -45,6 +45,31 @@ export function countPanes(node: LayoutNode): number {
   return node.type === 'pane' ? 1 : countPanes(node.first) + countPanes(node.second);
 }
 
+function normalizeNode(raw: unknown): LayoutNode | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const o = raw as Record<string, unknown>;
+  if (o.type === 'pane') {
+    const nested = o.pane as Record<string, unknown> | undefined;
+    const id = typeof o.pane_id === 'string' ? o.pane_id
+      : typeof nested?.pane_id === 'string' ? nested.pane_id : null;
+    return id ? { type: 'pane', pane_id: id } : null;
+  }
+  if (o.type === 'split') {
+    const first = normalizeNode(o.first);
+    const second = normalizeNode(o.second);
+    if (!first || !second) return null;
+    const direction = o.direction === 'down' || o.direction === 'vertical' ? 'down' : 'right';
+    return {
+      type: 'split',
+      direction,
+      ratio: typeof o.ratio === 'number' ? o.ratio : 0.5,
+      first,
+      second,
+    };
+  }
+  return null;
+}
+
 export function unwrapLayout(exported: unknown): {
   root: LayoutNode | null;
   tabId: string | null;
@@ -52,7 +77,7 @@ export function unwrapLayout(exported: unknown): {
 } {
   const obj = (exported ?? {}) as Record<string, unknown>;
   const layout = (obj.layout ?? obj) as Record<string, unknown>;
-  const root = (layout.root ?? obj.root ?? null) as LayoutNode | null;
+  const root = normalizeNode(layout.root ?? obj.root ?? null);
   const tabId = (typeof layout.tab_id === 'string' ? layout.tab_id : null)
     ?? (typeof obj.tab_id === 'string' ? obj.tab_id : null);
   return { root, tabId, zoomed: Boolean(layout.zoomed ?? obj.zoomed) };
