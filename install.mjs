@@ -86,8 +86,17 @@ function which(bin) {
   }
 }
 
-function run(cmd, args) {
-  return execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+function run(cmd, args, opts = {}) {
+  // win32: npm 全局 bin 是 .cmd shim，无 shell 直接 spawn 会 ENOENT/EINVAL，须走 cmd.exe；
+  // 且 shell:true 时 Node 把 args 按空格裸拼接（不加引号），含空格的路径参数会被拆碎，故预拼接并加引号。
+  // POSIX 走原生分支，保持 execFileSync(cmd, args) 原语义。
+  if (IS_WIN) {
+    const cmdline = [cmd, ...args]
+      .map((a) => (/[\s"]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a))
+      .join(' ');
+    return execFileSync(cmdline, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], shell: true, ...opts }).trim();
+  }
+  return execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts }).trim();
 }
 
 function tryRun(cmd, args) {
@@ -126,9 +135,7 @@ function readPkgVersion(dir) {
 
 function npmLatest(name) {
   try {
-    return execFileSync('npm', ['view', name, 'version'], {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15000,
-    }).trim();
+    return run('npm', ['view', name, 'version'], { timeout: 15000 });
   } catch {
     return null;
   }
