@@ -111,9 +111,14 @@ export default async function (pi: ExtensionAPI) {
 
   /** Tier 2: worker role badge parsed from the env manifest and kept visible while idle. */
   let roleBadge: string | null = null;
+  /** Human-gate depth; ask_user_question and external herdr:blocked events share it. */
+  let blockedDepth = 0;
 
   function reportAgent(state: 'working' | 'idle' | 'blocked', activity: string | null): void {
     if (!client.available) return;
+    // While a human gate is open, never let tool-badge / turn_start / settle overwrite blocked.
+    // Needed when herdr:pi is absent (pi-herdr is the authority); no-op under full-lifecycle herdr:pi.
+    if (blockedDepth > 0 && state !== 'blocked') return;
     const message = activity ?? (state === 'idle' ? roleBadge : null);
     client.reportAgent(state, message).catch(() => {});
   }
@@ -374,10 +379,11 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  // v1.3 M8: report blocked state ourselves (D29's exemption relies on blocked visibility).
-  // Observed: pi 0.84.2 core emits no "herdr:blocked" (the official integration listener is dead code),
-  // so this extension manages enterBlocked/exitBlocked while ask_user_question waits for human input.
-  let blockedDepth = 0;
+  // Official herdr:pi is full-lifecycle authority when installed: it reports blocked
+  // only on the herdr:blocked event (pi core never emits it). Custom source=pi-herdr
+  // pane.report_agent is ignored while that authority is live
+  // (screen_detection_skip_reason=full_lifecycle_hook_authority). Emit the event so
+  // herdr:pi publishes blocked; keep report_agent as fallback when it is absent.
   function enterBlocked(label: string | null): void {
     blockedDepth += 1;
     reportAgent('blocked', label);
@@ -392,14 +398,34 @@ export default async function (pi: ExtensionAPI) {
       void client.reportAskFlag(null).catch(() => {});
     }
   }
-  (pi as { events?: { on?: (ev: string, cb: (data: unknown) => void) => void } }).events?.on?.(
-    'herdr:blocked',
-    (data) => {
-      const d = data as { active?: boolean; label?: string } | undefined;
-      if (d?.active) enterBlocked(typeof d.label === 'string' ? d.label : null);
+
+  // emit() is synchronous; this flag stops our own listener from double-counting depth.
+  let publishingHerdrBlocked = false;
+  function publishHerdrBlocked(active: boolean, label: string | null): void {
+    publishingHerdrBlocked = true;
+    try {
+      if (active) enterBlocked(label);
       else exitBlocked();
-    },
-  );
+      pi.events.emit(
+        'herdr:blocked',
+        active ? { active: true, ...(label ? { label } : {}) } : { active: false },
+      );
+    } finally {
+      publishingHerdrBlocked = false;
+    }
+  }
+  pi.events.on('herdr:blocked', (data) => {
+    if (publishingHerdrBlocked) return;
+    if (!data || typeof data !== 'object') {
+      exitBlocked();
+      return;
+    }
+    if (!('active' in data) || data.active !== true) {
+      exitBlocked();
+      return;
+    }
+    enterBlocked('label' in data && typeof data.label === 'string' ? data.label : null);
+  });
 
   /* ── Tool: ask_user_question (v1.3 M8 human gate, available to master and subagents) ── */
 
@@ -423,9 +449,10 @@ export default async function (pi: ExtensionAPI) {
       const ui = (ctx as {
         ui?: { input?: (title: string, placeholder?: string) => Promise<string | undefined> };
       }).ui;
-      enterBlocked(question);
-      // v1.3 M8 observed: herdr keeps detecting working while waiting for a human, overriding a one-shot blocked report;
-      // repeat it every 5s so the pane stays blocked and remains visible/GC-exempt.
+      publishHerdrBlocked(true, question);
+      // Fallback when herdr:pi is absent: a one-shot pi-herdr blocked report can lose
+      // to later working reports; refresh while the gate is open. Do not re-emit
+      // herdr:blocked here — official blockedCount is edge-triggered.
       const hb = setInterval(() => { reportAgent('blocked', question); }, 5000);
       try {
         const answer = await ui?.input?.(question, 'your answer');
@@ -435,7 +462,7 @@ export default async function (pi: ExtensionAPI) {
         };
       } finally {
         clearInterval(hb);
-        exitBlocked();
+        publishHerdrBlocked(false, null);
       }
     },
   });
