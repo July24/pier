@@ -25,14 +25,25 @@ jobs:
 
   mutation:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - run: npm install --ignore-scripts
+      - uses: actions/cache/restore@v4
+        with:
+          path: reports/stryker-incremental.json
+          key: stryker-incremental-${{ github.run_id }}
+          restore-keys: stryker-incremental-
       - run: npm run test:mutation
+      # 失败也要存：Stryker 写出增量文件后才因 break 阈值退出，存下可免下次全量
+      - uses: actions/cache/save@v4
+        if: always() && hashFiles('reports/stryker-incremental.json') != ''
+        with:
+          path: reports/stryker-incremental.json
+          key: stryker-incremental-${{ github.run_id }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
