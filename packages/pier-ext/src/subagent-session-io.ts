@@ -122,7 +122,11 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
   ): Promise<{ text: string | null; pendingTool: boolean; activity: boolean }> {
     for (const file of await resolveSessionFileCandidates(paneId, cwd)) {
       const entries = readSessionFile(file);
-      if (entries.length === 0) continue;
+      // readSessionFile returns null when the path is missing or unreadable.
+      // herdr often reports a .jsonl path before the worker creates the file;
+      // waitAgent(idle) then returns immediately and this path used to throw
+      // `Cannot read properties of null (reading 'length')` (session 01a055c5).
+      if (!entries?.length) continue;
       const r = lastAssistantText(entries, { sinceTs });
       if (r?.text) return { text: r.text, pendingTool: false, activity: true };
       if (hasPendingToolCall(entries, sinceTs)) return { text: null, pendingTool: true, activity: true };
