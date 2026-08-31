@@ -46,22 +46,32 @@ pier 由**两个半区**组成，各装一处：
 无需克隆仓库，直接用 npm 包运行：
 
 ```sh
-npx pier-setup            # 用户模式：pi install npm:pi-pier + herdr plugin install + 自动生成引导配置
-npm i -g pier-setup       # 或全局安装后直接跑 pier-setup
+npx pier-setup@latest            # 用户模式：pi install npm:pi-pier + herdr plugin install
+npx pier-setup@latest version    # 本地 vs npm latest（installer / pi-pier / herdr 插件）
+npx pier-setup@latest update     # 原地刷新两半区（不先卸载）
+npx pier-setup@latest uninstall  # --purge 连 boot-config.json 一起删
+
+npm i -g pier-setup              # 或全局安装后：pier-setup / version / update
 ```
+
+钉 `@latest`，避免 npx 用到缓存的旧安装器。克隆仓库后 `npm install` 会链上
+`node_modules/.bin/pier-setup`，因此仓库根下 `npx pier-setup` 跑的是本地 `./install.mjs`。
 
 开发模式仍需克隆仓库：
 
 ```sh
 git clone https://github.com/July24/pier && cd pier
 node install.mjs install --dev   # 本地路径 pi install + herdr plugin link，改码即生效
+node install.mjs version --dev
+node install.mjs update --dev    # 只重写 boot-config；代码请自己 git pull
 ```
 
 脚本自动校验环境（node / pi / herdr 版本）、探测 pi 的 node 与 cli.js 绝对路径、
 生成 boot-config.json（用户模式落 herdr 插件配置目录，重装不丢），并注册两半区。
 
-其他命令：`pier-setup update`（卸载+重装，重探测路径）、`pier-setup uninstall --purge`。
-发行规格可用 `--pi-spec=` / `--herdr-spec=` 覆盖（npm 发布或 fork 场景）。
+`update` 会跑 `pi update npm:pi-pier`（失败则 `pi install`）和
+`herdr plugin install … --yes`，然后重写 boot-config。发行规格可用
+`--pi-spec=` / `--herdr-spec=` 覆盖。`pier-setup --help` 列出全部命令。
 
 ### 手动安装（等价步骤）
 

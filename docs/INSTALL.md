@@ -1,4 +1,4 @@
-# 安装与使用手册（pier v0.1.0）
+# 安装与使用手册
 
 pi × herdr 工作台融合插件的双半区安装。环境要求：Node ≥ 22、pi ≥ 0.84、
 herdr ≥ 0.8（macOS / Linux 稳定支持；Windows 为 preview beta）。
@@ -6,9 +6,15 @@ herdr ≥ 0.8（macOS / Linux 稳定支持；Windows 为 preview beta）。
 ## 0. 一键安装（推荐）
 
 ```sh
+npx pier-setup@latest            # 用户模式
+npx pier-setup@latest version    # 查看本地 / npm latest
+npx pier-setup@latest update     # 原地刷新（不先卸载）
+
 git clone git@github.com:July24/pier.git && cd pier
-node install.mjs                 # 用户模式（默认）
+node install.mjs                 # 用户模式（默认 npm:pi-pier）
 node install.mjs install --dev   # 开发模式（本地 link，改码即生效）
+node install.mjs version
+node install.mjs update          # 用户模式：pi update + herdr plugin install --yes
 ```
 
 脚本流程：
@@ -22,12 +28,13 @@ node install.mjs install --dev   # 开发模式（本地 link，改码即生效�
 
 | | 用户模式（默认） | 开发模式（`--dev`） |
 |---|---|---|
-| pi 扩展 | `pi install git:github.com/July24/pier`（仓库根 `pi` 字段：扩展 + skill） | `pi install ./packages/pier-ext` |
+| pi 扩展 | `pi install npm:pi-pier` | `pi install ./packages/pier-ext` |
 | herdr 插件 | `herdr plugin install July24/pier/packages/pier-workbench --yes` | `herdr plugin link ./packages/pier-workbench` |
-| 更新 | `node install.mjs update`（或 `herdr plugin install` 重装替换 checkout + `pi update`） | 无需操作（link 目录是活的） |
-| 卸载 | `node install.mjs uninstall`（`--purge` 连配置删） | 同左（unlink 保留文件） |
+| 查看版本 | `npx pier-setup@latest version` | `node install.mjs version --dev` |
+| 更新 | `npx pier-setup@latest update`（`pi update` + herdr 重装 checkout，不先卸载） | 只重写 boot-config（link 目录是活的） |
+| 卸载 | `npx pier-setup@latest uninstall`（`--purge` 连配置删） | 同左（unlink 保留文件） |
 
-发行规格覆盖：`--pi-spec=npm:@pier/ext`（npm 发布场景）或 `--herdr-spec=<owner>/<repo>/…`（fork）。
+发行规格覆盖：`--pi-spec=` / `--herdr-spec=`（npm 发布或 fork）。
 
 ## 1. 手动安装：pi 侧扩展（`pier-ext` / `@pier/ext`）
 

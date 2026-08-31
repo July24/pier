@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 /**
- * pier 一键安装/卸载/更新（跨平台：macOS / Linux / Windows）。
+ * pier 一键安装/卸载/更新/查版本（跨平台：macOS / Linux / Windows）。
  *
  * 用法：
  *   node install.mjs install  [--dev] [--hmr-dev] [--force]   # 安装（默认命令，可省略 install）
+ *   node install.mjs update   [--dev] [--hmr-dev]             # 原地刷新两半区到最新发行（不先卸载）
+ *   node install.mjs version  [--json]                        # 本地 vs npm latest
  *   node install.mjs uninstall [--dev] [--purge]              # 卸载；--purge 连 boot-config.json 一起删
- *   node install.mjs update   [--dev] [--hmr-dev] [--force]   # 更新 = 卸载注册 + 重新安装（重探测路径）
+ *   node install.mjs --prepare                                # npm prepare：hooksPath + 仓库根 bin 链接
+ *   node install.mjs --help
  *
  * 模式：
  *   用户模式（默认）：pi install npm:pi-pier
@@ -18,7 +21,7 @@
  * 失败语义：每步给出手动等价命令；步骤失败不阻断报告（exitCode=1）。
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,10 +32,38 @@ const WB_DIR = join(ROOT, 'packages', 'pier-workbench');
 const DEV_BOOT_CONFIG = join(WB_DIR, 'scripts', 'boot-config.json');
 const EXT_PATH = join(EXT_DIR, 'src', 'index.ts');
 const IS_WIN = process.platform === 'win32';
+const COMMANDS = ['install', 'uninstall', 'update', 'version', 'help'];
+
+/** Workspace root is named pier-setup but npm does not bin-link it, so
+ * `npx pier-setup@version` from the clone runs `sh -c pier-setup` against a
+ * missing node_modules/.bin/pier-setup. Published tarball has no packages/. */
+function prepareRepo() {
+  if (existsSync(join(ROOT, '.githooks'))) {
+    try { execFileSync('git', ['config', 'core.hooksPath', '.githooks'], { stdio: 'ignore' }); } catch { /* not a git checkout */ }
+  }
+  if (!existsSync(EXT_PATH)) return;
+  const binDir = join(ROOT, 'node_modules', '.bin');
+  mkdirSync(binDir, { recursive: true });
+  const posix = join(binDir, 'pier-setup');
+  const cmd = join(binDir, 'pier-setup.cmd');
+  rmSync(posix, { force: true });
+  rmSync(cmd, { force: true });
+  if (IS_WIN) {
+    writeFileSync(cmd, '@echo off\r\nnode "%~dp0\\..\\..\\install.mjs" %*\r\n');
+    writeFileSync(posix, '#!/bin/sh\nexec node "$(dirname "$0")/../../install.mjs" "$@"\n');
+    try { chmodSync(posix, 0o755); } catch { /* git-bash optional */ }
+  } else {
+    symlinkSync('../../install.mjs', posix);
+  }
+}
 
 const argv = process.argv.slice(2);
-const command = ['install', 'uninstall', 'update'].includes(argv[0]) ? argv.shift() : 'install';
-const flags = new Set(argv.filter((a) => a.startsWith('--') && !a.includes('=')));
+if (argv[0] === '--prepare') {
+  prepareRepo();
+  process.exit(0);
+}
+const command = COMMANDS.includes(argv[0]) ? argv.shift() : null;
+const flags = new Set(argv.filter((a) => (a.startsWith('--') && !a.includes('=')) || a === '-h' || a === '-v'));
 const optValue = (name) => argv.find((a) => a.startsWith(`--${name}=`))?.split('=').slice(1).join('=') ?? null;
 const dev = flags.has('--dev');
 const PI_SPEC = optValue('pi-spec') ?? 'npm:pi-pier';   // 用户模式默认 npm 发行版；--pi-spec=git:github.com/July24/pier 可跟随仓库 main
@@ -73,6 +104,34 @@ function geVersion(v, min) {
     if (v[i] !== min[i]) return v[i] > min[i];
   }
   return true;
+}
+
+function cmpSemver(a, b) {
+  const pa = parseVersion(a);
+  const pb = parseVersion(b);
+  if (!pa || !pb) return 0;
+  for (let i = 0; i < 3; i++) {
+    if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+function readPkgVersion(dir) {
+  try {
+    return JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function npmLatest(name) {
+  try {
+    return execFileSync('npm', ['view', name, 'version'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15000,
+    }).trim();
+  } catch {
+    return null;
+  }
 }
 
 /** herdr 插件配置目录（用户模式 boot-config 落点；插件已注册才存在路径语义）。 */
@@ -217,7 +276,109 @@ function writeBootConfig(hmrDev, force) {
   log(`  extPath = ${config.extPath}`);
 }
 
-/* ── 三命令 ──────────────────────────────────────────────────────── */
+function pkgDirFromExtPath(extPath) {
+  let d = dirname(extPath);
+  for (let i = 0; i < 5; i++) {
+    if (existsSync(join(d, 'package.json'))) return d;
+    const parent = dirname(d);
+    if (parent === d) break;
+    d = parent;
+  }
+  return null;
+}
+
+function herdrPluginInfo() {
+  let out;
+  try { out = run('herdr', ['plugin', 'list']); } catch { return { installed: false, spec: null, sha: null }; }
+  const line = out.split(/\r?\n/).find((l) => l.includes('pier.workbench'));
+  if (!line) return { installed: false, spec: null, sha: null };
+  const bracket = line.match(/\[([^\]]+)\]/);
+  const spec = bracket ? bracket[1] : line.trim();
+  const at = spec.lastIndexOf('@');
+  const fullSha = at >= 0 && !spec.startsWith('local:') ? spec.slice(at + 1) : null;
+  return { installed: true, spec, sha: fullSha ? fullSha.slice(0, 7) : null };
+}
+
+function collectStatus() {
+  const installer = readPkgVersion(ROOT);
+  const extPath = dev ? (existsSync(EXT_PATH) ? EXT_PATH : null) : resolveUserExtPath();
+  const extDir = extPath ? pkgDirFromExtPath(extPath) : null;
+  return {
+    product: (extDir ? readPkgVersion(extDir) : null) || installer,
+    mode: dev ? 'dev' : 'user',
+    installer: { name: 'pier-setup', version: installer },
+    piExt: { spec: piSource(), version: extDir ? readPkgVersion(extDir) : null, path: extDir },
+    herdr: herdrPluginInfo(),
+    latest: { 'pier-setup': npmLatest('pier-setup'), 'pi-pier': npmLatest('pi-pier') },
+  };
+}
+
+/* ── 命令 ────────────────────────────────────────────────────────── */
+function usage() {
+  log(`pier-setup — install / update / inspect pier (pi-pier + pier.workbench)
+
+Usage:
+  pier-setup [install] [--dev] [--hmr-dev] [--force]
+  pier-setup update    [--dev] [--hmr-dev]
+  pier-setup version   [--json]
+  pier-setup uninstall [--dev] [--purge]
+
+  npx pier-setup@latest          # recommended user install
+  npx pier-setup@latest update   # refresh both halves to newest release
+  npx pier-setup@latest version  # local vs npm latest
+
+  --pi-spec= / --herdr-spec= override distribution sources
+  --dev  local link (clone); update only rewrites boot-config`);
+}
+
+function version() {
+  const s = collectStatus();
+  if (flags.has('--json')) {
+    log(JSON.stringify(s, null, 2));
+    return;
+  }
+  log(`pier ${s.product ?? 'not installed'}${s.mode === 'dev' ? '  (dev, local link)' : ''}`);
+  log('');
+  log(`  installer   pier-setup      ${s.installer.version ?? 'unknown'}    (this CLI)`);
+  log(`  pi ext      ${s.piExt.spec}    ${s.piExt.version ?? 'not installed'}    ${s.piExt.path ?? ''}`);
+  const herdrVer = s.herdr.installed ? (s.herdr.sha ?? s.herdr.spec) : 'not installed';
+  log(`  herdr       pier.workbench  ${herdrVer}    ${s.herdr.spec ?? ''}`);
+  log('');
+  const ls = s.latest['pier-setup'] ?? 'unavailable (offline?)';
+  const lp = s.latest['pi-pier'] ?? 'unavailable (offline?)';
+  log(`  npm latest  pier-setup ${ls}    pi-pier ${lp}`);
+  if (s.installer.version && s.piExt.version && s.installer.version !== s.piExt.version) {
+    log(`\n⚠ mismatch: installer ${s.installer.version} ≠ pi-pier ${s.piExt.version}`);
+  }
+  const target = s.latest['pi-pier'];
+  if (s.piExt.version && target && cmpSemver(s.piExt.version, target) < 0) {
+    log(`\nupdate available → ${target}    npx pier-setup@latest update`);
+  }
+}
+
+function update() {
+  checkEnv();
+  const me = readPkgVersion(ROOT);
+  const latestSetup = npmLatest('pier-setup');
+  if (latestSetup && me && cmpSemver(me, latestSetup) < 0) {
+    log(`⚠ installer ${me} < latest ${latestSetup} — re-run: npx pier-setup@latest update`);
+  }
+  const hmrDev = flags.has('--hmr-dev');
+  if (dev) {
+    log('dev mode: local link is live; pull the repo yourself. Refreshing boot-config only.');
+    writeBootConfig(hmrDev, true);
+  } else {
+    if (tryRun('pi', ['update', piSource()])) log(`✓ pi extension updated (${piSource()})`);
+    else if (tryRun('pi', ['install', piSource()])) log(`✓ pi extension installed (${piSource()})`);
+    else { console.error('✗ pi update/install failed'); log(`  manual: pi update ${piSource()}`); process.exitCode = 1; }
+    if (tryRun('herdr', ['plugin', 'install', HERDR_SPEC, '--yes'])) log(`✓ herdr plugin updated (${HERDR_SPEC})`);
+    else { console.error('✗ herdr plugin update failed'); log(`  manual: herdr plugin install ${HERDR_SPEC} --yes`); process.exitCode = 1; }
+    writeBootConfig(hmrDev, true);
+  }
+  log('');
+  version();
+}
+
 function install() {
   const hmrDev = flags.has('--hmr-dev');
   const force = flags.has('--force');
@@ -264,6 +425,8 @@ function uninstall() {
   log(`\npier uninstalled.${purge ? '' : ' (boot-config.json kept; use --purge to remove)'}`);
 }
 
-if (command === 'uninstall') uninstall();
-else if (command === 'update') { log('== uninstall =='); uninstall(); log('\n== install =='); install(); }
+if (command === 'help' || flags.has('--help') || flags.has('-h')) usage();
+else if (command === 'version' || flags.has('--version') || flags.has('-v')) version();
+else if (command === 'uninstall') uninstall();
+else if (command === 'update') update();
 else install();

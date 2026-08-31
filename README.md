@@ -46,24 +46,34 @@ pier ships as **two halves**, installed separately:
 No clone needed — run the npm package directly:
 
 ```sh
-npx pier-setup            # user mode: pi install npm:pi-pier + herdr plugin install + auto-generated bootstrap config
-npm i -g pier-setup       # or install globally, then just run pier-setup
+npx pier-setup@latest            # user mode: pi install npm:pi-pier + herdr plugin install
+npx pier-setup@latest version    # local vs npm latest (installer / pi-pier / herdr plugin)
+npx pier-setup@latest update     # refresh both halves in place (does not uninstall first)
+npx pier-setup@latest uninstall  # --purge also drops boot-config.json
+
+npm i -g pier-setup              # or install globally, then: pier-setup / version / update
 ```
+
+Pin `@latest` so npx does not reuse a cached installer. In a clone, `npm install`
+links `node_modules/.bin/pier-setup`, so in-repo `npx pier-setup` runs `./install.mjs`.
 
 Dev mode still requires cloning the repo:
 
 ```sh
 git clone https://github.com/July24/pier && cd pier
 node install.mjs install --dev   # local-path pi install + herdr plugin link; code changes are live
+node install.mjs version --dev
+node install.mjs update --dev    # rewrite boot-config only; pull the repo yourself
 ```
 
 The script verifies the environment (node / pi / herdr versions), probes pi's node
 and cli.js absolute paths, generates boot-config.json (user mode stores it in the
 herdr plugin config dir, so reinstalls don't lose it), and registers both halves.
 
-Other commands: `pier-setup update` (uninstall + reinstall, re-probes paths),
-`pier-setup uninstall --purge`. Override the distribution specs with
-`--pi-spec=` / `--herdr-spec=` (npm publishing or forks).
+`update` re-runs `pi update npm:pi-pier` (falls back to `pi install`) and
+`herdr plugin install … --yes`, then rewrites boot-config. Override sources with
+`--pi-spec=` / `--herdr-spec=` (npm publishing or forks). `pier-setup --help`
+lists every command.
 
 ### Manual install (equivalent steps)
 

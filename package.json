@@ -1,7 +1,7 @@
 {
   "name": "pier-setup",
-  "version": "0.2.1",
-  "description": "One-shot installer for pier: registers the pi-pier extension with pi and the pier.workbench plugin with herdr (install / uninstall / update)",
+  "version": "0.2.2",
+  "description": "One-shot installer for pier: install / update / version / uninstall for pi-pier + pier.workbench",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -33,7 +33,7 @@
   "scripts": {
     "test": "node --test \"packages/*/test/*.test.ts\"",
     "test:mutation": "stryker run",
-    "prepare": "git config core.hooksPath .githooks"
+    "prepare": "node ./install.mjs --prepare"
   },
   "devDependencies": {
     "@deepseek-ai/cordis-plugin-group": "^1.0.1",
