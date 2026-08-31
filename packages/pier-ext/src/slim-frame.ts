@@ -1,6 +1,7 @@
 /**
  * D97 slim frame: when a pane is too narrow or short for the minimum usable TUI,
- * cover it with a non-capturing full-screen overlay containing a static frame sourced from the pane title.
+ * cover it with a non-capturing overlay. Content is three-tier: full TUI (overlay
+ * hidden), an activity-anchored todo window when ≥3 rows fit, else the pane title.
  *
  * Why (observed by the user): after the heat view compresses an unfocused pane, streaming worker thinking
  * continuously repaints the entire screen in the narrow pane, causing flicker. The static frame updates only on
@@ -22,11 +23,21 @@
  * flow. PI_HERDR_SLIM_FRAME=0 is the escape hatch.
  */
 
+import { isArchived } from './stale-core.ts';
+import type { TodoItem } from './vocab.ts';
+import { anchorTodoRange, formatTodoSummary, renderTodoGroups } from './todo-window.ts';
+
 /** Minimum usable TUI dimensions (pi interactive-mode layout: editor 3 rows + footer 1 + transcript ≥3 + spacing).
- * Below either threshold the pane cannot display a readable TUI, so it renders the title as a static frame. */
+ * Below either threshold the pane cannot display a readable TUI, so the overlay covers it. */
 
 export const SLIM_MIN_COLS = 24;
 export const SLIM_MIN_ROWS = 12;
+/** Overlay todo window needs this many rows after wrap; below that, fall back to the title frame. */
+export const SLIM_TODO_MIN_ROWS = 3;
+/** Narrower than this, todo lines wrap into a column; keep the title frame instead. */
+export const SLIM_TODO_MIN_COLS = 16;
+/** Empty-list copy: the pane is alive but has no plan yet (replaces a lone ·). */
+export const SLIM_EMPTY_COPY = 'no todos yet';
 
 /** Visibility predicate (overlayOptions.visible invokes it on every render frame). */
 export function isSlimFrame(cols: number, rows: number): boolean {
@@ -115,6 +126,93 @@ export function frameLines(
   return out;
 }
 
+function padFrame(
+  content: readonly string[],
+  opts: { width: number; rows: number; colorize: (s: string) => string; vAlign: 'center' | 'top' },
+): string[] {
+  const width = Math.max(1, Math.floor(opts.width));
+  const rows = Math.max(1, Math.floor(opts.rows));
+  const pad = (s: string) => s + ' '.repeat(Math.max(0, width - displayWidth(s)));
+  const body = content.slice(0, rows);
+  const top = opts.vAlign === 'center' ? Math.max(0, Math.floor((rows - body.length) / 2)) : 0;
+  const out: string[] = [];
+  for (let i = 0; i < rows; i++) {
+    const idx = i - top;
+    out.push(idx >= 0 && idx < body.length ? pad(opts.colorize(body[idx])) : ' '.repeat(width));
+  }
+  return out;
+}
+
+function wrapTodoBody(items: readonly TodoItem[], width: number): string[] {
+  return renderTodoGroups(items).flatMap((line) => wrapByWidth(line, width));
+}
+
+function itemsEqual(a: readonly TodoItem[], b: readonly TodoItem[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (x.content !== y.content || x.status !== y.status || x.blocker !== y.blocker || x.phase !== y.phase) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export interface SlimFrameInput {
+  title?: string | null;
+  items?: readonly TodoItem[];
+  lastWriteAt?: number | null;
+  now?: number;
+}
+
+/**
+ * Choose overlay content: todo window when the pane can show ≥3 wrapped rows at ≥16 cols;
+ * otherwise the pane title (or SLIM_EMPTY_COPY when the list is empty).
+ */
+export function slimContentLines(
+  input: SlimFrameInput & { width: number; rows: number; colorize?: (s: string) => string },
+): string[] {
+  const width = Math.max(1, Math.floor(input.width));
+  const rows = Math.max(1, Math.floor(input.rows));
+  const colorize = input.colorize ?? ((s: string) => s);
+  const items = input.items ?? [];
+  const title = (input.title ?? '').trim();
+  const fallback = title || SLIM_EMPTY_COPY;
+  const titleFrame = () => frameLines(fallback, { width, rows, colorize });
+
+  if (rows < SLIM_TODO_MIN_ROWS || width < SLIM_TODO_MIN_COLS) return titleFrame();
+  if (items.length === 0) return titleFrame();
+  if (isArchived(items, input.lastWriteAt ?? null, input.now ?? Date.now())) return titleFrame();
+
+  const header = wrapByWidth(formatTodoSummary(items), width);
+  const fullBody = wrapTodoBody(items, width);
+  if (header.length + fullBody.length <= rows) {
+    const packed = [...header, ...fullBody];
+    if (packed.length < SLIM_TODO_MIN_ROWS) return titleFrame();
+    return padFrame(packed, { width, rows, colorize, vAlign: 'top' });
+  }
+
+  const footerProbe = wrapByWidth('   +99 hidden (99✓) · /todos', width);
+  const itemBudget = rows - header.length - footerProbe.length;
+  if (itemBudget < 1) return titleFrame();
+
+  const [start, end] = anchorTodoRange(
+    items,
+    (s, e) => wrapTodoBody(items.slice(s, e), width).length <= itemBudget,
+  );
+  const kept = items.slice(start, end);
+  const body = wrapTodoBody(kept, width);
+  if (body.length === 0 || body.length > itemBudget) return titleFrame();
+
+  const hidden = items.filter((_, i) => i < start || i >= end);
+  const hiddenCompleted = hidden.filter((it) => it.status === 'completed').length;
+  const footer = wrapByWidth(`   +${hidden.length} hidden (${hiddenCompleted}✓) · /todos`, width);
+  const packed = [...header, ...body, ...footer];
+  if (packed.length < SLIM_TODO_MIN_ROWS) return titleFrame();
+  return padFrame(packed, { width, rows, colorize, vAlign: 'top' });
+}
+
 /* ── Overlay component plus registration/update (process-local singleton) ─────────────────────────── */
 
 interface FrameTui {
@@ -122,7 +220,9 @@ interface FrameTui {
 }
 
 class SlimFrameComponent {
-  private text = '';
+  private title = '';
+  private items: readonly TodoItem[] = [];
+  private lastWriteAt: number | null = null;
   private lastRows = 0;
   private cache: { width: number; lines: string[] } | null = null;
   private readonly tui: FrameTui;
@@ -137,21 +237,30 @@ class SlimFrameComponent {
   onViewport(cols: number, rows: number): boolean {
     if (this.lastRows !== rows) {
       this.lastRows = rows;
-      this.cache = null; // A row-count change requires re-centering.
+      this.cache = null; // A row-count change requires re-layout.
     }
     return isSlimFrame(cols, rows);
   }
 
-  setText(text: string): void {
-    if (this.text === text) return;
-    this.text = text;
+  setSnapshot(title: string, items: readonly TodoItem[], lastWriteAt: number | null): void {
+    if (this.title === title && this.lastWriteAt === lastWriteAt && itemsEqual(this.items, items)) return;
+    this.title = title;
+    this.items = items;
+    this.lastWriteAt = lastWriteAt;
     this.cache = null;
     this.tui.requestRender();
   }
 
   render(width: number): string[] {
     if (this.cache && this.cache.width === width) return this.cache.lines;
-    const lines = frameLines(this.text, { width, rows: this.lastRows, colorize: this.colorize });
+    const lines = slimContentLines({
+      title: this.title,
+      items: this.items,
+      lastWriteAt: this.lastWriteAt,
+      width,
+      rows: this.lastRows,
+      colorize: this.colorize,
+    });
     this.cache = { width, lines };
     return lines;
   }
@@ -214,7 +323,7 @@ export function registerSlimFrame(eventCtx: unknown): void {
   }
 }
 
-/** Update static-frame content (same arguments/source as the pane-title projection; null means no plan). */
-export function updateSlimFrame(title: string | null): void {
-  active?.setText(title ?? '');
+/** Update overlay snapshot. Title remains the fallback; items drive the todo window. */
+export function updateSlimFrame(input: SlimFrameInput): void {
+  active?.setSnapshot(input.title ?? '', input.items ?? [], input.lastWriteAt ?? null);
 }

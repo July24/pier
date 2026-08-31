@@ -1,20 +1,25 @@
 /**
- * D97 窄格静帧单测：可见性谓词 / 宽度感知折行 / 静帧行 / overlay 注册生命周期。
+ * D97 窄格静帧单测：可见性谓词 / 宽度感知折行 / 静帧行 / overlay 注册生命周期 / 三档内容。
  * 缝：纯函数 + 进程内单例（resetForTest 隔离）。
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  SLIM_EMPTY_COPY,
   SLIM_MIN_COLS,
   SLIM_MIN_ROWS,
+  SLIM_TODO_MIN_COLS,
+  SLIM_TODO_MIN_ROWS,
   displayWidth,
   frameLines,
   isSlimFrame,
   registerSlimFrame,
   resetForTest,
+  slimContentLines,
   updateSlimFrame,
   wrapByWidth,
 } from '../src/slim-frame.ts';
+import type { TodoItem } from '../src/vocab.ts';
 
 beforeEach(() => resetForTest());
 
@@ -59,7 +64,7 @@ test('registerSlimFrame：无 ui / 无 custom → 静默不注册', () => {
   registerSlimFrame(null);
   registerSlimFrame({ ui: {} });
   // 未抛错且后续 update 是 no-op 即可
-  updateSlimFrame('x');
+  updateSlimFrame({ title: 'x' });
   assert.ok(true);
 });
 
@@ -92,9 +97,9 @@ test('registerSlimFrame：注册 → visible 随尺寸切换 → dispose 后可�
   assert.equal(overlayOptions.visible(200, 50), false);
 
   // 内容更新触发重渲染；幂等（同文本不重绘）
-  updateSlimFrame('▶1 ○2 · task');
+  updateSlimFrame({ title: '▶1 ○2 · task' });
   assert.equal(renders, 1);
-  updateSlimFrame('▶1 ○2 · task');
+  updateSlimFrame({ title: '▶1 ○2 · task' });
   assert.equal(renders, 1);
 
   // 渲染：满宽行
@@ -119,4 +124,73 @@ test('registerSlimFrame：PI_HERDR_SLIM_FRAME=0 逃生口', () => {
     if (prev === undefined) delete process.env.PI_HERDR_SLIM_FRAME;
     else process.env.PI_HERDR_SLIM_FRAME = prev;
   }
+});
+
+const todo = (content: string, status: TodoItem['status']): TodoItem => ({ content, status });
+
+test('slimContentLines：空列表 → 居中 no todos yet（不再是 ·）', () => {
+  const lines = slimContentLines({ title: null, items: [], width: 40, rows: 8 });
+  assert.equal(lines.length, 8);
+  assert.ok(lines.every((l) => displayWidth(l) === 40));
+  assert.ok(lines.some((l) => l.includes(SLIM_EMPTY_COPY)));
+  assert.ok(!lines.some((l) => l.trim() === '·'));
+});
+
+test('slimContentLines：行数 < 3 或列数 < 16 → title 档', () => {
+  const items = [todo('implement auth', 'in_progress'), todo('write tests', 'pending')];
+  const short = slimContentLines({ title: '▶1 ○1 · implement auth', items, width: 40, rows: 2 });
+  assert.equal(short.length, 2);
+  assert.ok(short.some((l) => l.includes('▶1 ○1')), '矮格走 title');
+  assert.ok(!short.some((l) => l.includes('todo:')), '不画 todo 窗');
+
+  const narrow = slimContentLines({ title: '▶1 ○1 · implement auth', items, width: SLIM_TODO_MIN_COLS - 1, rows: 8 });
+  assert.ok(narrow.some((l) => l.includes('▶1 ○1')));
+  assert.ok(!narrow.some((l) => l.includes('todo:')));
+});
+
+test('slimContentLines：中档围绕 in_progress 填满可用行', () => {
+  const items = Array.from({ length: 12 }, (_, i) =>
+    todo(`task-${i}`, i === 4 ? 'in_progress' : 'pending'));
+  const lines = slimContentLines({
+    title: '▶1 ○11 · task-4',
+    items,
+    width: 40,
+    rows: 8,
+  });
+  assert.equal(lines.length, 8);
+  assert.ok(lines.every((l) => displayWidth(l) === 40), '满宽不透明');
+  const joined = lines.join('\n');
+  assert.match(joined, /todo: 1▶ 11○/);
+  assert.ok(joined.includes('▶ task-4'), '锚点可见');
+  assert.ok(joined.includes('hidden'), '超窗有 +N');
+  assert.equal(lines[0].trim().startsWith('todo:'), true, '顶对齐');
+});
+
+test('slimContentLines：列表能放下则不画 hidden 行', () => {
+  const items = [todo('a', 'in_progress'), todo('b', 'pending')];
+  const lines = slimContentLines({ title: '▶1 ○1 · a', items, width: 40, rows: 8 });
+  const joined = lines.join('\n');
+  assert.ok(joined.includes('▶ a'));
+  assert.ok(joined.includes('○ b'));
+  assert.ok(!joined.includes('hidden'));
+});
+
+test('slimContentLines：归档列表走 title 档', () => {
+  const items = [todo('old', 'completed'), todo('done', 'completed')];
+  const title = '✓2 done 2h';
+  const lines = slimContentLines({
+    title,
+    items,
+    lastWriteAt: 0,
+    now: 2 * 60 * 60_000,
+    width: 40,
+    rows: 8,
+  });
+  assert.ok(lines.some((l) => l.includes('✓2 done 2h')));
+  assert.ok(!lines.some((l) => l.includes('todo:')));
+});
+
+test('slimContentLines：SLIM_TODO_MIN_ROWS 门槛', () => {
+  assert.equal(SLIM_TODO_MIN_ROWS, 3);
+  assert.equal(SLIM_TODO_MIN_COLS, 16);
 });

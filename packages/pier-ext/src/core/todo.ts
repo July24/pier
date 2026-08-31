@@ -13,12 +13,11 @@ import type { PiSurface } from '../pi-surface.ts';
 import type { TodosService } from '../todos-service.ts';
 import { planTodoReadHook } from '../todo-read-hook.ts';
 import { makeProgressUpdate } from '../subagent-core.ts';
-import { TODO_DETAILS_KEY, TODO_TOOL_NAME, formatTodoConfirmation, type TodoItem, type TodoStatus } from '../vocab.ts';
+import { TODO_DETAILS_KEY, TODO_TOOL_NAME, formatTodoConfirmation, type TodoItem } from '../vocab.ts';
 import { formatAge, isArchived } from '../stale-core.ts';
 import {
   TODO_EDIT_CUSTOM_TYPE,
   completionTransitions,
-  countTodos,
   fuzzyFind,
   listsEqual,
   makeSnapshot,
@@ -26,6 +25,7 @@ import {
   revertedCompleted,
   validateTodos,
 } from '../todo-core.ts';
+import { anchorTodoRange, formatTodoSummary, renderTodoGroups } from '../todo-window.ts';
 
 export interface TodoUiSlot {
   /** Lets index lifecycle events render through the currently mounted plugin. */
@@ -52,36 +52,8 @@ const TOOL_DESCRIPTION = [
   'Delegated work belongs on this list too. When you hand an entry to a subagent, append ` <sub>` to its content (the subagent is doing it, not you); when the subagent settles, a matching entry is auto-completed — you will see "Reconciled:" in the settlement note. If no auto-match fired, update the entry yourself.',
 ].join(' ');
 
-const TODO_MARKS: Record<TodoStatus, string> = {
-  pending: '○',
-  in_progress: '▶',
-  completed: '✓',
-  blocked: '■',
-  abandoned: '✗',
-};
-
 /** Stay within pi interactive mode's ten-line widget cap instead of relying on head truncation. */
 export const WIDGET_MAX_LINES = 10;
-
-/** Share phase rendering between the widget and /todos so both views order entries identically. */
-function renderGroups(items: readonly TodoItem[]): string[] {
-  const groups = new Map<string, TodoItem[]>();
-  for (const it of items) {
-    const key = it.phase ?? '';
-    const arr = groups.get(key) ?? [];
-    arr.push(it);
-    groups.set(key, arr);
-  }
-  const lines: string[] = [];
-  for (const [phase, list] of groups) {
-    if (phase) lines.push(`  [${phase}]`);
-    for (const it of list) {
-      const suffix = it.status === 'blocked' && it.blocker ? ` — ${it.blocker}` : '';
-      lines.push(`  ${TODO_MARKS[it.status]} ${it.content}${suffix}`);
-    }
-  }
-  return lines;
-}
 
 /**
  * Keep the active task visible within WIDGET_MAX_LINES instead of truncating to a fixed head or
@@ -91,64 +63,28 @@ function renderGroups(items: readonly TodoItem[]): string[] {
  */
 export function widgetLines(items: readonly TodoItem[], opts?: { archivedAgeMs?: number | null }): string[] {
   if (items.length === 0) return [];
-  const c = countTodos(items);
   // Collapse archived plans to two lines so stale work cannot monopolize the widget.
   if (opts?.archivedAgeMs != null) {
     return [
-      `todo: ${c.inProgress}▶ ${c.pending}○ ${c.blocked}■ ${c.completed}✓ · archived ${formatAge(opts.archivedAgeMs)}`,
+      `${formatTodoSummary(items)} · archived ${formatAge(opts.archivedAgeMs)}`,
       '  archived — /todos 全量',
     ];
   }
 
   // Reserve summary and overflow lines, then shrink around the anchor because phase headers also consume the budget.
   const renderBudget = WIDGET_MAX_LINES - 1 - 1;
-  const [start, end] = anchorRange(items, renderBudget);
+  const [start, end] = anchorTodoRange(
+    items,
+    (s, e) => renderTodoGroups(items.slice(s, e)).length <= renderBudget,
+  );
   const kept = items.slice(start, end);
   const hidden = items.filter((_, i) => i < start || i >= end);
-  const lines = [`todo: ${c.inProgress}▶ ${c.pending}○ ${c.blocked}■ ${c.completed}✓`, ...renderGroups(kept)];
+  const lines = [formatTodoSummary(items), ...renderTodoGroups(kept)];
   if (hidden.length > 0) {
     const hiddenCompleted = hidden.filter((it) => it.status === 'completed').length;
     lines.push(`   +${hidden.length} hidden (${hiddenCompleted}✓) · /todos 全量`);
   }
   return lines;
-}
-
-/**
- * Expand around the active anchor within the rendered-line budget, favoring upcoming work while
- * guaranteeing that the anchor remains visible.
- */
-function anchorRange(items: readonly TodoItem[], renderBudget: number): [number, number] {
-  if (renderGroups(items).length <= renderBudget) return [0, items.length];
-  const anchor = items.findIndex((it) => it.status === 'in_progress');
-  const anchorIdx = anchor >= 0
-    ? anchor
-    : items.reduce((acc, it, i) => (it.status !== 'completed' ? i : acc), -1);
-  if (anchorIdx < 0) {
-    // Completed plans keep the most recent tail visible within the line budget.
-    let end = items.length;
-    while (renderGroups(items.slice(0, end)).length > renderBudget && end > 1) end -= 1;
-    return [0, end];
-  }
-  let start = anchorIdx;
-  let end = anchorIdx + 1;
-  const fits = () => renderGroups(items.slice(start, end)).length <= renderBudget;
-  let growTail = true;
-  while ((end < items.length || start > 0) && (end - start) < items.length) {
-    if (growTail && end < items.length) {
-      end += 1;
-      if (!fits()) { end -= 1; break; }
-    } else if (start > 0) {
-      start -= 1;
-      if (!fits()) { start += 1; break; }
-    } else if (end < items.length) {
-      end += 1;
-      if (!fits()) { end -= 1; break; }
-    } else {
-      break;
-    }
-    growTail = !growTail; // Alternate sides so both context and upcoming work remain visible.
-  }
-  return [start, end];
 }
 
 export default function todoPlugin(ctx: Context): void {
@@ -372,14 +308,13 @@ export default function todoPlugin(ctx: Context): void {
         return;
       }
       // /todos is the unbounded view because the widget intentionally prioritizes active context.
-      const body = renderGroups(todos.items);
+      const body = renderTodoGroups(todos.items);
       if (body.length === 0) {
         ui?.notify?.('todo list is empty', 'info');
         return;
       }
-      const c = countTodos(todos.items);
       const age = archivedAgeMs();
-      const head = `todo: ${c.inProgress}▶ ${c.pending}○ ${c.blocked}■ ${c.completed}✓`
+      const head = formatTodoSummary(todos.items)
         + (age != null ? ` · archived ${formatAge(age)}（不再注入）` : '');
       ui?.notify?.([head, ...body].join('\n'), 'info');
     },

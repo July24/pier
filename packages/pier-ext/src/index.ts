@@ -161,8 +161,8 @@ export default async function (pi: ExtensionAPI) {
       progressSuffix: suffix,
       lastWriteAt: todos.lastWriteAt,
     });
-    // D97: narrow-frame static state shares inputs with the pane title; thinking tokens cannot reach it, so a static frame would freeze.
-    updateSlimFrame(title);
+    // D97: overlay content shares the todo snapshot; thinking tokens cannot reach it.
+    updateSlimFrame({ title, items: todos.items, lastWriteAt: todos.lastWriteAt });
     client.reportMetadata({
       session: label,
       items: todos.items,
