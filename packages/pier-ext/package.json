@@ -1,6 +1,6 @@
 {
   "name": "pi-pier",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "pier: pi extension that fuses pi agent sessions with the herdr pane/tab orchestrator — todo_write loop closure + interactive subagents in isolated panes",
   "license": "MIT",
   "type": "module",
