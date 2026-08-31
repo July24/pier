@@ -39,11 +39,11 @@ export interface MasterPluginMount {
 
 async function loadEntry(
   sessionRoot: Context,
-  loaderReady: boolean,
+  useLoader: boolean,
   name: string,
   plugin: (ctx: Context) => void,
 ): Promise<void> {
-  if (loaderReady) {
+  if (useLoader) {
     const withLoader = sessionRoot as typeof sessionRoot & {
       loader?: { create: (o: { name: string }) => Promise<unknown> };
     };
@@ -56,6 +56,9 @@ async function loadEntry(
 export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
   const cordisApp = await createCordisApp();
   const sessionRoot = cordisApp.root;
+  // loader.create re-imports .ts via Node ESM — fails under node_modules (npm:pi-pier
+  // strip-types) and misses pi's typebox alias. HMR-only; production uses plugin().
+  const useLoader = cordisApp.loaderReady && cordisApp.hmrActive;
 
   // Pipe server is created in the common segment; closing it from a core
   // plugin would kill it on hmr reload (d87).
@@ -75,7 +78,7 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
   };
   sessionRoot.provide('pi-herdr.terminal-deps', terminalDeps);
 
-  await loadEntry(sessionRoot, cordisApp.loaderReady, './core/terminal.ts', terminalPlugin);
+  await loadEntry(sessionRoot, useLoader, './core/terminal.ts', terminalPlugin);
 
   sessionRoot.provide('pi-herdr.todo-deps', {
     todos: m.todos,
@@ -87,7 +90,7 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
     },
     state: m.todoUi,
   });
-  await loadEntry(sessionRoot, cordisApp.loaderReady, './core/todo.ts', todoPlugin);
+  await loadEntry(sessionRoot, useLoader, './core/todo.ts', todoPlugin);
 
   sessionRoot.provide('pi-herdr.subagent-deps', {
     client: m.client,
@@ -105,7 +108,7 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
     terminalState: terminalDeps.state,
     todos: m.todos,
   });
-  await loadEntry(sessionRoot, cordisApp.loaderReady, './core/subagent.ts', subagentPlugin);
+  await loadEntry(sessionRoot, useLoader, './core/subagent.ts', subagentPlugin);
 
   m.pi.on('session_shutdown', () => {
     void disposeSessionRoot(sessionRoot);

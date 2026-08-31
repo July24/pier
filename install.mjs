@@ -8,17 +8,18 @@
  *   node install.mjs update   [--dev] [--hmr-dev] [--force]   # 更新 = 卸载注册 + 重新安装（重探测路径）
  *
  * 模式：
- *   用户模式（默认）：pi install git:github.com/July24/pier（仓库根 package.json 的 pi 字段）
+ *   用户模式（默认）：pi install npm:pi-pier
  *                   + herdr plugin install July24/pier/packages/pier-workbench --yes
- *                   boot-config.json 写 herdr plugin config-dir（reinstall 不丢）。
+ *                   boot-config.json 写 herdr plugin config-dir；extPath 指向 pi 已安装的
+ *                   pi-pier（~/.pi/agent/npm/...），不是 pier-setup 包内的仓库路径。
  *   --dev 开发模式：pi install <repo>/packages/pier-ext + herdr plugin link <repo>/packages/pier-workbench
  *                   （link 目录是活的，改码即生效；update 只重写 boot-config）。
- *
  * 发行规格可用 --pi-spec= / --herdr-spec= 覆盖（npm 发布或 fork 场景）。
  * 失败语义：每步给出手动等价命令；步骤失败不阻断报告（exitCode=1）。
  */
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -121,14 +122,70 @@ function probePiRuntime() {
   return null;
 }
 
+function piAgentDir() {
+  return process.env.PI_CODING_AGENT_DIR || join(homedir(), '.pi', 'agent');
+}
+
+function npmNameFromSpec(spec) {
+  if (!spec.startsWith('npm:')) return null;
+  const rest = spec.slice(4);
+  if (rest.startsWith('@')) {
+    const slash = rest.indexOf('/');
+    if (slash < 0) return rest;
+    return `${rest.slice(0, slash)}/${rest.slice(slash + 1).split('@')[0]}`;
+  }
+  return rest.split('@')[0];
+}
+
+function extPathFromPiList() {
+  let out;
+  try { out = run('pi', ['list']); } catch { return null; }
+  const lines = out.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const spec = lines[i].trim();
+    const loc = lines[i + 1]?.trim();
+    if (!loc) continue;
+    if (!/pi-pier|pier-ext|july24\/pier/i.test(spec)) continue;
+    for (const c of [join(loc, 'src', 'index.ts'), join(loc, 'packages', 'pier-ext', 'src', 'index.ts')]) {
+      if (existsSync(c)) return c;
+    }
+  }
+  return null;
+}
+
+/** User-mode extPath: pi's installed package, never the pier-setup npx cache. */
+function resolveUserExtPath() {
+  const candidates = [];
+  const npmName = npmNameFromSpec(PI_SPEC);
+  if (npmName) candidates.push(join(piAgentDir(), 'npm', 'node_modules', npmName, 'src', 'index.ts'));
+  if (PI_SPEC.startsWith('git:')) {
+    const hostPath = PI_SPEC.slice(4).replace(/^git@/, '').replace(/:/g, '/');
+    candidates.push(
+      join(piAgentDir(), 'git', hostPath, 'packages', 'pier-ext', 'src', 'index.ts'),
+      join(piAgentDir(), 'git', hostPath, 'src', 'index.ts'),
+    );
+  }
+  candidates.push(
+    join(piAgentDir(), 'npm', 'node_modules', 'pi-pier', 'src', 'index.ts'),
+    join(piAgentDir(), 'git', 'github.com', 'July24', 'pier', 'packages', 'pier-ext', 'src', 'index.ts'),
+  );
+  for (const p of candidates) {
+    if (p && existsSync(p)) return p;
+  }
+  return extPathFromPiList();
+}
+
 function writeBootConfig(hmrDev, force) {
   const probed = probePiRuntime();
   if (!probed) die('cannot locate pi cli.js (tried: pi shim realpath, npm root -g). Fill boot-config.json manually.');
-  if (!existsSync(EXT_PATH)) die(`pier-ext entry missing: ${EXT_PATH} (repo layout broken?)`);
-  // 用户模式 extPath 必须指向 herdr 管理的 checkout 内的扩展（安装 herdr 半区后才知道）；
-  // git 安装布局与本地同构：packages/pier-ext/src/index.ts。
-  const extPath = dev ? EXT_PATH
-    : join(herdrManagedRootGuess(), 'packages', 'pier-ext', 'src', 'index.ts');
+  let extPath;
+  if (dev) {
+    if (!existsSync(EXT_PATH)) die(`pier-ext entry missing: ${EXT_PATH} (repo layout broken?)`);
+    extPath = EXT_PATH;
+  } else {
+    extPath = resolveUserExtPath();
+    if (!extPath) die(`cannot locate installed pier-ext (npm:pi-pier / git clone). Did \`pi install ${piSource()}\` succeed?`);
+  }
 
   const config = {
     mainTabLabel: 'main',
@@ -158,14 +215,6 @@ function writeBootConfig(hmrDev, force) {
   log(`  piNode = ${config.piNode}`);
   log(`  piCli  = ${config.piCli}`);
   log(`  extPath = ${config.extPath}`);
-}
-
-/** herdr 管理的插件 checkout 根（GitHub 安装布局：…/plugins/<owner>-<repo>/…）。 */
-function herdrManagedRootGuess() {
-  const dir = herdrConfigDir();
-  if (!dir) return '';
-  // config-dir 形如 <plugins-root>/<plugin-id>/config → checkout 在 <plugins-root>/<plugin-id>/
-  return resolve(dir, '..');
 }
 
 /* ── 三命令 ──────────────────────────────────────────────────────── */
