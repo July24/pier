@@ -192,6 +192,25 @@ function piAgentDir() {
   return process.env.PI_CODING_AGENT_DIR || join(homedir(), '.pi', 'agent');
 }
 
+/* ── 旧版 git 模式注册迁移 ──────────────────────────────────────── */
+// 早期 `pi install git:github.com/July24/pier` 的遗留注册与 npm:pi-pier 并存时，
+// 两份扩展会注册同名工具（todo_write / ask_user_question…），pi 启动即报 conflict。
+const LEGACY_GIT_SPEC = 'git:github.com/July24/pier';
+
+function registeredPiPackages() {
+  try {
+    return JSON.parse(readFileSync(join(piAgentDir(), 'settings.json'), 'utf8'))?.packages ?? [];
+  } catch { return []; }
+}
+
+/** install/update 前清理旧 git 模式注册；--pi-spec 显式指定该 git 源时视为目标源，不动。 */
+function removeLegacyGitRegistration() {
+  if (piSource() === LEGACY_GIT_SPEC) return;
+  if (!registeredPiPackages().includes(LEGACY_GIT_SPEC)) return;
+  if (tryRun('pi', ['remove', LEGACY_GIT_SPEC])) log(`✓ removed legacy git-mode registration (${LEGACY_GIT_SPEC}); using ${piSource()}`);
+  else { console.error('✗ failed to remove legacy git-mode registration'); log(`  manual: pi remove ${LEGACY_GIT_SPEC}`); process.exitCode = 1; }
+}
+
 function npmNameFromSpec(spec) {
   if (!spec.startsWith('npm:')) return null;
   const rest = spec.slice(4);
@@ -365,6 +384,7 @@ function version() {
 
 function update() {
   checkEnv();
+  removeLegacyGitRegistration();
   const me = readPkgVersion(ROOT);
   const latestSetup = npmLatest('pier-setup');
   if (latestSetup && me && cmpSemver(me, latestSetup) < 0) {
@@ -390,6 +410,7 @@ function install() {
   const hmrDev = flags.has('--hmr-dev');
   const force = flags.has('--force');
   checkEnv();
+  removeLegacyGitRegistration();
 
   if (dev) {
     if (tryRun('pi', ['install', piSource()])) log('✓ pi extension installed (packages/pier-ext, local)');
