@@ -1,8 +1,8 @@
 /**
  * 档1 core/todo 插件接线：surface 挂载 todo_write + /todos 命令 +
- * 读钩 + widget 槽回填 + tombstone。真实 TodosService + 假 pi。
+ * 读钩 + widget 槽回填 + tombstone + master stop reminder。真实 TodosService + 假 pi。
  */
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { Context } from '@deepseek-ai/cordis';
 import todoPlugin from '../src/core/todo.ts';
@@ -11,11 +11,15 @@ import { DisposeLedger } from '../src/ledger.ts';
 import { TodosService } from '../src/todos-service.ts';
 
 function fakePi() {
+  const sent: Array<{ msg: { customType?: string; content?: string; display?: boolean }; opts?: { deliverAs?: string; triggerTurn?: boolean } }> = [];
+  const userSent: string[] = [];
   return {
     tools: new Map<string, { execute?: (...a: unknown[]) => unknown }>(),
     commands: new Map<string, { handler?: (...a: unknown[]) => unknown }>(),
     listeners: new Map<string, Array<(...a: unknown[]) => unknown>>(),
     entries: [] as Array<[string, unknown]>,
+    sent,
+    userSent,
     registerTool(def: { name: string; execute?: (...a: unknown[]) => unknown }) {
       this.tools.set(def.name, def);
     },
@@ -28,10 +32,23 @@ function fakePi() {
     appendEntry(customType: string, data: unknown) {
       this.entries.push([customType, data]);
     },
+    sendMessage(
+      msg: { customType?: string; content?: string; display?: boolean },
+      opts?: { deliverAs?: string; triggerTurn?: boolean },
+    ) {
+      sent.push({ msg, opts });
+      return Promise.resolve();
+    },
+    sendUserMessage(content: string) {
+      userSent.push(content);
+      return Promise.resolve();
+    },
   };
 }
 
-function makeDeps(pi: ReturnType<typeof fakePi>, ledger?: DisposeLedger) {
+type StopReminder = { getBlockedDepth: () => number; getRunningSubs: () => number };
+
+function makeDeps(pi: ReturnType<typeof fakePi>, ledger?: DisposeLedger, stopReminder?: StopReminder) {
   const todos = new TodosService({ strict: false, allowParallelInProgress: true });
   const surface = new PiSurface(pi as unknown as object, ledger);
   const calls: string[] = [];
@@ -43,12 +60,17 @@ function makeDeps(pi: ReturnType<typeof fakePi>, ledger?: DisposeLedger) {
     mirrorTodos: () => { calls.push('mirror'); },
     appendEntry: (t: string, d: unknown) => { pi.appendEntry(t, d); void d; },
     state,
+    ...(stopReminder ? { stopReminder } : {}),
   };
   return { todos, surface, deps, calls, state };
 }
 
-async function mount(pi: ReturnType<typeof fakePi>, ledger?: DisposeLedger, depsOverride?: { appendEntry?: (t: string, d: unknown) => void }) {
-  const m = makeDeps(pi, ledger);
+async function mount(
+  pi: ReturnType<typeof fakePi>,
+  ledger?: DisposeLedger,
+  depsOverride?: { appendEntry?: (t: string, d: unknown) => void; stopReminder?: StopReminder },
+) {
+  const m = makeDeps(pi, ledger, depsOverride?.stopReminder);
   if (depsOverride?.appendEntry) m.deps.appendEntry = depsOverride.appendEntry;
   const ctx = new Context();
   ctx.provide('pi-herdr.surface', m.surface);
@@ -159,5 +181,103 @@ test('core/todo：R1 归档清空执行链——窗口拍不清，终态拍 rm �
   for (let i = 0; i < 3; i++) await hook?.();
   const empty = (await hook?.()) as { message?: { content: string } } | undefined;
   assert.match(empty?.message?.content ?? '', /todo list is empty/i);
+  await ctx.fiber.dispose();
+});
+
+test('D41 stop 提醒：custom 通道 + 宽限窗 + 唤醒取消 + 封顶（01a040cc 修复）', async () => {
+  const pi = fakePi();
+  const { ctx, todos } = await mount(pi, undefined, {
+    stopReminder: { getBlockedDepth: () => 0, getRunningSubs: () => 0 },
+  });
+  const emit = async (ev: string, arg?: unknown) => {
+    for (const h of pi.listeners.get(ev) ?? []) await h(arg);
+  };
+  const settle = () => emit('agent_settled');
+  const flush = async (): Promise<void> => {
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+  };
+  todos.replace([
+    { content: 'push special- fix to repo', status: 'pending' },
+    { content: 'restart CRM user-service', status: 'in_progress' },
+  ]);
+  await emit('turn_end', { message: { role: 'assistant', stopReason: 'end_turn' } });
+
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    await settle();
+    mock.timers.tick(29_999);
+    await flush();
+    assert.equal(pi.sent.length, 0, '宽限窗内不注入');
+    assert.equal(pi.userSent.length, 0, 'user 通道零调用');
+
+    await emit('agent_start');
+    mock.timers.tick(60_000);
+    await flush();
+    assert.equal(pi.sent.length, 0, '用户已接管，提醒取消');
+
+    await settle();
+    mock.timers.tick(30_001);
+    await flush();
+    assert.equal(pi.sent.length, 1);
+    assert.equal(pi.userSent.length, 0, '不再走 sendUserMessage 用户通道');
+    const { msg, opts } = pi.sent[0]!;
+    assert.equal(msg.customType, 'pi-herdr.todo-reminder');
+    assert.equal(msg.display, true);
+    assert.equal(opts?.deliverAs, 'followUp');
+    assert.equal(opts?.triggerTurn, true);
+    assert.match(msg.content ?? '', /Reconcile the list instead of blindly continuing/);
+    assert.match(msg.content ?? '', /never execute it yourself/);
+    assert.doesNotMatch(msg.content ?? '', /Continue working on them before stopping/);
+
+    await settle();
+    mock.timers.tick(30_001);
+    await flush();
+    await settle();
+    mock.timers.tick(30_001);
+    await flush();
+    assert.equal(pi.sent.length, 3, '第 2、3 次提醒正常注入');
+    await settle();
+    mock.timers.tick(30_001);
+    await flush();
+    assert.equal(pi.sent.length, 3, '封顶后不再注入');
+
+    todos.replace([{ content: 'wait for ops restart', status: 'blocked', blocker: 'staging pod restart' }]);
+    await settle();
+    mock.timers.tick(60_000);
+    await flush();
+    assert.equal(pi.sent.length, 3, 'blocked 建模后不触发');
+  } finally {
+    mock.timers.reset();
+    await ctx.fiber.dispose();
+  }
+});
+
+test('D41 stop 提醒：ESC 中止（aborted）不催——反唤醒风暴守卫保留', async () => {
+  const pi = fakePi();
+  const { ctx, todos } = await mount(pi, undefined, {
+    stopReminder: { getBlockedDepth: () => 0, getRunningSubs: () => 0 },
+  });
+  const emit = async (ev: string, arg?: unknown) => {
+    for (const h of pi.listeners.get(ev) ?? []) await h(arg);
+  };
+  todos.replace([{ content: 'push fix', status: 'pending' }]);
+  await emit('turn_end', { message: { role: 'assistant', stopReason: 'aborted' } });
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    await emit('agent_settled');
+    mock.timers.tick(60_000);
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+    assert.equal(pi.sent.length, 0, 'abort 后的 settled 不做任何唤醒注入');
+    assert.equal(pi.userSent.length, 0);
+  } finally {
+    mock.timers.reset();
+    await ctx.fiber.dispose();
+  }
+});
+
+test('D41 stop 提醒：未配置 stopReminder 时不注册催办钩子', async () => {
+  const pi = fakePi();
+  const { ctx } = await mount(pi);
+  assert.equal((pi.listeners.get('agent_start') ?? []).length, 0);
   await ctx.fiber.dispose();
 });

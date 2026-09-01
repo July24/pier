@@ -11,7 +11,6 @@ import { randomUUID } from 'node:crypto';
 import { basename, join, dirname } from 'node:path';
 import type { PiSurface } from '../pi-surface.ts';
 import type { HerdrClientLike } from '../herdr-client.ts';
-import type { TodosService } from '../todos-service.ts';
 import { Semaphore, SUBS_CUSTOM_TYPE, agoText, buildAliveNotice, buildBlockedGateNotice, buildIsolatePreamble, classifyWorktreeZone, foldSubsRegistry, formatSubagentResult, isAlive, isPathUnder, makeProgressUpdate, makeRegistry, planIsolateWorktree, tabNameForTask, type AliveProbe, type SubEntry } from '../subagent-core.ts';
 import { applyReportedSessionFile, appendHistory, preferredHistoryFile, inheritOutcome, latestGeneration, readHistory, type HistoryEntry } from '../history-store.ts';
 import { runtimePolicy } from '../runtime-policy.ts';
@@ -30,7 +29,6 @@ import { promisify } from 'node:util';
 const statAsync = promisify(statCb);
 import { pipeNameFor, pipeRequestTo } from '../pipe-channel.ts';
 import { composeForRole } from '../manifest-compose.ts';
-import { TODO_REMINDER_CUSTOM_TYPE, planStopTodoReminder, todoReminderGraceMs } from '../todo-reminder-core.ts';
 import type { TerminalStateSlot } from './terminal.ts';
 import { createGitIo } from '../subagent-git-io.ts';
 import { createSessionIo } from '../subagent-session-io.ts';
@@ -54,7 +52,6 @@ interface SubagentDeps {
   sessionRoot: Context;
   port: SubagentPortBox;
   getSessionId: () => string;
-  getBlockedDepth: () => number;
   reconcileOnSettlement: (description: string, outcome: 'settled' | 'failed') => string[];
   withReconcileNotes: (base: string, notes: readonly string[]) => string;
   claimSettleNotice: (key: string) => boolean;
@@ -67,7 +64,6 @@ interface SubagentDeps {
   noticePending?: () => ReadonlySet<string>;
   /** Terminal-family GC exemption (live terminal panes are not collected). */
   terminalState: TerminalStateSlot;
-  todos: TodosService;
 }
 
 const SUBAGENT_DESCRIPTION = [
@@ -103,14 +99,10 @@ function agentRootDir(): string {
 export default function subagentPlugin(ctx: Context): void {
   const surface = ctx.get('pi-herdr.surface') as PiSurface<object>;
   const d = ctx.get('pi-herdr.subagent-deps') as SubagentDeps;
-  const { client, env, sessionRoot, port, terminalState, todos } = d;
+  const { client, env, sessionRoot, port, terminalState } = d;
   const pi = surface.raw as {
     appendEntry?: (customType: string, data: unknown) => void;
     sendUserMessage?: (content: string, opts?: { deliverAs?: string }) => Promise<void>;
-    sendMessage?: (
-      message: { customType: string; content: string; display?: boolean; details?: Record<string, unknown> },
-      opts?: { deliverAs?: string; triggerTurn?: boolean },
-    ) => Promise<void>;
   };
   const scoped = surface.forModule(import.meta.url);
 
@@ -242,68 +234,6 @@ export default function subagentPlugin(ctx: Context): void {
       Date.now(),
     );
     return { content: [{ type: 'text', text: notice }] };
-  });
-
-  /* ── D41 safe reminders for unfinished todos ─────────────────────
-   * 01a040cc showed that a user-role reminder overrode model judgment and executed work reserved
-   * for the user. Use a distinguishable custom message, request reconciliation rather than action,
-   * and delay delivery so any new agent start cancels it. Preserve the ESC guard from 01a03bf0 to
-   * avoid wake-up storms after explicit interruption. */
-
-  let todoReminders = 0;
-  let lastAssistantStopReason: string | null = null;
-  let todoReminderTimer: NodeJS.Timeout | null = null;
-
-  function cancelTodoReminder(): void {
-    if (todoReminderTimer !== null) {
-      clearTimeout(todoReminderTimer);
-      todoReminderTimer = null;
-    }
-  }
-
-  scoped.on('turn_end', async (event: unknown) => {
-    if (event === null || typeof event !== 'object' || !('message' in event)) return;
-    const msg = (event as { message: unknown }).message; // Safe after the property guard above.
-    if (msg === null || typeof msg !== 'object') return;
-    const { role, stopReason } = msg as { role?: unknown; stopReason?: unknown };
-    if (role === 'assistant' && typeof stopReason === 'string') {
-      lastAssistantStopReason = stopReason;
-    }
-  });
-
-  // B3 cancels the reminder when any source resumes work during the grace window.
-  scoped.on('agent_start', () => cancelTodoReminder());
-  scoped.on('session_shutdown', () => cancelTodoReminder());
-
-  scoped.on('agent_settled', async () => {
-    cancelTodoReminder(); // Cancel any timer left from the previous settlement.
-    const plan = planStopTodoReminder({
-      lastStopReason: lastAssistantStopReason,
-      reminders: todoReminders,
-      runningSubs: pollers.size,
-      blockedDepth: d.getBlockedDepth(),
-      items: todos.items,
-    });
-    if (!plan.due || plan.content == null) return;
-    const content = plan.content;
-    todoReminderTimer = setTimeout(() => {
-      todoReminderTimer = null;
-      void (async () => {
-        // Without sendMessage, skip the reminder rather than impersonating the user channel.
-        const send = pi.sendMessage;
-        if (typeof send !== 'function') return;
-        try {
-          await send(
-            { customType: TODO_REMINDER_CUSTOM_TYPE, content, display: true },
-            { deliverAs: 'followUp', triggerTurn: true },
-          );
-          todoReminders += 1; // Count only delivered reminders so cancellation and failure do not consume the cap.
-        } catch {
-          /* Delivery failure is non-fatal. */
-        }
-      })();
-    }, todoReminderGraceMs());
-    todoReminderTimer.unref?.(); // Do not keep tests or headless processes alive for a reminder.
   });
 
   function histFile(cwd: string): string {

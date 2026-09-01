@@ -13,6 +13,7 @@ test('planIndexMode: worker flag wins even inside herdr', () => {
     HERDR_PANE_ID: 'p1',
   });
   assert.equal(mode.isSubagent, true);
+  assert.equal(mode.hasHerdr, true);
   assert.equal(mode.composeMaster, false);
 });
 
@@ -23,11 +24,13 @@ test('planIndexMode: herdr pane without worker flag → compose master', () => {
     HERDR_PANE_ID: 'p1',
   });
   assert.equal(mode.isSubagent, false);
+  assert.equal(mode.hasHerdr, true);
   assert.equal(mode.composeMaster, true);
 });
 
-test('planIndexMode: herdr unavailable → no master manifest', () => {
+test('planIndexMode: herdr unavailable → no master manifest or workbench', () => {
   const mode = planIndexMode({});
   assert.equal(mode.isSubagent, false);
+  assert.equal(mode.hasHerdr, false);
   assert.equal(mode.composeMaster, false);
 });

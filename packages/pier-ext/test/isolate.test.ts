@@ -22,7 +22,6 @@ import {
 } from '../src/subagent-core.ts';
 import subagentPlugin from '../src/core/subagent.ts';
 import { PiSurface } from '../src/pi-surface.ts';
-import { TodosService } from '../src/todos-service.ts';
 import type { HerdrClientLike } from '../src/herdr-client.ts';
 import { emptySubagentPortBox } from '../src/subagent-port.ts';
 
@@ -173,12 +172,10 @@ async function mount(pi: FakePi): Promise<Context> {
     sessionRoot: root,
     port,
     getSessionId: () => '',
-    getBlockedDepth: () => 0,
     reconcileOnSettlement: () => [],
     withReconcileNotes: (b: string) => b,
     claimSettleNotice: () => true,
     terminalState: { activePaneIds: () => new Set<string>() },
-    todos: new TodosService({ strict: false, allowParallelInProgress: true }),
   };
   root.provide('pi-herdr.surface', surface);
   root.provide('pi-herdr.subagent-deps', deps);

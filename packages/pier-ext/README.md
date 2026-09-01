@@ -1,11 +1,11 @@
 # pi-pier
 
 > [!IMPORTANT]
-> **This npm package is only the pi-extension half of pier.** pier is a two-half system — this extension plus a **herdr plugin** (`pier.workbench`). Without the herdr side you still get `todo_write` / `ask_user_question`, but subagents, pane integration, notifications, and the workspace bootstrap all require herdr. See [Install the herdr half](#install-the-herdr-half-companion-plugin) below.
+> **This npm package is only the pi-extension half of pier.** pier is a two-half system — this extension plus a **herdr plugin** (`pier.workbench`). Without the herdr side you still get `todo_write` / `ask_user_question`; `subagent` / `terminal` are not registered. Pane integration, notifications, and workspace bootstrap all require herdr. See [Install the herdr half](#install-the-herdr-half-companion-plugin) below.
 
 **pier** = **pi** × h**erdr** — a [pi](https://pi.dev/) extension that fuses coding agent sessions with the [herdr](https://herdr.dev/) pane/tab orchestrator.
 
-`pi-pier` fills two gaps pi deliberately leaves open — the **todo list loop** and **interactive subagents** — using herdr panes/tabs as the visual and interaction substrate. It degrades gracefully outside herdr.
+`pi-pier` fills two gaps pi deliberately leaves open — the **todo list loop** and **interactive subagents** — using herdr panes/tabs as the visual and interaction substrate. Outside herdr it loads only the todo loop.
 
 ## Install (this pi half)
 
@@ -56,13 +56,43 @@ The installer also verifies node / pi / herdr versions, probes local paths, and 
 
 ## Scope & degradation
 
-Outside a herdr environment the extension auto-degrades: herdr reporting costs nothing, `subagent` / terminal tools return "requires a herdr-managed pane" hints, while `todo_write` / `ask_user_question` keep working (session JSONL as authority, no herdr dependency).
+This extension mutates the pi session even outside herdr. After `pi install npm:pi-pier`:
+
+| Surface | Bare `pi` (no `HERDR_ENV`) | Inside herdr |
+|---|---|---|
+| `todo_write`, `/todos`, widget, anti-freeze, stop reminder | live | live |
+| `ask_user_question` | live (TUI input) | live + blocked marker |
+| Hidden inject (`before_agent_start` todo-read; settle reminder) | live | live |
+| `subagent`, `terminal` | **not registered** | live |
+| `/locks`, write-lock on `write`/`edit` | not installed | live |
+| slim-frame overlay, pane title, pipe, isolate worktree | off | live |
+| `setActiveTools` role visible layer | off | on (herdr master) |
+
+Session JSONL custom types (`pi-herdr.todo-edit`, `.subs`, `.terminals`, `.todo-read`, `.todo-reminder`, …) persist across `/resume` even without herdr.
+
+## Plugin conflicts
+
+pi overwrites tools/commands by name; event listeners stack.
+
+**Do not install alongside** (same-name overwrite → wrong handler, split JSONL):
+
+- [`@nguyenquangthai/pi-todo`](https://pi.dev/packages/@nguyenquangthai/pi-todo) — `todo_write` + overlay
+- [`@josephyoung/pi-ask-user-question`](https://pi.dev/packages/@josephyoung/pi-ask-user-question) — `ask_user_question`
+- [`pi-herdr-subagents`](https://pi.dev/packages/pi-herdr-subagents) — `subagent` + herdr panes
+
+**Soft conflict** (two orchestrators / two injectors — the agent “talks to itself”):
+
+- [`@tintinweb/pi-subagents`](https://pi.dev/packages/@tintinweb/pi-subagents) (`Agent`)
+- [`@minhduydev/pi-subagents`](https://pi.dev/packages/@minhduydev/pi-subagents) (`task`)
+- any other extension that calls `setActiveTools`, `ui.custom` overlay, `before_agent_start`, or `sendUserMessage`/`sendMessage` followUp
+
+**Designed coexistence:** herdr’s official `herdr:pi` reporter. Keep it. pier emits `herdr:blocked` so that plugin remains lifecycle authority.
 
 ## Requirements
 
 - Node ≥ 22
 - pi ≥ 0.84 (`@earendil-works/pi-coding-agent`)
-- **herdr ≥ 0.8.0** — required for subagents / pane integration / notifications (see the IMPORTANT note above); without it only `todo_write` / `ask_user_question` work
+- **herdr ≥ 0.8.0** — required for subagents / pane integration / notifications (see the IMPORTANT note above); without it only the todo loop and `ask_user_question` load
 
 ## Development
 

@@ -88,11 +88,39 @@ herdr plugin link ./packages/pier-workbench                        # 开发期
 
 扩展在非 herdr 环境下自动降级（详见下节"作用域"）。
 
-### 作用域（只影响 herdr × pi 交叉场景）
+### 作用域（pi 扩展实际改了什么）
 
-- **非 herdr 环境用 pi**：扩展自动降级——herdr 上报零成本，`subagent` / 终端族
-  工具返回"requires a herdr-managed pane"提示；`todo_write` / `ask_user_question`
-  照常可用（以会话 JSONL 为权威，无 herdr 依赖）。
+装上 `pi-pier` 后，**裸跑 pi 也会改会话**，不是 herdr 休眠插件：
+
+| 表面 | 裸 `pi` | herdr 内 |
+|---|---|---|
+| `todo_write`、`/todos`、widget、反冻结、停工提醒 | 生效 | 生效 |
+| `ask_user_question` | 生效 | 生效 + blocked 标记 |
+| 隐藏注入（`before_agent_start` 读钩；停工 reminder） | 生效 | 生效 |
+| `subagent`、`terminal` | **不注册** | 生效 |
+| `/locks`、写锁、slim-frame、窗格标题、pipe | 不加载 | 生效 |
+| `setActiveTools` 角色可见层 | 不加载 | 生效（herdr master） |
+
+会话 JSONL 自定义类型（`pi-herdr.todo-edit`、`.subs`、`.terminals`、`.todo-read`、`.todo-reminder` 等）即使没有 herdr 也会随 `/resume` 回放。
+
+### 插件冲突
+
+pi 对同名 tool/command **后写覆盖**，event listener **累加**。两套 todo 或 subagent 会各写各的 JSONL，表现为列表丢失、问答框不对、spawn 开了别人的 pane。
+
+**不要并装**（同名覆盖）：
+
+- [`@nguyenquangthai/pi-todo`](https://pi.dev/packages/@nguyenquangthai/pi-todo) — `todo_write` + overlay
+- [`@josephyoung/pi-ask-user-question`](https://pi.dev/packages/@josephyoung/pi-ask-user-question) — `ask_user_question`
+- [`pi-herdr-subagents`](https://pi.dev/packages/pi-herdr-subagents) — 同名 `subagent` + herdr pane
+
+**软冲突**（两套编排/注入，模型会「自己又说一轮」）：
+
+- [`@tintinweb/pi-subagents`](https://pi.dev/packages/@tintinweb/pi-subagents)（`Agent`）
+- [`@minhduydev/pi-subagents`](https://pi.dev/packages/@minhduydev/pi-subagents)（`task`）
+- 其它调用 `setActiveTools`、`ui.custom` overlay、`before_agent_start`、或 `sendUserMessage`/`sendMessage` followUp 的扩展
+
+**设计上可共存：** herdr 官方 `herdr:pi` 上报器。不要卸——pier 发 `herdr:blocked`，由它当生命周期权威。
+
 - **herdr 中用其他 agent（claude code / codex 等）**：不含 pi pane 的 tab 不参与
   热力布局；blocked 通知只发给 pi；主 tab 自动引导可用 boot-config 的
   `autoBootstrap: false` 关闭。

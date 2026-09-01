@@ -32,8 +32,8 @@ test('subagent-deps provide: all required SubagentDeps keys present (port crash 
   const body = depsBody;
   for (const key of [
     'client', 'env', 'extPath', 'sessionRoot', 'port',
-    'getSessionId', 'getBlockedDepth', 'reconcileOnSettlement',
-    'withReconcileNotes', 'claimSettleNotice', 'terminalState', 'todos',
+    'getSessionId', 'reconcileOnSettlement',
+    'withReconcileNotes', 'claimSettleNotice', 'terminalState',
   ]) {
     assert.ok(
       new RegExp(`(^|[\\s{])${key}[:,\\s]`).test(body),

@@ -89,6 +89,10 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
       (m.pi as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.(customType, data);
     },
     state: m.todoUi,
+    stopReminder: {
+      getBlockedDepth: m.getBlockedDepth,
+      getRunningSubs: () => m.port.current?.listRunningSubs().length ?? 0,
+    },
   });
   await loadEntry(sessionRoot, useLoader, './core/todo.ts', todoPlugin);
 
@@ -101,12 +105,10 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
     deliverNotice: m.deliverNotice,
     noticePending: m.noticePending,
     getSessionId: m.getSessionId,
-    getBlockedDepth: m.getBlockedDepth,
     reconcileOnSettlement: m.reconcileOnSettlement,
     withReconcileNotes: m.withReconcileNotes,
     claimSettleNotice: m.claimSettleNotice,
     terminalState: terminalDeps.state,
-    todos: m.todos,
   });
   await loadEntry(sessionRoot, useLoader, './core/subagent.ts', subagentPlugin);
 

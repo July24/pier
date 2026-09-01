@@ -13,7 +13,6 @@ import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
 import subagentPlugin from '../src/core/subagent.ts';
 import { PiSurface } from '../src/pi-surface.ts';
-import { TodosService } from '../src/todos-service.ts';
 import type { HerdrClientLike } from '../src/herdr-client.ts';
 import { SUBS_CUSTOM_TYPE, type SubEntry } from '../src/subagent-core.ts';
 import { emptySubagentPortBox } from '../src/subagent-port.ts';
@@ -95,12 +94,10 @@ test('pane 级 GC：statuses 修复——consumed pane 被 closePane；消失 pa
     sessionRoot: root,
     port: emptySubagentPortBox(),
     getSessionId: () => '',
-    getBlockedDepth: () => 0,
     reconcileOnSettlement: () => [],
     withReconcileNotes: (b: string) => b,
     claimSettleNotice: () => true,
     terminalState: { activePaneIds: () => new Set<string>() },
-    todos: new TodosService({ strict: false, allowParallelInProgress: true }),
   };
   root.provide('pi-herdr.surface', surface);
   root.provide('pi-herdr.subagent-deps', deps);

@@ -90,12 +90,39 @@ herdr plugin link ./packages/pier-workbench                        # development
 
 The extension degrades gracefully outside a herdr environment (see Scope below).
 
-### Scope (only the herdr × pi intersection is affected)
+### Scope (what the pi extension mutates)
 
-- **pi outside herdr**: the extension degrades — reporting is free, workbench tools
-  (`subagent`, terminal family) return a clear "requires a herdr-managed pane" error;
-  `todo_write` / `ask_user_question` stay available (session JSONL is the authority,
-  no herdr dependency).
+`pi-pier` is not dormant outside herdr. After install it is live in every pi session:
+
+| Surface | Bare `pi` | Inside herdr |
+|---|---|---|
+| `todo_write`, `/todos`, widget, anti-freeze, stop reminder | live | live |
+| `ask_user_question` | live | live + blocked marker |
+| Hidden inject (`before_agent_start` todo-read; settle reminder) | live | live |
+| `subagent`, `terminal` | **not registered** | live |
+| `/locks`, write-lock, slim-frame, pane title, pipe | off | live |
+| `setActiveTools` role visible layer | off | on (herdr master) |
+
+Session JSONL custom types (`pi-herdr.todo-edit`, `.subs`, `.terminals`, `.todo-read`, `.todo-reminder`, …) persist across `/resume` even without herdr.
+
+### Plugin conflicts
+
+pi overwrites tools/commands by name; event listeners stack. Two todo or subagent plugins will silently replace each other.
+
+**Do not install alongside** (same-name overwrite → wrong handler, split JSONL):
+
+- [`@nguyenquangthai/pi-todo`](https://pi.dev/packages/@nguyenquangthai/pi-todo) — `todo_write` + overlay
+- [`@josephyoung/pi-ask-user-question`](https://pi.dev/packages/@josephyoung/pi-ask-user-question) — `ask_user_question`
+- [`pi-herdr-subagents`](https://pi.dev/packages/pi-herdr-subagents) — `subagent` + herdr panes
+
+**Soft conflict** (two orchestrators / two injectors — the agent “talks to itself”):
+
+- [`@tintinweb/pi-subagents`](https://pi.dev/packages/@tintinweb/pi-subagents) (`Agent`)
+- [`@minhduydev/pi-subagents`](https://pi.dev/packages/@minhduydev/pi-subagents) (`task`)
+- any other extension that calls `setActiveTools`, `ui.custom` overlay, `before_agent_start`, or `sendUserMessage`/`sendMessage` followUp
+
+**Designed coexistence:** herdr’s official `herdr:pi` reporter. Keep it. pier emits `herdr:blocked` so that plugin remains lifecycle authority.
+
 - **other agents inside herdr (claude code / codex etc.)**: tabs without a pi pane
   are excluded from heat reflow; blocked notifications are pi-only; master-tab
   auto-bootstrap can be disabled with `autoBootstrap: false` in boot-config.

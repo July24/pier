@@ -88,7 +88,7 @@ test('index worker mode: todo + ask_user_question; no subagent tools; herdr no-o
   assert.ok(pi.tools.has('todo_write'), 'worker mounts todo_write');
   assert.ok(pi.tools.has('ask_user_question'), 'common tool still registered');
   assert.ok(pi.commands.has('todos'));
-  assert.ok(pi.commands.has('locks'));
+  assert.ok(!pi.commands.has('locks'), 'write locks stay herdr-only');
   assert.ok(!pi.tools.has('subagent'), 'worker must not register subagent tools');
   assert.ok(!pi.tools.has('terminal'), 'worker must not register terminal tools');
 
@@ -100,7 +100,7 @@ test('index worker mode: todo + ask_user_question; no subagent tools; herdr no-o
   await fire(pi, 'session_shutdown');
 }));
 
-test('index master mode: loader mounts subagent + terminal + todo', withCleanup(async (cleanup) => {
+test('index bare pi: todo loop only; no workbench tools', withCleanup(async (cleanup) => {
   const env = cleanup.env();
   env.delete('PI_HERDR_SUBAGENT');
   env.delete('HERDR_ENV');
@@ -111,16 +111,36 @@ test('index master mode: loader mounts subagent + terminal + todo', withCleanup(
   const pi = fakePi();
   await pier(pi as never);
 
-  assert.ok(pi.tools.has('todo_write'), 'master mounts todo_write');
-  assert.ok(pi.tools.has('subagent'), 'master mounts subagent via loader');
-  assert.ok(pi.tools.has('terminal'), 'master mounts terminal via loader');
+  assert.ok(pi.tools.has('todo_write'), 'bare pi keeps todo_write');
+  assert.ok(pi.tools.has('ask_user_question'));
+  assert.ok(!pi.tools.has('subagent'), 'bare pi must not register subagent');
+  assert.ok(!pi.tools.has('terminal'), 'bare pi must not register terminal');
   assert.ok(!pi.tools.has('list_agents'));
   assert.ok(!pi.tools.has('terminal_open'));
   assert.ok(pi.commands.has('todos'));
-  assert.ok(pi.commands.has('locks'));
+  assert.ok(!pi.commands.has('locks'), 'write locks stay herdr-only');
 
   await fire(pi, 'session_start', { reason: 'new' }, { sessionManager: { getBranch: () => [] } });
   await fire(pi, 'agent_settled');
+  await fire(pi, 'session_shutdown');
+}));
+
+test('index herdr master: mounts subagent + terminal + locks', withCleanup(async (cleanup) => {
+  const env = cleanup.env();
+  env.delete('PI_HERDR_SUBAGENT');
+  env.set('HERDR_ENV', '1');
+  env.set('HERDR_SOCKET_PATH', '/tmp/pier-test-sock');
+  env.set('HERDR_PANE_ID', 'p1');
+  env.delete('PI_HERDR_ROLE_MANIFEST');
+
+  const pi = fakePi();
+  await pier(pi as never);
+
+  assert.ok(pi.tools.has('todo_write'));
+  assert.ok(pi.tools.has('subagent'), 'herdr master mounts subagent');
+  assert.ok(pi.tools.has('terminal'), 'herdr master mounts terminal');
+  assert.ok(pi.commands.has('todos'));
+  assert.ok(pi.commands.has('locks'));
   await fire(pi, 'session_shutdown');
 }));
 

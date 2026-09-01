@@ -3,15 +3,16 @@
  *
  * A Cordis plugin keeps the master surface hot-swappable while allowing workers to mount the
  * one-shot subset directly. Injected services preserve the D79 registration boundary and keep
- * session-owned todo state in index. This module owns the tool, command, widget, and read hook;
- * reconciliation, mirroring, and agent reporting stay with the session state layer to avoid a
- * dependency cycle.
+ * session-owned todo state in index. This module owns the tool, command, widget, read hook,
+ * and master stop reminder; reconciliation, mirroring, and agent reporting stay with the
+ * session state layer to avoid a dependency cycle.
  */
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
 import type { PiSurface } from '../pi-surface.ts';
 import type { TodosService } from '../todos-service.ts';
 import { planTodoReadHook } from '../todo-read-hook.ts';
+import { TODO_REMINDER_CUSTOM_TYPE, planStopTodoReminder, todoReminderGraceMs } from '../todo-reminder-core.ts';
 import { makeProgressUpdate } from '../subagent-core.ts';
 import { TODO_DETAILS_KEY, TODO_TOOL_NAME, formatTodoConfirmation, type TodoItem } from '../vocab.ts';
 import { formatAge, isArchived } from '../stale-core.ts';
@@ -40,6 +41,11 @@ interface TodoDeps {
   mirrorTodos: () => void;
   appendEntry: (customType: string, data: unknown) => void;
   state: TodoUiSlot;
+  /** Master-only unfinished-todo reminder; omitted on worker panes. */
+  stopReminder?: {
+    getBlockedDepth: () => number;
+    getRunningSubs: () => number;
+  };
 }
 
 const TOOL_DESCRIPTION = [
@@ -89,7 +95,7 @@ export function widgetLines(items: readonly TodoItem[], opts?: { archivedAgeMs?:
 
 export default function todoPlugin(ctx: Context): void {
   const surface = ctx.get('pi-herdr.surface') as PiSurface<object>;
-  const { todos, allowParallelInProgress, maxItems, mirrorTodos, appendEntry, state } =
+  const { todos, allowParallelInProgress, maxItems, mirrorTodos, appendEntry, state, stopReminder } =
     ctx.get('pi-herdr.todo-deps') as TodoDeps;
   const scoped = surface.forModule(import.meta.url);
 
@@ -177,6 +183,64 @@ export default function todoPlugin(ctx: Context): void {
       },
     };
   });
+
+  if (stopReminder) {
+    const pi = surface.raw as {
+      sendMessage?: (
+        message: { customType: string; content: string; display?: boolean; details?: Record<string, unknown> },
+        opts?: { deliverAs?: string; triggerTurn?: boolean },
+      ) => Promise<void>;
+    };
+    let todoReminders = 0;
+    let lastAssistantStopReason: string | null = null;
+    let todoReminderTimer: NodeJS.Timeout | null = null;
+    function cancelTodoReminder(): void {
+      if (todoReminderTimer !== null) {
+        clearTimeout(todoReminderTimer);
+        todoReminderTimer = null;
+      }
+    }
+    scoped.on('turn_end', async (event: unknown) => {
+      if (event === null || typeof event !== 'object' || !('message' in event)) return;
+      const msg = (event as { message: unknown }).message;
+      if (msg === null || typeof msg !== 'object') return;
+      const { role, stopReason } = msg as { role?: unknown; stopReason?: unknown };
+      if (role === 'assistant' && typeof stopReason === 'string') {
+        lastAssistantStopReason = stopReason;
+      }
+    });
+    scoped.on('agent_start', () => cancelTodoReminder());
+    scoped.on('session_shutdown', () => cancelTodoReminder());
+    scoped.on('agent_settled', async () => {
+      cancelTodoReminder();
+      const plan = planStopTodoReminder({
+        lastStopReason: lastAssistantStopReason,
+        reminders: todoReminders,
+        runningSubs: stopReminder.getRunningSubs(),
+        blockedDepth: stopReminder.getBlockedDepth(),
+        items: todos.items,
+      });
+      if (!plan.due || plan.content == null) return;
+      const content = plan.content;
+      todoReminderTimer = setTimeout(() => {
+        todoReminderTimer = null;
+        void (async () => {
+          const send = pi.sendMessage;
+          if (typeof send !== 'function') return;
+          try {
+            await send(
+              { customType: TODO_REMINDER_CUSTOM_TYPE, content, display: true },
+              { deliverAs: 'followUp', triggerTurn: true },
+            );
+            todoReminders += 1;
+          } catch {
+            /* Delivery failure is non-fatal. */
+          }
+        })();
+      }, todoReminderGraceMs());
+      todoReminderTimer.unref?.();
+    });
+  }
 
   /* ── todo_write tool ───────────────────────────────────────────── */
   scoped.registerTool({

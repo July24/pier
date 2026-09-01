@@ -7,10 +7,7 @@
  * Capabilities:
  *  - `todo_write`: replace the complete todo list; the current pi session JSONL is authoritative,
  *    and branches automatically roll back in DSH-aligned semantics.
- *  - `subagent`: foreground/background delegation plus resume/list/send/interrupt actions.
- *    Each child pane is an interactive pi TUI with an independent session/context that humans
- *    can enter directly; the controller uses herdr for state-gated injection (idle only),
- *    waiting (agent.wait), and JSONL result reads.
+ *  - `subagent` / `terminal`: herdr-master only. Bare pi does not register them.
  *  - `/todos`, TUI widget, and herdr title projection with graceful degradation without herdr.
  *
  * pi 0.84.2 contract (validated):
@@ -231,11 +228,13 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  installWriteLocks(pi, {
-    client,
-    env,
-    hard: process.env[WRITE_LOCK_ENV] === '1',
-  });
+  if (env) {
+    installWriteLocks(pi, {
+      client,
+      env,
+      hard: process.env[WRITE_LOCK_ENV] === '1',
+    });
+  }
 
   /* ── todo family slot (core/todo.ts fills the plugin hook; widget rendering moved with the family) ── */
   const todoUi: { renderWidget: (ctx: unknown) => void } = {
@@ -560,8 +559,10 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  /* subagent tools are master-only (depth 1). C3: worker never loads bootstrap. */
-  if (!isSubagent) {
+  /* Workbench plugins (subagent/terminal + cordis) are herdr-master only.
+   * Bare pi and worker panes mount todo only so unused tools never appear.
+   * Dynamic import: worker/bare-pi must never load bootstrap/subagent-scope (C3). */
+  if (mode.composeMaster) {
     const { mountMasterPlugins } = await import('./index-master.ts');
     await mountMasterPlugins({
       pi,
@@ -582,7 +583,20 @@ export default async function (pi: ExtensionAPI) {
       claimSettleNotice,
     });
   } else {
-    const { mountWorkerTodo } = await import('./index-worker.ts');
-    await mountWorkerTodo({ pi, todos, todoUi, mirrorTodos });
+    const { mountTodoOnly } = await import('./index-worker.ts');
+    await mountTodoOnly({
+      pi,
+      todos,
+      todoUi,
+      mirrorTodos,
+      ...(isSubagent
+        ? {}
+        : {
+            stopReminder: {
+              getBlockedDepth: () => blockedDepth,
+              getRunningSubs: () => subagentPort.current?.listRunningSubs().length ?? 0,
+            },
+          }),
+    });
   }
 }
