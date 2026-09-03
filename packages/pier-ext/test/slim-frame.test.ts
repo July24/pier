@@ -2,7 +2,7 @@
  * D97 窄格静帧单测：可见性谓词 / 宽度感知折行 / 静帧行 / overlay 注册生命周期 / 三档内容。
  * 缝：纯函数 + 进程内单例（resetForTest 隔离）。
  */
-import { test, beforeEach } from 'node:test';
+import { test, beforeEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   SLIM_EMPTY_COPY,
@@ -14,6 +14,7 @@ import {
   frameLines,
   isSlimFrame,
   registerSlimFrame,
+  RESIZE_WATCHDOG_MS,
   resetForTest,
   slimContentLines,
   updateSlimFrame,
@@ -123,6 +124,72 @@ test('registerSlimFrame：PI_HERDR_SLIM_FRAME=0 逃生口', () => {
   } finally {
     if (prev === undefined) delete process.env.PI_HERDR_SLIM_FRAME;
     else process.env.PI_HERDR_SLIM_FRAME = prev;
+  }
+});
+
+test('D98 resize watchdog：尺寸变化 → requestRender；未变化不重绘；dispose 解除 SIGWINCH', () => {
+  const listenersBefore = process.listenerCount('SIGWINCH');
+  let renders = 0;
+  let factory!: (tui: { requestRender(): void }, theme: { fg(c: string, s: string): string }) => object;
+  const custom = (f: typeof factory, _o: unknown) => {
+    factory = f;
+    return new Promise<never>(() => {}); // done 永不调用（overlay 常驻）
+  };
+  registerSlimFrame({ ui: { custom } });
+  const comp = factory({ requestRender: () => { renders += 1; } }, { fg: (_c, s) => s }) as {
+    dispose(): void;
+    viewportSize(): { cols: number; rows: number };
+    onMaybeResized(): void;
+  };
+  assert.equal(process.listenerCount('SIGWINCH'), listenersBefore + 1, '注册后挂上 SIGWINCH');
+
+  let size = { cols: 150, rows: 43 };
+  comp.viewportSize = () => size;
+  comp.onMaybeResized(); // 首次同步基准（构造时读到的 0×0 → 150×43）
+  assert.equal(renders, 1);
+
+  comp.onMaybeResized(); // 尺寸未变 → 不重绘
+  assert.equal(renders, 1);
+
+  size = { cols: 150, rows: 4 }; // heat-reflow 压缩 → 必须触发一次重绘（D98 主修复）
+  comp.onMaybeResized();
+  assert.equal(renders, 2);
+
+  comp.dispose();
+  assert.equal(process.listenerCount('SIGWINCH'), listenersBefore, 'dispose 后解除 SIGWINCH');
+});
+
+test('D98 resize watchdog：轮询兜底发现尺寸变化（SIGWINCH 丢失场景）', () => {
+  mock.timers.enable({ apis: ['setInterval'] });
+  try {
+    let renders = 0;
+    let factory!: (tui: { requestRender(): void }, theme: { fg(c: string, s: string): string }) => object;
+    const custom = (f: typeof factory, _o: unknown) => {
+      factory = f;
+      return new Promise<never>(() => {});
+    };
+    registerSlimFrame({ ui: { custom } });
+    const comp = factory({ requestRender: () => { renders += 1; } }, { fg: (_c, s) => s }) as {
+      dispose(): void;
+      viewportSize(): { cols: number; rows: number };
+    };
+    let size = { cols: 150, rows: 43 };
+    comp.viewportSize = () => size;
+
+    mock.timers.tick(RESIZE_WATCHDOG_MS); // 基准同步（0×0 → 150×43）
+    assert.equal(renders, 1);
+    mock.timers.tick(RESIZE_WATCHDOG_MS); // 未变 → 不重绘
+    assert.equal(renders, 1);
+
+    size = { cols: 150, rows: 8 }; // 缩格（SIGWINCH 丢失时由轮询兜底）
+    mock.timers.tick(RESIZE_WATCHDOG_MS);
+    assert.equal(renders, 2);
+
+    comp.dispose();
+    mock.timers.tick(RESIZE_WATCHDOG_MS * 10); // dispose 后轮询停止
+    assert.equal(renders, 2);
+  } finally {
+    mock.timers.reset();
   }
 });
 

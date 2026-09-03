@@ -21,6 +21,10 @@
  * (done() is never called, leaving the Promise pending, swallowing rejection, and never awaiting it). If switching
  * pi sessions removes the overlay (resetExtensionUI), the static frame naturally exits without affecting the main
  * flow. PI_HERDR_SLIM_FRAME=0 is the escape hatch.
+ * Resize watchdog (D98): the component owns a SIGWINCH listener plus a 1s size poll that call tui.requestRender() on
+ * any PTY size change. Why: long-running sessions stop re-rendering on resize (observed in herdr — an idle master
+ * shrunk by heat reflow froze on a stale clipped frame: no todo, no title), so pi's own resize wiring cannot be relied
+ * on; columns/rows are read live per render, so one render is the whole fix. Stopped in dispose().
  */
 
 import { isArchived } from './stale-core.ts';
@@ -38,6 +42,8 @@ export const SLIM_TODO_MIN_ROWS = 3;
 export const SLIM_TODO_MIN_COLS = 16;
 /** Empty-list copy: the pane is alive but has no plan yet (replaces a lone ·). */
 export const SLIM_EMPTY_COPY = 'no todos yet';
+/** D98: watchdog poll period — SIGWINCH covers the delivered signal; the poll covers lost ones (e.g. after suspend). */
+export const RESIZE_WATCHDOG_MS = 1_000;
 
 /** Visibility predicate (overlayOptions.visible invokes it on every render frame). */
 export function isSlimFrame(cols: number, rows: number): boolean {
@@ -227,6 +233,11 @@ class SlimFrameComponent {
   private cache: { width: number; lines: string[] } | null = null;
   private readonly tui: FrameTui;
   private readonly colorize: (s: string) => string;
+  /** D98 watchdog: last PTY size seen by onMaybeResized (re-seeded at watchdog start). */
+  private seenCols = 0;
+  private seenRows = 0;
+  private sigwinch: (() => void) | null = null;
+  private poll: NodeJS.Timeout | null = null;
 
   constructor(tui: FrameTui, colorize: (s: string) => string) {
     this.tui = tui;
@@ -271,13 +282,56 @@ class SlimFrameComponent {
 
   /** Reclaim the module singleton when pi tears down the overlay (session switch/exit), allowing re-registration. */
   dispose(): void {
+    this.stopResizeWatchdog();
     if (active === this) active = null;
+  }
+
+  /** Live PTY size (pi-tui reads the same source on every render; an instance method so tests can stub it). */
+  viewportSize(): { cols: number; rows: number } {
+    return { cols: process.stdout.columns ?? 0, rows: process.stdout.rows ?? 0 };
+  }
+
+  /** D98: SIGWINCH handler and poll tick — exactly one requestRender per actual size change; the next render reads live sizes. */
+  readonly onMaybeResized = (): void => {
+    const { cols, rows } = this.viewportSize();
+    if (cols === this.seenCols && rows === this.seenRows) return;
+    this.seenCols = cols;
+    this.seenRows = rows;
+    this.tui.requestRender();
+  };
+
+  /** Start the D98 watchdog (idempotent). SIGWINCH covers the delivered signal; the poll covers lost ones. */
+  startResizeWatchdog(): void {
+    if (this.poll) return;
+    const size = this.viewportSize();
+    this.seenCols = size.cols;
+    this.seenRows = size.rows;
+    try {
+      process.on('SIGWINCH', this.onMaybeResized);
+      this.sigwinch = this.onMaybeResized;
+    } catch {
+      /* Platforms without a SIGWINCH mapping keep the poll only. */
+    }
+    this.poll = setInterval(this.onMaybeResized, RESIZE_WATCHDOG_MS);
+    this.poll.unref?.();
+  }
+
+  private stopResizeWatchdog(): void {
+    if (this.sigwinch) {
+      process.removeListener('SIGWINCH', this.sigwinch);
+      this.sigwinch = null;
+    }
+    if (this.poll) {
+      clearInterval(this.poll);
+      this.poll = null;
+    }
   }
 }
 
 
-/** Test injection point (reset module state). */
+/** Test injection point (reset module state); dispose first so an undisposed component's watchdog cannot leak. */
 export function resetForTest(): void {
+  active?.dispose();
   active = null;
 }
 
@@ -302,6 +356,7 @@ export function registerSlimFrame(eventCtx: unknown): void {
     const pending = custom(
       (tui, theme) => {
         const comp = new SlimFrameComponent(tui, (s) => theme.fg('accent', s));
+        comp.startResizeWatchdog();
         active = comp;
         return comp;
       },
