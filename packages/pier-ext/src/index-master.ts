@@ -86,9 +86,10 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
     maxItems: 15,
     mirrorTodos: m.mirrorTodos,
     appendEntry: (customType: string, data: unknown) => {
-      (m.pi as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.(customType, data);
+      (m.pi as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.(customType, d);
     },
     state: m.todoUi,
+    getBlockedDepth: m.getBlockedDepth,
     stopReminder: {
       getBlockedDepth: m.getBlockedDepth,
       getRunningSubs: () => m.port.current?.listRunningSubs().length ?? 0,

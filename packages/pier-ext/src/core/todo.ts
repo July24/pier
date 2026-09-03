@@ -31,6 +31,8 @@ import { anchorTodoRange, formatTodoSummary, renderTodoGroups } from '../todo-wi
 export interface TodoUiSlot {
   /** Lets index lifecycle events render through the currently mounted plugin. */
   renderWidget: (ctx: unknown) => void;
+  /** Re-render from the last seen context without a fresh event (human-gate open/close). */
+  rerenderWidget?: () => void;
 }
 
 interface TodoDeps {
@@ -41,6 +43,8 @@ interface TodoDeps {
   mirrorTodos: () => void;
   appendEntry: (customType: string, data: unknown) => void;
   state: TodoUiSlot;
+  /** Human-gate depth (ask_user_question / herdr:blocked); >0 collapses the widget to one line. */
+  getBlockedDepth?: () => number;
   /** Master-only unfinished-todo reminder; omitted on worker panes. */
   stopReminder?: {
     getBlockedDepth: () => number;
@@ -67,8 +71,18 @@ export const WIDGET_MAX_LINES = 10;
  * completions. A +N line points to /todos when the full plan cannot fit. This fixes 01a03c0d,
  * where active work scrolled out while only the final entries remained visible.
  */
-export function widgetLines(items: readonly TodoItem[], opts?: { archivedAgeMs?: number | null }): string[] {
+export function widgetLines(
+  items: readonly TodoItem[],
+  opts?: { archivedAgeMs?: number | null; blockedDepth?: number | null },
+): string[] {
   if (items.length === 0) return [];
+  // Human gate open (ask_user_question waiting): the question + editor own the fixed area, so the
+  // widget collapses to the one-line summary — /todos still reaches the full list. Without this,
+  // a 10-line widget plus a multi-line question leaves almost no scrollable transcript
+  // (user-reported: both blocks visible ⇒ history range too small).
+  if ((opts?.blockedDepth ?? 0) > 0) {
+    return [`${formatTodoSummary(items)} · /todos 全量`];
+  }
   // Collapse archived plans to two lines so stale work cannot monopolize the widget.
   if (opts?.archivedAgeMs != null) {
     return [
@@ -95,7 +109,7 @@ export function widgetLines(items: readonly TodoItem[], opts?: { archivedAgeMs?:
 
 export default function todoPlugin(ctx: Context): void {
   const surface = ctx.get('pi-herdr.surface') as PiSurface<object>;
-  const { todos, allowParallelInProgress, maxItems, mirrorTodos, appendEntry, state, stopReminder } =
+  const { todos, allowParallelInProgress, maxItems, mirrorTodos, appendEntry, state, stopReminder, getBlockedDepth } =
     ctx.get('pi-herdr.todo-deps') as TodoDeps;
   const scoped = surface.forModule(import.meta.url);
 
@@ -115,9 +129,15 @@ export default function todoPlugin(ctx: Context): void {
       : undefined;
   }
 
+  /** Gate transitions fire outside lifecycle events; remember one ctx so rerenderWidget can target the live ui. */
+  let lastEventCtx: unknown = null;
   function renderWidget(eventCtx: unknown): void {
+    if (eventCtx !== null && eventCtx !== undefined) lastEventCtx = eventCtx;
     try {
-      widgetUi(eventCtx)?.setWidget?.('todos', widgetLines(todos.items, { archivedAgeMs: archivedAgeMs() }));
+      widgetUi(eventCtx)?.setWidget?.('todos', widgetLines(todos.items, {
+        archivedAgeMs: archivedAgeMs(),
+        blockedDepth: getBlockedDepth?.() ?? 0,
+      }));
     } catch {
       /* Older pi versions may omit widget support without disabling todo tracking. */
     }
@@ -125,6 +145,7 @@ export default function todoPlugin(ctx: Context): void {
 
   // Let index lifecycle hooks call the current plugin implementation.
   state.renderWidget = renderWidget;
+  state.rerenderWidget = () => renderWidget(lastEventCtx);
 
   /* ── Read hook: D39 reminders and stale-plan thawing ────────────── */
   let todoReadTurn = 0;

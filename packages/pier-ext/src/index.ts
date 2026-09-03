@@ -32,6 +32,7 @@ import { lastAssistantText, readSessionFile } from './session-tail.ts';
 import { fileURLToPath } from 'node:url';
 import { TodosService } from './todos-service.ts';
 import { reconcileTodos } from './reconcile-core.ts';
+import type { TodoUiSlot } from './core/todo.ts';
 import {
   estimateEta,
   formatProgressSuffix,
@@ -237,7 +238,7 @@ export default async function (pi: ExtensionAPI) {
   }
 
   /* ── todo family slot (core/todo.ts fills the plugin hook; widget rendering moved with the family) ── */
-  const todoUi: { renderWidget: (ctx: unknown) => void } = {
+  const todoUi: TodoUiSlot = {
     renderWidget: () => { /* No-op before plugin mounting; filled after mounting. */ },
   };
 
@@ -388,6 +389,8 @@ export default async function (pi: ExtensionAPI) {
     reportAgent('blocked', label);
     // D95: human-gate marker lets the workbench heatmap distinguish ask from block.
     if (label) void client.reportAskFlag(label).catch(() => {});
+    // Gate open collapses the todo widget to one line — the question owns the fixed area.
+    todoUi.rerenderWidget?.();
   }
   function exitBlocked(): void {
     blockedDepth = Math.max(0, blockedDepth - 1);
@@ -396,6 +399,8 @@ export default async function (pi: ExtensionAPI) {
       // D95: gate released → clear marker.
       void client.reportAskFlag(null).catch(() => {});
     }
+    // Gate closed → restore the full widget window.
+    todoUi.rerenderWidget?.();
   }
 
   // emit() is synchronous; this flag stops our own listener from double-counting depth.
@@ -589,6 +594,7 @@ export default async function (pi: ExtensionAPI) {
       todos,
       todoUi,
       mirrorTodos,
+      getBlockedDepth: () => blockedDepth,
       ...(isSubagent
         ? {}
         : {

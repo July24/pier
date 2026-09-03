@@ -48,11 +48,16 @@ function fakePi() {
 
 type StopReminder = { getBlockedDepth: () => number; getRunningSubs: () => number };
 
-function makeDeps(pi: ReturnType<typeof fakePi>, ledger?: DisposeLedger, stopReminder?: StopReminder) {
+function makeDeps(
+  pi: ReturnType<typeof fakePi>,
+  ledger?: DisposeLedger,
+  stopReminder?: StopReminder,
+  getBlockedDepth?: () => number,
+) {
   const todos = new TodosService({ strict: false, allowParallelInProgress: true });
   const surface = new PiSurface(pi as unknown as object, ledger);
   const calls: string[] = [];
-  const state = { renderWidget: (_ctx: unknown) => {} };
+  const state = { renderWidget: (_ctx: unknown) => {}, rerenderWidget: () => {} };
   const deps = {
     todos,
     allowParallelInProgress: true,
@@ -60,6 +65,7 @@ function makeDeps(pi: ReturnType<typeof fakePi>, ledger?: DisposeLedger, stopRem
     mirrorTodos: () => { calls.push('mirror'); },
     appendEntry: (t: string, d: unknown) => { pi.appendEntry(t, d); void d; },
     state,
+    ...(getBlockedDepth ? { getBlockedDepth } : {}),
     ...(stopReminder ? { stopReminder } : {}),
   };
   return { todos, surface, deps, calls, state };
@@ -68,9 +74,13 @@ function makeDeps(pi: ReturnType<typeof fakePi>, ledger?: DisposeLedger, stopRem
 async function mount(
   pi: ReturnType<typeof fakePi>,
   ledger?: DisposeLedger,
-  depsOverride?: { appendEntry?: (t: string, d: unknown) => void; stopReminder?: StopReminder },
+  depsOverride?: {
+    appendEntry?: (t: string, d: unknown) => void;
+    stopReminder?: StopReminder;
+    getBlockedDepth?: () => number;
+  },
 ) {
-  const m = makeDeps(pi, ledger, depsOverride?.stopReminder);
+  const m = makeDeps(pi, ledger, depsOverride?.stopReminder, depsOverride?.getBlockedDepth);
   if (depsOverride?.appendEntry) m.deps.appendEntry = depsOverride.appendEntry;
   const ctx = new Context();
   ctx.provide('pi-herdr.surface', m.surface);
@@ -280,4 +290,33 @@ test('D41 stop 提醒：未配置 stopReminder 时不注册催办钩子', async 
   const { ctx } = await mount(pi);
   assert.equal((pi.listeners.get('agent_start') ?? []).length, 0);
   await ctx.fiber.dispose();
+});
+
+test('core/todo：闸门深度>0 → widget 折叠一行；归零恢复；rerender 槽生效', async () => {
+  const pi = fakePi();
+  let depth = 0;
+  const captured: string[][] = [];
+  const widgetCtx = { ui: { setWidget: (_id: string, lines: string[]) => { captured.push(lines); } } };
+  const { state } = await mount(pi, undefined, { getBlockedDepth: () => depth });
+  assert.equal(typeof state.rerenderWidget, 'function', 'rerender 槽已回填');
+
+  await pi.tools.get('todo_write')?.execute?.(null, {
+    todos: [
+      { content: 'a', status: 'in_progress' },
+      { content: 'b', status: 'pending' },
+    ],
+  }, undefined, undefined, widgetCtx);
+  state.renderWidget(widgetCtx);
+  assert.ok((captured.at(-1) ?? []).length > 1, '闸门关着 → 全量窗口');
+
+  depth = 1;
+  state.rerenderWidget(); // index enterBlocked 路径
+  const collapsed = captured.at(-1) ?? [];
+  assert.equal(collapsed.length, 1, '闸门开着 → 一行摘要');
+  assert.match(collapsed[0], /^todo: 1▶ 1○ /);
+  assert.match(collapsed[0], /\/todos/);
+
+  depth = 0;
+  state.rerenderWidget(); // index exitBlocked 路径
+  assert.ok((captured.at(-1) ?? []).length > 1, '闸门释放 → 恢复全量');
 });

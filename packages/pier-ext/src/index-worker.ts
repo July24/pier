@@ -16,6 +16,8 @@ export interface TodoOnlyMount {
   todos: TodosService;
   todoUi: TodoUiSlot;
   mirrorTodos: () => void;
+  /** Human-gate depth source; collapses the todo widget to one line while a gate is open. */
+  getBlockedDepth?: () => number;
   /** Master-only stop reminder; omit on worker panes. */
   stopReminder?: {
     getBlockedDepth: () => number;
@@ -33,9 +35,10 @@ export async function mountTodoOnly(m: TodoOnlyMount): Promise<void> {
     maxItems: 15,
     mirrorTodos: m.mirrorTodos,
     appendEntry: (customType: string, data: unknown) => {
-      (m.pi as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.(customType, data);
+      (m.pi as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.(customType, d);
     },
     state: m.todoUi,
+    ...(m.getBlockedDepth ? { getBlockedDepth: m.getBlockedDepth } : {}),
     ...(m.stopReminder ? { stopReminder: m.stopReminder } : {}),
   });
   await workerRoot.plugin(todoPlugin);

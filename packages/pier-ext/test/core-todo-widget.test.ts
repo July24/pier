@@ -110,3 +110,21 @@ test('widgetLines: 反冻结——归档列表不逐条渲染，两行降权', (
   const plain = widgetLines(items);
   assert.ok(plain.some((l) => l.includes('✓ Verify gateway')));
 });
+
+test('widgetLines: 闸门开着 → 一行摘要 + /todos 指引（把固定区让给 ask 问题）', () => {
+  const items = [
+    it('Dispatch workers', 'in_progress', 'repro'),
+    it('Wait user', 'blocked'),
+    it('Old done', 'completed', 'repro'),
+  ];
+  const lines = widgetLines(items, { blockedDepth: 1 });
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^todo: 1▶ 0○ 1■ 1✓ · \/todos/);
+  // 归档 + 闸门同时存在 → 闸门优先，同样一行
+  const both = widgetLines(items, { blockedDepth: 2, archivedAgeMs: 16 * 3_600_000 });
+  assert.equal(both.length, 1);
+  // 深度归零 → 恢复原有窗口行为
+  const released = widgetLines(items, { blockedDepth: 0 });
+  assert.ok(released.length > 1);
+  assert.ok(released.some((l) => l.includes('Dispatch workers')));
+});
