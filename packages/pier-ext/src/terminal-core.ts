@@ -328,3 +328,66 @@ export function foldTerminalsRegistry(entries: readonly BranchEntryLike3[]): Ter
   }
   return found;
 }
+
+/* ── Idle-terminal nudge: turn-end self-cleanup for shells the model forgot to close ──
+ * Observed (wF:p7 orphan): a master opened a resident terminal for a one-shot background
+ * compile, the job finished, and nothing ever closed the pane — terminals are persistent by
+ * design, so the shell lingered as a dead split in the main tab. Decision core mirrors the
+ * todo stop-reminder: pure plan here, delivery wiring in core/terminal. */
+
+/** Cap idle-terminal nudges for the lifetime of the process (same shape as TODO_REMINDERS_MAX). */
+export const TERM_REMINDERS_MAX = 2;
+
+/** Idle threshold before a nudge is due; PI_HERDR_TERM_IDLE_MS is read per call so tests can use small values. */
+export function terminalIdleMs(): number {
+  return Number(process.env.PI_HERDR_TERM_IDLE_MS ?? 30 * 60_000) || 30 * 60_000;
+}
+
+/** Grace from agent_settled to injection, letting the user read the answer and intervene; cancel on agent_start. */
+export function terminalReminderGraceMs(): number {
+  return Number(process.env.PI_HERDR_TERM_GRACE_MS ?? 30_000) || 30_000;
+}
+
+/** Custom message type for the idle-terminal nudge (registerMessageRenderer may restyle it). */
+export const TERM_REMINDER_CUSTOM_TYPE = 'pi-herdr.term-reminder';
+
+export interface IdleTerminalInput {
+  terminalId: string;
+  cwd: string;
+  label: string | null;
+  lastActivityAt: number;
+}
+
+export interface IdleTerminalReminderPlan {
+  /** Whether a nudge should be injected. */
+  due: boolean;
+  /** Complete injected content, or null when due is false. */
+  content: string | null;
+  /** Nudge count after successful injection, or the original count when due is false. */
+  nextReminders: number;
+}
+
+
+/**
+ * Due only when an open terminal has been idle past the threshold and the process-wide cap
+ * allows another nudge. Shells still hosting long-running work were touched recently, so the
+ * idle filter is what keeps legitimate dev-server terminals out of the nudge.
+ */
+export function planIdleTerminalReminder(
+  input: { open: readonly IdleTerminalInput[]; now: number; reminders: number },
+): IdleTerminalReminderPlan {
+  const idleMs = terminalIdleMs();
+  const idle = input.open.filter((t) => input.now - t.lastActivityAt >= idleMs);
+  if (idle.length === 0 || input.reminders >= TERM_REMINDERS_MAX) {
+    return { due: false, content: null, nextReminders: input.reminders };
+  }
+  const list = idle.map((t) => `- ${t.terminalId} (${t.label ?? t.cwd})`).join('\n');
+  const content = [
+    `<system-reminder>Open terminal(s) idle for a while (nudge ${input.reminders + 1}/${TERM_REMINDERS_MAX}):`,
+    list,
+    'If the work in them is done, close them now with terminal(action: "close", terminal_id: "…").',
+    'Keep a terminal only if a long-running process still needs that shell.',
+    '</system-reminder>',
+  ].join('\n');
+  return { due: true, content, nextReminders: input.reminders + 1 };
+}

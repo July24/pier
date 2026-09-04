@@ -13,6 +13,7 @@ import type { HerdrClientLike } from '../herdr-client.ts';
 import {
   READINESS_TIMEOUT_MS,
   READ_MAX_CHARS,
+  TERM_REMINDER_CUSTOM_TYPE,
   TERMINALS_CUSTOM_TYPE,
   activeTerminalPaneIds,
   classifyReadiness,
@@ -21,10 +22,12 @@ import {
   detectFullscreenTUI,
   foldTerminalsRegistry,
   makeTerminalsRegistry,
+  planIdleTerminalReminder,
   promptStrategyFor,
   registerTerminal,
   stripAnsi,
   summarizeSessions,
+  terminalReminderGraceMs,
   validateSendText,
   validateSignal,
   type ReadCursor,
@@ -95,6 +98,74 @@ export default function terminalPlugin(ctx: Context): void {
     rebuildTerminals(eventCtx);
   });
 
+  // Session teardown (quit / Ctrl+D / SIGTERM) is the last chance to reclaim resident shells:
+  // terminals are persistent by design, so a master that exits without closing them leaks live
+  // zsh panes. Session SWITCH never fires this event (only session_start/session_tree), so
+  // switching branches cannot kill shells that the registry replays on the next session_start.
+  scoped.on('session_shutdown', async () => {
+    idleReminderTimer && clearTimeout(idleReminderTimer);
+    idleReminderTimer = null;
+    const open = terminals.filter((t) => t.status === 'open');
+    if (open.length === 0) return;
+    await Promise.allSettled(open.map((t) => client.closePane(t.paneId)));
+    const now = Date.now();
+    terminals = terminals.map((t) =>
+      t.status === 'open' ? { ...t, status: 'closed' as const, closedAt: now } : t,
+    );
+    persistTerminals();
+  });
+
+  // Turn-end nudge: remind the model to close terminals idle past the threshold (wF:p7 orphan —
+  // a one-shot background compile left a dead split in the main tab forever). Same delivery
+  // shape as the todo stop reminder: grace window, cancel on agent_start, capped followUp.
+  const piSend = surface.raw as {
+    sendMessage?: (
+      message: { customType: string; content: string; display?: boolean },
+      opts?: { deliverAs?: string; triggerTurn?: boolean },
+    ) => Promise<void>;
+  };
+  let idleReminders = 0;
+  let idleReminderTimer: NodeJS.Timeout | null = null;
+  scoped.on('agent_start', () => {
+    if (idleReminderTimer !== null) {
+      clearTimeout(idleReminderTimer);
+      idleReminderTimer = null;
+    }
+  });
+  scoped.on('agent_settled', async () => {
+    if (idleReminderTimer !== null) {
+      clearTimeout(idleReminderTimer);
+      idleReminderTimer = null;
+    }
+    const plan = planIdleTerminalReminder({
+      open: terminals.filter((t) => t.status === 'open'),
+      now: Date.now(),
+      reminders: idleReminders,
+    });
+    if (!plan.due || plan.content == null) return;
+    // Count at schedule time: delivery is best-effort, and a failed delivery must not grant
+    // an unbounded retry (reminder-storm guard). The sync increment also keeps the counter
+    // exact for the next settle without depending on microtask ordering.
+    idleReminders += 1;
+    const content = plan.content;
+    idleReminderTimer = setTimeout(() => {
+      idleReminderTimer = null;
+      void (async () => {
+        const send = piSend.sendMessage;
+        if (typeof send !== 'function') return;
+        try {
+          await send(
+            { customType: TERM_REMINDER_CUSTOM_TYPE, content, display: true },
+            { deliverAs: 'followUp', triggerTurn: true },
+          );
+        } catch {
+          /* Delivery failure is non-fatal; the cap already bounds retries. */
+        }
+      })();
+    }, terminalReminderGraceMs());
+    idleReminderTimer.unref?.();
+  });
+
   const TERM_READ_MAX = Number(process.env.PI_HERDR_TERM_READ_MAX ?? READ_MAX_CHARS) || READ_MAX_CHARS;
   const errText = (msg: string) => ({ content: [{ type: 'text' as const, text: `Error: ${msg}` }], details: {} });
 
@@ -106,6 +177,7 @@ export default function terminalPlugin(ctx: Context): void {
       'Operations: open (create session), send (type commands), read (capture output), signal (ctrl+c/ctrl+d/ctrl+z/esc/enter), close (kill shell), list (show all).',
       'The shell keeps cwd, environment variables, and background processes across calls.',
       'Use for dev servers, REPLs, or multi-step shell work — not one-shot bash calls.',
+      'Close a terminal with action: "close" as soon as the work in it is done — finished terminals are never auto-reclaimed and keep occupying a pane.',
     ].join(' '),
     parameters: Type.Object({
       action: Type.Union([
