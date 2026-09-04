@@ -143,7 +143,6 @@ export default function terminalPlugin(ctx: Context): void {
       reminders: idleReminders,
     });
     if (!plan.due || plan.content == null) return;
-    // Count at schedule time: delivery is best-effort, and a failed delivery must not grant
     // an unbounded retry (reminder-storm guard). The sync increment also keeps the counter
     // exact for the next settle without depending on microtask ordering.
     idleReminders += 1;
@@ -167,6 +166,12 @@ export default function terminalPlugin(ctx: Context): void {
   });
 
   const TERM_READ_MAX = Number(process.env.PI_HERDR_TERM_READ_MAX ?? READ_MAX_CHARS) || READ_MAX_CHARS;
+  /** wait action: default and ceiling for the blocking output wait (an LLM call must not hang forever). */
+  const WAIT_DEFAULT_MS = 120_000;
+  const WAIT_MAX_MS = 600_000;
+  /** wait action: recent-tail size handed back on timeout so the model can decide the next move. */
+  const WAIT_TAIL_CHARS = 2_000;
+
   const errText = (msg: string) => ({ content: [{ type: 'text' as const, text: `Error: ${msg}` }], details: {} });
 
   scoped.registerTool({
@@ -174,23 +179,30 @@ export default function terminalPlugin(ctx: Context): void {
     label: 'Terminal',
     description: [
       'Manage persistent interactive terminals (resident shells in dedicated herdr panes).',
-      'Operations: open (create session), send (type commands), read (capture output), signal (ctrl+c/ctrl+d/ctrl+z/esc/enter), close (kill shell), list (show all).',
+      'Operations: open (create session), send (type commands), wait (block until output matches a pattern), read (capture output), signal (ctrl+c/ctrl+d/ctrl+z/esc/enter), close (kill shell), list (show all).',
       'The shell keeps cwd, environment variables, and background processes across calls.',
       'Use for dev servers, REPLs, or multi-step shell work — not one-shot bash calls.',
       'Close a terminal with action: "close" as soon as the work in it is done — finished terminals are never auto-reclaimed and keep occupying a pane.',
+      'Long job pattern: send "cmd; echo TERM_DONE_$?" then wait with pattern "TERM_DONE_" — the sentinel also carries the exit code; redirect verbose output to a log file and read the file, because output between two reads is lost.',
+      'After send, use read to confirm the command actually started; multi-line text executes line-by-line. send(wait_prompt: true) refuses to queue text while a previous command is still running.',
     ].join(' '),
     parameters: Type.Object({
       action: Type.Union([
         Type.Literal('open'),
         Type.Literal('send'),
+        Type.Literal('wait'),
         Type.Literal('read'),
         Type.Literal('signal'),
         Type.Literal('close'),
         Type.Literal('list'),
       ], { description: 'Terminal operation to perform' }),
       cwd: Type.Optional(Type.String({ description: '[open] Working directory for the shell (defaults to session cwd)' })),
-      terminal_id: Type.Optional(Type.String({ description: '[send|read|signal|close] Terminal id returned by open action' })),
+      terminal_id: Type.Optional(Type.String({ description: '[send|wait|read|signal|close] Terminal id returned by open action' })),
       text: Type.Optional(Type.String({ description: '[send] Command text to type and run (Enter appended automatically)' })),
+      wait_prompt: Type.Optional(Type.Boolean({ description: '[send] Verify the shell is back at a prompt before sending; refuses with the detected readiness instead of queueing text behind a running command' })),
+      pattern: Type.Optional(Type.String({ description: '[wait] Literal text or regular expression to wait for in pane output' })),
+      regex: Type.Optional(Type.Boolean({ description: '[wait] Treat pattern as a regular expression (default: literal substring)' })),
+      timeout_ms: Type.Optional(Type.Number({ description: '[wait] Give up after this many ms (default 120000, max 600000)' })),
       pane_id: Type.Optional(Type.String({ description: '[read] Direct pane read (limited to own tab panes only)' })),
       max_chars: Type.Optional(Type.Number({ description: '[read] Output cap for this read (default 10000)' })),
       key: Type.Optional(Type.String({ description: '[signal] Control key: ctrl+c | ctrl+d | ctrl+z | esc | enter' })),
@@ -200,17 +212,32 @@ export default function terminalPlugin(ctx: Context): void {
       switch (action) {
         case 'open': return executeTerminalOpen(params, ctx);
         case 'send': return executeTerminalSend(params);
+        case 'wait': return executeTerminalWait(params);
         case 'read': return executeTerminalRead(params);
         case 'signal': return executeTerminalSignal(params);
         case 'close': return executeTerminalClose(params);
         case 'list': return executeTerminalList();
         default:
           return errText(action
-            ? `unknown action "${action}" (valid: open, send, read, signal, close, list)`
-            : 'action is required (open, send, read, signal, close, list)');
+            ? `unknown action "${action}" (valid: open, send, wait, read, signal, close, list)`
+            : 'action is required (open, send, wait, read, signal, close, list)');
       }
     },
   });
+
+  /** Probe whether the shell sits at its interactive prompt (advisory: probe failures degrade to 'busy'). */
+  async function probeReadiness(paneId: string): Promise<'prompt' | 'silent' | 'busy'> {
+    const prompt = promptStrategyFor();
+    try {
+      const matched = await client.waitForOutput(paneId, { type: 'regex', value: prompt.waitPattern }, READINESS_TIMEOUT_MS);
+      if (matched) return 'prompt';
+      const read = await client.readPane(paneId, { stripAnsi: false });
+      return classifyReadiness(stripAnsi(read.text), { silentMs: 0, prompt });
+    } catch {
+      /* Readiness is advisory, so probe failures still leave a usable terminal. */
+      return 'busy';
+    }
+  }
 
   async function executeTerminalOpen(params, ctx) {
     if (!client.available || !env) return errText('terminal tools require a herdr-managed pane');
@@ -232,18 +259,7 @@ export default function terminalPlugin(ctx: Context): void {
     r.entry.paneId = paneId;
     terminals = r.entries;
     persistTerminals();
-    const prompt = promptStrategyFor();
-    let readiness: 'prompt' | 'silent' | 'busy' = 'busy';
-    try {
-      const matched = await client.waitForOutput(paneId, { type: 'regex', value: prompt.waitPattern }, READINESS_TIMEOUT_MS);
-      if (matched) readiness = 'prompt';
-      else {
-        const read = await client.readPane(paneId, { stripAnsi: false });
-        readiness = classifyReadiness(stripAnsi(read.text), { silentMs: 0, prompt });
-      }
-    } catch {
-      /* Readiness is advisory, so probe failures still leave a usable terminal. */
-    }
+    const readiness = await probeReadiness(paneId);
     const text = [
       `terminal ${r.entry.terminalId} open (pane ${paneId})`,
       `cwd: ${cwd}`,
@@ -257,6 +273,18 @@ export default function terminalPlugin(ctx: Context): void {
     if (!entry) return errText(`unknown or closed terminal "${String(params?.terminal_id)}" (see action list)`);
     const v = validateSendText(typeof params?.text === 'string' ? params.text : '');
     if (!v.ok) return errText(v.error);
+    if (params?.wait_prompt === true) {
+      // Orchestration convention: read before writing. Text typed while a previous command still
+      // owns the foreground gets queued and fires later, which reads as "the shell ignored me".
+      // Refuse with the observed readiness instead of guessing.
+      const readiness = await probeReadiness(entry.paneId);
+      if (readiness !== 'prompt') {
+        return errText(
+          `shell is ${readiness === 'busy' ? 'busy (a previous command may still be running)' : 'silent (no prompt detected)'} — text was NOT sent. `
+            + 'Use action read to inspect the pane, or omit wait_prompt to send anyway.',
+        );
+      }
+    }
     try {
       await client.sendPaneText(entry.paneId, v.text);
     } catch (e) {
@@ -264,6 +292,50 @@ export default function terminalPlugin(ctx: Context): void {
     }
     touchTerminal(entry);
     return { content: [{ type: 'text', text: `sent to ${entry.terminalId} (${v.text.length} chars)` }], details: { terminal_id: entry.terminalId } };
+  }
+
+  async function executeTerminalWait(params) {
+    const entry = findOpenTerminal(params?.terminal_id);
+    if (!entry) return errText(`unknown or closed terminal "${String(params?.terminal_id)}" (see action list)`);
+    const raw = typeof params?.pattern === 'string' ? params.pattern : '';
+    if (!raw) return errText('pattern is required (literal text, or a regular expression with regex: true)');
+    const useRegex = params?.regex === true;
+    if (useRegex) {
+      try {
+        new RegExp(raw);
+      } catch (e) {
+        return errText(`invalid regex: ${(e as Error).message}`);
+      }
+    }
+    const requested = typeof params?.timeout_ms === 'number' && params.timeout_ms > 0 ? params.timeout_ms : WAIT_DEFAULT_MS;
+    const timeoutMs = Math.min(Math.max(requested, 1000), WAIT_MAX_MS);
+    const matcher = useRegex ? { type: 'regex' as const, value: raw } : { type: 'substring' as const, value: raw };
+    let matched: boolean | null;
+    try {
+      matched = await client.waitForOutput(entry.paneId, matcher, timeoutMs);
+    } catch (e) {
+      return errText(`wait failed (pane may be closed): ${(e as Error).message}`);
+    }
+    if (matched !== true) {
+      // wait-for-text convention: on timeout, hand back the recent tail so the model can decide
+      // the next move instead of re-polling blind.
+      let tail = '';
+      try {
+        const read = await client.readPane(entry.paneId, { stripAnsi: false });
+        tail = stripAnsi(read.text).slice(-WAIT_TAIL_CHARS);
+      } catch {
+        /* The pane is gone; the timeout text alone still tells the model it is stuck. */
+      }
+      const reason = matched === false ? 'no match' : 'wait unavailable';
+      return {
+        content: [{ type: 'text', text: `no match within ${timeoutMs}ms (${reason}).${tail ? `\nrecent output tail:\n${tail}` : ''}` }],
+        details: { terminal_id: entry.terminalId, matched: false, pattern: raw },
+      };
+    }
+    return {
+      content: [{ type: 'text', text: `matched in ${entry.terminalId} — output is ready, use action read to inspect it` }],
+      details: { terminal_id: entry.terminalId, matched: true, pattern: raw },
+    };
   }
 
   async function executeTerminalRead(params) {

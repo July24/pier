@@ -35,17 +35,28 @@ function fakePi() {
   };
 }
 
-function fakeClient(): HerdrClientLike {
-  return {
+function fakeClient(overrides: {
+  waitForOutput?: (paneId: string, match: { type: string; value: string }, timeoutMs: number) => Promise<boolean | null>;
+} = {}) {
+  const calls = {
+    waitForOutput: [] as Array<{ paneId: string; match: unknown; timeoutMs: number }>,
+    sendPaneText: [] as string[],
+  };
+  const client = {
     available: true,
     splitPane: async () => 'pane-2',
-    waitForOutput: async () => true,
+    waitForOutput: async (paneId: string, match: { type: string; value: string }, timeoutMs: number) => {
+      calls.waitForOutput.push({ paneId, match, timeoutMs });
+      return true;
+    },
     readPane: async () => ({ text: '$ ', revision: 1, truncated: false }),
-    sendPaneText: async () => undefined,
+    sendPaneText: async (paneId: string, text: string) => { calls.sendPaneText.push(text); },
     sendPaneKeys: async () => undefined,
     closePane: async () => undefined,
     listPanes: async () => [{ paneId: 'pane-2', tabId: 't1', agentStatus: 'idle' }],
+    ...overrides,
   } as unknown as HerdrClientLike;
+  return { client, calls };
 }
 
 const TOOL_NAME = 'terminal';
@@ -55,7 +66,7 @@ test('core/terminal：surface 挂载 terminal 工具 + GC 槽回填 + open/list 
   const ledger = new DisposeLedger();
   const surface = new PiSurface(pi as unknown as object, ledger);
   const deps = {
-    client: fakeClient(),
+    client: fakeClient().client,
     env: { paneId: 'p1', tabId: 't1' },
     state: { activePaneIds: (): Set<string> => new Set() },
   };
@@ -90,7 +101,7 @@ test('core/terminal：ledger.disposeKey(本文件) → 工具墓碑 inert（hmr 
   const ledger = new DisposeLedger();
   const surface = new PiSurface(pi as unknown as object, ledger);
   const deps = {
-    client: fakeClient(),
+    client: fakeClient().client,
     env: { paneId: 'p1', tabId: 't1' },
     state: { activePaneIds: (): Set<string> => new Set() },
   };
@@ -125,7 +136,7 @@ async function mountTerminal(client: HerdrClientLike) {
 
 test('core/terminal：session_shutdown 关停全部 open terminal（防泄漏）', async () => {
   const closeCalls: string[] = [];
-  const client = fakeClient();
+  const client = fakeClient().client;
   client.closePane = async (paneId: string) => { closeCalls.push(paneId); };
   const { pi, deps, ctx } = await mountTerminal(client);
 
@@ -146,21 +157,22 @@ test('core/terminal：session_shutdown 关停全部 open terminal（防泄漏）
   await ctx.fiber.dispose();
 });
 
-test('core/terminal：agent_settled 催办闲置 terminal，进程级上限生效', async () => {
+test('core/terminal：agent_settled 催办闲置 terminal，进程级上限生效', async (t) => {
   const prevIdle = process.env.PI_HERDR_TERM_IDLE_MS;
   const prevGrace = process.env.PI_HERDR_TERM_GRACE_MS;
   process.env.PI_HERDR_TERM_IDLE_MS = '1';
   process.env.PI_HERDR_TERM_GRACE_MS = '5';
   // Date 一并假化：tick 精确制造闲置时长，杜绝真实时钟的毫秒竞态
-  mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   try {
-    const { pi, ctx } = await mountTerminal(fakeClient());
+    const { pi, deps, ctx } = await mountTerminal(fakeClient().client);
     await pi.tools.get(TOOL_NAME)?.execute?.(null, { action: 'open' }, undefined, undefined, { cwd: 'F:/w' });
+    console.error('DBG after open, activePanes=', [...deps.state.activePaneIds()]);
     const settled = (pi.listeners.get('agent_settled') ?? [])[0] as (() => Promise<void>) | undefined;
     const settle = async () => {
-      mock.timers.tick(50); // 制造 ≥ 阈值的闲置时长
+      t.mock.timers.tick(50); // 制造 ≥ 阈值的闲置时长
       await settled?.(undefined);
-      mock.timers.tick(5); // grace 到点
+      t.mock.timers.tick(5); // grace 到点
       await new Promise<void>((resolve) => setImmediate(resolve)); // 排空异步投递
     };
 
@@ -175,10 +187,72 @@ test('core/terminal：agent_settled 催办闲置 terminal，进程级上限生�
     await settle();
     assert.equal(pi.sent.length, 2, '达到 TERM_REMINDERS_MAX 后不再催办');
   } finally {
-    mock.timers.reset();
+    t.mock.timers.reset();
     if (prevIdle === undefined) delete process.env.PI_HERDR_TERM_IDLE_MS;
     else process.env.PI_HERDR_TERM_IDLE_MS = prevIdle;
     if (prevGrace === undefined) delete process.env.PI_HERDR_TERM_GRACE_MS;
     else process.env.PI_HERDR_TERM_GRACE_MS = prevGrace;
   }
+});
+
+test('core/terminal：wait 命中 → matched；超时 → 带尾部输出的 no match', async () => {
+  const { client, calls } = fakeClient();
+  const { pi, ctx } = await mountTerminal(client);
+  await pi.tools.get(TOOL_NAME)?.execute?.(null, { action: 'open' }, undefined, undefined, { cwd: 'F:/w' });
+
+  // open 的就绪探测是第一次 waitForOutput；wait 命中是第二次
+  const hit = await pi.tools.get(TOOL_NAME)?.execute?.(null, {
+    action: 'wait', terminal_id: 'term-1', pattern: 'TERM_DONE_', timeout_ms: 5000,
+  }) as { content: Array<{ text: string }>; details: { matched: boolean } };
+  assert.equal(hit.details.matched, true, '命中 → matched');
+  assert.equal(calls.waitForOutput[1]?.paneId, 'pane-2');
+  assert.deepEqual(calls.waitForOutput[1]?.match, { type: 'substring', value: 'TERM_DONE_' });
+
+  client.waitForOutput = async (paneId: string, match: { type: string; value: string }, timeoutMs: number) => {
+    calls.waitForOutput.push({ paneId, match, timeoutMs });
+    return false; // 模拟超时无匹配
+  };
+
+  const miss = await pi.tools.get(TOOL_NAME)?.execute?.(null, {
+    action: 'wait', terminal_id: 'term-1', pattern: 'never-appears', regex: true, timeout_ms: 5000,
+  }) as { content: Array<{ text: string }>; details: { matched: boolean } };
+  assert.equal(miss.details.matched, false);
+  assert.match(miss.content[0].text, /no match within 5000ms/);
+  assert.match(miss.content[0].text, /recent output tail/, '超时回带最近输出，免去盲目轮询');
+  assert.equal(calls.waitForOutput[2]?.match.type, 'regex');
+
+  const bad = await pi.tools.get(TOOL_NAME)?.execute?.(null, {
+    action: 'wait', terminal_id: 'term-1', pattern: '(', regex: true,
+  }) as { content: Array<{ text: string }> };
+  assert.match(bad.content[0].text, /invalid regex/);
+  await ctx.fiber.dispose();
+});
+
+test('core/terminal：send(wait_prompt) 就绪才发；busy 拒发不排队', async () => {
+  const { client, calls } = fakeClient();
+  const { pi, ctx } = await mountTerminal(client);
+  await pi.tools.get(TOOL_NAME)?.execute?.(null, { action: 'open' }, undefined, undefined, { cwd: 'F:/w' });
+
+  // waitForOutput=false 且 readPane 非 prompt → busy 拒发
+  const busy = client as unknown as {
+    waitForOutput: () => Promise<boolean>;
+    readPane: () => Promise<{ text: string; revision: number; truncated: boolean }>;
+  };
+  busy.waitForOutput = async () => false;
+  busy.readPane = async () => ({ text: 'compiling src/main.rs...', revision: 2, truncated: false });
+  const refused = await pi.tools.get(TOOL_NAME)?.execute?.(null, {
+    action: 'send', terminal_id: 'term-1', text: 'echo next', wait_prompt: true,
+  }) as { content: Array<{ text: string }> };
+  assert.match(refused.content[0].text, /text was NOT sent/);
+  assert.match(refused.content[0].text, /busy/);
+  assert.equal(calls.sendPaneText.length, 0, 'busy 时文本不入队');
+
+  // 提示符就绪 → 正常发送
+  busy.waitForOutput = async () => true;
+  const ok = await pi.tools.get(TOOL_NAME)?.execute?.(null, {
+    action: 'send', terminal_id: 'term-1', text: 'echo next', wait_prompt: true,
+  }) as { content: Array<{ text: string }> };
+  assert.match(ok.content[0].text, /sent to term-1/);
+  assert.deepEqual(calls.sendPaneText, ['echo next']);
+  await ctx.fiber.dispose();
 });
