@@ -6,6 +6,12 @@ import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { Context } from '@deepseek-ai/cordis';
 import terminalPlugin from '../src/core/terminal.ts';
+import {
+  foldTerminalsRegistry,
+  makeTerminalsRegistry,
+  planIdleTerminalReminder,
+  TERM_REMINDERS_MAX,
+} from '../src/terminal-core.ts';
 import { PiSurface } from '../src/pi-surface.ts';
 import { DisposeLedger } from '../src/ledger.ts';
 import type { HerdrClientLike } from '../src/herdr-client.ts';
@@ -157,7 +163,7 @@ test('core/terminal：session_shutdown 关停全部 open terminal（防泄漏）
   await ctx.fiber.dispose();
 });
 
-test('core/terminal：agent_settled 催办闲置 terminal，进程级上限生效', async (t) => {
+test('core/terminal：agent_settled 催办闲置 terminal——每个 terminal 只催一次（01a06ae3 循环守卫）', async (t) => {
   const prevIdle = process.env.PI_HERDR_TERM_IDLE_MS;
   const prevGrace = process.env.PI_HERDR_TERM_GRACE_MS;
   process.env.PI_HERDR_TERM_IDLE_MS = '1';
@@ -165,9 +171,14 @@ test('core/terminal：agent_settled 催办闲置 terminal，进程级上限生�
   // Date 一并假化：tick 精确制造闲置时长，杜绝真实时钟的毫秒竞态
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   try {
-    const { pi, deps, ctx } = await mountTerminal(fakeClient().client);
-    await pi.tools.get(TOOL_NAME)?.execute?.(null, { action: 'open' }, undefined, undefined, { cwd: 'F:/w' });
-    console.error('DBG after open, activePanes=', [...deps.state.activePaneIds()]);
+    const client = fakeClient().client;
+    let splitSeq = 2;
+    client.splitPane = async () => `pane-${splitSeq++}`;
+    const { pi, deps, ctx } = await mountTerminal(client);
+    const run = (params: Record<string, unknown>) =>
+      pi.tools.get(TOOL_NAME)?.execute?.(null, params, undefined, undefined, { cwd: 'F:/w' });
+    await run({ action: 'open' });
+    await run({ action: 'open' });
     const settled = (pi.listeners.get('agent_settled') ?? [])[0] as (() => Promise<void>) | undefined;
     const settle = async () => {
       t.mock.timers.tick(50); // 制造 ≥ 阈值的闲置时长
@@ -177,15 +188,16 @@ test('core/terminal：agent_settled 催办闲置 terminal，进程级上限生�
     };
 
     await settle();
-    assert.equal(pi.sent.length, 1, '首次闲置催办注入');
-    assert.equal(pi.sent[0]?.customType, 'pi-herdr.term-reminder');
+    assert.equal(pi.sent.length, 1, '首轮：两个闲置 terminal 合并注入一次催办');
     assert.match(pi.sent[0]?.content ?? '', /term-1/);
+    assert.match(pi.sent[0]?.content ?? '', /term-2/);
 
     await settle();
-    assert.equal(pi.sent.length, 2, '第二次催办（上限内）');
+    assert.equal(pi.sent.length, 1, '已催过的 terminal 不再催——告别循环不可能成立');
 
     await settle();
-    assert.equal(pi.sent.length, 2, '达到 TERM_REMINDERS_MAX 后不再催办');
+    assert.equal(pi.sent.length, 1);
+    assert.deepEqual([...deps.state.activePaneIds()].sort(), ['pane-2', 'pane-3'], '催办只提醒，不关 pane');
   } finally {
     t.mock.timers.reset();
     if (prevIdle === undefined) delete process.env.PI_HERDR_TERM_IDLE_MS;
@@ -255,4 +267,40 @@ test('core/terminal：send(wait_prompt) 就绪才发；busy 拒发不排队', as
   assert.match(ok.content[0].text, /sent to term-1/);
   assert.deepEqual(calls.sendPaneText, ['echo next']);
   await ctx.fiber.dispose();
+});
+
+test('planIdleTerminalReminder：闲置超阈值且未催过 → due；催过/未闲置/达上限 → 不催', () => {
+  const term = (id: string, lastActivityAt: number, nudgedAt: number | null = null) => ({
+    terminalId: id, cwd: `/w/${id}`, label: id, lastActivityAt, nudgedAt,
+  });
+  // 闲置 50ms、阈值 1ms、未催过 → due，ids 只含未催过的
+  const p0 = planIdleTerminalReminder({ open: [term('term-1', 0), term('term-2', 5, 40)], now: 2_000_000, reminders: 0 });
+  assert.equal(p0.due, true);
+  assert.deepEqual(p0.ids, ['term-1'], '已催过的 term-2 不再列入');
+  assert.match(p0.content ?? '', /term-1/);
+  assert.doesNotMatch(p0.content ?? '', /term-2/);
+
+  // 全部催过 → 不催
+  const p1 = planIdleTerminalReminder({ open: [term('term-1', 0, 40)], now: 2_000_000, reminders: 1 });
+  assert.equal(p1.due, false);
+
+  // 未到阈值 → 不催（长跑 dev server 被触碰过就不会进催办）
+  const p2 = planIdleTerminalReminder({ open: [term('term-1', 1_999_999)], now: 2_000_000, reminders: 0 });
+  assert.equal(p2.due, false);
+
+  // 进程级上限兜底
+  const p3 = planIdleTerminalReminder({ open: [term('term-1', 0)], now: 2_000_000, reminders: TERM_REMINDERS_MAX });
+  assert.equal(p3.due, false);
+});
+
+test('foldTerminalsRegistry：nudgedAt 往返持久化，缺省为 null', () => {
+  const registry = makeTerminalsRegistry([
+    { terminalId: 'term-1', paneId: 'p1', tabId: 't1', cwd: '/w', label: null, createdAt: 1, lastActivityAt: 2, nudgedAt: 40, status: 'open', closedAt: null, readRevision: null, readLen: 0, readTail: '', readEoTail: '' },
+    { terminalId: 'term-2', paneId: 'p2', tabId: 't1', cwd: '/w', label: null, createdAt: 1, lastActivityAt: 2, status: 'open', closedAt: null, readRevision: null, readLen: 0, readTail: '', readEoTail: '' },
+  ] as never);
+  const folded = foldTerminalsRegistry([
+    { type: 'custom', customType: 'pi-herdr.terminals', data: registry },
+  ]);
+  assert.equal(folded[0]?.nudgedAt, 40, '已催时间戳往返保留');
+  assert.equal(folded[1]?.nudgedAt, null, '未催过缺省 null');
 });

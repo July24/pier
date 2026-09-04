@@ -57,13 +57,10 @@ export interface TerminalEntry {
   label: string | null;
   createdAt: number;
   lastActivityAt: number;
+  /** Idle-nudge bookkeeping: set when this terminal has been nudged once (per-entry, persisted). */
+  nudgedAt: number | null;
   status: 'open' | 'closed';
   closedAt: number | null;
-  /** Why: Preserve the established compatibility and safety behavior. */
-  readRevision: number | null;
-  readLen: number;
-  readTail: string;
-  readEoTail: string;
 }
 
 export interface TerminalsRegistry {
@@ -107,6 +104,7 @@ export function registerTerminal(
     label: opts.label ?? (opts.cwd ? basename(opts.cwd.replace(/\\/g, '/')) || opts.cwd : null),
     createdAt: opts.createdAt,
     lastActivityAt: opts.createdAt,
+    nudgedAt: null,
     status: 'open',
     closedAt: null,
     readRevision: null,
@@ -322,8 +320,9 @@ export function foldTerminalsRegistry(entries: readonly BranchEntryLike3[]): Ter
         closedAt: typeof t.closedAt === 'number' ? t.closedAt : null,
         readRevision: typeof t.readRevision === 'number' ? t.readRevision : null,
         readLen: typeof t.readLen === 'number' ? t.readLen : 0,
-        readTail: typeof t.readTail === 'string' ? t.readTail : '',
-        readEoTail: typeof t.readEoTail === 'string' ? t.readEoTail : '',
+        lastActivityAt: typeof t.lastActivityAt === 'number' ? t.lastActivityAt : 0,
+        nudgedAt: typeof t.nudgedAt === 'number' ? t.nudgedAt : null,
+        status: t.status === 'closed' ? ('closed' as const) : ('open' as const),
       }));
   }
   return found;
@@ -356,6 +355,8 @@ export interface IdleTerminalInput {
   cwd: string;
   label: string | null;
   lastActivityAt: number;
+  /** Set once this terminal has been nudged; a nudged terminal is never nudged again (01a06ae3 goodbye-loop guard). */
+  nudgedAt?: number | null;
 }
 
 export interface IdleTerminalReminderPlan {
@@ -365,29 +366,44 @@ export interface IdleTerminalReminderPlan {
   content: string | null;
   /** Nudge count after successful injection, or the original count when due is false. */
   nextReminders: number;
+  /** Terminal ids this nudge covers; the caller marks them nudged at schedule time. */
+  ids: string[];
 }
 
+function noIdleInject(reminders: number): IdleTerminalReminderPlan {
+  return { due: false, content: null, nextReminders: reminders, ids: [] };
+}
 
 /**
- * Due only when an open terminal has been idle past the threshold and the process-wide cap
- * allows another nudge. Shells still hosting long-running work were touched recently, so the
- * idle filter is what keeps legitimate dev-server terminals out of the nudge.
+ * Due only when an OPEN terminal is idle past the threshold AND has never been nudged
+ * (01a06ae3: a per-process counter alone let nudges resume after restarts and looped a
+ * farewell exchange 52 times — a nudged terminal must stay nudged, persisted in the ledger).
+ * Shells still hosting long-running work were touched recently, so the idle filter is what
+ * keeps legitimate dev-server terminals out of the nudge.
  */
 export function planIdleTerminalReminder(
   input: { open: readonly IdleTerminalInput[]; now: number; reminders: number },
 ): IdleTerminalReminderPlan {
   const idleMs = terminalIdleMs();
-  const idle = input.open.filter((t) => input.now - t.lastActivityAt >= idleMs);
+  const idle = input.open.filter(
+    (t) => !t.nudgedAt && input.now - t.lastActivityAt >= idleMs,
+  );
   if (idle.length === 0 || input.reminders >= TERM_REMINDERS_MAX) {
-    return { due: false, content: null, nextReminders: input.reminders };
+    return noIdleInject(input.reminders);
   }
   const list = idle.map((t) => `- ${t.terminalId} (${t.label ?? t.cwd})`).join('\n');
   const content = [
     `<system-reminder>Open terminal(s) idle for a while (nudge ${input.reminders + 1}/${TERM_REMINDERS_MAX}):`,
     list,
+    'This is an internal housekeeping notice — do NOT reply to the user and do NOT send any farewell on this notice.',
     'If the work in them is done, close them now with terminal(action: "close", terminal_id: "…").',
     'Keep a terminal only if a long-running process still needs that shell.',
     '</system-reminder>',
   ].join('\n');
-  return { due: true, content, nextReminders: input.reminders + 1 };
+  return {
+    due: true,
+    content,
+    nextReminders: input.reminders + 1,
+    ids: idle.map((t) => t.terminalId),
+  };
 }

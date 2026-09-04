@@ -143,8 +143,13 @@ export default function terminalPlugin(ctx: Context): void {
       reminders: idleReminders,
     });
     if (!plan.due || plan.content == null) return;
-    // an unbounded retry (reminder-storm guard). The sync increment also keeps the counter
-    // exact for the next settle without depending on microtask ordering.
+    // 01a06ae3 goodbye-loop: mark the covered terminals nudged NOW (persisted), and deliver the
+    // notice as a queued followUp WITHOUT triggerTurn — a reminder alone must never wake the
+    // agent, or a farewell exchange loops: wake → polite goodbye → settle → nudge → wake …
+    const now = Date.now();
+    const ids = new Set(plan.ids);
+    terminals = terminals.map((t) => (ids.has(t.terminalId) ? { ...t, nudgedAt: now } : t));
+    persistTerminals();
     idleReminders += 1;
     const content = plan.content;
     idleReminderTimer = setTimeout(() => {
@@ -155,7 +160,7 @@ export default function terminalPlugin(ctx: Context): void {
         try {
           await send(
             { customType: TERM_REMINDER_CUSTOM_TYPE, content, display: true },
-            { deliverAs: 'followUp', triggerTurn: true },
+            { deliverAs: 'followUp' },
           );
         } catch {
           /* Delivery failure is non-fatal; the cap already bounds retries. */
