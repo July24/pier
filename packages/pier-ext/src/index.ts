@@ -36,7 +36,9 @@ import { APPROVAL_NEEDED_CUSTOM_TYPE, ROLE_MANIFEST_CUSTOM_TYPE, installRenderer
 import { createHerdrClient } from './herdr-client.ts';
 // The subagent family moved to core/subagent.ts (loader entry, D78/D81); its history-store,
 // session-tail, and gc-core imports moved with it, leaving index.ts only the common readers.
-import { lastAssistantText, readSessionFile } from './session-tail.ts';
+import { bareSessionId, lastAssistantText, readSessionFile, sessionFileById } from './session-tail.ts';
+import { join } from 'node:path';
+import { platformPaths } from './platform-paths.ts';
 import { fileURLToPath } from 'node:url';
 import { TodosService } from './todos-service.ts';
 import { reconcileTodos } from './reconcile-core.ts';
@@ -60,7 +62,7 @@ import {
   planSwitchActiveTools,
   roleRecordDiffers,
 } from './role-state.ts';
-import { readdirSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { RESERVED_ROLE_NAMES, roleLayers } from './role-loader.ts';
 
 import { formatPaneTitle } from './pane-title.ts';
@@ -87,10 +89,17 @@ import { installConfigCommand } from './config-command.ts';
 import { CompactCoordinator } from './compact-coordinator.ts';
 import { handleReducerToolResult, type ToolResultEventLike } from './reducer-invoker.ts';
 import {
-  isValidSessionId,
+  appendEfficiencyLog,
+  efficiencyLogPath,
   pruneSessionObjects,
   resolveSessionRoot,
 } from './efficiency-store.ts';
+import {
+  planDenyHitRow,
+  scanRoleAxisUsage,
+  type RoutingTelemetryRecord,
+  type RoutingTelemetryRow,
+} from './routing-telemetry.ts';
 import {
   loadEfficiencyConfigFromDisk,
   resolveEfficiencyConfig,
@@ -262,17 +271,16 @@ export default async function (pi: ExtensionAPI) {
   }
 
   /**
-   * pi may hand back the full transcript file path; the id used for
-   * `herdr-pi/<id>/` dirs is the bare UUID suffix of `<timestamp>_<uuid>.jsonl`.
-   * resolveSessionRoot rejects path-shaped ids (SAFE_SESSION_ID_RE), which
-   * silently nulls every consumer of the module-level sessionRoot.
+   * Phase 0 routing telemetry (RFC docs/rfc-jev-role-routing.md §8): best-effort append to
+   * efficiency-logs/routing.jsonl. Observation only — a failure here must never touch the
+   * gate, the spawn path, or the session. sessionId is stamped centrally so every threaded
+   * call site stays session-id-free.
    */
-  function bareSessionId(raw: string): string {
-    const base = raw.replaceAll('\\', '/').split('/').pop()!.replace(/\.jsonl$/, '');
-    // Only strip pi's real transcript prefix (<date>T<time>Z_); arbitrary ids
-    // like PI_SESSION_FILE=sess_idx_prune must survive untouched.
-    const stripped = base.replace(/^\d{4}-\d{2}-\d{2}T[\d-]+Z_/, '');
-    return isValidSessionId(stripped) ? stripped : base;
+  function appendRoutingLog(row: RoutingTelemetryRecord): void {
+    const root = sessionRoot;
+    if (!root) return;
+    const stamped: RoutingTelemetryRow = { ...row, sessionId: sessionId || 'unknown' };
+    void appendEfficiencyLog(efficiencyLogPath(root, 'routing'), stamped).catch(() => {});
   }
 
   function mirrorTodos(): void {
@@ -477,6 +485,11 @@ export default async function (pi: ExtensionAPI) {
     // D97: narrow-frame overlay is meaningful only inside herdr; covering an interactive narrow terminal is unsafe,
     // and the heatmap amplification provides the exit path. Re-register on resume because session switching resets the overlay.
     if (env) registerSlimFrame(ctx);
+    // P2-5 (01a0bd3a): resume used to skip branch reconstruction entirely — the master
+    // came back to an EMPTY todo list (and zeroed OCC debt state) after a kill+resume,
+    // rebuilding 11 items from memory. Fold todos/compaction state from the branch like
+    // session_tree does; a fresh session folds nothing and stays untouched.
+    rebuildFromBranch(ctx);
     mirrorTodos();
     // D-2: the session path is NOT reported here. herdr's own pi integration publishes it
     // (agent.list/agent.pane show `session_source: "herdr:pi"` on every pi pane, incl. pier subagents),
@@ -485,6 +498,26 @@ export default async function (pi: ExtensionAPI) {
     // master → 'master'; worker → manifest.role (prettify worker-default as worker).
     // A bare pi without a manifest does not report, so ordinary pi sessions remain undisturbed.
     syncRoleFromBranch(ctx);
+    // Phase 0 (RFC §8): scan the user-authored role layers once per master session start —
+    // axis-usage data backs the grants collapse (ask expected all-zero, allow stance dominant).
+    if (mode.composeMaster && sessionRoot) {
+      try {
+        const files: Array<{ name: string; text: string }> = [];
+        for (const layer of roleLayers({ baseDir: roleBase }).slice(0, 2)) {
+          for (const f of readdirSync(layer.dir)) {
+            if (!f.endsWith('.json')) continue;
+            try {
+              files.push({ name: f, text: readFileSync(join(layer.dir, f), 'utf8') });
+            } catch {
+              /* Unreadable file counts neither as parsed nor invalid; the scan stays robust. */
+            }
+          }
+        }
+        appendRoutingLog(scanRoleAxisUsage({ now: Date.now(), files }));
+      } catch {
+        /* Layer directory absent; the scan is best-effort. */
+      }
+    }
     reportAgent('idle', null);
     // Self-healing: a gate does not survive a process restart, but the ask marker lives in herdr
     // with a 24h TTL, so a session killed while a dialog was open would otherwise keep the pane
@@ -504,6 +537,7 @@ export default async function (pi: ExtensionAPI) {
     if (gate.kind === 'deny') {
       // terminate (pi 0.84.1+) stops a batch whose results are all terminating without another
       // model call, so a blocked worker tool no longer costs an extra round trip.
+      appendRoutingLog(planDenyHitRow({ now: Date.now(), role: manifest.role, tool }));
       return { block: true, reason: gate.reason, terminate: true };
     }
     if (gate.kind === 'ask') {
@@ -1067,8 +1101,21 @@ export default async function (pi: ExtensionAPI) {
     pendingMachineRequest = null;
     try {
       let text: string | null = null;
-      if (sessionId && /\.jsonl$/.test(sessionId)) {
-        const entries = readSessionFile(sessionId);
+      // p24-class: sessionId is a BARE id — the .jsonl-only read guard below meant every
+      // settle reply carried text: null, so closing text depended solely on the master's
+      const ownFile = sessionId
+        ? (/\.jsonl$/.test(sessionId)
+          ? sessionId
+          : sessionFileById(
+            process.cwd(),
+            process.env.PI_CODING_AGENT_DIR
+              ? join(process.env.PI_CODING_AGENT_DIR, 'sessions')
+              : platformPaths.sessionsDir,
+            sessionId,
+          ))
+        : null;
+      if (ownFile) {
+        const entries = readSessionFile(ownFile);
         if (entries) text = lastAssistantText(entries, { sinceTs: req.sinceTs })?.text ?? null;
       }
       await pipeRequest(req.from, {
@@ -1076,7 +1123,9 @@ export default async function (pi: ExtensionAPI) {
         id: req.id,
         paneId: env?.paneId ?? '',
         text,
-        sessionFile: sessionId || null,
+        // Push the resolved PATH when we could read it (older/newer masters accept it
+        // directly); fall back to the bare id for a master-side mapping.
+        sessionFile: ownFile ?? (sessionId || null),
       }, 5000);
     } catch {
       /* Push failed silently; the requester's pollLoop is the fallback. */
@@ -1107,6 +1156,8 @@ export default async function (pi: ExtensionAPI) {
       claimSettleNotice,
       isCompactionInFlight: () => coordinator.compactionInFlight,
       isIntentionalAbort: () => coordinator.intentionalAbort,
+      jev: { ask: (request, meta) => jevRuntime.ask(request, meta), getMinConfidence: jevMinConfidence },
+      appendRoutingLog,
     });
   } else {
     const { mountTodoOnly } = await import('./index-worker.ts');
@@ -1129,3 +1180,4 @@ export default async function (pi: ExtensionAPI) {
     });
   }
 }
+

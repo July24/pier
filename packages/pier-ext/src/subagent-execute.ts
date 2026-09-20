@@ -11,6 +11,7 @@ import { promisify } from 'node:util';
 import type { HerdrClientLike } from './herdr-client.ts';
 import { composeForRole } from './manifest-compose.ts';
 import { pipeNameFor, pipeRequestTo } from './pipe-channel.ts';
+import { planSpawnProfileRow, type RoutingTelemetryRecord } from './routing-telemetry.ts';
 import { platformPaths } from './platform-paths.ts';
 import { runtimePolicy } from './runtime-policy.ts';
 import {
@@ -56,6 +57,8 @@ export interface SpawnActionHost {
   session: SessionIo;
   spawn: Spawner;
   poller: Poller;
+  /** Phase 0 routing telemetry (RFC rfc-jev-role-routing §8): best-effort spawn profile; absent in tests. */
+  logRouting?: (row: RoutingTelemetryRecord) => void;
 }
 
 export type SpawnAction = (
@@ -161,6 +164,18 @@ export function createSpawnAction(h: SpawnActionHost): SpawnAction {
       };
       // WS-D10: Route the model by role; omission intentionally uses the process default.
       if (typeof role.model === 'string' && role.model.trim()) roleModel = role.model.trim();
+      // Phase 0 (RFC §8): spawn profile — manual-routing signal (role param / allowed_tools) plus
+      // the composed result. taskSha8 correlates spawns without persisting the task text.
+      h.logRouting?.(
+        planSpawnProfileRow({
+          now: Date.now(),
+          roleExplicit: typeof manifestRole === 'string' && manifestRole.trim() !== '',
+          role: role.role,
+          allowedTools: suggested,
+          manifestTools: manifest.tools,
+          task: spec.prompt,
+        }),
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return toolError(`Error: role "${manifestRole}" manifest invalid — ${msg}`);

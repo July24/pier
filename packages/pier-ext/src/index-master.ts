@@ -14,6 +14,8 @@ import terminalPlugin from './core/terminal.ts';
 import todoPlugin from './core/todo.ts';
 import subagentPlugin from './core/subagent.ts';
 import type { HerdrClientLike, HerdrEnv } from './herdr-client.ts';
+import type { JevRuntime } from './jev-client.ts';
+import type { RoutingTelemetryRecord } from './routing-telemetry.ts';
 import type { TodosService } from './todos-service.ts';
 import type { TodoUiSlot } from './core/todo.ts';
 import type { SubagentPortBox } from './subagent-port.ts';
@@ -37,7 +39,12 @@ export interface MasterPluginMount {
   claimSettleNotice: (key: string) => boolean;
   isCompactionInFlight?: () => boolean;
   isIntentionalAbort?: () => boolean;
+  /** Optional jev seam for subagent settle attribution (fail-open when absent). */
+  jev?: { ask: JevRuntime['ask']; getMinConfidence: () => number };
+  /** Phase 0 routing telemetry append (RFC rfc-jev-role-routing §8); absent in tests. */
+  appendRoutingLog?: (row: RoutingTelemetryRecord) => void;
 }
+
 
 async function loadEntry(
   sessionRoot: Context,
@@ -114,6 +121,8 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
     withReconcileNotes: m.withReconcileNotes,
     claimSettleNotice: m.claimSettleNotice,
     terminalState: terminalDeps.state,
+    ...(m.jev ? { jev: m.jev } : {}),
+    ...(m.appendRoutingLog ? { logRouting: m.appendRoutingLog } : {}),
   });
   await loadEntry(sessionRoot, useLoader, './core/subagent.ts', subagentPlugin);
 
