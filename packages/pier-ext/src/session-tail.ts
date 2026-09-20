@@ -10,6 +10,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { piSessionDirCandidates, sessionDirName } from './storage-layout.ts';
+import { isValidSessionId } from './efficiency-store.ts';
 
 export { sessionDirName };
 
@@ -214,6 +215,19 @@ export function sessionFileById(cwd: string, agentDir: string, id: string): stri
     }
   }
   return null;
+}
+
+/**
+ * Normalize a session path or id to the bare id used across herdr-pi state
+ * (`<timestamp>_<uuid>.jsonl` → `<uuid>`; `sub-session.jsonl` stays whole).
+ * Only pi's real transcript prefix is stripped, so arbitrary ids like
+ * PI_SESSION_FILE=sess_idx_prune survive untouched. Same-normalization
+ * comparisons (own session vs candidate paths) must go through here.
+ */
+export function bareSessionId(raw: string): string {
+  const base = raw.replaceAll('\\', '/').split('/').pop()!.replace(/\.jsonl$/, '');
+  const stripped = base.replace(/^\d{4}-\d{2}-\d{2}T[\d-]+Z_/, '');
+  return isValidSessionId(stripped) ? stripped : base;
 }
 
 export function readSessionFile(file: string): SessionEntryLike[] | null {

@@ -165,6 +165,7 @@ function createFakeHost(options?: {
     resolveSessionFile: async () => sessionMock.resolvedSessionFile,
     collectFinalText: async () => null,
     probeAlive: async () => ({ alive: true, paneExists: true, agentStatus: 'working', lastActivityMs: Date.now() }),
+    readSettleTail: async () => null,
   };
 
   const fakeGit: GitIo = {

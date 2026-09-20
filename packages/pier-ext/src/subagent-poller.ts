@@ -6,7 +6,7 @@
  * window explicit and unit-testable without a live pane.
  */
 
-import { formatSettlementNotice } from './vocab.ts';
+import { formatSettlementNotice, type SettlementNullReason } from './vocab.ts';
 
 export const TAKEOVER_RECHECK_MS = 5_000;
 export const OBSERVATION_TICK_MS = 1_000;
@@ -114,8 +114,9 @@ export function buildSettlementNoticeText(
   agentLabel: string,
   closing: string | null,
   statLine: string | null,
+  nullReason: SettlementNullReason = 'silent',
 ): string {
-  const base = formatSettlementNotice(agentLabel, closing);
+  const base = formatSettlementNotice(agentLabel, closing, nullReason);
   return statLine ? `${base}\n${statLine}` : base;
 }
 

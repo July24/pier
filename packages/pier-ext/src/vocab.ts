@@ -72,13 +72,27 @@ export function countTodos(items: readonly TodoItem[]): TodoCounts {
   return { pending, inProgress, completed, blocked };
 }
 
+/** Why a settlement carried no closing text (p24-class mis-attribution vs a truly silent worker). */
+export type SettlementNullReason = 'silent' | 'attribution-suspect' | 'extraction-failed';
+
+function nullClosingSentence(reason: SettlementNullReason): string {
+  if (reason === 'attribution-suspect') {
+    return 'Its closing message could NOT be read — the session attribution is suspect (a wrong transcript may have been read). Check `subagent action output` / the ledger sessionFile before assuming it produced nothing; its work may be complete.';
+  }
+  if (reason === 'extraction-failed') {
+    return 'It appears to have ended with a final report, but the closing text could not be extracted — read it from the session transcript.';
+  }
+  return 'It left no closing message.';
+}
+
 /** Subagent settlement notice (aligned with DSH). */
 export function formatSettlementNotice(
   agentId: string,
   closingMessage: string | null,
+  nullReason: SettlementNullReason = 'silent',
 ): string {
   const head = `Background subagent ${agentId} finished and will do no further work unless you send it more.`;
   return closingMessage
     ? `${head} Its closing message: ${closingMessage}`
-    : `${head} It left no closing message.`;
+    : `${head} ${nullClosingSentence(nullReason)}`;
 }

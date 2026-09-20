@@ -45,6 +45,10 @@ export interface CoordinatorState {
   positiveContextDeltaCount: number;
   lastContextTokens: number | null;
   currentBoundaryRequestCount: number;
+  /** P1-3: consecutive summarization failures (token-cap class) driving exponential backoff. */
+  consecutiveCompactionFailures: number;
+  /** P1-3: turn-end compact decisions to skip after a failure (each abort costs an in-flight turn). */
+  compactBackoffTurnEnds: number;
 }
 
 export function initialCoordinatorState(): CoordinatorState {
@@ -59,6 +63,8 @@ export function initialCoordinatorState(): CoordinatorState {
     positiveContextDeltaCount: 0,
     lastContextTokens: null,
     currentBoundaryRequestCount: 0,
+    consecutiveCompactionFailures: 0,
+    compactBackoffTurnEnds: 0,
   };
 }
 
@@ -80,6 +86,8 @@ export function restoreCoordinatorState(entries: readonly unknown[]): Coordinato
           positiveContextDeltaCount: typeof d.positiveContextDeltaCount === 'number' ? d.positiveContextDeltaCount : 0,
           lastContextTokens: typeof d.lastContextTokens === 'number' ? d.lastContextTokens : null,
           currentBoundaryRequestCount: typeof d.currentBoundaryRequestCount === 'number' ? d.currentBoundaryRequestCount : 0,
+          consecutiveCompactionFailures: typeof d.consecutiveCompactionFailures === 'number' ? d.consecutiveCompactionFailures : 0,
+          compactBackoffTurnEnds: typeof d.compactBackoffTurnEnds === 'number' ? d.compactBackoffTurnEnds : 0,
         };
       }
     }
@@ -213,6 +221,16 @@ export class CompactCoordinator {
     });
 
     if (decision.compact) {
+      // P1-3: after a failed summarization (token-cap class), skip compact decisions for
+      // a bounded backoff window — each attempt aborts an in-flight turn, so retrying a
+      // doomed compaction burns turns for nothing (observed 05:47:03→05:48:37, 01a0bd3a).
+      if (this.state.compactBackoffTurnEnds > 0) {
+        this.state.compactBackoffTurnEnds--;
+        if (opts.config.logEnabled) {
+          this.logDecision(opts.ctx, { ...decision, compact: false, reason: 'failure_backoff' });
+        }
+        return;
+      }
       const branch = opts.ctx.sessionManager?.getBranch?.() ?? [];
       const keepRecentTokens = opts.config.keepRecentTokens ?? DEFAULT_KEEP_RECENT_TOKENS;
       const feasible = nativeCompactionFeasible(branch, keepRecentTokens);
@@ -262,13 +280,17 @@ export class CompactCoordinator {
     const remaining = opts.todos.filter(
       (it) => it.status !== 'completed' && it.status !== 'abandoned',
     );
+    // P1-3: bound the instruction payload — a huge open-task list inflates the summary
+    // request itself (token-cap failures were observed with a 10M-token debt session).
     const taskLines = remaining
-      .map((it) => `- [${it.status}] ${it.content}${it.blocker ? ` (waiting on: ${it.blocker})` : ''}`)
+      .slice(0, 25)
+      .map((it) => `- [${it.status}] ${it.content.slice(0, 160)}${it.blocker ? ` (waiting on: ${it.blocker.slice(0, 80)})` : ''}`)
       .join('\n');
+    const elided = remaining.length > 25 ? `\n… (+${remaining.length - 25} more, elided)` : '';
 
     const customInstructions = [
       'Preserve completed work, verification results, important decisions, and remaining work.',
-      remaining.length > 0 ? `Active/remaining tasks to preserve:\n${taskLines}` : 'All listed tasks are completed.',
+      remaining.length > 0 ? `Active/remaining tasks to preserve:\n${taskLines}${elided}` : 'All listed tasks are completed.',
     ].join('\n\n');
 
     const startMs = Date.now();
@@ -290,6 +312,8 @@ export class CompactCoordinator {
             this.state.carriedDebtTokens = decision.writeTokens * incrementalRatio;
             this.state.cacheDebtRepaymentTokens = Math.max(0, decision.archiveTokens - decision.memoTokens);
             this.state.epoch++;
+            this.state.consecutiveCompactionFailures = 0;
+            this.state.compactBackoffTurnEnds = 0;
 
             opts.pi.appendEntry(COMPACT_STATE_CUSTOM_TYPE, this.state);
 
@@ -364,6 +388,7 @@ export class CompactCoordinator {
                 decision: decision.reason,
                 cancelled,
                 error: error instanceof Error ? error.message : String(error),
+                consecutiveCompactionFailures: this.state.consecutiveCompactionFailures,
                 durationMs: Date.now() - startMs,
               }).catch(() => {});
             }
@@ -374,15 +399,25 @@ export class CompactCoordinator {
             return;
           }
 
+          // P1-3: record the failure and back off exponentially (cap 4 skipped decisions)
+          // so a token-cap-sized context does not buy repeated abort-then-fail cycles.
+          this.state.consecutiveCompactionFailures++;
+          this.state.compactBackoffTurnEnds = Math.min(2 ** this.state.consecutiveCompactionFailures, 4);
+
           // Resume the task: OCC aborted the turn on purpose, so a failed compaction would
           // otherwise leave the session parked on an aborted assistant message. Pi's own
-          // threshold compaction stays available as the safety net.
+          // threshold compaction stays available as the safety net. Visible (display: true):
+          // a silent failure left a 209K-token session running unaware (01a0bd3a).
+          const approxTokens = this.state.lastContextTokens;
           try {
             opts.pi.sendMessage(
               {
                 customType: COMPACTION_CONTINUE_TYPE,
-                content: 'Context compaction failed. Continuing with the current context.',
-                display: false,
+                content: `Context compaction FAILED (${error instanceof Error ? error.message : String(error)}). `
+                  + `Context ≈ ${approxTokens != null ? `${Math.round(approxTokens / 1000)}K tokens` : 'near the window limit'}; `
+                  + `OCC backs off for the next ${this.state.compactBackoffTurnEnds} opportunities. `
+                  + 'If this repeats, run /compact manually, prune large outputs, or restart the session.',
+                display: true,
               },
               { triggerTurn: true },
             );

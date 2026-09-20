@@ -22,6 +22,9 @@ import {
   planTakeoverTick,
   planVacuumTick,
 } from './subagent-poller.ts';
+import type { JevRuntime } from './jev-client.ts';
+import { evaluateSettleVerdict, settleAskIsSafe, settleVerdictRequest } from './jev-core.ts';
+import type { SettlementNullReason } from './vocab.ts';
 import { buildBlockedGateNotice, type SubEntry } from './subagent-core.ts';
 import type { SessionIo } from './subagent-session-io.ts';
 import type { GitIo } from './subagent-git-io.ts';
@@ -52,6 +55,8 @@ export interface PollerHost {
   now?: () => number;
   /** Optional runtime policy overrides for testing */
   policy?: Partial<RuntimePolicy>;
+  /** Optional jev seam for the settle attribution check; absent → legacy wording (fail-open). */
+  jev?: { ask: JevRuntime['ask']; getMinConfidence: () => number };
 }
 
 export interface Poller {
@@ -144,7 +149,7 @@ export function createPoller(h: PollerHost): Poller {
         }
         if (gate.kind === 'clear-gate') h.blockedGateNotified.delete(paneId);
         if (state === 'idle' || state === 'done') {
-          const s = await h.session.subSessionState(paneId, cwd, injectTs);
+          const s = await h.session.subSessionState(paneId, cwd, injectTs, entry.sessionFile);
           pollTrace?.(`state=${state} text=${s.text ? s.text.length : 'null'} pend=${s.pendingTool} act=${s.activity} obs=${String(entry.observationStartedAt ?? null)} takeover=${String(Boolean(entry.userTakeover))}`);
           if (isSettlementCandidate(s)) {
             const closing = s.text;
@@ -196,6 +201,37 @@ export function createPoller(h: PollerHost): Poller {
               continue;
             }
             entry.observationStartedAt = null;
+
+            // p24-class: null closing text is ambiguous — a mis-attributed transcript reads
+            // the same as a worker that truly died silent. Computed AFTER the observation
+            // gates settle on 'settle' so a full window of 'wait' ticks does not pay a jev
+            // call per iteration. Deterministic signal first: when NO readable candidate
+            // existed at all (activity false), claiming "left no closing message" would be
+            // a lie — that is an attribution failure by definition. Otherwise ask jev to
+            // classify the tail we did read (semantic judgment); fail-open keeps the
+            // legacy wording byte-identical.
+            let nullReason: SettlementNullReason = 'silent';
+            if (closing == null) {
+              if (!s.activity) {
+                nullReason = 'attribution-suspect';
+              } else if (h.jev) {
+                try {
+                  const tail = await h.session.readSettleTail(paneId, cwd, entry.sessionFile);
+                  if (tail && settleAskIsSafe(tail)) {
+                    const res = await h.jev.ask(
+                      settleVerdictRequest({ description, tail }),
+                      { questionId: 'settle-attribution', timeoutMs: 2500 },
+                    );
+                    if (res.ok) {
+                      const verdict = evaluateSettleVerdict(res.answers);
+                      if (verdict) nullReason = verdict;
+                    }
+                  }
+                } catch {
+                  /* jev down → legacy wording */
+                }
+              }
+            }
             if (!entry.sessionFile) {
               entry.sessionFile = applyReportedSessionFile(
                 entry.sessionFile,
@@ -211,7 +247,7 @@ export function createPoller(h: PollerHost): Poller {
             const notes = h.reconcileOnSettlement(description, 'settled');
             const statLine = await h.git.worktreeStatLine(entry);
             const notice = h.withReconcileNotes(
-              buildSettlementNoticeText(`${paneId} (${description})`, closing, statLine),
+              buildSettlementNoticeText(`${paneId} (${description})`, closing, statLine, nullReason),
               notes,
             );
             if (h.claimSettleNotice(`${paneId}:${requestId}`)) {

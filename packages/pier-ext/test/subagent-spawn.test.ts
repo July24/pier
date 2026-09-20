@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as net from 'node:net';
-import { mkdtempSync, writeFileSync, unlinkSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, unlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
@@ -19,6 +19,10 @@ import { PiSurface } from '../src/pi-surface.ts';
 import { pipeNameFor, pipePathFor, type PipeRequest } from '../src/pipe-channel.ts';
 import type { HerdrClientLike } from '../src/herdr-client.ts';
 import { emptySubagentPortBox, type SubagentPortBox } from '../src/subagent-port.ts';
+import { appendHistory } from '../src/history-store.ts';
+import { preferredHistoryFile } from '../src/storage-layout.ts';
+import { SUBS_CUSTOM_TYPE, type SubEntry } from '../src/subagent-core.ts';
+import { sessionDirName } from '../src/session-tail.ts';
 
 const SUB_TEXT = 'REPORT: all channel-fee contact points mapped';
 const PROMPT = '你在 apnv3-backend 仓库探查渠道费用触点（只读）。输出完整报告。';
@@ -456,4 +460,255 @@ test('waitSubReady: pane.list unknown shell is not pane-gone (agent.list 会漏�
   assert.ok(readCalls >= 1, 'alive 时也要采 tail，timeout 才能带上崩溃栈');
   assert.ok(elapsed >= 900, `应等到 short timeout，实际 ${elapsed}ms`);
   assert.ok(elapsed < 10_000, `不得落到 90s 默认上限，实际 ${elapsed}ms`);
+});
+
+/**
+ * 01a0bd3a 回归：ledger 的 sessionFile 被误归因为 master 自己的 transcript 时，
+ * resume 的 D94 复用路径曾按"同 session 的现有 pane"认领 master pane 本身
+ * （"reused existing pane with same session"），把 master 注册成自己的 subagent，
+ * 后续被 poll 消费、被 GC closePane。断言：指向自身 → 硬失败；指向其他 pane → 复用照常。
+ */
+test('resume（01a0bd3a）：ledger sessionFile 命中 master 自身会话 → 拒绝认领；命中其他 pane 仍正常复用', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'pier-resume-self-'));
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = home; // histFile 落到临时台账根
+  const cwd = mkdtempSync(join(tmpdir(), 'pier-resume-self-cwd-'));
+  const masterFile = join(cwd, 'master-session.jsonl');
+  const otherFile = join(cwd, 'other-session.jsonl');
+  writeFileSync(masterFile, '{}\n');
+  writeFileSync(otherFile, '{}\n');
+  const pi = fakePi();
+  const h: Harness = { closePaneCalls: [], waitAgentCalls: [], prompts: [] };
+  const surface = new PiSurface(pi as unknown as object);
+  const root = new Context();
+  const deps = {
+    client: {
+      ...fakeClient(masterFile, h),
+      listPanes: async () => [
+        { paneId: 'p0', tabId: 't0', agentStatus: 'idle' },
+        { paneId: 'p2', tabId: 't0', agentStatus: 'idle' },
+      ],
+      listAgents: async () => [
+        { paneId: 'p0', status: 'idle', session: masterFile },
+        { paneId: 'p2', status: 'idle', session: otherFile },
+      ],
+    } as unknown as HerdrClientLike,
+    env: { paneId: 'p0', tabId: 't0', workspaceId: 'w1' }, // master = p0
+    extPath: new URL('../src/index.ts', import.meta.url).pathname,
+    sessionRoot: root,
+    port: emptySubagentPortBox(),
+    getSessionId: () => '',
+    reconcileOnSettlement: () => [],
+    withReconcileNotes: (b: string) => b,
+    claimSettleNotice: () => true,
+    terminalState: { activePaneIds: () => new Set<string>() },
+  };
+  root.provide('pi-herdr.surface', surface);
+  root.provide('pi-herdr.subagent-deps', deps);
+  await root.plugin(subagentPlugin);
+  try {
+    const histFile = preferredHistoryFile(home, cwd);
+    const base = {
+      kind: 'task' as const,
+      tabId: 't0',
+      workspaceId: 'w1',
+      cwd,
+      launchCommand: ['node', 'cli.js'],
+      status: 'closed' as const,
+    };
+    appendHistory(histFile, {
+      ...base,
+      taskId: '8183022d-a733-4292-911b-850e6dffba5a',
+      paneId: 'wA:p25',
+      description: 'Investigate bug 19812',
+      sessionFile: masterFile, // 被污染：指向 master 自己的 transcript
+      createdAt: Date.now(),
+    });
+    appendHistory(histFile, {
+      ...base,
+      taskId: '937f4abf-0000-4111-8222-333333333333',
+      paneId: 'wA:p2old',
+      description: 'healthy task',
+      sessionFile: otherFile,
+      createdAt: Date.now() + 1,
+    });
+
+    const tool = pi.tools.get('subagent');
+    assert.ok(tool?.execute, 'subagent 工具已注册');
+
+    await assert.rejects(
+      async () => {
+        await tool!.execute!('tc_self', { action: 'resume', taskId: '8183022d' }, undefined, undefined, { cwd });
+      },
+      /master's own session/,
+    );
+    const snap1 = pi.entries.filter(([t]) => t === SUBS_CUSTOM_TYPE).at(-1)?.[1] as { subs: SubEntry[] } | undefined;
+    assert.ok(!snap1?.subs.some((s) => s.paneId === 'p0'), 'master pane 不得进入 subagent 注册表');
+
+    const ok = await tool!.execute!(
+      'tc_other',
+      { action: 'resume', taskId: '937f4abf' },
+      undefined,
+      undefined,
+      { cwd },
+    ) as { content: Array<{ text: string }>; details?: { paneId?: string } };
+    assert.match(ok.content[0].text, /reused existing pane/);
+    assert.equal(ok.details?.paneId, 'p2');
+  } finally {
+    await root.fiber.dispose();
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+  }
+});
+
+async function fireSpawnEvents(pi: FakePi, event: string, ...args: unknown[]): Promise<void> {
+  for (const h of pi.listeners.get(event) ?? []) await h(...args);
+}
+
+/** P0-1 回归（p24）：worker 经 pipe 自报裸 session id → master 必须映射成路径并纠正误归因。 */
+test('applyReplySession：裸 id 自报纠正中毒 sessionFile（.jsonl-only 守卫不再丢弃）', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'pier-reply-session-'));
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = home;
+  const cwd = mkdtempSync(join(tmpdir(), 'pier-reply-cwd-'));
+  const dir = join(home, 'sessions', sessionDirName(cwd));
+  mkdirSync(dir, { recursive: true });
+  const realFile = join(dir, '2026-09-20T05-14-07-064Z_01a0bd3c-6557-746b-adf6-5128f2326c57.jsonl');
+  writeFileSync(realFile, '{}\n');
+  const poisoned = join(cwd, 'stale-01a0bd34.jsonl');
+  writeFileSync(poisoned, '{}\n');
+  const pi = fakePi();
+  const h: Harness = { closePaneCalls: [], waitAgentCalls: [], prompts: [] };
+  const surface = new PiSurface(pi as unknown as object);
+  const root = new Context();
+  const deps = {
+    client: fakeClient(realFile, h),
+    env: { paneId: 'p0', tabId: 't0', workspaceId: 'w1' },
+    extPath: new URL('../src/index.ts', import.meta.url).pathname,
+    sessionRoot: root,
+    port: emptySubagentPortBox(),
+    getSessionId: () => '99999999-9999-4999-8999-999999999999',
+    reconcileOnSettlement: () => [],
+    withReconcileNotes: (b: string) => b,
+    claimSettleNotice: () => true,
+    terminalState: { activePaneIds: () => new Set<string>() },
+  };
+  root.provide('pi-herdr.surface', surface);
+  root.provide('pi-herdr.subagent-deps', deps);
+  await root.plugin(subagentPlugin);
+  try {
+    const entry: SubEntry = {
+      taskId: '11111111-2222-4333-8444-555555555555',
+      kind: 'task',
+      paneId: 'p2',
+      tabId: 't0',
+      tabName: 'main',
+      cwd,
+      description: 'Investigate bug 19803',
+      status: 'settled',
+      background: true,
+      sessionFile: poisoned, // 中毒：指向陈旧文件
+      launchCommand: [],
+      createdAt: Date.now() - 60_000,
+      revivedFrom: null,
+    };
+    await fireSpawnEvents(pi, 'session_start', {}, { sessionManager: { getBranch: () => [
+      { type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { subs: [entry] } },
+    ] } });
+    deps.port.current!.applyReplySession('p2', '01a0bd3c-6557-746b-adf6-5128f2326c57'); // 裸 id
+    const snap = pi.entries.filter(([t]) => t === SUBS_CUSTOM_TYPE).at(-1)?.[1] as { subs: SubEntry[] };
+    const healed = snap.subs.find((s) => s.paneId === 'p2');
+    assert.equal(healed?.sessionFile, realFile, '裸 id 自报必须映射为真实 transcript 路径并覆盖中毒值');
+  } finally {
+    await root.fiber.dispose();
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+  }
+});
+
+/** P0-2 回归（01a0bd3a aftermath）：master resume 后 running 子代理必须重新上哨并发结算通知。 */
+test('session_start recovery：running 子代理重建 poller → 结算通知自动送达', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'pier-recover-home-'));
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = home;
+  const cwd = mkdtempSync(join(tmpdir(), 'pier-recover-cwd-'));
+  const dir = join(home, 'sessions', sessionDirName(cwd));
+  mkdirSync(dir, { recursive: true });
+  const workerFile = join(dir, '2026-09-20T06-10-00-000Z_aaaa1111-2222-4333-8444-555555555555.jsonl');
+  writeFileSync(workerFile, JSON.stringify({
+    type: 'message',
+    message: {
+      role: 'assistant',
+      content: [{ type: 'text', text: 'RECOVERED_REPORT: fix committed, 199 tests green' }],
+      timestamp: Date.now(),
+      stopReason: 'stop',
+    },
+  }) + '\n');
+  const pi = fakePi();
+  const h: Harness = { closePaneCalls: [], waitAgentCalls: [], prompts: [] };
+  const notices: string[] = [];
+  const surface = new PiSurface(pi as unknown as object);
+  const root = new Context();
+  const deps = {
+    client: {
+      ...fakeClient(workerFile, h),
+      listPanes: async () => [{ paneId: 'pAlive', tabId: 't0', agentStatus: 'idle' }],
+      listAgents: async () => [{ paneId: 'pAlive', status: 'idle', session: workerFile }],
+    } as unknown as HerdrClientLike,
+    env: { paneId: 'p0', tabId: 't0', workspaceId: 'w1' },
+    extPath: new URL('../src/index.ts', import.meta.url).pathname,
+    sessionRoot: root,
+    port: emptySubagentPortBox(),
+    getSessionId: () => 'bbbb2222-3333-4444-8555-666666666666',
+    reconcileOnSettlement: () => [],
+    withReconcileNotes: (b: string) => b,
+    claimSettleNotice: () => true,
+    terminalState: { activePaneIds: () => new Set<string>() },
+    deliverNotice: async (content: string) => { notices.push(content); },
+  };
+  root.provide('pi-herdr.surface', surface);
+  root.provide('pi-herdr.subagent-deps', deps);
+  await root.plugin(subagentPlugin);
+  try {
+    const createdAt = Date.now() - 120_000;
+    const entry: SubEntry = {
+      taskId: 'cccc3333-4444-4555-8666-777777777777',
+      kind: 'task',
+      paneId: 'pAlive',
+      tabId: 't0',
+      tabName: 'main',
+      cwd,
+      description: 'Fix bugs in isolated worktree',
+      background: true,
+      status: 'running',
+      sessionFile: null,
+      launchCommand: [],
+      createdAt,
+      // The worker was idle long before the master restarted; an already-elapsed
+      // observation window lets the recovered poller settle on its first tick.
+      observationStartedAt: createdAt,
+      revivedFrom: null,
+    };
+    await fireSpawnEvents(pi, 'session_start', {}, { sessionManager: { getBranch: () => [
+      { type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { subs: [entry] } },
+    ] } });
+    // Integration timing: the recovered poller runs on cordis-internal timers with no
+    // exposed completion promise, so we poll its observable effect (deliverNotice) —
+    // the seeded expired observation window keeps the settle within ~1 tick.
+    for (let i = 0; i < 150 && !notices.some((n) => n.includes('closing message')); i++) {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      setTimeout(resolve, 200);
+      await promise;
+    }
+    assert.ok(notices.some((n) => n.includes('settlement watch re-armed')), `恢复通知缺失: ${JSON.stringify(notices)}`);
+    const settle = notices.find((n) => n.includes('closing message'));
+    assert.ok(settle, `结算通知缺失: ${JSON.stringify(notices)}`);
+    assert.match(settle!, /RECOVERED_REPORT/);
+    const snap = pi.entries.filter(([t]) => t === SUBS_CUSTOM_TYPE).at(-1)?.[1] as { subs: SubEntry[] };
+    assert.equal(snap.subs.find((s) => s.paneId === 'pAlive')?.status, 'consumed', 'ledger 状态收敛为 consumed');
+  } finally {
+    await root.fiber.dispose();
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+  }
 });

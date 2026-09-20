@@ -46,3 +46,14 @@ test('formatSettlementNotice: with and without closing message', () => {
     'Background subagent p1 (task) finished and will do no further work unless you send it more. It left no closing message.',
   );
 });
+
+test('formatSettlementNotice (P0-1): nullReason 区分误归因/抽取失败/真·无输出', () => {
+  const head = 'Background subagent p1 (task) finished and will do no further work unless you send it more.';
+  const suspect = formatSettlementNotice('p1 (task)', null, 'attribution-suspect');
+  assert.ok(suspect.includes('attribution is suspect'), suspect);
+  assert.ok(!suspect.includes('left no closing message'), '误归因不得再用“无输出”措辞');
+  const extract = formatSettlementNotice('p1 (task)', null, 'extraction-failed');
+  assert.ok(extract.includes('could not be extracted'), extract);
+  assert.equal(formatSettlementNotice('p1 (task)', null), `${head} It left no closing message.`);
+  assert.equal(formatSettlementNotice('p1 (task)', null, 'silent'), `${head} It left no closing message.`);
+});

@@ -439,3 +439,66 @@ test('CompactCoordinator.getRemainingHorizon: fallback when empty and derived fr
 
 
 
+
+test('P1-3: 压缩失败后进入退避——下一次 compact 决策被跳过（不再白付 abort），成功后复位', async () => {
+  const coordinator = new CompactCoordinator();
+  const todos: TodoItem[] = [{ content: 'Remaining task', status: 'in_progress' }];
+  const config = {
+    enabled: true,
+    logEnabled: false,
+    cacheWriteReadRatio: 2.0,
+    firstCompactionRequestScale: 2.0,
+    subsequentCompactionMargin: 1.5,
+  } as never;
+  const branchEntries = Array.from({ length: 25 }, (_, i) => ({
+    type: 'message',
+    id: `msg_${i}`,
+    parentId: i > 0 ? `msg_${i - 1}` : null,
+    message: {
+      role: i % 2 === 0 ? 'user' : 'assistant',
+      content: [{ type: 'text', text: 'Some long log content exceeding threshold...\n'.repeat(200) }],
+    },
+  }));
+  coordinator.state.completedBoundaryRequestCounts = [1];
+  coordinator.pendingBoundaryCompleted = true;
+  const { ctx, abortCalls, compactCalls } = createMockContext({ tokens: 60000, branch: branchEntries });
+  coordinator.onTurnEnd({ ctx, todos, config });
+  assert.equal(abortCalls(), 1, '首次决策应 abort（OCC 正常路径）');
+
+  // 2. 压缩失败（token cap 类）→ 失败计数 + 退避窗口 + 可见失败消息
+  const messages: Array<{ content: string; display?: boolean }> = [];
+  const pi = {
+    sendMessage: (m: { content: string; display?: boolean }) => { messages.push(m); },
+    appendEntry: () => {},
+  } as never;
+  const settled = coordinator.onAgentSettled({ ctx, todos, pi, config });
+  assert.equal(compactCalls.length, 1);
+  compactCalls[0].onError(new Error('Summarization failed: generation hit the token cap and the summary is incomplete'));
+  await settled;
+  assert.ok(coordinator.state.compactBackoffTurnEnds >= 2, '退避窗口 ≥2');
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].display, true, '失败消息必须可见');
+  assert.match(messages[0].content, /FAILED/);
+
+  // 3. 退避期内：同样的决策不再 abort（窗口 2 → 消耗 1）。每次决策前复位经济前置，
+  //    因为 onTurnEnd 会消耗 pendingBoundaryCompleted 并更新边界采样。
+  const rearm = (): void => {
+    coordinator.state.completedBoundaryRequestCounts = [1];
+    coordinator.pendingBoundaryCompleted = true;
+  };
+  rearm();
+  coordinator.onTurnEnd({ ctx, todos, config });
+  assert.equal(abortCalls(), 1, '退避期内不得再次 abort');
+
+  // 4. 退避耗尽后恢复 abort，onComplete 复位失败计数
+  rearm();
+  coordinator.onTurnEnd({ ctx, todos, config }); // 窗口 1 → 0
+  rearm();
+  coordinator.onTurnEnd({ ctx, todos, config }); // 正常决策 → abort
+  assert.equal(abortCalls(), 2, '退避耗尽后应恢复 abort');
+  const settled2 = coordinator.onAgentSettled({ ctx, todos, pi, config });
+  compactCalls.at(-1)!.onComplete({ summary: 'ok' });
+  await settled2;
+  assert.equal(coordinator.state.consecutiveCompactionFailures, 0, '成功后失败计数复位');
+  assert.equal(coordinator.state.compactBackoffTurnEnds, 0, '成功后退避复位');
+});

@@ -418,3 +418,61 @@ export function excerptAskIsSafe(
   const parts = [headExcerpt, tailExcerpt, ...middleWindows.map((w) => w.text)];
   return !parts.some((part) => containsLikelySecret(part));
 }
+
+// ---------------------------------------------------------------------------
+// P0-4: settlement attribution check (p24-class "left no closing message")
+//---------------------------------------------------------------------------
+
+/**
+ * Noul answers carry no confidence field (unlike choice/score), so this use case
+ * gates on the noul probabilities themselves via dedicated constants — the same
+ * convention as DIAGNOSTIC_OUTPUT_MIN_NOUL / NOTICE_FAIL_PIN_THRESHOLD.
+ */
+export const SETTLE_MATCH_MIN_NOUL = 0.6;
+export const SETTLE_FINAL_MIN_NOUL = 0.6;
+
+
+export type SettleNullVerdict = 'silent' | 'attribution-suspect' | 'extraction-failed';
+
+/** State is the delegated task plus the transcript tail we actually read. */
+export function settleVerdictRequest(input: { description: string; tail: string }): JevRequest {
+  return {
+    state: { task: input.description, transcriptTail: input.tail },
+    questions: {
+      tail_matches_task: {
+        type: 'noul',
+        instructions: 'Is this transcript tail from a session working on the described task? Answer false only when the tail is clearly about a different task or conversation.',
+        criteria: {
+          true: 'The tail discusses, works on, or reports on the described task',
+          false: 'The tail is about an unrelated task or a different conversation',
+        },
+      },
+      tail_has_final_answer: {
+        type: 'noul',
+        instructions: 'Does the transcript tail end with (or contain) a complete final answer or report for the task, rather than only intermediate tool exchanges?',
+        criteria: {
+          true: 'A complete final answer/report is present',
+          false: 'Only intermediate steps, questions, or tool exchanges — no final answer',
+        },
+      },
+    },
+  };
+}
+/**
+ * Compose the null-closing verdict. null = unanswered (jev off / failed / wrong
+ * shapes) — callers fall back to deterministic signals and the legacy wording so
+ * jev-off stays byte-identical (RFC fail-open invariant).
+ */
+export function evaluateSettleVerdict(answers: Record<string, JevAnswer>): SettleNullVerdict | null {
+  const match = answers.tail_matches_task;
+  const fin = answers.tail_has_final_answer;
+  if (match?.type !== 'noul' || fin?.type !== 'noul') return null;
+  if (match.noul < SETTLE_MATCH_MIN_NOUL) return 'attribution-suspect';
+  if (fin.noul >= SETTLE_FINAL_MIN_NOUL) return 'extraction-failed';
+  return 'silent';
+}
+
+/** Privacy gate shared with EPR: never ship credential-shaped tails off-host. */
+export function settleAskIsSafe(tail: string): boolean {
+  return !containsLikelySecret(tail);
+}

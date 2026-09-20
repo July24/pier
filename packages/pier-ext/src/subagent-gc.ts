@@ -24,7 +24,7 @@ function sleep(ms: number): Promise<void> {
 
 export interface GcHost {
   client: HerdrClientLike;
-  env: { tabId: string } | null;
+  env: { tabId: string; paneId?: string } | null;
   subs: Map<string, SubEntry>;
   persistSubs(): void;
   writeHistory(e: SubEntry, patch?: { outcome?: string | null; status?: SubEntry['status']; closedAt?: number }, via?: string): void;
@@ -109,6 +109,9 @@ export function createGcController(h: GcHost): GcController {
     );
     for (const e of candidates) {
       if (termPaneIds.has(e.paneId) || pendingNoticeIds.has(e.paneId)) continue;
+      // 01a0bd3a: a poisoned registry entry once let GC closePane the master's own pane
+      // while its workers were still running. Never collect self, whatever the registry says.
+      if (h.env?.paneId && e.paneId === h.env.paneId) continue;
       if (!shouldClosePane({
         consumedAt: e.consumedAt ?? null,
         herdrStatus: statuses.get(e.paneId),

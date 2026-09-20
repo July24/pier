@@ -54,6 +54,7 @@ export type CompactionReason =
   | 'horizon_unavailable'
   | 'cache_ratio_unavailable'
   | 'native_not_compactable'
+  | 'failure_backoff'
   | 'non_positive_saving';
 
 export interface RequestHorizonEstimate {

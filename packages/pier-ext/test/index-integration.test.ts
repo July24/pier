@@ -547,3 +547,44 @@ test('index: turn_start resets lastStopReason (A11) so a stale abort cannot swal
     await fire(pi, 'session_shutdown'); // close the pipe server even when an assertion fails
   }
 }));
+
+test('P2-5: resume (session_start) folds todos from branch — kill+resume no longer starts empty', withCleanup(async (cleanup) => {
+  const env = cleanup.env();
+  env.delete('PI_HERDR_SUBAGENT');
+  env.delete('HERDR_ENV');
+  env.delete('HERDR_SOCKET_PATH');
+  env.delete('HERDR_PANE_ID');
+
+  const pi = fakePi();
+  await pier(pi as never);
+
+  // A branch carrying the last todo_write toolResult snapshot (the fold source).
+  const branch = [{
+    type: 'message',
+    message: {
+      role: 'toolResult',
+      toolName: 'todo_write',
+      details: {
+        'pi-herdr.todo': {
+          version: 1,
+          items: [
+            { content: 'Fix bug 19801 in isolated worktree', status: 'completed' },
+            { content: 'Push to origin + update ZenTao', status: 'pending' },
+          ],
+        },
+      },
+    },
+  }];
+  await fire(pi, 'session_start', { reason: 'resume' }, { sessionManager: { getBranch: () => branch } });
+
+  const notified: string[] = [];
+  const todosHandler = pi.commands.get('todos')?.handler;
+  assert.ok(todosHandler, 'todos command registered');
+  await todosHandler([], { ui: { notify: (t: string) => { notified.push(t); } } });
+  const out = notified.join('\n');
+  assert.match(out, /Fix bug 19801 in isolated worktree/, `fold must restore items, got: ${out}`);
+  assert.match(out, /Push to origin \+ update ZenTao/);
+  assert.doesNotMatch(out, /todo list is empty/);
+
+  await fire(pi, 'session_shutdown');
+}));

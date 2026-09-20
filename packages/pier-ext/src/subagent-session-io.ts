@@ -3,11 +3,13 @@
  *
  * Why: pollLoop, foreground wait, and revive all shared the same candidate
  * order (reported path/id before recent-file fallback, excluding the parent
- * session). Keeping it in one adapter prevents settlement text from crossing sessions.
+ * session and sessions claimed by other live panes). Keeping it in one
+ * adapter prevents settlement text from crossing sessions.
  */
 import { accessSync, constants, statSync } from 'node:fs';
 import type { HerdrClientLike } from './herdr-client.ts';
 import {
+  bareSessionId,
   deriveSubSessionState,
   lastAssistantText,
   listSessionFiles,
@@ -25,12 +27,13 @@ export interface SessionIoHost {
 }
 
 export interface SessionIo {
-  resolveSessionFileCandidates(paneId: string, cwd: string): Promise<string[]>;
-  resolveSessionFile(paneId: string, cwd: string): Promise<string | null>;
-  collectFinalText(paneId: string, cwd: string, sinceTs: number, attempts?: number): Promise<string | null>;
+  resolveSessionFileCandidates(paneId: string, cwd: string, preferred?: string | null): Promise<string[]>;
+  resolveSessionFile(paneId: string, cwd: string, preferred?: string | null): Promise<string | null>;
+  collectFinalText(paneId: string, cwd: string, sinceTs: number, attempts?: number, preferred?: string | null): Promise<string | null>;
   readAskFlag(paneId: string): Promise<string | null>;
   probeAlive(paneId: string, cwd: string): Promise<AliveProbe>;
-  subSessionState(paneId: string, cwd: string, sinceTs: number): Promise<SubSessionState>;
+  subSessionState(paneId: string, cwd: string, sinceTs: number, preferred?: string | null): Promise<SubSessionState>;
+  readSettleTail(paneId: string, cwd: string, preferred?: string | null, maxChars?: number): Promise<string | null>;
 }
 
 /** Cheap change fingerprint of a session file; null when it does not exist. */
@@ -97,30 +100,59 @@ class DerivedCache<T> {
 export function createSessionIo(h: SessionIoHost): SessionIo {
   const stateCache = new DerivedCache<SubSessionState>();
   const finalTextCache = new DerivedCache<string | null>();
-
-  async function resolveSessionFileCandidates(paneId: string, cwd: string): Promise<string[]> {
+  async function resolveSessionFileCandidates(paneId: string, cwd: string, preferred?: string | null): Promise<string[]> {
     const out: string[] = [];
+    // 01a0bd3a: a sub's sessionFile must never resolve to the master's own transcript.
+    // herdr's report for a just-spawned pane can lag (or briefly point elsewhere) and the
+    // mtime fallback otherwise picks the hottest file — the master's own jsonl. A poisoned
+    // entry later made `resume` adopt the master pane as its own subagent and GC close it
+    // while two real workers were still running. Compare via bareSessionId: herdr reports
+    // ids and paths interchangeably, and the old full-path vs bare-id check never matched.
+    const own = bareSessionId(h.getSessionId());
+    // One agent.list serves both the per-pane report and the claimed-elsewhere set —
+    // getAgentSessionPath hides a second identical RPC, and this resolver sits on poll
+    // hot paths (collectFinalText retries, subSessionState ticks).
+    let reported: string | null = null;
+    const taken = new Set<string>();
     try {
-      const reported = await h.client.getAgentSessionPath(paneId);
-      if (reported) {
-        if (/\.jsonl$/.test(reported)) out.push(reported);
-        else {
-          const byId = sessionFileById(cwd, h.sessionsDir(), reported);
-          if (byId) out.push(byId);
-        }
+      for (const a of await h.client.listAgents()) {
+        if (!a.session) continue;
+        if (a.paneId === paneId) reported = a.session;
+        else taken.add(bareSessionId(a.session));
+      }
+      if (!reported) {
+        // agent.list is authoritative in production, but a pane may be absent during
+        // report lag (fresh spawn) — and stub clients expose only the per-pane report.
+        reported = await h.client.getAgentSessionPath(paneId);
       }
     } catch {
-      /* Reports may be unavailable during startup. */
+      /* agent list unavailable (startup) → per-pane report fallback, own exclusion still holds */
+      try {
+        reported = await h.client.getAgentSessionPath(paneId);
+      } catch {
+        /* both unavailable */
+      }
     }
-    const ownSession = h.getSessionId();
-    for (const f of listSessionFiles(cwd, h.sessionsDir(), 4)) {
-      if (f !== ownSession && !out.includes(f)) out.push(f);
+    const push = (file: string | null): void => {
+      if (!file || out.includes(file)) return;
+      const id = bareSessionId(file);
+      if (own && id === own) return;
+      if (taken.has(id)) return;
+      out.push(file);
+    };
+    // p24-class: the pipe self-report (entry.sessionFile) is authoritative for this pane —
+    // try it before the herdr report and the mtime fallback (same own/taken filters apply).
+    if (preferred && /\.jsonl$/i.test(preferred)) push(preferred);
+    if (reported) {
+      if (/\.jsonl$/.test(reported)) push(reported);
+      else push(sessionFileById(cwd, h.sessionsDir(), reported));
     }
+    for (const f of listSessionFiles(cwd, h.sessionsDir(), 4)) push(f);
     return out;
   }
 
-  async function resolveSessionFile(paneId: string, cwd: string): Promise<string | null> {
-    for (const file of await resolveSessionFileCandidates(paneId, cwd)) {
+  async function resolveSessionFile(paneId: string, cwd: string, preferred?: string | null): Promise<string | null> {
+    for (const file of await resolveSessionFileCandidates(paneId, cwd, preferred)) {
       if (isReadableFile(file)) return file;
     }
     return null;
@@ -131,9 +163,10 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     cwd: string,
     sinceTs: number,
     attempts = 12,
+    preferred?: string | null,
   ): Promise<string | null> {
     for (let i = 0; i < attempts; i++) {
-      for (const file of await resolveSessionFileCandidates(paneId, cwd)) {
+      for (const file of await resolveSessionFileCandidates(paneId, cwd, preferred)) {
         const stamp = stampOf(file);
         if (!stamp) continue;
         const cached = finalTextCache.get(file, stamp, sinceTs);
@@ -199,8 +232,9 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     paneId: string,
     cwd: string,
     sinceTs: number,
+    preferred?: string | null,
   ): Promise<SubSessionState> {
-    for (const file of await resolveSessionFileCandidates(paneId, cwd)) {
+    for (const file of await resolveSessionFileCandidates(paneId, cwd, preferred)) {
       const stamp = stampOf(file);
       // A missing or vanished path is skipped: herdr often reports a .jsonl path before the worker
       // creates the file, and waitAgent(idle) returns immediately, which used to throw
@@ -218,6 +252,36 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     return { text: null, pendingTool: false, activity: false, turnEnded: false };
   }
 
+  /** Last assistant text (any stopReason) tail of the best candidate — state for the
+   * settle attribution judgment when closing text came back null. Unlike
+   * collectFinalText this ignores stopReason and sinceTs: the question is "what does
+   * the tail we READ look like", not "is there a finalized report". */
+  async function readSettleTail(
+    paneId: string,
+    cwd: string,
+    preferred?: string | null,
+    maxChars = 1200,
+  ): Promise<string | null> {
+    for (const file of await resolveSessionFileCandidates(paneId, cwd, preferred)) {
+      if (!isReadableFile(file)) continue;
+      const entries = readSessionFile(file);
+      if (!entries?.length) continue;
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const m = entries[i]?.message as { role?: string; content?: Array<{ type?: string; text?: string }> } | undefined;
+        if (!m || m.role !== 'assistant' || !Array.isArray(m.content)) continue;
+        const text = m.content
+          .filter((c) => c && c.type === 'text' && c.text)
+          .map((c) => c.text as string)
+          .join('\n')
+          .trim();
+        if (text) return text.slice(-maxChars);
+      }
+      return null;
+    }
+    return null;
+  }
+
+
   return {
     resolveSessionFileCandidates,
     resolveSessionFile,
@@ -225,6 +289,7 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     readAskFlag,
     probeAlive,
     subSessionState,
+    readSettleTail,
   };
 }
 

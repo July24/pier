@@ -200,7 +200,7 @@ test('formatSubagentOutput: renders empty delta notice and restart/truncated fla
     },
   });
   assert.match(formatted, /status: blocked \(question: "Confirm overwrite\?"\)/);
-  assert.match(formatted, /restart: true/);
+  assert.match(formatted, /buffer scrolled or reset — full text returned \(not a process restart\)/);
   assert.match(formatted, /truncated: true/);
   assert.match(formatted, /\(no new output since last read\)/);
 });
@@ -564,4 +564,16 @@ test('HerdrClient: readAgent sends agent.read RPC and unwraps response envelope'
     server.close();
     rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+test('P2-4: restart 旗标文案不再暗示进程重启（fullscreen TUI 恒态）', () => {
+  const out = formatSubagentOutput({
+    paneId: 'p1',
+    status: 'running',
+    revision: 0,
+    bufferTruncated: false,
+    deltaResult: { delta: 'x', restart: true, truncated: false, nextCursor: { tail: 'x', fullLength: 1 } },
+  });
+  assert.match(out, /buffer scrolled or reset — full text returned \(not a process restart\)/);
+  assert.doesNotMatch(out, /restart: true/);
 });

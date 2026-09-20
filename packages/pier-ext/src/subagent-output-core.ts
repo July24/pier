@@ -244,7 +244,9 @@ export function formatSubagentOutput(opts: FormatSubagentOutputOpts): string {
   ];
 
   if (opts.deltaResult.restart) {
-    metaItems.push('restart: true (buffer reset or scrolled)');
+    // P2-4: fullscreen TUI redraws make this the CONSTANT state, not a crash signal —
+    // the old "restart: true" wording repeatedly misled incident triage (01a0bd3a).
+    metaItems.push('buffer scrolled or reset — full text returned (not a process restart)');
   }
   if (opts.bufferTruncated || opts.deltaResult.truncated) {
     metaItems.push('truncated: true');

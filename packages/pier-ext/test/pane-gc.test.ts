@@ -120,3 +120,42 @@ test('pane 级 GC：statuses 修复——consumed pane 被 closePane；消失 pa
     await root.fiber.dispose();
   }
 });
+
+test('pane 级 GC（01a0bd3a）：master 自己的 pane 绝不被回收——即使注册表里存在指向它的 consumed 条目', async () => {
+  const pi = fakePi();
+  const closePaneCalls: string[] = [];
+  const cwd = mkdtempSync(join(tmpdir(), 'pane-gc-self-'));
+  const surface = new PiSurface(pi as unknown as object);
+  const root = new Context();
+  const deps = {
+    client: fakeClient(closePaneCalls, ['p0']), // p0 = env.paneId，master 自己
+    env: { paneId: 'p0', tabId: 'tMAIN', workspaceId: 'w1' },
+    extPath: 'F:/repo/pier/packages/pier-ext/src/index.ts',
+    sessionRoot: root,
+    port: emptySubagentPortBox(),
+    getSessionId: () => '',
+    reconcileOnSettlement: () => [],
+    withReconcileNotes: (b: string) => b,
+    claimSettleNotice: () => true,
+    terminalState: { activePaneIds: () => new Set<string>() },
+  };
+  root.provide('pi-herdr.surface', surface);
+  root.provide('pi-herdr.subagent-deps', deps);
+  await root.plugin(subagentPlugin);
+  try {
+    // 被污染的注册表条目：paneId 指向 master 自身、已 consumed、herdr 状态 idle
+    // —— 正是会话 01a0bd3a 里 wA:p1F 条目的形态
+    const poisoned = makeEntry('p0', cwd);
+    await fire(pi, 'session_start', {}, { sessionManager: { getBranch: () => [
+      { type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { subs: [poisoned] } },
+    ] } });
+    await fire(pi, 'turn_start');
+    assert.deepEqual(closePaneCalls, [], 'master 自身 pane 不得被 closePane');
+    const snap = pi.entries.filter(([t]) => t === SUBS_CUSTOM_TYPE).at(-1)?.[1] as { subs: SubEntry[] };
+    const self = snap.subs.find((s) => s.paneId === 'p0');
+    assert.ok(self, '条目仍在注册表');
+    assert.equal(self.status, 'consumed', '条目不被误标 closed');
+  } finally {
+    await root.fiber.dispose();
+  }
+});

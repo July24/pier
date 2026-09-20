@@ -12,6 +12,7 @@ import {
   composeNoticeRanking,
   diagnosticGateRequest,
   evaluateDiagnosticGate,
+  evaluateSettleVerdict,
   evaluateExcerptPick,
   excerptAskIsSafe,
   excerptPickRequest,
@@ -256,4 +257,26 @@ test('formatObservationPlaceholder：middle 替换低信号半段，标签如实
   // 头尾两窗中信号少的一侧被替换：头部（setup 行，无信号）让位
   assert.ok(!withMiddle.includes('[first complete lines'));
   assert.ok(withMiddle.includes('[middle omitted; last complete lines'));
+});
+
+test('P0-4 evaluateSettleVerdict：尾巴归属/最终答案两问组合出三态，未答即 null（fail-open）', () => {
+  const noul = (v: number) => ({ type: 'noul' as const, noul: v });
+  // 明显是别的任务的 transcript → 误归因
+  assert.equal(
+    evaluateSettleVerdict({ tail_matches_task: noul(0.1), tail_has_final_answer: noul(0.2) }),
+    'attribution-suspect',
+  );
+  // 同任务且有完整报告 → 抽取失败（报告在，是我们没读到）
+  assert.equal(
+    evaluateSettleVerdict({ tail_matches_task: noul(0.9), tail_has_final_answer: noul(0.9) }),
+    'extraction-failed',
+  );
+  // 同任务且无最终回答 → 真·无输出
+  assert.equal(
+    evaluateSettleVerdict({ tail_matches_task: noul(0.9), tail_has_final_answer: noul(0.1) }),
+    'silent',
+  );
+  // 缺答/形状不对 → null（调用方回落旧措辞）
+  assert.equal(evaluateSettleVerdict({ tail_has_final_answer: noul(0.9) }), null);
+  assert.equal(evaluateSettleVerdict({}), null);
 });

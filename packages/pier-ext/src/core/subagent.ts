@@ -14,7 +14,7 @@ import { Semaphore, buildAliveNotice, isAlive, tabNameForTask, type SubEntry } f
 import { applyReportedSessionFile, appendHistory, preferredHistoryFile, inheritOutcome, latestGeneration, readHistory, type HistoryEntry } from '../history-store.ts';
 import { platformPaths } from '../platform-paths.ts';
 import type { SubagentPort, SubagentPortBox } from '../subagent-port.ts';
-import { toolError } from '../tool-error.ts'
+import { toolError, ToolError } from '../tool-error.ts'
 
 /** Raw tool arguments: every field is validated inside the action handlers. */
 type ToolParams = Record<string, unknown> | undefined;;
@@ -22,7 +22,9 @@ import { pipeNameFor, pipeRequestTo } from '../pipe-channel.ts';
 import type { TerminalStateSlot } from './terminal.ts';
 import { createGitIo } from '../subagent-git-io.ts';
 import { createSessionIo } from '../subagent-session-io.ts';
+import { bareSessionId, sessionFileById } from '../session-tail.ts';
 import { createSpawner } from '../subagent-spawn.ts';
+import type { JevRuntime } from '../jev-client.ts';
 import { createPoller } from '../subagent-poll-loop.ts';
 import { createGcController } from '../subagent-gc.ts';
 import { createSubagentRegistry } from '../subagent-registry.ts';
@@ -31,6 +33,7 @@ import type { SubagentOutputCursor } from '../subagent-output-core.ts';
 import { executeSubagentList } from '../subagent-list-action.ts';
 import { executeSubagentOutput } from '../subagent-output-action.ts';
 import { resolveTaskIdPrefix } from '../subagent-resolution.ts';
+import type { RoutingTelemetryRecord } from '../routing-telemetry.ts';
 
 interface SubagentEnv {
   paneId: string;
@@ -59,7 +62,12 @@ interface SubagentDeps {
   noticePending?: () => ReadonlySet<string>;
   /** Terminal-family GC exemption (live terminal panes are not collected). */
   terminalState: TerminalStateSlot;
+  /** Optional jev seam (settle attribution check); absent → fail-open legacy behavior. */
+  jev?: { ask: JevRuntime['ask']; getMinConfidence: () => number };
+  /** Phase 0 routing telemetry (RFC rfc-jev-role-routing §8): spawn profile append; absent in tests. */
+  logRouting?: (row: RoutingTelemetryRecord) => void;
 }
+
 
 const SUBAGENT_DESCRIPTION = [
   'Delegate a self-contained subtask to an isolated subagent that runs in its own herdr pane as an interactive pi session (separate context window; it does NOT see this conversation). A human can also open that pane and talk to the subagent directly.',
@@ -73,10 +81,10 @@ const SUBAGENT_DESCRIPTION = [
   '[spawn] `isolate` (default false): creates a FRESH git worktree for this subagent and runs it there (branch pier/<slug> from your HEAD under ~/.herdr/worktrees/<repo>/). Three-way choice: heavy independent writing in parallel with your own edits or other workers, or work needing its own clean reviewable diff → isolate; read-mostly or sequential helper work → omit (shared checkout, writes guarded by the write-lock); targeting an existing directory/worktree → cwd. In isolate mode the subagent\'s writes cannot conflict with your checkout; its panes group into a tab named after the worktree; its prompt is prefixed with commit discipline (commit to its own branch, NEVER push); when it settles you get a diff summary (commits since base, files changed, uncommitted count). Review with git log/diff HEAD..<branch>, merge with git merge --no-ff <branch>; once merged and clean the worktree auto-removes (branch kept). Mutually exclusive with cwd.',
   '[resume] `taskId`: revive a finished (collected) subagent from the delegation ledger — opens its saved conversation in a new pane (pi --session), then use action send to give it new work. The ledger is an append-only JSONL file, one row per status change (same taskId rows = generations, latest row is current): fields taskId, description, status (running|settled|consumed|closed), outcome (closing text), paneId, sessionFile, launchCommand, createdAt. It is per-checkout at ~/.pi/agent/herdr-pi/history/<flattened-cwd>/history.jsonl. Use action list for live panes from this session; for earlier sessions or closed panes, grep the ledger for the taskId.',
   '[list] no extra parameters: list background subagents with live state (running / idle), pane ids, last activity, role, and descriptions. Foreground one-shot panes are not listed.',
-  '[send] `agentId` + `message`: follow-up to a background subagent. If working, delivered at next tool-call gap (steer, seconds); if idle, wakes a new turn. After settle, send to wake it; do not spawn a duplicate.',
+  '[output] `agentId` (required, the subagent pane id): view incremental output of a running or background subagent since the last output call. Text returned to the model is bounded (default 6000 chars) with status metadata (running/idle/blocked/settled), revision, and a truncated flag. When the delta cannot be computed the full text is returned with a "buffer scrolled or reset" note — that is normal for fullscreen TUI panes, not a crash indicator. Use this to observe subagent progress before settlement.',
   '[interrupt] `agentId`: abort the current turn (fire-and-return). The pane stays; you can send again.',
   '[role] `agentId` + `role`: switch that worker\'s role profile mid-session (pi 0.86 transcript tool delta — the new toolset applies on its next request and survives resume). Same role resolution as spawn; the reply reports the tool diff. Use when a task outgrew its delegation (needs more tools) or should be narrowed.',
-  '[output] `agentId` (required, the subagent pane id): view incremental output of a running or background subagent since the last output call. Text returned to the model is bounded (default 6000 chars) with status metadata (running/idle/blocked/settled), revision, truncated flag, and whether the buffer reset/scrolled (restart: true). Use this to observe subagent progress before settlement.',
+  '[send] `agentId` + `message`: follow-up to a background subagent. If working, delivered at next tool-call gap (steer, seconds); if idle, wakes a new turn. After settle, send to wake it; do not spawn a duplicate.',
 ].join(' ');
 
 /** Subagent concurrency limit (max parallel delegations) */
@@ -130,7 +138,14 @@ export default function subagentPlugin(ctx: Context): void {
     applyReplySession(paneId, sessionFile) {
       const entry = subs.get(paneId);
       if (!entry) return;
-      const next = applyReportedSessionFile(entry.sessionFile, sessionFile);
+      // p24-class (01a0bd3c): workers self-report a BARE session id over the pipe; the
+      // .jsonl-only guard in applyReportedSessionFile used to discard it, freezing a
+      // mis-attributed sessionFile forever. Map the id to its transcript path first so
+      // the authoritative self-report corrects the ledger.
+      const reported = typeof sessionFile === 'string' && !/\.jsonl$/i.test(sessionFile)
+        ? sessionFileById(entry.cwd, defaultAgentSessionsDir(), sessionFile)
+        : sessionFile;
+      const next = applyReportedSessionFile(entry.sessionFile, reported);
       if (next === entry.sessionFile) return;
       entry.sessionFile = next;
       persistSubs();
@@ -157,11 +172,48 @@ export default function subagentPlugin(ctx: Context): void {
   scoped.on('session_start', async (_event: unknown, eventCtx: unknown) => {
     registry.rebuild(eventCtx);
     await registry.sweepZombieRunning();
+    await recoverRunningPollers('session_start');
   });
   scoped.on('session_tree', async (_event: unknown, eventCtx: unknown) => {
     registry.rebuild(eventCtx);
     await registry.sweepZombieRunning();
+    await recoverRunningPollers('session_tree');
   });
+
+  /** P0-2 (01a0bd3a aftermath): a restarted master used to lose every running subagent's
+   * poller — settle notices stopped arriving and ledger rows stayed 'running' until a
+   * manual send re-armed one by accident. Re-arm pollers for live running panes; the
+   * 'recover-*' requestId is never echoed by a worker, so this poller's settle claim wins. */
+  async function recoverRunningPollers(via: string): Promise<void> {
+    if (!client.available) return;
+    const running = [...subs.values()].filter((s) => s.background && s.status === 'running' && !pollers.has(s.paneId));
+    if (running.length === 0) return;
+    let livePaneIds: ReadonlySet<string>;
+    try {
+      livePaneIds = new Set((await client.listPanes()).map((p) => p.paneId));
+    } catch {
+      return; // liveness lookup failed → do not guess
+    }
+    const recovered: string[] = [];
+    for (const entry of running) {
+      if (!livePaneIds.has(entry.paneId)) continue; // zombie sweep already closed those
+      try {
+        await startPoller(entry.paneId, entry.cwd, entry.createdAt, entry.createdAt, entry.description, `recover-${via}-${entry.paneId}`);
+        recovered.push(`${entry.paneId} (${entry.description})`);
+      } catch {
+        /* one failure must not block the rest */
+      }
+    }
+    if (recovered.length > 0) {
+      try {
+        await injectNotice(
+          `Session recovery (${via}): ${recovered.length} background subagent(s) still running — settlement watch re-armed for: ${recovered.join('; ')}.`,
+        );
+      } catch {
+        /* non-fatal */
+      }
+    }
+  }
 
   /* ── B1 liveness rewrite for subagent errors ─────────────────────
    * A false no-output result caused the model to seize work from a healthy subagent. Probe
@@ -251,6 +303,7 @@ export default function subagentPlugin(ctx: Context): void {
     reconcileOnSettlement: d.reconcileOnSettlement,
     withReconcileNotes: d.withReconcileNotes,
     claimSettleNotice: d.claimSettleNotice,
+    ...(d.jev ? { jev: d.jev } : {}),
   });
   const gc = createGcController({
     client,
@@ -278,7 +331,13 @@ export default function subagentPlugin(ctx: Context): void {
       throw new Error(`isolate worktree ${entry.isolate.branch} was released (merged) — delegate a new subagent instead`);
     }
     const latest = latestGeneration(readHistory(histFile(entry.cwd)), entry.taskId) ?? entry;
-    const resumeFile = latest.sessionFile && /\.jsonl$/.test(latest.sessionFile) ? latest.sessionFile : null;
+    // 01a0bd3a: never relaunch the master's own transcript in a worker pane (two pi
+    // processes competing on one jsonl). A mis-attributed ledger entry degrades to a
+    // fresh conversation instead.
+    const ownId = bareSessionId(d.getSessionId());
+    const resumeFile = latest.sessionFile && /\.jsonl$/.test(latest.sessionFile)
+      && bareSessionId(latest.sessionFile) !== ownId
+      ? latest.sessionFile : null;
     // D86 trust matches spawn: pass -a only for the master's checkout/worktrees; revive has no tool context, so use process cwd.
     const approve = await approveFor(entry.cwd, process.cwd());
     const spawned = await spawnPaneInTaskTab(
@@ -334,6 +393,16 @@ export default function subagentPlugin(ctx: Context): void {
       try {
         // D94: Reuse an existing pane for the same session to avoid competing pi processes.
         const existing = await findExistingPane(latest.sessionFile);
+        // 01a0bd3a: when the ledger's sessionFile was mis-attributed to the master's own
+        // transcript, this lookup matched the MASTER pane ("reused existing pane with same
+        // session"), registering the master as its own subagent; the poller later consumed
+        // it and GC closed the pane mid-run. Never adopt self — refuse instead, because
+        // falling through to revive would relaunch the master transcript in a new pane.
+        if (existing?.paneId === env?.paneId) {
+          return toolError(
+            `Error: task ${taskId} is attributed to the master's own session (mis-recorded sessionFile in the ledger); it cannot be resumed here — spawn a fresh subagent for this work instead.`,
+          );
+        }
         if (existing) {
           const entry: SubEntry = {
             taskId,
@@ -392,6 +461,7 @@ export default function subagentPlugin(ctx: Context): void {
           details: { paneId: entry.paneId, taskId },
         };
       } catch (err) {
+        if (err instanceof ToolError) throw err;
         return toolError(`Error: failed to resume task "${taskId}": ${(err as Error).message}`);
       } finally {
         release();
@@ -606,6 +676,7 @@ export default function subagentPlugin(ctx: Context): void {
     session,
     spawn,
     poller,
+    ...(d.logRouting ? { logRouting: d.logRouting } : {}),
   });
 
 
