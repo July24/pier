@@ -498,13 +498,20 @@ export default async function (pi: ExtensionAPI) {
     // master → 'master'; worker → manifest.role (prettify worker-default as worker).
     // A bare pi without a manifest does not report, so ordinary pi sessions remain undisturbed.
     syncRoleFromBranch(ctx);
-    // Phase 0 (RFC §8): scan the user-authored role layers once per master session start —
-    // axis-usage data backs the grants collapse (ask expected all-zero, allow stance dominant).
     if (mode.composeMaster && sessionRoot) {
       try {
         const files: Array<{ name: string; text: string }> = [];
         for (const layer of roleLayers({ baseDir: roleBase }).slice(0, 2)) {
-          for (const f of readdirSync(layer.dir)) {
+          // Each layer's readdir is individually guarded: the workspace layer is commonly
+          // absent (no .pi-herdr/roles), and one missing directory must not skip the user
+          // layer where the interesting custom roles live — same pattern as /pier-role listing.
+          let names: string[];
+          try {
+            names = readdirSync(layer.dir);
+          } catch {
+            continue;
+          }
+          for (const f of names) {
             if (!f.endsWith('.json')) continue;
             try {
               files.push({ name: f, text: readFileSync(join(layer.dir, f), 'utf8') });
@@ -515,7 +522,7 @@ export default async function (pi: ExtensionAPI) {
         }
         appendRoutingLog(scanRoleAxisUsage({ now: Date.now(), files }));
       } catch {
-        /* Layer directory absent; the scan is best-effort. */
+        /* The scan is best-effort. */
       }
     }
     reportAgent('idle', null);

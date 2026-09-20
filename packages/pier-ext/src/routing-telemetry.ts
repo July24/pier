@@ -114,14 +114,21 @@ export function scanRoleAxisUsage(opts: {
       invalid += 1;
       continue;
     }
-    if (typeof doc.role !== 'string' || typeof doc.manifest?.rules !== 'object' || doc.manifest?.rules === null) {
+    // Schema contract: only role + manifest are required; `rules` may be omitted (implicit
+    // {"*":"allow"}) and unknownTools defaults to deny — a minimal legal custom role must count
+    // as parsed, not invalid, or the phase-1 dataset loses exactly the files it decides on.
+    if (typeof doc.role !== 'string' || typeof doc.manifest !== 'object' || doc.manifest === null) {
       invalid += 1;
       continue;
     }
     parsed += 1;
     if (doc.manifest.unknownTools === 'allow') stanceAllow += 1;
-    else if (doc.manifest.unknownTools === 'deny') stanceDeny += 1;
-    for (const [tool, action] of Object.entries(doc.manifest.rules)) {
+    else stanceDeny += 1;
+    const rules =
+      typeof doc.manifest.rules === 'object' && doc.manifest.rules !== null
+        ? doc.manifest.rules
+        : ({ '*': 'allow' } as Record<string, unknown>);
+    for (const [tool, action] of Object.entries(rules)) {
       if (action === 'ask') askEntries += 1;
       else if (action === 'deny' && tool !== '*') explicitDenies.push([doc.role, tool]);
     }

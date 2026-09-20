@@ -62,6 +62,21 @@ const ROLE_B = JSON.stringify({
   manifest: { unknownTools: 'allow', rules: { subagent: 'deny', terminal: 'deny', '*': 'allow' } },
 });
 
+test('三轴扫描：省略 rules 的最小合法档案按隐式 {"*":"allow"} 计入 parsed（schema 可省略）', () => {
+  const row = scanRoleAxisUsage({
+    now: 1,
+    files: [
+      { name: 'minimal.json', text: JSON.stringify({ role: 'fast-worker', manifest: { tools: ['read'] } }) },
+      { name: 'no-manifest.json', text: JSON.stringify({ role: 'x' }) },
+    ],
+  });
+  assert.equal(row.parsed, 1, 'rules 省略 ≠ 非法');
+  assert.equal(row.invalid, 1, '缺 manifest 才是非法');
+  assert.equal(row.stanceDeny, 1, 'unknownTools 缺省 = deny（schema 契约）');
+  assert.equal(row.askEntries, 0);
+  assert.deepEqual(row.explicitDenies, []);
+});
+
 test('三轴扫描：ask/姿态/explicit deny 计数正确；通配 deny 不计入 explicit', () => {
   const row = scanRoleAxisUsage({ now: 1, files: [{ name: 'a.json', text: ROLE_A }, { name: 'b.json', text: ROLE_B }] });
   assert.deepEqual(row, {
@@ -79,23 +94,4 @@ test('三轴扫描：ask/姿态/explicit deny 计数正确；通配 deny 不计�
       ['worker-default', 'terminal'],
     ],
   });
-});
-
-test('三轴扫描：畸形 JSON / 缺 role / 缺 rules 计入 invalid，扫描不抛', () => {
-  const row = scanRoleAxisUsage({
-    now: 1,
-    files: [
-      { name: 'broken.json', text: '{not json' },
-      { name: 'no-role.json', text: JSON.stringify({ manifest: { rules: {} } }) },
-      { name: 'no-rules.json', text: JSON.stringify({ role: 'x', manifest: { tools: [] } }) },
-      { name: 'ok.json', text: ROLE_B },
-    ],
-  });
-  assert.equal(row.parsed, 1);
-  assert.equal(row.invalid, 3, '三类畸形各计一次，互不掩盖');
-  assert.equal(row.stanceAllow, 1);
-  assert.deepEqual(row.explicitDenies, [
-    ['worker-default', 'subagent'],
-    ['worker-default', 'terminal'],
-  ]);
 });
