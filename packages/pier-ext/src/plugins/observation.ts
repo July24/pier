@@ -51,10 +51,12 @@ function buildPlaceholder(
   textBytes: number,
   obsConfig: ObservationPackConfig,
   middle?: ExcerptMiddlePick,
-): { id: string; placeholder: string } {
-  const id = deriveObservationId(toolName, toolCallId, sha256Hex(text));
+): { id: string; placeholder: string; contentHash: string } {
+  const contentHash = sha256Hex(text);
+  const id = deriveObservationId(toolName, toolCallId, contentHash);
   return {
     id,
+    contentHash,
     placeholder: formatObservationPlaceholder({
       id,
       toolName,
@@ -163,14 +165,14 @@ async function packOneMessage(opts: {
     : pickMiddleExcerpt
       ? (await pickMiddleExcerpt(text, obsConfig.excerptBytes)) ?? undefined
       : undefined;
-  const { id: obsId, placeholder } = buildPlaceholder(toolName, toolCallId, text, textBytes, obsConfig, middle);
+  const { id: obsId, placeholder, contentHash } = buildPlaceholder(toolName, toolCallId, text, textBytes, obsConfig, middle);
   const originalTokens = estimateTokens(text);
   const placeholderTokens = estimateTokens(placeholder);
 
   try {
     await storeContentAddressedObject(observationObjectPath(sessionRoot, obsId), text, {
       bytes: textBytes,
-      hash: sha256Hex(text),
+      hash: contentHash,
       lines: countLines(text),
     });
   } catch {

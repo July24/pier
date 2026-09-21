@@ -81,7 +81,8 @@ export function restoreCoordinatorState(entries: readonly unknown[]): Coordinato
     const entry = entries[i] as { type?: string; customType?: string; data?: unknown };
     if (entry?.type !== 'custom' || entry.customType !== COMPACT_STATE_CUSTOM_TYPE) continue;
     const d = entry.data as Partial<CoordinatorState> | null | undefined;
-    if (!d || d.version !== 1 || !Array.isArray(d.completedBoundaryRequestCounts)) break;
+    // Older/invalid marker: keep scanning, the previous valid one still describes the pacing samples.
+    if (!d || d.version !== 1 || !Array.isArray(d.completedBoundaryRequestCounts)) continue;
     for (const field of NUMERIC_STATE_FIELDS) {
       const value = d[field];
       if (typeof value === 'number') base[field] = value;

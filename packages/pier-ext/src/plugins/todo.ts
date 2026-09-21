@@ -243,10 +243,14 @@ export default function todoPlugin(ctx: Context): void {
         if (stopReminder.isCompactionInFlight?.()) return;
         const send = pi.sendMessage;
         if (typeof send !== 'function') return;
-        void send(
-          { customType: TODO_REMINDER_CUSTOM_TYPE, content, display: true },
-          { deliverAs: 'followUp', triggerTurn: true },
-        ).then(() => { todoReminders += 1; }, () => {});
+        try {
+          void send(
+            { customType: TODO_REMINDER_CUSTOM_TYPE, content, display: true },
+            { deliverAs: 'followUp', triggerTurn: true },
+          ).then(() => { todoReminders += 1; }, () => {});
+        } catch {
+          /* A synchronous send failure must not escape the timer callback. */
+        }
       }, todoReminderGraceMs());
       todoReminderTimer.unref?.();
     });
@@ -335,7 +339,7 @@ export default function todoPlugin(ctx: Context): void {
         ? args.split(/\s+/).filter(Boolean)
         : Array.isArray(args) ? args.map(String) : [];
       const opArg = raw[0];
-      if (opArg && opArg in OP_VERBS) {
+      if (opArg && Object.hasOwn(OP_VERBS, opArg)) {
         const query = raw.slice(1).join(' ').trim();
         if (!query) {
           ui?.notify?.('usage: /todos done|drop|rm|unblock <content>', 'warning');
