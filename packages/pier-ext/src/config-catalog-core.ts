@@ -1,15 +1,16 @@
 /**
- * D104 Config Catalog Core (pure).
+ * D104 config catalog core (pure).
  *
  * Single source of truth for the five pier configuration planes: knob descriptors,
- * effective-value provenance (env > workspace > user > default) and text rendering
- * for `/pier-config show|check|doc`.
+ * effective-value provenance (env > workspace > user > default) and text rendering for
+ * `/pier-config show|check|doc`. The `env` plane is derived from the `PIER_OPTIONS`
+ * registry (pier-options.ts), so the catalog cannot disagree with the runtime readers.
  *
- * No I/O here; file/env reading lives in config-guide.ts. The catalog is guarded
- * against drift by test/config-catalog-core.test.ts, which diffs it against
- * schemas/efficiency-config.schema.json, schemas/role-manifest.schema.json and the
- * env keys actually read by runtime-policy.ts / efficiency-config-core.ts.
+ * No I/O here; reading the real files/env and registering the command live in config-command.ts.
+ * test/config-catalog.test.ts diffs the efficiency knobs against schemas/efficiency-config.schema.json.
  */
+
+import { PIER_OPTIONS } from './pier-options.ts';
 
 export type ConfigPlaneId = 'efficiency' | 'roles' | 'pi' | 'boot' | 'env';
 
@@ -83,7 +84,7 @@ export const CONFIG_PLANES: readonly ConfigPlane[] = Object.freeze([
   },
 ] as const);
 
-/** Efficiency knobs: mirrors schemas/efficiency-config.schema.json (guarded by the drift test). */
+/** Efficiency knobs: mirrors schemas/efficiency-config.schema.json (guarded by the catalog test). */
 const EFFICIENCY_KNOBS: readonly ConfigKnob[] = [
   { plane: 'efficiency', key: 'onlineContextCompact.enabled', kind: 'boolean', defaultValue: false, envVar: 'PI_HERDR_COMPACT_ENABLE', impact: 'Todo-driven online compaction (OCC) master switch', docRef: 'docs/efficiency-trial.md' },
   { plane: 'efficiency', key: 'onlineContextCompact.logEnabled', kind: 'boolean', defaultValue: false, envVar: 'PI_HERDR_COMPACT_LOG', impact: 'Write compact.jsonl decisions', docRef: 'docs/efficiency-trial.md' },
@@ -114,81 +115,34 @@ const EFFICIENCY_KNOBS: readonly ConfigKnob[] = [
   { plane: 'efficiency', key: 'jev.apiKey', kind: 'string', envVar: 'PIER_JEV_API_KEY', impact: 'API key; PIER_JEV_API_KEY env > config value > TYPESAFE_API_KEY env', docRef: 'docs/rfc-jev-integration.md' },
 ];
 
-/** Role-manifest keys (mirrors schemas/role-manifest.schema.json). Roles are per-file, so these are inventory keys. */
-const ROLE_KNOBS: readonly ConfigKnob[] = [
-  { plane: 'roles', key: 'role', kind: 'string', impact: 'Role name (must match the file name)', docRef: 'docs/sidebar-role-config.md' },
-  { plane: 'roles', key: 'version', kind: 'string', impact: 'Role profile version string', docRef: 'docs/sidebar-role-config.md' },
-  { plane: 'roles', key: 'model', kind: 'string', impact: 'Dispatch routing: provider/model for panes spawned with this role', docRef: 'docs/sidebar-role-config.md' },
-  { plane: 'roles', key: 'description', kind: 'string', impact: 'Human description shown in role listings', docRef: 'docs/sidebar-role-config.md' },
-  { plane: 'roles', key: 'guidelines', kind: 'string', impact: 'Per-role behavior constraints injected as a pier-role prompt section each turn; see the Role profiles behavior in this package README', docRef: 'packages/pier-ext/README.md' },
-  { plane: 'roles', key: 'manifest.tools', kind: 'string', impact: 'Visible tool names for the role', docRef: 'docs/sidebar-role-config.md' },
-  { plane: 'roles', key: 'manifest.rules', kind: 'string', impact: 'Permission map: tool name → allow|ask|deny', docRef: 'docs/sidebar-role-config.md' },
-  { plane: 'roles', key: 'manifest.unknownTools', kind: 'enum', impact: 'Stance for tools missing from manifest.tools: allow|deny', docRef: 'docs/sidebar-role-config.md' },
-  { plane: 'roles', key: 'services.todos', kind: 'string', impact: 'Todo service mode for the role: serial|parallel', docRef: 'docs/sidebar-role-config.md' },
-];
-
 /** Pi-owned keys pier only reads. */
 const PI_KNOBS: readonly ConfigKnob[] = [
   { plane: 'pi', key: 'compaction.enabled', kind: 'boolean', impact: 'When false, OCC is disabled too (unless PI_HERDR_COMPACT_ENABLE=1)', docRef: 'docs/efficiency-trial.md', readOnly: true },
   { plane: 'pi', key: 'compaction.keepRecentTokens', kind: 'number', impact: 'Inherited as the OCC retention window when not set in the efficiency config', docRef: 'docs/efficiency-trial.md', readOnly: true },
 ];
 
-/** Workbench boot-config keys (template: packages/pier-workbench/scripts/boot-config.example.json). */
-const BOOT_KNOBS: readonly ConfigKnob[] = [
-  { plane: 'boot', key: 'mainTabLabel', kind: 'string', impact: 'Label of the main tab the workbench keeps', readOnly: true },
-  { plane: 'boot', key: 'piNode', kind: 'string', impact: 'Absolute node binary used to launch pi', readOnly: true },
-  { plane: 'boot', key: 'piCli', kind: 'string', impact: 'Absolute path to pi\'s cli.js', readOnly: true },
-  { plane: 'boot', key: 'extPath', kind: 'string', impact: 'Absolute path to the pier extension entry (index.ts)', readOnly: true },
-  { plane: 'boot', key: 'workbenchPluginId', kind: 'string', impact: 'herdr plugin id the boot script drives', readOnly: true },
-  { plane: 'boot', key: 'hmrDev', kind: 'boolean', impact: 'Enable hot-reload wiring for local development', readOnly: true },
-];
-
 /**
- * Runtime policy / behaviour env knobs. Bounds mirror runtime-policy.ts (parseEnvInt) and
- * the readers in terminal-core.ts / todo-reminder-core.ts / pi-surface bootstrap.
+ * Runtime policy / behaviour env knobs, derived from the `PIER_OPTIONS` registry:
+ * `min` decides whether a knob is numeric, and its `fallback`/`description` are the
+ * catalog's default value and impact line. Bounds mirror runtime-policy.ts.
  */
-const ENV_KNOBS: readonly ConfigKnob[] = [
-  { plane: 'env', key: 'PIER_SUBAGENT_TIMEOUT_MS', aliases: ['PI_HERDR_SUBAGENT_TIMEOUT_MS'], kind: 'number', defaultValue: 600000, min: 1000, impact: 'Subagent inactivity budget before forced termination' },
-  { plane: 'env', key: 'PIER_GC_TICK_MS', aliases: ['PI_HERDR_GC_TICK_MS'], kind: 'number', defaultValue: 30000, min: 1000, impact: 'Subagent GC ticker interval' },
-  { plane: 'env', key: 'PIER_POLL_INTERVAL_MS', aliases: ['PI_HERDR_POLL_INTERVAL_MS'], kind: 'number', defaultValue: 30000, min: 1000, impact: 'Subagent state observation poll interval' },
-  { plane: 'env', key: 'PIER_SETTLEMENT_WINDOW_MS', aliases: ['PI_HERDR_SETTLEMENT_WINDOW_MS'], kind: 'number', defaultValue: 60000, min: 0, impact: 'Settlement notice window / machine-inject grace / takeover idle' },
-  { plane: 'env', key: 'PIER_OBSERVATION_WINDOW_MS', aliases: ['PI_HERDR_OBSERVATION_WINDOW_MS'], kind: 'number', defaultValue: 30000, min: 0, impact: 'Post-settle observation window before auto-consume' },
-  { plane: 'env', key: 'PIER_FOREGROUND_PATIENCE_MS', aliases: ['PI_HERDR_FOREGROUND_PATIENCE_MS'], kind: 'number', defaultValue: 300000, min: 0, impact: 'Foreground patience before demoting a subagent to background' },
-  { plane: 'env', key: 'PIER_SESSION_TTL_SECONDS', aliases: ['PI_HERDR_SESSION_TTL_SECONDS'], kind: 'number', defaultValue: 600, min: 0, impact: 'Session retention after subagent exit before GC' },
-  { plane: 'env', key: 'PIER_GIT_TIMEOUT_MS', aliases: ['PI_HERDR_GIT_TIMEOUT_MS'], kind: 'number', defaultValue: 10000, min: 1, impact: 'git worktree/diff/cleanup execution timeout' },
-  { plane: 'env', key: 'PIER_READY_TIMEOUT_MS', aliases: ['PI_HERDR_READY_TIMEOUT_MS'], kind: 'number', defaultValue: 90000, min: 1000, impact: 'Subagent pane pipe readiness wait (backoff; a dead pane fails fast)' },
-  { plane: 'env', key: 'PIER_ISOLATE_SWEEP_ORPHANS', aliases: ['PI_HERDR_ISOLATE_SWEEP_ORPHANS'], kind: 'string', impact: 'Opt-in sweeping of orphaned isolate worktrees' },
-  { plane: 'env', key: 'PIER_FOCUS_POLL_MS', kind: 'number', defaultValue: 1500, min: 0, impact: 'Pane-focus sampling cadence for the workbench heat layout (0 disables). Default 1500ms on Herdr <0.9.1; 0 (event-first) on 0.9.1+' },
-  { plane: 'env', key: 'PIER_TERMINAL_PROMPT', aliases: ['PI_HERDR_TERMINAL_PROMPT'], kind: 'string', impact: 'Terminal readiness prompt strategy: bash|zsh|powershell|pwsh (default: $SHELL)' },
-  // B10: canonical names are `PIER_*`; the `PI_HERDR_*` spelling stays accepted (aliases).
-  { plane: 'env', key: 'PIER_TODO_GRACE_MS', aliases: ['PI_HERDR_TODO_GRACE_MS'], kind: 'number', defaultValue: 30000, min: 1, impact: 'Delay before the unfinished-todo reminder fires (0/NaN falls back to the default)' },
-  { plane: 'env', key: 'PIER_TERM_IDLE_MS', aliases: ['PI_HERDR_TERM_IDLE_MS'], kind: 'number', defaultValue: 1800000, min: 1, impact: 'Terminal idle threshold before a nudge is due (0/NaN falls back to the default)' },
-  { plane: 'env', key: 'PIER_TERM_GRACE_MS', aliases: ['PI_HERDR_TERM_GRACE_MS'], kind: 'number', defaultValue: 30000, min: 1, impact: 'Extra grace after terminal idle before reading (0/NaN falls back to the default)' },
-  { plane: 'env', key: 'PIER_TERM_READ_MAX', aliases: ['PI_HERDR_TERM_READ_MAX'], kind: 'number', defaultValue: 8000, min: 1, impact: 'Maximum terminal characters read per operation (0/NaN falls back to the default)' },
-  { plane: 'env', key: 'PIER_TRACE', aliases: ['PI_HERDR_TRACE'], kind: 'string', impact: 'Write pier diagnostics to stderr (or to this file when it is a path)' },
-  { plane: 'env', key: 'PIER_SLIM_FRAME', aliases: ['PI_HERDR_SLIM_FRAME'], kind: 'string', impact: 'Force the slim transcript frame on/off' },
-  { plane: 'env', key: 'PIER_HMR', aliases: ['PI_HERDR_HMR'], kind: 'string', impact: 'Force hot-reload wiring on/off' },
-];
+const ENV_KNOBS: readonly ConfigKnob[] = PIER_OPTIONS.map((option) => ({
+  plane: 'env' as const,
+  key: option.name,
+  kind: option.min === undefined ? ('string' as const) : ('number' as const),
+  defaultValue: option.min === undefined
+    ? (option.fallback === '' ? undefined : option.fallback)
+    : Number(option.fallback),
+  aliases: option.legacy ? [option.legacy] : undefined,
+  min: option.min,
+  impact: option.description,
+}));
 
-export const CONFIG_KNOBS: readonly ConfigKnob[] = Object.freeze([
-  ...EFFICIENCY_KNOBS,
-  ...ROLE_KNOBS,
-  ...PI_KNOBS,
-  ...BOOT_KNOBS,
-  ...ENV_KNOBS,
-]);
-
-export function catalogKeysForPlane(plane: ConfigPlaneId): string[] {
-  return CONFIG_KNOBS.filter((k) => k.plane === plane).map((k) => k.key);
-}
-
-export function planeById(id: ConfigPlaneId): ConfigPlane | undefined {
-  return CONFIG_PLANES.find((p) => p.id === id);
-}
+/** Every knob the catalog can resolve (roles/boot are per-file planes: their schemas are the reference). */
+export const CONFIG_KNOBS: readonly ConfigKnob[] = Object.freeze([...EFFICIENCY_KNOBS, ...PI_KNOBS, ...ENV_KNOBS]);
 
 /** Dotted-path getter for parsed JSON layers. */
 export function readDotted(obj: unknown, dotted: string): unknown {
-  if (!obj || typeof obj !== 'object') return undefined;
   let cursor: unknown = obj;
   for (const part of dotted.split('.')) {
     if (!cursor || typeof cursor !== 'object' || Array.isArray(cursor)) return undefined;
@@ -203,11 +157,6 @@ export function readDotted(obj: unknown, dotted: string): unknown {
  */
 const SECRET_LIKE = /(api[_-]?key|apikey|authorization|bearer|access[_-]?token|client[_-]?secret|password|credential)/i;
 
-/** True when a value should never be echoed verbatim in command output. */
-export function isSecretLike(key: string): boolean {
-  return SECRET_LIKE.test(key);
-}
-
 export function formatValue(value: unknown): string {
   if (value === undefined) return '(unset)';
   if (typeof value === 'string') return value === '' ? '""' : value;
@@ -218,7 +167,7 @@ export function formatValue(value: unknown): string {
 
 /** Renders a knob value, masking secret-looking keys. */
 export function redactValue(key: string, value: unknown): string {
-  if (isSecretLike(key) && value !== undefined && value !== '') return '***';
+  if (SECRET_LIKE.test(key) && value !== undefined && value !== '') return '***';
   return formatValue(value);
 }
 
@@ -244,52 +193,40 @@ export interface RawConfigLayers {
   readonly piSettings?: { enabled?: boolean; keepRecentTokens?: number };
 }
 
-function resolveFileKnob(
-  knob: ConfigKnob,
-  layers: RawConfigLayers,
-): ResolvedKnob {
-  const env = layers.env ?? {};
-  const envRaw = knob.envVar ? env[knob.envVar] : undefined;
-  if (envRaw !== undefined && envRaw !== '') {
-    return { knob, value: redactValue(knob.key, envRaw), source: 'env' };
-  }
+function resolveFileKnob(knob: ConfigKnob, layers: RawConfigLayers): ResolvedKnob {
+  const envRaw = knob.envVar ? (layers.env ?? {})[knob.envVar] : undefined;
+  if (envRaw !== undefined && envRaw !== '') return { knob, value: redactValue(knob.key, envRaw), source: 'env' };
 
   const workspaceValue = readDotted(layers.workspace, knob.key);
   const userValue = readDotted(layers.user, knob.key);
-  if (layers.workspace !== undefined && !layers.workspaceTrusted) {
+  if (workspaceValue !== undefined) {
+    if (layers.workspaceTrusted) return { knob, value: redactValue(knob.key, workspaceValue), source: 'workspace' };
     // Untrusted workspace layer exists but is ignored by the loader: surface both facts.
-    if (workspaceValue !== undefined) {
-      if (userValue !== undefined) {
-        return { knob, value: redactValue(knob.key, userValue), source: 'user', note: 'workspace layer ignored (untrusted project)' };
-      }
-      return { knob, value: redactValue(knob.key, knob.defaultValue), source: 'default', note: 'workspace value ignored (untrusted project)' };
-    }
-  } else if (workspaceValue !== undefined) {
-    return { knob, value: redactValue(knob.key, workspaceValue), source: 'workspace' };
+    return userValue === undefined
+      ? { knob, value: redactValue(knob.key, knob.defaultValue), source: 'default', note: 'workspace value ignored (untrusted project)' }
+      : { knob, value: redactValue(knob.key, userValue), source: 'user', note: 'workspace layer ignored (untrusted project)' };
   }
-
   if (userValue !== undefined) return { knob, value: redactValue(knob.key, userValue), source: 'user' };
   return { knob, value: redactValue(knob.key, knob.defaultValue), source: 'default' };
 }
 
 /** Resolves efficiency + pi knobs from parsed layers. */
 export function resolveConfigKnobs(layers: RawConfigLayers): ResolvedKnob[] {
-  const out: ResolvedKnob[] = [];
-  for (const knob of EFFICIENCY_KNOBS) out.push(resolveFileKnob(knob, layers));
+  const out = EFFICIENCY_KNOBS.map((knob) => resolveFileKnob(knob, layers));
 
   // Effective-value rule from loadEfficiencyConfigFromDisk: pi's compaction.enabled=false
   // disables OCC unless PI_HERDR_COMPACT_ENABLE forces it on.
   const occ = out.find((e) => e.knob.key === 'onlineContextCompact.enabled');
   const envForced = (layers.env?.PI_HERDR_COMPACT_ENABLE ?? '') !== '';
   if (occ && occ.value === 'true' && layers.piSettings?.enabled === false && !envForced) {
-    const index = out.indexOf(occ);
-    out[index] = { ...occ, value: 'false', note: 'pi compaction.enabled=false disables OCC (set PI_HERDR_COMPACT_ENABLE=1 to force)' };
+    out[out.indexOf(occ)] = { ...occ, value: 'false', note: 'pi compaction.enabled=false disables OCC (set PI_HERDR_COMPACT_ENABLE=1 to force)' };
   }
 
   for (const knob of PI_KNOBS) {
     const raw = knob.key === 'compaction.enabled' ? layers.piSettings?.enabled : layers.piSettings?.keepRecentTokens;
-    if (raw !== undefined) out.push({ knob, value: redactValue(knob.key, raw), source: 'pi' });
-    else out.push({ knob, value: formatValue(undefined), source: 'pi', note: 'not set in pi settings' });
+    out.push(raw === undefined
+      ? { knob, value: formatValue(undefined), source: 'pi', note: 'not set in pi settings' }
+      : { knob, value: redactValue(knob.key, raw), source: 'pi' });
   }
   return out;
 }
@@ -301,12 +238,7 @@ export function resolveEnvKnobs(env: Record<string, string | undefined> = {}): R
     for (const name of [knob.key, ...(knob.aliases ?? [])]) {
       const raw = env[name];
       if (raw === undefined || raw === '') continue;
-      return {
-        knob,
-        value: redactValue(knob.key, raw),
-        source: 'env' as const,
-        ...(name === knob.key ? {} : { via: name }),
-      };
+      return { knob, value: redactValue(knob.key, raw), source: 'env' as const, ...(name === knob.key ? {} : { via: name }) };
     }
     return { knob, value: redactValue(knob.key, knob.defaultValue), source: 'default' as const };
   });
@@ -320,14 +252,14 @@ export interface CheckReport {
   readonly issues: readonly string[];
 }
 
-/** Validates env knobs against catalog bounds (mirrors parseEnvInt's warn-and-default behaviour). */
+/** Validates env knobs against catalog bounds (mirrors the runtime warn-and-default behaviour). */
 export function checkEnvKnobs(env: Record<string, string | undefined> = {}): string[] {
   const issues: string[] = [];
   for (const knob of ENV_KNOBS) {
+    if (knob.kind !== 'number') continue;
     for (const name of [knob.key, ...(knob.aliases ?? [])]) {
       const raw = env[name];
       if (raw === undefined || raw === '') continue;
-      if (knob.kind !== 'number') continue;
       const parsed = Number.parseInt(raw, 10);
       const min = knob.min ?? 0;
       if (!Number.isFinite(parsed) || parsed < min) {
@@ -340,27 +272,18 @@ export function checkEnvKnobs(env: Record<string, string | undefined> = {}): str
 
 /* ── rendering ──────────────────────────────────────────────────────────── */
 
-const SOURCE_TAG: Record<ConfigSource, string> = {
-  env: 'env',
-  workspace: 'workspace',
-  user: 'user',
-  default: 'default',
-  pi: 'pi',
-};
-
 function sourceLabel(entry: ResolvedKnob): string {
-  const base = entry.via ? `${SOURCE_TAG[entry.source]} via ${entry.via}` : SOURCE_TAG[entry.source];
+  const base = entry.via ? `${entry.source} via ${entry.via}` : entry.source;
   return entry.note ? `${base} (${entry.note})` : base;
 }
 
-/** Short non-default summary of one plane: "3 changed (env 1 / workspace 1 / user 1)". */
+/** Short non-default summary of one plane: "3 set (env 1, workspace 1, user 1)". */
 export function summarizePlane(entries: readonly ResolvedKnob[]): string {
   const changed = entries.filter((e) => e.source !== 'default');
   if (changed.length === 0) return 'all defaults';
   const bySource = new Map<ConfigSource, number>();
   for (const e of changed) bySource.set(e.source, (bySource.get(e.source) ?? 0) + 1);
-  const parts = [...bySource.entries()].map(([s, n]) => `${SOURCE_TAG[s]} ${n}`);
-  return `${changed.length} set (${parts.join(', ')})`;
+  return `${changed.length} set (${[...bySource].map(([s, n]) => `${s} ${n}`).join(', ')})`;
 }
 
 /** Index lines for `/pier-config` (kept short: one line per plane). */
@@ -371,31 +294,29 @@ export function renderIndex(lines: {
   roleSummary: string;
   bootSummary: string;
 }): string[] {
-  const enabled = (prefix: string): number =>
-    lines.efficiency.filter((e) => e.knob.key === `${prefix}.enabled` && e.value === 'true').length;
-  const out: string[] = [];
-  out.push(`pier config — 5 planes, env > workspace > user > default`);
-  out.push(`  efficiency  ${summarizePlane(lines.efficiency)} — OCC ${enabled('onlineContextCompact') ? 'on' : 'off'} / OBS ${enabled('observationPack') ? 'on' : 'off'} / EPR ${enabled('evidencePreservingReducer') ? 'on' : 'off'}`);
-  out.push(`  roles       ${lines.roleSummary}`);
-  out.push(`  pi          ${summarizePlane(lines.pi)} — OCC reads compaction.* only`);
-  out.push(`  boot        ${lines.bootSummary}`);
-  out.push(`  env         ${summarizePlane(lines.env)}`);
-  out.push(`  show: /pier-config show <efficiency|roles|pi|boot|env|all>   check: /pier-config check   report: /pier-config doc`);
-  return out;
+  const mechanism = (prefix: string): string =>
+    lines.efficiency.some((e) => e.knob.key === `${prefix}.enabled` && e.value === 'true') ? 'on' : 'off';
+  return [
+    'pier config — 5 planes, env > workspace > user > default',
+    `  efficiency  ${summarizePlane(lines.efficiency)} — OCC ${mechanism('onlineContextCompact')} / OBS ${mechanism('observationPack')} / EPR ${mechanism('evidencePreservingReducer')}`,
+    `  roles       ${lines.roleSummary}`,
+    `  pi          ${summarizePlane(lines.pi)} — OCC reads compaction.* only`,
+    `  boot        ${lines.bootSummary}`,
+    `  env         ${summarizePlane(lines.env)}`,
+    '  show: /pier-config show <efficiency|roles|pi|boot|env|all>   check: /pier-config check   report: /pier-config doc',
+  ];
 }
 
-/** Full listing for one plane. */
-export function renderPlane(plane: ConfigPlaneId, entries: readonly ResolvedKnob[]): string[] {
+/** Full listing of one plane's knobs. */
+export function renderPlane(entries: readonly ResolvedKnob[]): string[] {
   const out: string[] = [];
   for (const entry of entries) {
-    const key = entry.knob.envVar && entry.knob.plane === 'efficiency' && entry.knob.envVar
-      ? `${entry.knob.key}${entry.source === 'env' ? ' (from ' + entry.knob.envVar + ')' : ''}`
-      : entry.knob.key;
-    const flags = [entry.knob.readOnly ? 'read-only' : '', entry.knob.docRef ?? ''].filter(Boolean).join('; ');
-    out.push(`  ${key} = ${entry.value}  [${sourceLabel(entry)}]${flags ? `  (${flags})` : ''}`);
-    if (entry.knob.impact) out.push(`      ${entry.knob.impact}`);
+    const { knob } = entry;
+    const from = knob.envVar && entry.source === 'env' ? ` (from ${knob.envVar})` : '';
+    const flags = [knob.readOnly ? 'read-only' : '', knob.docRef ?? ''].filter(Boolean).join('; ');
+    out.push(`  ${knob.key}${from} = ${entry.value}  [${sourceLabel(entry)}]${flags ? `  (${flags})` : ''}`);
+    out.push(`      ${knob.impact}`);
   }
-  void plane;
   return out;
 }
 
@@ -418,34 +339,28 @@ export interface ReportMeta {
 
 /** Machine-truth markdown report (`/pier-config doc`). */
 export function renderReport(entries: readonly ResolvedKnob[], meta: ReportMeta): string {
-  const lines: string[] = [];
-  lines.push('# pier config report');
-  lines.push('');
-  lines.push(`- generated: ${meta.generatedAt}`);
-  lines.push(`- cwd: ${meta.cwd}`);
-  lines.push(`- workspace trusted: ${meta.workspaceTrusted}`);
-  if (meta.piVersion) lines.push(`- pi: ${meta.piVersion}`);
-  lines.push('');
-  lines.push('Precedence: env > workspace (trusted) > user > default.');
-  lines.push('');
+  const lines = [
+    '# pier config report',
+    '',
+    `- generated: ${meta.generatedAt}`,
+    `- cwd: ${meta.cwd}`,
+    `- workspace trusted: ${meta.workspaceTrusted}`,
+    ...(meta.piVersion ? [`- pi: ${meta.piVersion}`] : []),
+    '',
+    'Precedence: env > workspace (trusted) > user > default.',
+    '',
+  ];
+  const escape = (text: string): string => text.replace(/\|/g, '\\|');
   for (const plane of CONFIG_PLANES) {
     const planeEntries = entries.filter((e) => e.knob.plane === plane.id);
-    lines.push(`## ${plane.id} — ${plane.title}`);
-    lines.push('');
-    lines.push(`Files: ${plane.files.map((f) => `\`${f}\``).join(' , ')}`);
-    lines.push('');
-    lines.push(`> ${plane.editHint}`);
-    lines.push('');
+    lines.push(`## ${plane.id} — ${plane.title}`, '', `Files: ${plane.files.map((f) => `\`${f}\``).join(' , ')}`, '', `> ${plane.editHint}`, '');
     if (planeEntries.length === 0) {
-      lines.push('(no value-carrying knobs; per-file plane)');
-      lines.push('');
+      lines.push('(no value-carrying knobs; per-file plane)', '');
       continue;
     }
-    lines.push('| key | value | source | impact |');
-    lines.push('|---|---|---|---|');
+    lines.push('| key | value | source | impact |', '|---|---|---|---|');
     for (const entry of planeEntries) {
-      const value = entry.value.replace(/\|/g, '\\|');
-      lines.push(`| \`${entry.knob.key}\` | ${value} | ${sourceLabel(entry)} | ${entry.knob.impact.replace(/\|/g, '\\|')} |`);
+      lines.push(`| \`${entry.knob.key}\` | ${escape(entry.value)} | ${sourceLabel(entry)} | ${escape(entry.knob.impact)} |`);
     }
     lines.push('');
   }
