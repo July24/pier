@@ -86,30 +86,40 @@ function todoEditLines(data: unknown, theme: RenderTheme, expanded: boolean): st
   ];
 }
 
+/**
+ * Registry card, shared by the subagent and terminal registries: a titled count line, plus one row
+ * per entry when expanded. An empty or malformed registry renders a single dim placeholder.
+ */
+function registryLines<T>(
+  items: readonly T[] | undefined,
+  theme: RenderTheme,
+  expanded: boolean,
+  card: { label: string; unit: string; badge?: string; row: (item: T) => string },
+): string[] {
+  if (!items || items.length === 0) return [theme.fg('dim', `${card.label} · none`)];
+  const head = `${theme.fg('accent', theme.bold(card.label))} ${theme.fg('dim', `· ${items.length} ${card.unit}`)}${card.badge ? ` ${theme.fg('success', card.badge)}` : ''}`;
+  if (!expanded) return [head];
+  return [head, ...items.map((item) => theme.fg('dim', card.row(item)))];
+}
+
 function subsLines(data: unknown, theme: RenderTheme, expanded: boolean): string[] {
   const subs = (data as SubsRegistry | undefined)?.subs;
-  if (!Array.isArray(subs) || subs.length === 0) return [theme.fg('dim', 'subagents · none')];
-  const running = subs.filter((s) => s.status === 'running').length;
-  const head = `${theme.fg('accent', theme.bold('subagents'))} ${theme.fg('dim', `· ${subs.length} tracked`)}${running ? ` ${theme.fg('success', `${running} running`)}` : ''}`;
-  if (!expanded) return [head];
-  return [
-    head,
-    ...subs.map((sub) => theme.fg(
-      'dim',
-      `  ${sub.status === 'running' ? '●' : '○'} ${sub.paneId} · ${sub.status} · ${clip(String(sub.description ?? ''), 70)}`,
-    )),
-  ];
+  const running = Array.isArray(subs) ? subs.filter((sub) => sub.status === 'running').length : 0;
+  return registryLines(Array.isArray(subs) ? subs : undefined, theme, expanded, {
+    label: 'subagents',
+    unit: 'tracked',
+    ...(running ? { badge: `${running} running` } : {}),
+    row: (sub) => `  ${sub.status === 'running' ? '●' : '○'} ${sub.paneId} · ${sub.status} · ${clip(String(sub.description ?? ''), 70)}`,
+  });
 }
 
 function terminalsLines(data: unknown, theme: RenderTheme, expanded: boolean): string[] {
   const terminals = (data as TerminalsRegistry | undefined)?.terminals;
-  if (!Array.isArray(terminals) || terminals.length === 0) return [theme.fg('dim', 'terminals · none')];
-  const head = `${theme.fg('accent', theme.bold('terminals'))} ${theme.fg('dim', `· ${terminals.length} open`)}`;
-  if (!expanded) return [head];
-  return [
-    head,
-    ...terminals.map((t) => theme.fg('dim', `  ${t.paneId} · ${clip(String(t.label ?? t.cwd ?? ''), 70)}`)),
-  ];
+  return registryLines(Array.isArray(terminals) ? terminals : undefined, theme, expanded, {
+    label: 'terminals',
+    unit: 'open',
+    row: (t) => `  ${t.paneId} · ${clip(String(t.label ?? t.cwd ?? ''), 70)}`,
+  });
 }
 
 function roleManifestLines(data: unknown, theme: RenderTheme): string[] {

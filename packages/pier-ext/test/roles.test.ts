@@ -5,12 +5,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { validateRoleManifest } from '../src/role-manifest.ts';
 import {
   RESERVED_ROLE_NAMES,
   ROLES_DIR,
   RoleLoaderError,
+  listRoleNames,
   loadRoleConfig,
   roleLayers,
   userRolesDir,
@@ -268,6 +271,25 @@ test('layers: an invalid manifest at the hit layer fails loudly instead of falli
     () => loadRoleConfig('reviewer', { layerRead: read, baseDir: 'F:\\ws' }),
     (e: unknown) => (e as RoleLoaderError).code === 'INVALID_ROLE_CONFIG' && /workspace/.test((e as Error).message),
   );
+});
+
+test('listRoleNames: the workspace and user layers, deduped and sorted, built-ins excluded', async () => {
+  const ws = await mkdtemp(join(tmpdir(), 'pier-roles-ws-'));
+  const user = await mkdtemp(join(tmpdir(), 'pier-roles-user-'));
+  try {
+    await mkdir(join(ws, '.pi-herdr', 'roles'), { recursive: true });
+    for (const name of ['reviewer', 'auditor']) await writeFile(join(ws, '.pi-herdr', 'roles', `${name}.json`), '{}');
+    await writeFile(join(ws, '.pi-herdr', 'roles', 'notes.txt'), 'ignored');
+    await writeFile(join(user, 'auditor.json'), '{}');
+    await writeFile(join(user, 'builder.json'), '{}');
+    // `auditor` appears in both layers, so it is listed once.
+    assert.deepEqual(listRoleNames(ws, user), ['auditor', 'builder', 'reviewer']);
+    // Missing directories contribute nothing instead of throwing.
+    assert.deepEqual(listRoleNames(join(ws, 'absent'), join(user, 'absent')), []);
+  } finally {
+    await rm(ws, { recursive: true, force: true });
+    await rm(user, { recursive: true, force: true });
+  }
 });
 
 test('directory helpers: workspace/user/bundled layer shapes', () => {

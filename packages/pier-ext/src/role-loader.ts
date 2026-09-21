@@ -91,9 +91,9 @@ export function roleLayers(opts?: { baseDir?: string; userDir?: string }): Array
  * not listed here — they are exactly RESERVED_ROLE_NAMES, which no user layer may override.
  * A layer directory that does not exist simply contributes nothing.
  */
-export function listRoleNames(baseDir?: string): string[] {
+export function listRoleNames(baseDir?: string, userDir?: string): string[] {
   const names = new Set<string>();
-  for (const layer of roleLayers({ baseDir }).slice(0, 2)) {
+  for (const layer of roleLayers({ baseDir, userDir }).slice(0, 2)) {
     let entries: string[];
     try {
       entries = readdirSync(layer.dir);

@@ -209,9 +209,8 @@ export function isDiagnosticGateUnanswered(verdict: DiagnosticGateVerdict): bool
 // ---------------------------------------------------------------------------
 
 /**
- * Stricter than the global minConfidence default: settlement text is mostly
- * Chinese while English is jev's primary training language (models page), so
- * the initial gate starts at 0.7 and calibrates from jev.jsonl.
+ * Stricter than the global default: settlement text is mostly Chinese while English is jev's primary
+ * training language, so the initial gate starts at 0.7 and calibrates from jev.jsonl.
  */
 export const NOTICE_RANK_MIN_CONFIDENCE = 0.7;
 const RANK_SCORE_WEIGHT = 0.6;
@@ -228,9 +227,8 @@ export function noticeRankRequest(input: {
 }): JevRequest {
   const questions: Record<string, JevQuestion> = {};
   for (let i = 0; i < input.notices.length; i++) {
-    // Question keys are NOT sent to the model, so identical instructions would
-    // collapse every notice into the same question (observed live: 5x "1.98:0.97").
-    // Each instruction must name its settlement by state index (cookbook pattern).
+    // Question keys are NOT sent to the model, so identical instructions would collapse every
+    // notice into one question (observed live: five identical answers). Name the state index.
     questions[`notice_${i}_rank`] = {
       type: 'score',
       instructions: `How urgently does the master agent need to see settlements[${i}] right now, given in_progress_todos?`,
@@ -258,13 +256,11 @@ export function noticeRankRequest(input: {
 const NOTICE_FAIL_PIN_THRESHOLD = 0.7;
 
 /**
- * Compose the display order: pinned failures first, then descending composed
- * relevance (stable on ties -> arrival order). Per-item confidence gate: an
- * item whose score answer is below the gate sinks to the routine bucket
- * instead of voiding the batch (one unsure routine notice must not reorder
- * everything back to arrival). All items gated -> null (nothing was answered).
- * The fail pin itself ignores the score gate: noul answers carry no confidence
- * field, and failure visibility is the safety property.
+ * Display order: pinned failures first, then descending composed relevance (stable on ties ->
+ * arrival order). Per-item confidence gate: an item below the gate sinks to the routine bucket
+ * instead of voiding the batch (one unsure routine notice must not reorder everything back). All
+ * items gated -> null. The fail pin ignores the score gate: noul answers carry no confidence field
+ * and failure visibility is the safety property.
  */
 export function composeNoticeRanking(
   noticeCount: number,
@@ -329,12 +325,10 @@ function buildLineWindow(lines: readonly string[], start: number, budgetBytes: n
 }
 
 /**
- * Generate code-owned middle-window candidates for a packed observation.
- * Failure-signal windows (first hit, densest cluster) when present, plus a
- * plain middle-of-output window that is ALWAYS offered (2026-09-19 flip): jev
- * judges every packed output — including logs whose failure lines the English
- * FAILURE_SIGNAL regex cannot see (CJK output, exit-code-only failures).
- * Deterministic, no model.
+ * Code-owned middle-window candidates for a packed observation: failure-signal windows (first hit,
+ * densest cluster) when present, plus a plain mid-output window ALWAYS offered, so jev judges every
+ * packed output — including logs whose failure lines the English FAILURE_SIGNAL regex cannot see
+ * (CJK output, exit-code-only failures). Deterministic, no model.
  */
 export function buildExcerptWindows(text: string, halfBudgetBytes: number): ExcerptWindow[] {
   if (halfBudgetBytes <= 0) return [];
