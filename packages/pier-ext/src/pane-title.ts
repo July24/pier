@@ -8,9 +8,7 @@ import { countTodos, PI_HERDR_META_KEY, type TodoItem } from './vocab.ts';
 import { formatAge, isArchived } from './stale-core.ts';
 
 /** herdr's character limit for title/state_label (from official documentation and schema measurements). */
-export const TITLE_MAX = 80;
-/** Empty list: callers send clear_title rather than an empty string. */
-export const TITLE_EMPTY = null;
+const TITLE_MAX = 80;
 /**
  * Valid state_labels keys are only idle|working|blocked|done|unknown
  * (herdr socket-api; the early WIRE `todo` value was rejected as invalid_state_label).
@@ -21,18 +19,16 @@ export const BLOCKED_LABEL_KEY = 'blocked';
  * D93: custom sidebar token for the todo summary (referenced as `$pi-todo` by herdr `[ui.sidebar.agents]`).
  * Keep its value in the same format and source as the pane title (`▶i ○p ■b ✓c (N/M) · activity`).
  */
-export const SIDEBAR_TODO_TOKEN = 'pi-todo';
+const SIDEBAR_TODO_TOKEN = 'pi-todo';
 /** D95: token marking an ask_user_question wait (the workbench heat scale uses it to distinguish ask from block). */
 export const SIDEBAR_ASK_TOKEN = 'pi-ask';
 
 /**
- * D93: build the pi-todo token patch for report_metadata.
- * A title becomes the token value so the sidebar can render `$pi-todo`; no todo becomes an empty string so herdr's
- * patch semantics remove the key rather than retaining an old summary.
+ * D93: build the pi-todo token patch for report_metadata. A title becomes the token value so the sidebar
+ * can render `$pi-todo`; no todo becomes an empty string so herdr's patch semantics remove the key.
  *
- * D96 correction: **do not merge stale**. Stale (16 nulls) is a one-time cleanup sent separately via reportMetadata;
- * merging would make 17 entries exceed herdr's tokens maxProperties=16, rejecting the entire request and dropping
- * both title and tokens (observed on the user's machine: pane title and sidebar token disappeared; D93 regression root cause).
+ * D96: never merge the stale cleanup in here — stale(16) + pi-todo(1) exceeds herdr's
+ * tokens maxProperties=16, and the rejected request drops both title and tokens.
  */
 export function sidebarTodoTokens(title: string | null): Record<string, string> {
   return { [SIDEBAR_TODO_TOKEN]: title ?? '' };
@@ -47,18 +43,17 @@ function clipTitle(s: string): string {
 /**
  * `▶i ○p ■b ✓c (N/M [~eta]) · <activity>` (D91 unifies the four black-and-white status glyphs).
  * activity is the first in_progress item, then fallbackDescription, then only the counts.
- * Empty list → null. progressSuffix (M16) is produced by formatProgressSuffix.
+ * Empty list → null, which callers translate into clear_title. progressSuffix (M16) comes from formatProgressSuffix.
  *
- * Anti-freeze behavior (stale-core D): once all work is complete and the wall clock expires (archived), lower the
- * dead list to `✓N done <age>` instead of presenting it as a fully weighted current-state view; report_agent's tool
- * badge/activity line explains what is happening, while the todo token reports only the plan's actual state.
+ * Anti-freeze (stale-core D): once all work is complete and the wall clock expires (archived), the dead list
+ * degrades to `✓N done <age>` instead of presenting itself as a weighted current-state view.
  */
 export function formatPaneTitle(
   items: readonly TodoItem[],
   fallbackDescription?: string | null,
   opts?: { progressSuffix?: string | null; lastWriteAt?: number | null; now?: number },
 ): string | null {
-  if (items.length === 0) return TITLE_EMPTY;
+  if (items.length === 0) return null;
   const c = countTodos(items);
   const now = opts?.now ?? Date.now();
   if (isArchived(items, opts?.lastWriteAt ?? null, now)) {

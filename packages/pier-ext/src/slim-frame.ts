@@ -31,6 +31,7 @@ import { isArchived } from './stale-core.ts';
 import type { TodoItem } from './vocab.ts';
 import { anchorTodoRange, formatTodoSummary, renderTodoGroups } from './todo-window.ts';
 import { pierOption } from './pier-options.ts';
+import { styledWidth, wrapStyled } from './ansi-text.ts';
 
 /** Minimum usable TUI dimensions (pi interactive-mode layout: editor 3 rows + footer 1 + transcript ≥3 + spacing).
  * Below either threshold the pane cannot display a readable TUI, so the overlay covers it. */
@@ -51,61 +52,7 @@ export function isSlimFrame(cols: number, rows: number): boolean {
   return cols < SLIM_MIN_COLS || rows < SLIM_MIN_ROWS;
 }
 
-/* ── Width-aware wrapping (conservative East Asian width; ambiguous glyphs such as ▶○■✓ count as 1, affecting only break positions) ── */
-
-function isWide(cp: number): boolean {
-  return (
-    (cp >= 0x1100 && cp <= 0x115f) // Hangul compatibility jamo
-    || (cp >= 0x2e80 && cp <= 0xa4cf) // CJK radicals through Yi (including kana)
-    || (cp >= 0xac00 && cp <= 0xd7a3) // Hangul syllables
-    || (cp >= 0xf900 && cp <= 0xfaff) // CJK compatibility ideographs
-    || (cp >= 0xfe30 && cp <= 0xfe4f) // CJK compatibility forms
-    || (cp >= 0xff00 && cp <= 0xff60) // Fullwidth forms
-    || (cp >= 0xffe0 && cp <= 0xffe6)
-  );
-}
-
-export function displayWidth(s: string): number {
-  let w = 0;
-  for (const ch of s) w += isWide(ch.codePointAt(0) ?? 0) ? 2 : 1;
-  return w;
-}
-
-/**
- * Wrap at visible width: prefer word breaks (retreat to the last space instead of cutting an English phrase);
- * CJK text without spaces hard-wraps naturally. Consume the space at the break point.
- */
-export function wrapByWidth(text: string, width: number): string[] {
-  const w = Math.max(1, Math.floor(width));
-  const lines: string[] = [];
-  let line = '';
-  let lineW = 0;
-  const push = () => {
-    lines.push(line);
-    line = '';
-    lineW = 0;
-  };
-  for (const ch of text) {
-    const cw = isWide(ch.codePointAt(0) ?? 0) ? 2 : 1;
-    if (lineW + cw > w) {
-      const lastSpace = line.lastIndexOf(' ');
-      if (lastSpace > 0) {
-        lines.push(line.slice(0, lastSpace));
-        line = line.slice(lastSpace + 1) + ch;
-        lineW = displayWidth(line);
-      } else {
-        push();
-        line = ch;
-        lineW = cw;
-      }
-    } else {
-      line += ch;
-      lineW += cw;
-    }
-  }
-  if (line !== '' || lines.length === 0) lines.push(line);
-  return lines;
-}
+/* ── Width-aware wrapping lives in ansi-text (styledWidth / wrapStyled); the frame content is plain text ── */
 
 /**
  * Frame lines: wrap the title, center it vertically, and clamp to rows. Pad every line to full visible width:
@@ -118,40 +65,29 @@ export function frameLines(
 ): string[] {
   const width = Math.max(1, Math.floor(opts.width));
   const rows = Math.max(1, Math.floor(opts.rows));
-  const colorize = opts.colorize ?? ((s: string) => s);
-  const pad = (s: string) => s + ' '.repeat(Math.max(0, width - displayWidth(s)));
-
-  const body = text.trim()
-    ? wrapByWidth(text.trim(), width).slice(0, rows)
-    : ['·'];
-  const top = Math.max(0, Math.floor((rows - body.length) / 2));
-  const out: string[] = [];
-  for (let i = 0; i < rows; i++) {
-    const idx = i - top;
-    out.push(idx >= 0 && idx < body.length ? pad(colorize(body[idx])) : ' '.repeat(width));
-  }
-  return out;
+  const body = text.trim() ? wrapStyled(text.trim(), width).slice(0, rows) : ['·'];
+  return padFrame(body, { width, rows, colorize: opts.colorize ?? ((s: string) => s), vAlign: 'center' });
 }
 
+/** Row-wise compose: pad to full width, place `content` at the top or vertically centered, clamp to rows. */
 function padFrame(
   content: readonly string[],
   opts: { width: number; rows: number; colorize: (s: string) => string; vAlign: 'center' | 'top' },
 ): string[] {
-  const width = Math.max(1, Math.floor(opts.width));
-  const rows = Math.max(1, Math.floor(opts.rows));
-  const pad = (s: string) => s + ' '.repeat(Math.max(0, width - displayWidth(s)));
+  const { width, rows } = opts;
   const body = content.slice(0, rows);
   const top = opts.vAlign === 'center' ? Math.max(0, Math.floor((rows - body.length) / 2)) : 0;
   const out: string[] = [];
   for (let i = 0; i < rows; i++) {
     const idx = i - top;
-    out.push(idx >= 0 && idx < body.length ? pad(opts.colorize(body[idx])) : ' '.repeat(width));
+    const line = idx >= 0 && idx < body.length ? opts.colorize(body[idx]) : '';
+    out.push(line + ' '.repeat(Math.max(0, width - styledWidth(line))));
   }
   return out;
 }
 
 function wrapTodoBody(items: readonly TodoItem[], width: number): string[] {
-  return renderTodoGroups(items).flatMap((line) => wrapByWidth(line, width));
+  return renderTodoGroups(items).flatMap((line) => wrapStyled(line, width));
 }
 
 function itemsEqual(a: readonly TodoItem[], b: readonly TodoItem[]): boolean {
@@ -192,7 +128,7 @@ export function slimContentLines(
   if (items.length === 0) return titleFrame();
   if (isArchived(items, input.lastWriteAt ?? null, input.now ?? Date.now())) return titleFrame();
 
-  const header = wrapByWidth(formatTodoSummary(items), width);
+  const header = wrapStyled(formatTodoSummary(items), width);
   const fullBody = wrapTodoBody(items, width);
   if (header.length + fullBody.length <= rows) {
     const packed = [...header, ...fullBody];
@@ -200,7 +136,7 @@ export function slimContentLines(
     return padFrame(packed, { width, rows, colorize, vAlign: 'top' });
   }
 
-  const footerProbe = wrapByWidth('   +99 hidden (99✓) · /todos', width);
+  const footerProbe = wrapStyled('   +99 hidden (99✓) · /todos', width);
   const itemBudget = rows - header.length - footerProbe.length;
   if (itemBudget < 1) return titleFrame();
 
@@ -214,7 +150,7 @@ export function slimContentLines(
 
   const hidden = items.filter((_, i) => i < start || i >= end);
   const hiddenCompleted = hidden.filter((it) => it.status === 'completed').length;
-  const footer = wrapByWidth(`   +${hidden.length} hidden (${hiddenCompleted}✓) · /todos`, width);
+  const footer = wrapStyled(`   +${hidden.length} hidden (${hiddenCompleted}✓) · /todos`, width);
   const packed = [...header, ...body, ...footer];
   if (packed.length < SLIM_TODO_MIN_ROWS) return titleFrame();
   return padFrame(packed, { width, rows, colorize, vAlign: 'top' });

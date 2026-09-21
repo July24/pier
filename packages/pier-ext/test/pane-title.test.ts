@@ -1,12 +1,10 @@
 /**
- * pane-title 纯函数单测（M22：标题即看板，D68 公式）。
+ * pane-title pure functions (M22: the title is the kanban, D68 formula).
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   BLOCKED_LABEL_KEY,
-  SIDEBAR_TODO_TOKEN,
-  TITLE_MAX,
   formatBlockedLabel,
   formatPaneTitle,
   sidebarTodoTokens,
@@ -56,10 +54,10 @@ test('formatPaneTitle: M16 progressSuffix 拼进计数后（保守/ETA/空）', 
 });
 
 test('formatPaneTitle: 超 TITLE_MAX 本地先裁', () => {
-  const long = 'x'.repeat(200);
-  const title = formatPaneTitle([{ content: long, status: 'in_progress' }]);
+  // herdr truncates title/state_label at 80 characters, so the clip has to happen locally first.
+  const title = formatPaneTitle([{ content: 'x'.repeat(200), status: 'in_progress' }]);
   assert.ok(title);
-  assert.ok(title.length <= TITLE_MAX);
+  assert.equal(title.length, 80);
   assert.equal(title.slice(0, 8), '▶1 ○0 ■0');
 });
 
@@ -70,13 +68,13 @@ test('formatPaneTitle: 反冻结（stale-core D）——归档列表降权为 �
     { content: 'Update doc', status: 'completed' as const },
   ];
   const t0 = 100 * 3_600_000;
-  // 未传 lastWriteAt（旧调用方）→ 行为不变（满权重四件套）
+  // no lastWriteAt (older callers) → unchanged behaviour (the full four-glyph summary)
   assert.equal(formatPaneTitle(done3, null, {}), '▶0 ○0 ■0 ✓3');
-  // 新鲜（<1h）→ 满权重
+  // fresh (<1h) → full weight
   assert.equal(formatPaneTitle(done3, null, { lastWriteAt: t0, now: t0 + 30 * 60_000 }), '▶0 ○0 ■0 ✓3');
-  // 归档（≥1h）→ `✓3 done <age>`，死列表不再冒充当前状态
+  // archived (≥1h) → `✓3 done <age>`; a dead list no longer poses as the current state
   assert.equal(formatPaneTitle(done3, null, { lastWriteAt: t0, now: t0 + 16 * 3_600_000 }), '✓3 done 16h');
-  // 有 open 项 → 永不归档（多老都满权重）
+  // any open item → never archived, however old the list is
   const withOpen = [...done3, { content: 'next', status: 'in_progress' as const }];
   assert.equal(
     formatPaneTitle(withOpen, null, { lastWriteAt: t0, now: t0 + 48 * 3_600_000 }),
@@ -101,21 +99,21 @@ test('staleTokenClearance: 头 + 15 分块全部 null（清 M13b 残留）', () 
   assert.equal(tokens['pi-herdr'], null);
   assert.equal(Object.keys(tokens).length, 16);
   for (let i = 0; i < 15; i++) assert.equal(tokens[`pi-herdr-${i}`], null);
+  // the blocked state_label key herdr accepts (anything else is rejected as invalid_state_label)
   assert.equal(BLOCKED_LABEL_KEY, 'blocked');
 });
 
 test('sidebarTodoTokens（D93/D96）：有 title → 键=pi-todo 值=title；无 → 空串清键；不合并 stale', () => {
-  assert.equal(SIDEBAR_TODO_TOKEN, 'pi-todo');
   const withTodo = sidebarTodoTokens('▶1 ○0 ■0 ✓0 · a');
   assert.equal(withTodo['pi-todo'], '▶1 ○0 ■0 ✓0 · a');
   assert.equal(Object.keys(withTodo).length, 1);
-  // 无 todo：空串（herdr patch 语义 = 删除键，不留旧摘要）
+  // no todo: an empty string (herdr patch semantics delete the key instead of keeping a stale summary)
   assert.equal(sidebarTodoTokens(null)['pi-todo'], '');
-  // D96：stale 不再合并进日常上报（stale 16 + pi-todo 1 = 17 > herdr tokens max=16
-  // → 整个请求被拒 → title/tokens 全丢。stale 由 reportMetadata 单独批次发送）
+  // D96: the stale cleanup is never merged into the daily report (stale 16 + pi-todo 1 = 17 > herdr's
+  // tokens maxProperties=16, which rejects the whole request and drops title and tokens alike).
   const daily = sidebarTodoTokens('t');
-  assert.ok(!('pi-herdr' in daily), '日常上报只带 pi-todo，不掺 stale');
+  assert.ok(!('pi-herdr' in daily), 'the daily report carries pi-todo only, never the stale chunks');
   assert.deepEqual(Object.keys(daily), ['pi-todo']);
-  // stale 清理本身就是 16 个（单独批次的独立函数）
+  // the stale clearance itself is 16 keys (a separate batch of its own)
   assert.equal(Object.keys(staleTokenClearance()).length, 16);
 });
