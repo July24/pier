@@ -4,8 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { NOTICE_MAX_SHOWN, collapseNotices } from '../src/notice-buffer.ts';
-import { createNoticeBuffer } from '../src/index-notices.ts';
+import { NOTICE_MAX_SHOWN, collapseNotices, createNoticeBuffer } from '../src/index-notices.ts';
 
 test('空 → null（不注入）', () => {
   assert.equal(collapseNotices([]), null);
