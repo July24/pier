@@ -1,10 +1,8 @@
 /**
- * Jev decision layer — direct HTTP client (RFC docs/rfc-jev-integration.md §5).
- *
- * Not the official SDK (@typesafe-ai/sdk): its retry machinery has no total-latency budget (timeouts
- * are retried by default, Retry-After honored up to 60s), which is incompatible with pier's
- * fail-open budgets, and the call surface here is one endpoint and three question types. Payload is
- * pinned to the versioned model id; see the RFC for re-evaluation triggers.
+ * Jev decision layer — direct HTTP client (RFC docs/rfc-jev-integration.md §5). Not the official SDK
+ * (@typesafe-ai/sdk): its retry machinery has no total-latency budget (timeouts retried by default,
+ * Retry-After honored up to 60s), which is incompatible with pier's fail-open budgets, and the call
+ * surface is one endpoint and three question types.
  *
  * Every ask() resolves (never throws): errors, timeouts, 429s and low confidence at the call site
  * all mean unanswered, and the caller fails open.
@@ -25,9 +23,8 @@ export interface JevAskMeta {
   /** Site-specific static fields for telemetry; must never contain request bodies. */
   extra?: Record<string, unknown>;
   /**
-   * Post-answer decision fields for telemetry (choices/scores/final verdicts —
-   * the data later threshold tuning needs; still never request bodies).
-   * Called exactly once per ask, success or failure.
+   * Post-answer decision fields for telemetry (choices/scores/final verdicts — the data threshold
+   * tuning needs; still never request bodies). Called exactly once per ask.
    */
   enrich?: (outcome: { ok: boolean; answers: Record<string, JevAnswer> | null }) => Record<string, unknown>;
 }

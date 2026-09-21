@@ -1,9 +1,7 @@
 /**
- * Worker execution enforcement (C7, D76/D77/D82) — pure.
- *
- * RuntimeRoleManifest is THE runtime manifest shape: the file-format shape lives in
- * role-manifest.ts, the composed/persisted shapes derive from this one (see
- * manifest-compose.ts and role-state.ts).
+ * Worker execution enforcement (C7, D76/D77/D82) — pure. RuntimeRoleManifest is THE runtime manifest
+ * shape; the file format lives in role-manifest.ts and the composed/persisted shapes derive from
+ * this one (manifest-compose.ts, role-state.ts).
  */
 import type { PermissionAction, UnknownToolStance } from './role-manifest.ts';
 

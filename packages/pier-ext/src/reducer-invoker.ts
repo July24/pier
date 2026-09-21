@@ -81,8 +81,6 @@ interface ReducerCandidate {
   fullOutputPath?: string;
   fullOutputSource: 'details' | 'notice' | 'none';
   isTruncated: boolean;
-  minBytes: number;
-  maxChars: number;
 }
 
 type ReducerLog = (record: Record<string, unknown>) => Promise<void>;
@@ -118,7 +116,6 @@ function resolveCandidate(
   if (!block || typeof block.text !== 'string') return undefined;
   const text = block.text;
 
-  const minBytes = config.minBytes ?? DEFAULT_MIN_BYTES;
   const maxChars = config.maxChars ?? DEFAULT_MAX_CHARS;
   const detailPath = typeof event.details?.fullOutputPath === 'string' ? event.details.fullOutputPath : undefined;
   // Pi repeats the path inside the truncation notice that ships with the result text; a replayed or
@@ -130,7 +127,7 @@ function resolveCandidate(
   // Cheap reducibility precondition: a truncated output is presumed large (that is why pi truncated
   // it); anything else must clear minBytes/maxChars on the preview, which for non-truncated results
   // IS the full body. Commands below this line never pay for the gate call or the full read.
-  if (!isTruncated && (Buffer.byteLength(text, 'utf8') < minBytes || text.length > maxChars)) {
+  if (!isTruncated && (Buffer.byteLength(text, 'utf8') < (config.minBytes ?? DEFAULT_MIN_BYTES) || text.length > maxChars)) {
     return undefined;
   }
 
@@ -142,8 +139,6 @@ function resolveCandidate(
     ...(fullOutputPath ? { fullOutputPath } : {}),
     fullOutputSource: detailPath ? 'details' : noticePath ? 'notice' : 'none',
     isTruncated,
-    minBytes,
-    maxChars,
   };
 }
 
@@ -207,7 +202,7 @@ async function readSource(
     return null; // Truncated with no recoverable full log: fail open rather than reduce the preview.
   }
   if (!candidate.fullOutputPath) return candidate.text;
-  const full = await readBashFullOutput(candidate.fullOutputPath, candidate.maxChars);
+  const full = await readBashFullOutput(candidate.fullOutputPath, config.maxChars ?? DEFAULT_MAX_CHARS);
   if (!full) {
     await truncatedRow();
     return null;
@@ -288,7 +283,9 @@ export async function handleReducerToolResult(
 
   const candidate = resolveCandidate(event, ctx, config);
   if (!candidate) return undefined;
-  const { command, block, minBytes, maxChars } = candidate;
+  const { command, block } = candidate;
+  const minBytes = config.minBytes ?? DEFAULT_MIN_BYTES;
+  const maxChars = config.maxChars ?? DEFAULT_MAX_CHARS;
 
   const sessionId = ctx.sessionManager?.getSessionId?.();
   const sessionRoot = resolveSessionRoot(ctx.sessionManager?.getSessionDir?.(), sessionId);

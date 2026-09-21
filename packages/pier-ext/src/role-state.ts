@@ -1,9 +1,8 @@
 /**
- * P0 (RFC docs/rfc-pi-0.86-dynamic-tools.md §4): mutable role state for mid-session switching.
- *
- * pi 0.86 records `setActiveTools` changes as transcript tool deltas, so a switch survives resume
- * and branch navigation on pi's side. This module owns pier's half: replaying the gate manifest
- * from the last `pi-herdr.role-manifest` entry and planning the active-set transition.
+ * P0 (RFC docs/rfc-pi-0.86-dynamic-tools.md §4): mutable role state for mid-session switching. pi
+ * 0.86 records `setActiveTools` deltas in the transcript, so a switch survives resume and branch
+ * navigation; this module owns pier's half — replaying the gate manifest from the last
+ * `pi-herdr.role-manifest` entry and planning the active-set transition.
  */
 import type { PermissionAction, UnknownToolStance } from './role-manifest.ts';
 import type { RuntimeRoleManifest } from './tool-gate.ts';

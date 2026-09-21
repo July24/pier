@@ -194,12 +194,8 @@ export function evaluateDiagnosticGate(
   return { hit: true, reason: 'hit', confidence: kind.confidence, choice: kind.choice, noul: output.noul };
 }
 
-/**
- * Flip semantics (2026-09-19, user directive): jev is the primary judge and the regex list the
- * fallback. The regex list decides only when jev never produced a usable answer — call failure,
- * malformed answers, below-gate confidence. A confident rejection is authoritative even for
- * commands the regex list would match.
- */
+/** Flip semantics: jev judges first, the regex list decides only when jev produced no usable answer
+ * (failure, malformed, below gate). A confident rejection outranks a regex match. */
 export function isDiagnosticGateUnanswered(verdict: DiagnosticGateVerdict): boolean {
   return verdict.reason === 'missing-answer' || verdict.reason === 'low-confidence';
 }
@@ -248,11 +244,8 @@ export function noticeRankRequest(input: {
   };
 }
 
-/**
- * A settlement whose fail-noul clears this is forced to the front regardless of its relevance score:
- * score noise on CJK rejected the same failure notice from #2 to #4 in live calibration — beyond the
- * cap of shown notices. The invariant lives in code, not in the model.
- */
+/** A settlement whose fail-noul clears this is pinned to the front regardless of relevance score:
+ * score noise on CJK reordered the same failure notice beyond the cap of shown notices. */
 const NOTICE_FAIL_PIN_THRESHOLD = 0.7;
 
 /**

@@ -1,9 +1,9 @@
 /**
  * ask_user_question I/O: normalize params, select+Other dialog, result envelope.
  *
- * Why: the herdr gate (blocked / pi-ask / widget collapse) stays in index.ts.
- * This module is the questionnaire — authored options plus a runtime Other row —
- * so the model cannot forget a free-text escape and Esc is a real decline.
+ * The herdr gate (blocked / pi-ask / widget collapse) stays in index.ts; this module owns the
+ * questionnaire — authored options plus a runtime Other row, so the model cannot forget a free-text
+ * escape and Esc is a real decline.
  */
 import { Type } from 'typebox';
 import { OTHER_ROW_LABEL, numberedOptionLine, runSelectDialog } from './ask-dialog.ts';
@@ -75,7 +75,6 @@ export const ASK_TOOL_DESCRIPTION = [
   'Use recommended (0-based) to mark the default; "(Recommended)" is added automatically — do NOT write it in the label.',
   'Use multi: true when several options can apply — the TUI opens an interactive toggle list (space toggles a row, a toggles all, enter confirms, esc declines) instead of making the human type numbers.',
   'Set allowOther: false when the authored choices are exhaustive and a free-text answer would be misleading.',
-  'The answer comes back as the tool result; then continue your work.',
 ].join(' ');
 
 export const ASK_PROMPT_GUIDELINES = [

@@ -1,10 +1,8 @@
 /**
- * TUI renderers for pier's own session custom entries and reminder messages.
- *
- * pier persists authority in the session JSONL (todo edits, subagent registry, terminal registry,
- * role manifests, soft-approvals) and injects reminder messages; without a renderer those transcript
- * rows are raw JSON, which buries the one line that matters. Pure string builders plus an ANSI-aware
- * truncator, so this module needs no pi-tui import and degrades to "no renderer" on older pi builds.
+ * TUI renderers for pier's own session custom entries and reminder messages: those transcript rows
+ * are raw JSON without a renderer, which buries the one line that matters. Pure string builders plus
+ * an ANSI-aware truncator, so this module needs no pi-tui import and degrades to "no renderer" on
+ * older pi builds.
  */
 import { TODO_EDIT_CUSTOM_TYPE, type TodoEditPayload } from './todo-core.ts';
 import { SUBS_CUSTOM_TYPE, type SubsRegistry } from './subagent-core.ts';

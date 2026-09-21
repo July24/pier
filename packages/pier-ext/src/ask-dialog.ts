@@ -1,14 +1,8 @@
 /**
- * ask_user_question dialog: one pier-owned selector for single- and multi-select questions,
- * rendered through `ctx.ui.custom`.
- *
- * pi's built-in selector and pier's former toggle list styled the same question differently
- * (frame, cursor glyph, numbering, hints, navigation), so both modes share this component; only the
- * checkbox column, the key hints and the selection counter differ.
- *
- * The chrome deliberately mirrors pi's ExtensionSelectorComponent: border rules above and below, an
- * accent+bold title, a `→ ` cursor, dim description text and keyHint-style footer hints (dim key +
- * muted verb, double-space separated) resolved from the keybindings manager pi hands the factory.
+ * ask_user_question dialog: one pier-owned selector for single- and multi-select questions, rendered
+ * through `ctx.ui.custom`. Both modes share it because the chrome — border rules, accent+bold title,
+ * `→ ` cursor, dim descriptions, keyHint-style footer (dim key + muted verb) — must not diverge;
+ * only the checkbox column, the hints and the selection counter are mode-specific.
  */
 import { styledWidth, truncateStyled, wrapStyled } from './ansi-text.ts';
 
@@ -183,7 +177,6 @@ interface DialogUiOptions {
   toggleToolsExpanded?: () => void;
   /** Called with the outcome; the host resolves ctx.ui.custom. */
   done(outcome: DialogOutcome): void;
-  /** Ask for the gate label used by the renderer (tests only). */
   requestRender?: () => void;
 }
 

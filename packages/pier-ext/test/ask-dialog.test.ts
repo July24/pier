@@ -270,9 +270,7 @@ test('narrow panes shed guessable hints but never the action keys or the count',
 test('component: renders the framed chrome and fits every line to width', () => {
   let outcome: DialogOutcome | null = null;
   const component = createDialogComponent({
-    title: 'Pick',
-    config: multi(),
-    theme: plain,
+    title: 'Pick', config: multi(), theme: plain,
     done: (o) => { outcome = o; },
   });
   const lines = component.render(40);
@@ -310,9 +308,7 @@ test('component: key sequences drive the state machine and finish once', () => {
   const outcomes: DialogOutcome[] = [];
   let renders = 0;
   const component = createDialogComponent({
-    title: 'Q',
-    config: multi({ recommended: undefined }),
-    theme: plain,
+    title: 'Q', config: multi({ recommended: undefined }), theme: plain,
     keybindings: kb,
     done: (o) => outcomes.push(o),
     requestRender: () => { renders += 1; },
@@ -330,9 +326,7 @@ test('component: key sequences drive the state machine and finish once', () => {
 test('component: enter on the Other row finishes with the other outcome', () => {
   const outcomes: DialogOutcome[] = [];
   const component = createDialogComponent({
-    title: 'Q',
-    config: multi(),
-    theme: plain,
+    title: 'Q', config: multi(), theme: plain,
     keybindings: kb,
     done: (o) => outcomes.push(o),
   });
@@ -345,9 +339,7 @@ test('component: aborting the signal cancels exactly once and later keys are ign
   const outcomes: DialogOutcome[] = [];
   const controller = new AbortController();
   const component = createDialogComponent({
-    title: 'Q',
-    config: multi(),
-    theme: plain,
+    title: 'Q', config: multi(), theme: plain,
     keybindings: kb,
     signal: controller.signal,
     done: (o) => outcomes.push(o),
@@ -365,9 +357,7 @@ test('component: ctrl+o toggles tool expansion without touching the state', () =
     matches: (data, id) => (id === 'app.tools.expand' ? data === '\x0f' : kb.matches(data, id)),
   };
   const component = createDialogComponent({
-    title: 'Q',
-    config: multi(),
-    theme: plain,
+    title: 'Q', config: multi(), theme: plain,
     keybindings,
     toggleToolsExpanded: () => expansions.push(true),
     done: () => { throw new Error('dialog must not finish'); },

@@ -12,23 +12,25 @@ export interface DashboardCommandDeps {
 }
 
 /**
- * Presentation of the todo states that appear in the standalone view: `count` labels the summary
- * line, `live` adds the detail line that follows it. `abandoned` is tracked but not shown.
+ * Presentation of the todo states in the standalone view: `SUMMARY_ORDER` fixes the summary-line
+ * order, `LIVE_ROWS` adds the detail line that follows it. `abandoned` is counted but not shown.
  */
-const STATUS_ROWS: ReadonlyArray<{
-  status: Exclude<TodoStatus, 'abandoned'>;
-  count: string;
-  live?: { label: string; glyph: string; line: (todo: TodoItem) => string };
-}> = [
-  { status: 'completed', count: 'done' },
-  { status: 'in_progress', count: 'working', live: { label: 'Active', glyph: '▶', line: (todo) => todo.content } },
+const SUMMARY_ORDER = [
+  { status: 'completed', label: 'done' },
+  { status: 'in_progress', label: 'working' },
+  { status: 'blocked', label: 'blocked' },
+  { status: 'pending', label: 'pending' },
+] as const;
+
+const LIVE_ROWS = [
+  { status: 'in_progress', label: 'Active', glyph: '▶', line: (todo: TodoItem) => todo.content },
   {
     status: 'blocked',
-    count: 'blocked',
-    live: { label: 'Blocked', glyph: '■', line: (todo) => `${todo.content}${todo.blocker ? ` (${todo.blocker})` : ''}` },
+    label: 'Blocked',
+    glyph: '■',
+    line: (todo: TodoItem) => `${todo.content}${todo.blocker ? ` (${todo.blocker})` : ''}`,
   },
-  { status: 'pending', count: 'pending' },
-];
+] as const;
 
 export function formatStandaloneDashboard(opts: {
   todos: readonly TodoItem[];
@@ -50,13 +52,11 @@ export function formatStandaloneDashboard(opts: {
     for (const todo of opts.todos) groups[todo.status].push(todo);
 
     lines.push(
-      `Todos: ${opts.todos.length} total (${STATUS_ROWS.map((row) => `${groups[row.status].length} ${row.count}`).join(', ')})`,
+      `Todos: ${opts.todos.length} total (${SUMMARY_ORDER.map((row) => `${groups[row.status].length} ${row.label}`).join(', ')})`,
     );
-    for (const row of STATUS_ROWS) {
+    for (const row of LIVE_ROWS) {
       const items = groups[row.status];
-      if (row.live && items.length > 0) {
-        lines.push(`${row.live.label}: ${row.live.glyph} ${items.map(row.live.line).join(', ')}`);
-      }
+      if (items.length > 0) lines.push(`${row.label}: ${row.glyph} ${items.map(row.line).join(', ')}`);
     }
     // Recent completions only carry signal when nothing is in flight.
     if (groups.in_progress.length === 0 && groups.blocked.length === 0 && groups.completed.length > 0) {

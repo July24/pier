@@ -66,13 +66,10 @@ export function isDiagnosticCommand(command: string): boolean {
 }
 
 /**
- * Recover the untruncated-log path from Pi's inline truncation notice —
- * `[Output truncated. Full output: /tmp/pi-bash-abc.log]`,
- * `[Showing lines 1-2000 of 5000. Full output: …]`,
- * `[Showing last 50KB of line 12 (line is 80KB). Full output: …]`.
- *
- * `details.fullOutputPath` carries the same value, but a replayed or re-shaped event can keep only
- * the text, and verifying a receipt against a truncated preview would be wrong.
+ * Recover the untruncated-log path from Pi's inline notice (`[Output truncated. Full output: …]`,
+ * `[Showing lines 1-2000 of 5000. Full output: …]`, …). `details.fullOutputPath` carries the same
+ * value, but a replayed or re-shaped event can keep only the text, and verifying a receipt against a
+ * truncated preview would be wrong.
  *
  * The returned path is NOT trusted: callers must still gate it (see `readBashFullOutput`, which
  * requires a `pi-bash-*.log` basename resolving to a regular non-symlink file inside tmpdir).
@@ -298,12 +295,9 @@ export function formatReceiptText(opts: {
 }
 
 /**
- * Usage shapes accepted from / returned to pi.
- *
- * pi persists a tool result's `usage` and renders it through `addUsageToTotals`, which reads
- * `usage.cost.total` WITHOUT a guard, so a partial object (say only `{ input, output, totalTokens }`)
- * crashes the whole pi process with "TypeError: Cannot read properties of undefined (reading
- * 'total')". Always emit the complete `UsageTotals` below; see docs/session-format.md.
+ * Usage shapes accepted from / returned to pi. pi renders a tool result's `usage` through
+ * `addUsageToTotals`, which reads `usage.cost.total` WITHOUT a guard, so a partial object crashes
+ * the whole pi process. Always emit the complete `UsageTotals` below; see docs/session-format.md.
  */
 export interface UsageLike {
   input?: number;
