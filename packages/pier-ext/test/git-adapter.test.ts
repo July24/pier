@@ -3,7 +3,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { NodeGitAdapter, type GitExecFile } from '../src/git-adapter.ts';
+import { NodeGitAdapter, type GitExecFile } from '../src/subagent-spawn.ts';
 
 function fakeExec(impl: GitExecFile): GitExecFile {
   return impl;

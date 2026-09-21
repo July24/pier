@@ -1,16 +1,9 @@
 /**
- * Pure core for the settled-wake decision (prevents wake storms; evidenced by session 01a03bf0).
+ * Pure core for the settled-wake decision (prevents wake storms).
  *
- * Evidence chain: ESC abort → agent_settled → D96 "background subagents still running" notice
- * → sendUserMessage(followUp) (always starts a new run while idle) → master restarts → user presses ESC again → …
- * After 30 aborts, ESC never breaks the cycle; only Ctrl+C stops the process.
- * Natural settlement also forms a self-triggering loop: settle → notice → new run → settle → notice …
- *
- * Rules:
- *  - Abort suppression: when the previous assistant stopReason === 'aborted', this settled event injects no
- *    wake-up message (the user explicitly stopped it; settlement-buffered content waits for the next natural turn);
- *  - D96 deduplication: notify once for a given running paneId set; any set change (new subagent/settlement) resets it;
- *  - D96 cooldown: repeat a notice for the same set only after REPEAT_NOTICE_MS (otherwise the unchanged set is noise).
+ * A settle wake that injects messages creates a self-triggering loop (settle → notice → new run →
+ * settle → …) that even ESC cannot break, so: an aborted previous turn injects nothing; a running
+ * set is announced once and only re-announced after REPEAT_NOTICE_MS or when the set changes.
  */
 
 export const ABORT_STOP_REASON = 'aborted';

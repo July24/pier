@@ -6,7 +6,7 @@
  */
 import { formatSettlementNotice } from './vocab.ts';
 import type { PipeRequest, PipeResponse } from './pipe-channel.ts';
-import type { SubagentPortBox } from './subagent-port.ts';
+import type { SubagentPortBox } from './subagent-core.ts';
 
 export interface MachineRequest {
   id: string;

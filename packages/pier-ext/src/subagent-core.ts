@@ -1,4 +1,8 @@
-/** Why: Preserve the established compatibility and safety behavior (D10). */
+/**
+ * Subagent domain: registry rows, launch lines, liveness notices, tab/worktree planning,
+ * isolate decisions, task-id resolution, execute planners, and the outbound port types.
+ * Pure — no Cordis, no herdr client, no fs (planners only decide; adapters do I/O).
+ */
 import { normalizeEntryKind } from './history-store.ts';
 
 export interface SubagentSpec {
@@ -6,25 +10,16 @@ export interface SubagentSpec {
   prompt: string;
 }
 
-/** Why: Preserve the established compatibility and safety behavior. */
-export function psQuote(s: string): string {
-  return `'${String(s).replace(/'/g, "''")}'`;
-}
-
-/** Why: Preserve the established compatibility and safety behavior. */
-export function shQuote(s: string): string {
-  return `'${String(s).replace(/'/g, `'\\''`)}'`;
-}
-
-/** Why: Preserve the established compatibility and safety behavior. */
+/** POSIX single-quote escape; win32 PowerShell doubles the quote instead. */
 export function buildLaunchLine(parts: readonly string[], platform: NodeJS.Platform = process.platform): string {
-  const quoted = platform === 'win32'
-    ? parts.map((s) => psQuote(s))
-    : parts.map((s) => shQuote(s));
-  return (platform === 'win32' ? '& ' : '') + quoted.join(' ');
+  const win = platform === 'win32';
+  const quoted = parts.map((s) => (win
+    ? `'${String(s).replace(/'/g, "''")}'`
+    : `'${String(s).replace(/'/g, `'\\''`)}'`));
+  return (win ? '& ' : '') + quoted.join(' ');
 }
 
-/** Why: Preserve the established compatibility and safety behavior. */
+/** Bounds concurrent delegation spawns (SUBAGENT_CONCURRENCY). */
 export class Semaphore {
   private active = 0;
   private queue: Array<() => void> = [];
@@ -44,12 +39,12 @@ export class Semaphore {
       this.active++;
       return Promise.resolve(this.release.bind(this));
     }
-    return new Promise((resolve) => {
-      this.queue.push(() => {
-        this.active++;
-        resolve(this.release.bind(this));
-      });
+    const { promise, resolve } = Promise.withResolvers<() => void>();
+    this.queue.push(() => {
+      this.active++;
+      resolve(this.release.bind(this));
     });
+    return promise;
   }
 
   private release(): void {
@@ -59,19 +54,15 @@ export class Semaphore {
   }
 }
 
-export interface SubagentOutcome {
+interface SubagentOutcome {
   kind: 'completed' | 'timeout' | 'no-output' | 'blocked' | 'spawn-failed';
-  /** Why: Preserve the established compatibility and safety behavior. */
   text: string;
 }
 
-/** Why: Preserve the established compatibility and safety behavior. */
 export function formatSubagentResult(outcome: SubagentOutcome, description: string): string {
   switch (outcome.kind) {
-    case 'completed': {
-      const text = outcome.text;
-      return text ? text : 'Subagent finished but produced no output.';
-    }
+    case 'completed':
+      return outcome.text ? outcome.text : 'Subagent finished but produced no output.';
     case 'timeout':
       return `Error: subagent "${description}" timed out. Partial output:\n${outcome.text || '(none)'}`;
     case 'blocked':
@@ -83,27 +74,25 @@ export function formatSubagentResult(outcome: SubagentOutcome, description: stri
   }
 }
 
-/** Why: Preserve the established compatibility and safety behavior (A2, B1). */
-
-/** Why: Preserve the established compatibility and safety behavior. */
 export interface AliveProbe {
   paneExists: boolean;
   agentStatus: string | null;
-  /** Why: Preserve the established compatibility and safety behavior. */
   lastActivityMs: number | null;
   /** Herdr 0.9.1: foreground working directory of the PTY process. */
   foregroundCwd?: string | null;
 }
 
-/** Why: Preserve the established compatibility and safety behavior. */
+/**
+ * A subagent outlives its "no output" result: a working/blocked agent is alive regardless of
+ * session age, otherwise recent session writes decide. `paneExists: false` is death — an
+ * unavailable probe must be reported as such by the caller, not guessed here.
+ */
 export function isAlive(probe: AliveProbe, nowMs: number, staleAfterMs = 120_000): boolean {
   if (!probe.paneExists) return false;
   if (probe.agentStatus === 'working' || probe.agentStatus === 'blocked') return true;
-  // Why: Preserve the established compatibility and safety behavior.
   return probe.lastActivityMs != null && nowMs - probe.lastActivityMs < staleAfterMs;
 }
 
-/** Why: Preserve the established compatibility and safety behavior. */
 export function agoText(ms: number, nowMs: number): string {
   const s = Math.max(0, Math.round((nowMs - ms) / 1000));
   if (s < 60) return `${s}s ago`;
@@ -111,7 +100,6 @@ export function agoText(ms: number, nowMs: number): string {
   return `${Math.floor(s / 3600)}h ago`;
 }
 
-/** Why: Preserve the established compatibility and safety behavior (A2, B1). */
 export function buildAliveNotice(
   opts: { paneId: string; description: string; scenario: 'moved-to-bg' | 'error-alive'; probe: AliveProbe },
   nowMs: number,
@@ -134,7 +122,7 @@ export function buildAliveNotice(
   ].join(' ');
 }
 
-/** Why: Preserve the established compatibility and safety behavior (E1, E2). */
+/** A pane blocked on a human decision keeps running: the master must not take the work over. */
 export function buildBlockedGateNotice(opts: { paneId: string; description: string; question: string | null }): string {
   const { paneId, description, question } = opts;
   const q = question ? ` (question: "${question}")` : '';
@@ -147,35 +135,30 @@ export function buildBlockedGateNotice(opts: { paneId: string; description: stri
   ].join(' ');
 }
 
-/** Why: Preserve the established compatibility and safety behavior. */
-
 export const SUBS_CUSTOM_TYPE = 'pi-herdr.subs';
 
 export interface SubEntry {
   taskId: string;
-  /** Why: Preserve the established compatibility and safety behavior. */
+  /** 'task' or a role name; only a display label for GC. */
   kind: string;
   paneId: string;
   tabId: string;
-  /** Why: Preserve the established compatibility and safety behavior (D25, D26). */
   tabName: string;
   cwd: string;
   description: string;
   background: boolean;
   status: 'running' | 'settled' | 'consumed' | 'closed';
-  /** Why: Preserve the established compatibility and safety behavior. */
+  /** GC grace basis (durable); closed rows keep the original value. */
   consumedAt?: number | null;
   sessionFile: string | null;
   launchCommand: string[];
   createdAt: number;
   revivedFrom?: string | null;
-  /** Why: Preserve the established compatibility and safety behavior (D94). */
+  /** D94: the human took the pane over; observation window judges when to hand control back. */
   userTakeover?: boolean;
-  /** Why: Preserve the established compatibility and safety behavior (D94). */
   observationStartedAt?: number | null;
-  /** Why: Preserve the established compatibility and safety behavior (D94). */
   lastAgentStatus?: string | null;
-  /** Why: Preserve the established compatibility and safety behavior (D98). */
+  /** D98: isolate worktree metadata; `releasedAt` set once the worktree is removed. */
   isolate?: {
     worktreePath: string;
     branch: string;
@@ -194,14 +177,17 @@ export function makeRegistry(subs: SubEntry[] = []): SubsRegistry {
   return { version: 2, subs };
 }
 
-/** Why: Preserve the established compatibility and safety behavior. */
-export function foldSubsRegistry(entries: readonly BranchEntryLike2[]): SubsRegistry {
+const SUB_STATUSES: Record<string, true> = { running: true, settled: true, consumed: true, closed: true };
+
+/**
+ * Replay `pi-herdr.subs` custom branch entries into a registry; last snapshot wins.
+ * Tolerant of v1 rows (missing taskId/kind/tabName) and unknown future fields.
+ */
+export function foldSubsRegistry(entries: ReadonlyArray<{ type?: string; customType?: string; data?: unknown }>): SubsRegistry {
   let found = makeRegistry();
   for (const entry of entries) {
     if (entry.type !== 'custom' || entry.customType !== SUBS_CUSTOM_TYPE) continue;
-    const data = entry.data as {
-      subs?: Array<Partial<SubEntry> & { paneId: string }>;
-    } | undefined;
+    const data = entry.data as { subs?: Array<Partial<SubEntry> & { paneId: string }> } | undefined;
     if (!data || !Array.isArray(data.subs)) continue;
     const subs: SubEntry[] = data.subs
       .filter((s) => typeof s?.paneId === 'string')
@@ -214,7 +200,9 @@ export function foldSubsRegistry(entries: readonly BranchEntryLike2[]): SubsRegi
         cwd: typeof s.cwd === 'string' ? s.cwd : '',
         description: typeof s.description === 'string' ? s.description : '',
         background: s.background === true,
-        status: s.status === 'closed' ? 'closed' : s.status === 'consumed' ? 'consumed' : s.status === 'settled' ? 'settled' : 'running',
+        status: typeof s.status === 'string' && SUB_STATUSES[s.status] === true
+          ? (s.status as SubEntry['status'])
+          : 'running',
         consumedAt: typeof s.consumedAt === 'number' ? s.consumedAt : null,
         sessionFile: typeof s.sessionFile === 'string' ? s.sessionFile : null,
         launchCommand: Array.isArray(s.launchCommand) ? s.launchCommand : [],
@@ -240,36 +228,45 @@ export function foldSubsRegistry(entries: readonly BranchEntryLike2[]): SubsRegi
   return found;
 }
 
-export interface BranchEntryLike2 {
-  type?: string;
-  customType?: string;
-  data?: unknown;
+/** Latest row per taskId (same taskId rows are generations); newest createdAt wins. */
+export function newestPerTaskId(entries: Iterable<SubEntry>): Map<string, SubEntry> {
+  const byTask = new Map<string, SubEntry>();
+  for (const sub of entries) {
+    const prev = byTask.get(sub.taskId);
+    if (!prev || sub.createdAt >= prev.createdAt) byTask.set(sub.taskId, sub);
+  }
+  return byTask;
 }
 
-/** Why: Preserve the established compatibility and safety behavior. */
-
-export interface ProgressUpdate {
-  content: Array<{ type: 'text'; text: string }>;
-  details: Record<string, never>;
+/** pi's AgentToolResult shape — a bare string crashes the interactive TUI's getTextOutput. */
+export function makeProgressUpdate(msg: string) {
+  return { content: [{ type: 'text' as const, text: msg }], details: {} as Record<string, never> };
 }
 
-/** Why: Preserve the established compatibility and safety behavior. */
-export function makeProgressUpdate(msg: string): ProgressUpdate {
-  return { content: [{ type: 'text', text: msg }], details: {} };
+/** First non-empty id parameter, stringified; callers pass their key order. */
+export function idParam(params: Record<string, unknown> | undefined, ...keys: string[]): string {
+  for (const key of keys) {
+    const v = params?.[key];
+    if (v != null && String(v).trim() !== '') return String(v).trim();
+  }
+  return '';
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D25, D26). */
+/** Shared wording for an ambiguous id prefix, at most five candidates listed. */
+export function ambiguousIdError(label: 'task id' | 'subagent id', query: string, candidates: readonly string[]): string {
+  const head = candidates.slice(0, 5).join(', ');
+  const more = candidates.length > 5 ? `, ... (+${candidates.length - 5} more)` : '';
+  return `Error: ambiguous ${label} "${query}" matches ${candidates.length} tasks: ${head}${more}`;
+}
 
 export const TAB_NAME_MAX = 20;
 
-/** Why: Preserve the established compatibility and safety behavior. */
 export function tabNameForTask(description: string): string {
   const cleaned = String(description ?? '').replace(/\s+/g, ' ').trim();
   const truncated = cleaned.slice(0, TAB_NAME_MAX).trim();
   return truncated || 'task';
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D26). */
 export function nextTaskTabName(base: string, existingNames: ReadonlySet<string>): string {
   let name = base;
   let n = 2;
@@ -282,16 +279,12 @@ export function nextTaskTabName(base: string, existingNames: ReadonlySet<string>
 }
 
 export interface TabPlacementPlan {
-  /** Why: Preserve the established compatibility and safety behavior. */
   mode: 'append' | 'new';
   tabName: string;
-  /** Why: Preserve the established compatibility and safety behavior. */
   tabId: string | null;
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D86). */
-
-/** Why: Preserve the established compatibility and safety behavior (D86). */
+/** Case/slash-insensitive containment; `/repo-x` is NOT under `/repo`. */
 export function isPathUnder(cwd: string, wt: string): boolean {
   const n = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
   const a = n(cwd);
@@ -300,13 +293,11 @@ export function isPathUnder(cwd: string, wt: string): boolean {
 }
 
 export interface WorktreeZone {
-  /** Why: Preserve the established compatibility and safety behavior. */
   zone: 'main' | 'worktree';
-  /** Why: Preserve the established compatibility and safety behavior. */
   tabName: string | null;
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D86). */
+/** D86: subagents working in the master's checkout share its tab; another worktree gets its own. */
 export function classifyWorktreeZone(opts: {
   cwd: string;
   masterCwd: string;
@@ -314,21 +305,19 @@ export function classifyWorktreeZone(opts: {
 }): WorktreeZone {
   for (const wt of opts.worktrees) {
     if (!isPathUnder(opts.cwd, wt)) continue;
-    if (isPathUnder(opts.masterCwd, wt)) return { zone: 'main', tabName: null }; // Why: Preserve the established compatibility and safety behavior.
+    if (isPathUnder(opts.masterCwd, wt)) return { zone: 'main', tabName: null };
     const base = wt.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? 'worktree';
     return { zone: 'worktree', tabName: base };
   }
   return { zone: 'main', tabName: null };
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D26, D86). */
+/** Explicit `tab` wins; otherwise D86 zone decides, and an unknown zone falls back to the description. */
 export function planTabPlacement(opts: {
   desiredTab?: string | null;
   description: string;
   knownTabs: ReadonlyArray<{ tabName: string; tabId: string }>;
-  /** Why: Preserve the established compatibility and safety behavior (D86). */
   zone?: WorktreeZone;
-  /** Why: Preserve the established compatibility and safety behavior (D86). */
   mainTabId?: string | null;
 }): TabPlacementPlan {
   const known = new Map<string, string>();
@@ -340,35 +329,21 @@ export function planTabPlacement(opts: {
   }
   const zone = opts.zone;
   if (zone?.zone === 'main' && opts.mainTabId) {
-    // Why: Preserve the established compatibility and safety behavior (D86, R1).
     return { mode: 'append', tabName: 'main', tabId: opts.mainTabId };
   }
   if (zone?.zone === 'worktree' && zone.tabName) {
-    // Why: Preserve the established compatibility and safety behavior (D86, R1).
     const base = zone.tabName;
     const existing = [...known.keys()].find((k) => k.toLowerCase() === base.toLowerCase());
     if (existing) return { mode: 'append', tabName: existing, tabId: known.get(existing)! };
-    const tabName = nextTaskTabName(base, new Set(known.keys()));
-    return { mode: 'new', tabName, tabId: null };
+    return { mode: 'new', tabName: nextTaskTabName(base, new Set(known.keys())), tabId: null };
   }
-  // Why: Preserve the established compatibility and safety behavior.
   const base = tabNameForTask(opts.description);
-  const tabName = nextTaskTabName(base, new Set(known.keys()));
-  return { mode: 'new', tabName, tabId: null };
+  return { mode: 'new', tabName: nextTaskTabName(base, new Set(known.keys())), tabId: null };
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D97). */
-
-/** Why: Preserve the established compatibility and safety behavior. */
-export interface LaunchRuntime {
-  nodePath: string;
-  cliPath: string;
-  extPath: string;
-}
-
-/** Why: Preserve the established compatibility and safety behavior (D97). */
+/** D97: fullscreen is what makes the pane a static frame the master can read. */
 export function buildLaunchParts(
-  runtime: LaunchRuntime,
+  runtime: { nodePath: string; cliPath: string; extPath: string },
   opts: { resumeFile?: string | null; roleModel?: string | null; approve?: boolean } = {},
   env: { PI_HERDR_TUI?: string | undefined } = process.env,
 ): string[] {
@@ -376,29 +351,19 @@ export function buildLaunchParts(
   if (opts.approve) parts.push('-a');
   parts.push('-e', runtime.extPath);
   if (env.PI_HERDR_TUI !== 'regular') parts.push('--tui-mode', 'fullscreen');
-  if (opts.roleModel) parts.push('--provider', opts.roleModel.split('/')[0], '--model', opts.roleModel.split('/')[1] ?? opts.roleModel);
+  if (opts.roleModel) parts.push('--provider', opts.roleModel.split('/')[0]!, '--model', opts.roleModel.split('/')[1] ?? opts.roleModel);
   if (opts.resumeFile) parts.push('--session', opts.resumeFile);
   return parts;
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D98). */
+const ISOLATE_SLUG_MAX = 40;
 
-/** Why: Preserve the established compatibility and safety behavior. */
-export interface IsolatePlan {
-  branch: string;
-  slug: string;
-  worktreeDirName: string;
-}
-
-/** Why: Preserve the established compatibility and safety behavior. */
-export const ISOLATE_SLUG_MAX = 40;
-
-/** Why: Preserve the established compatibility and safety behavior (D98). */
+/** Branch/dir name for a fresh isolate worktree, ascii-folded from the description. */
 export function planIsolateWorktree(opts: {
   description: string;
   taskHex: string;
   existingPierBranches: ReadonlySet<string>;
-}): IsolatePlan {
+}) {
   const folded = String(opts.description ?? '')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
@@ -415,7 +380,7 @@ export function planIsolateWorktree(opts: {
   return { branch: `pier/${name}`, slug: name, worktreeDirName: `pier-${name}` };
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D98). */
+/** Commit discipline is injected into the prompt: the worktree has no other protection. */
 export function buildIsolatePreamble(opts: { worktreePath: string; branch: string; baseShort: string }): string {
   return [
     `You are working in an isolated git worktree: ${opts.worktreePath} (branch ${opts.branch}, base ${opts.baseShort}).`,
@@ -426,7 +391,6 @@ export function buildIsolatePreamble(opts: { worktreePath: string; branch: strin
   ].join('\n');
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D98). */
 export function formatWorktreeStat(opts: {
   branch: string | null;
   commits: number | null;
@@ -445,17 +409,16 @@ export function formatWorktreeStat(opts: {
   return `git: ${opts.statLine}; uncommitted: ${opts.dirtyCount} file(s)`;
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D98). */
-export type ReleaseDecision = { action: 'release' } | { action: 'retain'; reason: 'unmerged' | 'dirty' | 'unknown' };
-
-export function evaluateRelease(opts: { merged: boolean | null; dirtyCount: number | null }): ReleaseDecision {
+/** D98: only a merged, clean, known worktree may be removed automatically. */
+export function evaluateRelease(opts: { merged: boolean | null; dirtyCount: number | null }):
+  { action: 'release' } | { action: 'retain'; reason: 'unmerged' | 'dirty' | 'unknown' } {
   if (opts.merged === null || opts.dirtyCount === null) return { action: 'retain', reason: 'unknown' };
   if (!opts.merged) return { action: 'retain', reason: 'unmerged' };
   if (opts.dirtyCount > 0) return { action: 'retain', reason: 'dirty' };
   return { action: 'release' };
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D98). */
+/** `git worktree list --porcelain` → branch (refs/heads/ stripped) → path. */
 export function parseWorktreePorcelain(out: string): Map<string, string> {
   const byBranch = new Map<string, string>();
   let curPath: string | null = null;
@@ -466,4 +429,143 @@ export function parseWorktreePorcelain(out: string): Map<string, string> {
     if (b && curPath) byBranch.set(b[1]!.replace(/^refs\/heads\//, ''), curPath);
   }
   return byBranch;
+}
+
+/* ── execute planners ───────────────────────────────────────────── */
+
+export const FOREGROUND_POLL_MS = 2_000;
+
+type LaunchValidation =
+  | { kind: 'error'; text: string }
+  | {
+    kind: 'ok';
+    spec: SubagentSpec;
+    background: boolean;
+    isolate: boolean;
+    cwdParam: string | null;
+    roleKind: string;
+    suggested: string[];
+    manifestRole: string | null;
+    tab: string | null;
+  };
+
+/**
+ * Validate spawn parameters. `role` doubles as the pane label and (when it names a profile) the
+ * manifest to compose; unknown names stay labels. `isolate` and `cwd` are mutually exclusive.
+ */
+export function planLaunchValidation(
+  params: {
+    description?: unknown;
+    prompt?: unknown;
+    run_in_background?: unknown;
+    cwd?: unknown;
+    isolate?: unknown;
+    role?: unknown;
+    allowed_tools?: unknown;
+    tab?: unknown;
+  } | null | undefined,
+  herdrAvailable: boolean,
+): LaunchValidation {
+  if (!herdrAvailable) {
+    return { kind: 'error', text: 'Error: subagent requires pi to run inside a herdr-managed pane (HERDR_ENV not set).' };
+  }
+  const spec: SubagentSpec = {
+    description: String(params?.description ?? 'subagent'),
+    prompt: String(params?.prompt ?? ''),
+  };
+  if (!spec.prompt.trim()) return { kind: 'error', text: 'Error: `prompt` must be a non-empty string' };
+  const cwdParam = typeof params?.cwd === 'string' && params.cwd.trim() ? params.cwd.trim() : null;
+  const isolate = params?.isolate === true;
+  if (isolate && cwdParam) {
+    return {
+      kind: 'error',
+      text: 'Error: `isolate` and `cwd` are mutually exclusive — isolate creates a new worktree, cwd delegates into an existing one',
+    };
+  }
+  const role = typeof params?.role === 'string' ? params.role.trim() : undefined;
+  return {
+    kind: 'ok',
+    spec,
+    background: params?.run_in_background === true,
+    isolate,
+    cwdParam,
+    roleKind: normalizeEntryKind(role),
+    suggested: Array.isArray(params?.allowed_tools)
+      ? params.allowed_tools.filter((t): t is string => typeof t === 'string' && t.trim() !== '')
+      : [],
+    manifestRole: role || 'worker-default',
+    tab: typeof params?.tab === 'string' ? params.tab : null,
+  };
+}
+
+export type ForegroundTickPlan =
+  | { kind: 'blocked' }
+  | { kind: 'settled'; text: string }
+  | { kind: 'wait'; delayMs: number }
+  | { kind: 'collect-final' }
+  | { kind: 'continue' };
+
+/** One foreground-wait iteration: only a human gate or finalized text ends the wait. */
+export function planForegroundTick(input: {
+  state: string | null;
+  session: { text: string | null; pendingTool: boolean; activity: boolean };
+}): ForegroundTickPlan {
+  if (input.state === 'blocked') return { kind: 'blocked' };
+  if (input.state !== 'idle' && input.state !== 'done') return { kind: 'continue' };
+  if (input.session.text) return { kind: 'settled', text: input.session.text };
+  if (input.session.pendingTool || !input.session.activity) return { kind: 'wait', delayMs: FOREGROUND_POLL_MS };
+  return { kind: 'collect-final' };
+}
+
+/* ── task-id resolution ─────────────────────────────────────────── */
+
+type TaskIdResolutionResult =
+  | { kind: 'resolved'; taskId: string }
+  | { kind: 'ambiguous'; query: string; candidates: string[] }
+  | { kind: 'too_short'; query: string }
+  | { kind: 'not_found'; query: string };
+
+/**
+ * Resolve a full or short task ID against known candidates. Exact matches are accepted at any
+ * length; prefix matching requires four characters and reports ambiguity with sorted candidates.
+ */
+export function resolveTaskIdPrefix(
+  query: string,
+  candidates: Iterable<string>,
+): TaskIdResolutionResult {
+  const trimmed = query.trim();
+  if (!trimmed) return { kind: 'not_found', query: trimmed };
+
+  const unique = Array.from(new Set(candidates));
+  const exact = unique.find((candidate) => candidate === trimmed);
+  if (exact) return { kind: 'resolved', taskId: exact };
+
+  if (trimmed.length < 4) return { kind: 'too_short', query: trimmed };
+
+  const lower = trimmed.toLowerCase();
+  const matches = unique.filter((candidate) => candidate.toLowerCase().startsWith(lower));
+  if (matches.length === 1) return { kind: 'resolved', taskId: matches[0]! };
+  if (matches.length > 1) {
+    matches.sort();
+    return { kind: 'ambiguous', query: trimmed, candidates: matches };
+  }
+  return { kind: 'not_found', query: trimmed };
+}
+
+/* ── outbound port (composition root → plugin) ──────────────────── */
+
+/** Bound atomically: a missing bag used to crash at mount when index mutated it field by field. */
+export interface SubagentPort {
+  applyReplySession(paneId: string, sessionFile: string | null): void;
+  reconcileOnReply(paneId: string): string[];
+  listRunningSubs(): Array<{ paneId: string; description: string }>;
+  settleStatLine(paneId: string): Promise<string | null>;
+}
+
+export interface SubagentPortBox {
+  current: SubagentPort | null;
+}
+
+export function emptySubagentPortBox(): SubagentPortBox {
+  return { current: null };
 }

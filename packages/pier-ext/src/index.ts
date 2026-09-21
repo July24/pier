@@ -68,7 +68,7 @@ import { RESERVED_ROLE_NAMES, roleLayers } from './role-loader.ts';
 import { formatPaneTitle } from './pane-title.ts';
 import { registerSlimFrame, updateSlimFrame } from './slim-frame.ts';
 import { planIndexMode } from './index-runtime.ts';
-import { emptySubagentPortBox } from './subagent-port.ts';
+import { emptySubagentPortBox } from './subagent-core.ts';
 import { createNoticeBuffer } from './index-notices.ts';
 import { handlePipeRequest } from './index-pipe.ts';
 import { installWriteLocks } from './index-locks.ts';
@@ -1143,7 +1143,7 @@ export default async function (pi: ExtensionAPI) {
 
   /* Workbench plugins (subagent/terminal + cordis) are herdr-master only.
    * Bare pi and worker panes mount todo only so unused tools never appear.
-   * Dynamic import: worker/bare-pi must never load bootstrap/subagent-scope (C3). */
+   * Dynamic import: worker/bare-pi must never load bootstrap/subagent-poller (C3). */
   if (mode.composeMaster) {
     const { mountMasterPlugins } = await import('./index-master.ts');
     await mountMasterPlugins({

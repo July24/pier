@@ -1,33 +1,33 @@
 /**
- * Controlled mirror of workbench heat-layout for spawn-time pane.split ratio.
+ * Controlled mirror of workbench heat-layout for spawn-time pane.split ratio — do NOT merge with
+ * pier-workbench/src/heat-layout.ts (npm pi-pier has no workbench, and the workbench checkout has
+ * no pi-pier). Only planSpawnSplitRatio / simulateSplit / SPAWN_PLACEHOLDER_ID / fromShapeTree /
+ * LayoutNode are the interface; the weights stay in lockstep with
+ * packages/pier-workbench/test/heat-grid.test.ts.
  *
- * Cannot import pier-workbench (npm pi-pier has no workbench; workbench user-mode
- * checkout has no pi-pier). Canonical tree shape matches workbench LayoutNode.
- * Lockstep: packages/pier-workbench/test/heat-grid.test.ts.
- *
- * herdr v0.9.1 src/layout.rs split_at: first = original, second = new, ratio = first share.
+ * herdr src/layout.rs split_at: first = original, second = new, ratio = first share.
  */
 import { type ShapeNode } from './grid-shape.ts';
 
 export const SPAWN_PLACEHOLDER_ID = '__pier_new__';
-export const RATIO_FLOOR = 0.10;
-export const FOCUS_SHARE = 0.72;
-export const FOCUS_SHARE_BLOCKED = 0.60;
-export const MAX_AUTO_LAYOUT_PANES = 10;
-export const BLOCKED_WEIGHT = 3;
-export const ASK_WEIGHT = 2.5;
-export const WORKING_WEIGHT = 1.4;
-export const IDLE_WEIGHT = 1;
-export const SLIM_THRESHOLD = 4;
-export const SLIM_FACTOR = 0.6;
+const RATIO_FLOOR = 0.10;
+const FOCUS_SHARE = 0.72;
+const FOCUS_SHARE_BLOCKED = 0.60;
+const MAX_AUTO_LAYOUT_PANES = 10;
+const BLOCKED_WEIGHT = 3;
+const ASK_WEIGHT = 2.5;
+const WORKING_WEIGHT = 1.4;
+const IDLE_WEIGHT = 1;
+const SLIM_THRESHOLD = 4;
+const SLIM_FACTOR = 0.6;
 
 /** Same shape as pier-workbench heat-layout LayoutNode. */
 export type LayoutNode =
   | { type: 'pane'; pane_id: string }
   | { type: 'split'; direction: 'right' | 'down'; ratio: number; first: LayoutNode; second: LayoutNode };
 
-export type AgentStatusMap = Record<string, string>;
-export type AskFlagMap = Record<string, boolean>;
+type AgentStatusMap = Record<string, string>;
+type AskFlagMap = Record<string, boolean>;
 
 /** parseShapeTree (paneId) → LayoutNode (pane_id). */
 export function fromShapeTree(node: ShapeNode): LayoutNode {
@@ -42,15 +42,15 @@ export function fromShapeTree(node: ShapeNode): LayoutNode {
   };
 }
 
-export function countPanes(node: LayoutNode): number {
+function countPanes(node: LayoutNode): number {
   return node.type === 'pane' ? 1 : countPanes(node.first) + countPanes(node.second);
 }
 
-export function flattenPanes(node: LayoutNode): string[] {
+function flattenPanes(node: LayoutNode): string[] {
   return node.type === 'pane' ? [node.pane_id] : [...flattenPanes(node.first), ...flattenPanes(node.second)];
 }
 
-export function containsPane(node: LayoutNode, paneId: string): boolean {
+function containsPane(node: LayoutNode, paneId: string): boolean {
   if (node.type === 'pane') return node.pane_id === paneId;
   return containsPane(node.first, paneId) || containsPane(node.second, paneId);
 }

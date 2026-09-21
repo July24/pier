@@ -56,14 +56,11 @@ export function shouldClosePane(opts: {
 }
 
 /* ── Isolate worktree collection (why the rules are this narrow) ──────
- * The first version treated ANY branch under `refs/heads/pier/` as pier-owned, so
- * every pier master session swept the whole namespace. A worker session lives in
- * exactly such a worktree, and its own branch is trivially an ancestor of its own
- * HEAD and clean once it commits — so the sweep deleted the worktree the process
- * was running in (observed twice: 01a06ae3-era workers and the env-hook worker).
- * Ownership must therefore be explicit: only branches registered in THIS session's
- * subagent registry are candidates, the current working directory is never a
- * candidate, and untracked `pier/*` branches require an explicit opt-in.
+ * `refs/heads/pier/*` is NOT proof of pier ownership: a worker session lives in such a
+ * worktree, its branch is trivially an ancestor of its own HEAD and clean once it commits,
+ * so a namespace-wide sweep deletes the worktree its own process is running in.
+ * Only branches registered in THIS session's registry are candidates, cwd is never a
+ * candidate, and untracked `pier/*` branches need an explicit opt-in.
  */
 
 /** True when `path` is `parent` or lives inside it (both resolved, no I/O). */

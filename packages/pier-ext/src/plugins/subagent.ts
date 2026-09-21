@@ -1,39 +1,53 @@
 /**
- * core/subagent — master-only loader entry (tools, registry, poller, GC).
+ * subagent — master-only plugin entry: tool registration, action dispatch, the resume / send /
+ * interrupt / output / role / list actions, and port binding.
  *
- * Inbound deps via `pi-herdr.subagent-deps`. Outbound pipe/settle queries bind
- * atomically onto `port.current` (see subagent-port.ts). Settlement reconcile
- * stays in index session state; this plugin consumes it through the port.
+ * Inbound deps arrive via `pi-herdr.subagent-deps`; outbound pipe/settle queries bind atomically
+ * onto `port.current`. Settlement reconcile stays in index session state and is consumed here.
  */
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
-import { join, dirname } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import type { PiSurface } from '../pi-surface.ts';
 import type { HerdrClientLike } from '../herdr-client.ts';
-import { Semaphore, buildAliveNotice, isAlive, tabNameForTask, type SubEntry } from '../subagent-core.ts';
-import { applyReportedSessionFile, appendHistory, preferredHistoryFile, inheritOutcome, latestGeneration, readHistory, type HistoryEntry } from '../history-store.ts';
+import {
+  Semaphore,
+  agoText,
+  ambiguousIdError,
+  buildAliveNotice,
+  idParam,
+  isAlive,
+  newestPerTaskId,
+  resolveTaskIdPrefix,
+  tabNameForTask,
+  type AliveProbe,
+  type SubEntry,
+  type SubagentPort,
+  type SubagentPortBox,
+} from '../subagent-core.ts';
+import {
+  appendHistory,
+  applyReportedSessionFile,
+  inheritOutcome,
+  latestGeneration,
+  preferredHistoryFile,
+  readHistory,
+  type HistoryEntry,
+} from '../history-store.ts';
 import { platformPaths } from '../platform-paths.ts';
-import type { SubagentPort, SubagentPortBox } from '../subagent-port.ts';
-import { toolError, ToolError } from '../tool-error.ts'
-
-/** Raw tool arguments: every field is validated inside the action handlers. */
-type ToolParams = Record<string, unknown> | undefined;;
+import { toolError, ToolError } from '../tool-error.ts';
 import { pipeNameFor, pipeRequestTo } from '../pipe-channel.ts';
 import type { TerminalStateSlot } from './terminal.ts';
-import { createGitIo } from '../subagent-git-io.ts';
-import { createSessionIo } from '../subagent-session-io.ts';
-import { bareSessionId, sessionFileById } from '../session-tail.ts';
-import { createSpawner } from '../subagent-spawn.ts';
+import { bareSessionId, resolveSessionFileValue } from '../session-tail.ts';
+import { createGitIo, createSpawnAction, createSpawner } from '../subagent-spawn.ts';
 import type { JevRuntime } from '../jev-client.ts';
-import { createPoller } from '../subagent-poll-loop.ts';
-import { createGcController } from '../subagent-gc.ts';
-import { createSubagentRegistry } from '../subagent-registry.ts';
-import { createSpawnAction } from '../subagent-execute.ts';
-import type { SubagentOutputCursor } from '../subagent-output-core.ts';
-import { executeSubagentList } from '../subagent-list-action.ts';
-import { executeSubagentOutput } from '../subagent-output-action.ts';
-import { resolveTaskIdPrefix } from '../subagent-resolution.ts';
+import { createPoller } from '../subagent-poller.ts';
+import { createGcController, createSubagentRegistry } from '../subagent-gc.ts';
+import { createSessionIo, executeSubagentOutput, type SubagentOutputCursor } from '../subagent-session.ts';
 import type { RoutingTelemetryRecord } from '../routing-telemetry.ts';
+
+/** Raw tool arguments: every field is validated inside the action handlers. */
+type ToolParams = Record<string, unknown> | undefined;
 
 interface SubagentEnv {
   paneId: string;
@@ -53,10 +67,8 @@ interface SubagentDeps {
   reconcileOnSettlement: (description: string, outcome: 'settled' | 'failed') => string[];
   withReconcileNotes: (base: string, notes: readonly string[]) => string;
   claimSettleNotice: (key: string) => boolean;
-  /**
-   * Settlement notice injector from index: buffer while busy, flush at turn_end.
-   * Tests may omit it and fall back to pi.sendUserMessage(followUp).
-   */
+  /** Settlement notice injector from index: buffer while busy, flush at turn_end.
+   * Tests may omit it and fall back to pi.sendUserMessage(followUp). */
   deliverNotice?: (content: string, paneId?: string) => Promise<void>;
   /** Panes whose settlement notice is still buffered (GC exemption). */
   noticePending?: () => ReadonlySet<string>;
@@ -67,7 +79,6 @@ interface SubagentDeps {
   /** Phase 0 routing telemetry (RFC rfc-jev-role-routing §8): spawn profile append; absent in tests. */
   logRouting?: (row: RoutingTelemetryRecord) => void;
 }
-
 
 const SUBAGENT_DESCRIPTION = [
   'Delegate a self-contained subtask to an isolated subagent that runs in its own herdr pane as an interactive pi session (separate context window; it does NOT see this conversation). A human can also open that pane and talk to the subagent directly.',
@@ -95,12 +106,6 @@ function defaultAgentSessionsDir(): string {
   return join(base, 'sessions');
 }
 
-function agentRootDir(): string {
-  return dirname(defaultAgentSessionsDir());
-}
-
-
-
 export default function subagentPlugin(ctx: Context): void {
   const surface = ctx.get('pi-herdr.surface') as PiSurface<object>;
   const d = ctx.get('pi-herdr.subagent-deps') as SubagentDeps;
@@ -111,40 +116,66 @@ export default function subagentPlugin(ctx: Context): void {
   };
   const scoped = surface.forModule(import.meta.url);
 
-  const runtime = {
-    nodePath: process.execPath,
-    cliPath: process.argv[1] ?? '',
-    extPath: d.extPath,
-  };
+  const runtime = { nodePath: process.execPath, cliPath: process.argv[1] ?? '', extPath: d.extPath };
   const subSemaphore = new Semaphore(SUBAGENT_CONCURRENCY);
-  /** B4 timestamps machine injection so grace-period working events are not mistaken for takeover. */
+  /** B4: timestamps machine injection so grace-period working events are not mistaken for takeover. */
   const lastMachineInjectAt = new Map<string, number>();
-  /* Persist the subagent registry as custom branch state so parent restarts can rebuild it. */
+  /* Registry persisted as custom branch state so a parent restart can rebuild it. */
   const subs = new Map<string, SubEntry>();
-  /** In-memory cursor for incremental subagent output observation. */
   const outputCursors = new Map<string, SubagentOutputCursor>();
-  /** D98 excludes branches during worktree-add-to-registry races from orphan collection. */
+  /** D98: excludes branches during the worktree-add-to-registry race from orphan collection. */
   const pendingIsolateBranches = new Set<string>();
-  /** D50 tracks the latest machine request per pane for interrupt claims and poll deduplication. */
+  /** Latest machine request per pane, for interrupt claims and poll deduplication. */
   const lastRequestIdByPane = new Map<string, string>();
+  /** Deduplicates gate notices while blocked but permits a later, distinct human question. */
+  const blockedGateNotified = new Set<string>();
+
+  /** B5: latest non-empty outcome per task, so closed generations do not hide settled results. */
+  const lastOutcomeByTask = new Map<string, string>();
+
+  function histFile(cwd: string): string {
+    return preferredHistoryFile(dirname(defaultAgentSessionsDir()), cwd);
+  }
+
+  function toHistory(e: SubEntry, outcome: string | null): HistoryEntry {
+    return {
+      taskId: e.taskId,
+      kind: e.kind,
+      paneId: e.paneId,
+      tabId: e.tabId,
+      tabName: e.tabName,
+      workspaceId: env?.workspaceId ?? '',
+      cwd: e.cwd,
+      description: e.description,
+      sessionFile: e.sessionFile,
+      launchCommand: e.launchCommand,
+      status: e.status,
+      outcome,
+      createdAt: e.createdAt,
+      consumedAt: e.consumedAt ?? null,
+      closedAt: null,
+      revivedFrom: e.revivedFrom ?? null,
+    };
+  }
+
+  function writeHistory(e: SubEntry, patch?: Partial<HistoryEntry>, via?: string): void {
+    const outcome = inheritOutcome(lastOutcomeByTask.get(e.taskId), patch?.outcome);
+    if (typeof outcome === 'string' && outcome.length > 0) lastOutcomeByTask.set(e.taskId, outcome);
+    appendHistory(histFile(e.cwd), { ...toHistory(e, outcome), ...(patch ?? {}), ...(via ? { via } : {}) });
+  }
 
   const registry = createSubagentRegistry({ pi, client, subs, writeHistory });
   const { persist: persistSubs } = registry;
-  /** E2 deduplicates gate notices while blocked but permits a later, distinct human question. */
-  const blockedGateNotified = new Set<string>();
   const git = createGitIo();
 
   const boundPort: SubagentPort = {
     applyReplySession(paneId, sessionFile) {
       const entry = subs.get(paneId);
       if (!entry) return;
-      // p24-class (01a0bd3c): workers self-report a BARE session id over the pipe; the
-      // .jsonl-only guard in applyReportedSessionFile used to discard it, freezing a
-      // mis-attributed sessionFile forever. Map the id to its transcript path first so
-      // the authoritative self-report corrects the ledger.
-      const reported = typeof sessionFile === 'string' && !/\.jsonl$/i.test(sessionFile)
-        ? sessionFileById(entry.cwd, defaultAgentSessionsDir(), sessionFile)
-        : sessionFile;
+      // Workers self-report a BARE session id over the pipe; the .jsonl-only guard in
+      // applyReportedSessionFile would discard it and freeze a mis-attributed sessionFile
+      // forever. Map the id to its transcript path first so the self-report corrects the ledger.
+      const reported = resolveSessionFileValue(entry.cwd, defaultAgentSessionsDir(), sessionFile);
       const next = applyReportedSessionFile(entry.sessionFile, reported);
       if (next === entry.sessionFile) return;
       entry.sessionFile = next;
@@ -169,125 +200,12 @@ export default function subagentPlugin(ctx: Context): void {
   ctx.effect(() => () => {
     if (port.current === boundPort) port.current = null;
   }, 'subagent-port');
-  scoped.on('session_start', async (_event: unknown, eventCtx: unknown) => {
-    registry.rebuild(eventCtx);
-    await registry.sweepZombieRunning();
-    await recoverRunningPollers('session_start');
-  });
-  scoped.on('session_tree', async (_event: unknown, eventCtx: unknown) => {
-    registry.rebuild(eventCtx);
-    await registry.sweepZombieRunning();
-    await recoverRunningPollers('session_tree');
-  });
-
-  /** P0-2 (01a0bd3a aftermath): a restarted master used to lose every running subagent's
-   * poller — settle notices stopped arriving and ledger rows stayed 'running' until a
-   * manual send re-armed one by accident. Re-arm pollers for live running panes; the
-   * 'recover-*' requestId is never echoed by a worker, so this poller's settle claim wins. */
-  async function recoverRunningPollers(via: string): Promise<void> {
-    if (!client.available) return;
-    const running = [...subs.values()].filter((s) => s.background && s.status === 'running' && !pollers.has(s.paneId));
-    if (running.length === 0) return;
-    let livePaneIds: ReadonlySet<string>;
-    try {
-      livePaneIds = new Set((await client.listPanes()).map((p) => p.paneId));
-    } catch {
-      return; // liveness lookup failed → do not guess
-    }
-    const recovered: string[] = [];
-    for (const entry of running) {
-      if (!livePaneIds.has(entry.paneId)) continue; // zombie sweep already closed those
-      try {
-        await startPoller(entry.paneId, entry.cwd, entry.createdAt, entry.createdAt, entry.description, `recover-${via}-${entry.paneId}`);
-        recovered.push(`${entry.paneId} (${entry.description})`);
-      } catch {
-        /* one failure must not block the rest */
-      }
-    }
-    if (recovered.length > 0) {
-      try {
-        await injectNotice(
-          `Session recovery (${via}): ${recovered.length} background subagent(s) still running — settlement watch re-armed for: ${recovered.join('; ')}.`,
-        );
-      } catch {
-        /* non-fatal */
-      }
-    }
-  }
-
-  /* ── B1 liveness rewrite for subagent errors ─────────────────────
-   * A false no-output result caused the model to seize work from a healthy subagent. Probe
-   * agent.list and session mtime before the tool result enters model context; if alive, emit the
-   * same notice as A2 backgrounding. This hook enforces what prompting alone could not. */
-  scoped.on('tool_result', async (rawEvent: unknown) => {
-    const event = (rawEvent ?? {}) as { toolName?: string; isError?: boolean; content?: Array<{ type: string; text?: string }> };
-    if (event.toolName !== 'subagent' || !event.isError) return;
-    // Extract only pane ids carried by our own errors; leave unrelated errors untouched.
-    const errText = (event.content ?? []).map((c) => c.text ?? '').join(' ');
-    const paneId = [...subs.keys()].find((id) => errText.includes(id))
-      ?? (errText.match(/\bw[A-Za-z0-9]+:p\d+\b/) ?? [])[0];
-    if (!paneId) return;
-    const entry = subs.get(paneId);
-    if (!entry || entry.status === 'settled' || entry.status === 'consumed') return;
-    const probe = await probeAlive(paneId, entry.cwd);
-    if (!isAlive(probe, Date.now())) return; // Preserve the original error only when the agent is truly dead.
-    // Move a live agent to the poller so its eventual result can replace the false error.
-    if (!pollers.has(paneId)) {
-      entry.background = true;
-      startPoller(paneId, entry.cwd, entry.createdAt, entry.createdAt, entry.description, lastRequestIdByPane.get(paneId) ?? `probe-${paneId}`);
-      persistSubs();
-    }
-    const notice = buildAliveNotice(
-      { paneId, description: entry.description, scenario: 'error-alive', probe },
-      Date.now(),
-    );
-    return { content: [{ type: 'text', text: notice }] };
-  });
-
-  function histFile(cwd: string): string {
-    return preferredHistoryFile(agentRootDir(), cwd);
-  }
-
-  function toHistory(e: SubEntry, outcome: string | null): HistoryEntry {
-    return {
-      taskId: e.taskId,
-      kind: e.kind,
-      paneId: e.paneId,
-      tabId: e.tabId,
-      tabName: e.tabName,
-      workspaceId: env?.workspaceId ?? '',
-      cwd: e.cwd,
-      description: e.description,
-      sessionFile: e.sessionFile,
-      launchCommand: e.launchCommand,
-      status: e.status,
-      outcome,
-      createdAt: e.createdAt,
-      consumedAt: e.consumedAt ?? null,
-      closedAt: null,
-      revivedFrom: e.revivedFrom ?? null,
-    };
-  }
-
-  /** B5 retains the latest non-empty outcome because closed generations otherwise hid settled
-   * results behind outcome:null in latest-generation views. */
-  const lastOutcomeByTask = new Map<string, string>();
-
-  function writeHistory(e: SubEntry, patch?: Partial<HistoryEntry>, via?: string): void {
-    const outcome = inheritOutcome(lastOutcomeByTask.get(e.taskId), patch?.outcome);
-    if (typeof outcome === 'string' && outcome.length > 0) lastOutcomeByTask.set(e.taskId, outcome);
-    appendHistory(histFile(e.cwd), { ...toHistory(e, outcome), ...(patch ?? {}), ...(via ? { via } : {}) });
-  }
 
   const injectNotice = (content: string): Promise<void> =>
     d.deliverNotice ? d.deliverNotice(content)
       : (pi.sendUserMessage?.(content, { deliverAs: 'followUp' }) ?? Promise.resolve());
 
-  const session = createSessionIo({
-    client,
-    getSessionId: d.getSessionId,
-    sessionsDir: defaultAgentSessionsDir,
-  });
+  const session = createSessionIo({ client, getSessionId: d.getSessionId, sessionsDir: defaultAgentSessionsDir });
   const spawn = createSpawner({ client, env, runtime, git });
   const poller = createPoller({
     client,
@@ -305,6 +223,7 @@ export default function subagentPlugin(ctx: Context): void {
     claimSettleNotice: d.claimSettleNotice,
     ...(d.jev ? { jev: d.jev } : {}),
   });
+  const { startPoller, pollers } = poller;
   const gc = createGcController({
     client,
     env,
@@ -319,26 +238,90 @@ export default function subagentPlugin(ctx: Context): void {
   });
   gc.startTicker(ctx);
   scoped.on('turn_start', () => gc.onTurnStart());
-
   const { readAskFlag, probeAlive } = session;
   const { spawnPaneInTaskTab, launchLine, approveFor, waitSubReady, findExistingPane } = spawn;
-  const { startPoller, pollers } = poller;
 
-  /** Revive a closed task; resume and automatic send_message revival share this path. */
+  /** P0-2: a restarted master used to lose every running subagent's poller — settle notices
+   * stopped arriving and ledger rows stayed 'running'. Re-arm pollers for live running panes;
+   * the `recover-*` requestId is never echoed by a worker, so this poller's settle claim wins. */
+  async function recoverRunningPollers(via: string): Promise<void> {
+    if (!client.available) return;
+    const running = [...subs.values()].filter((s) => s.background && s.status === 'running' && !pollers.has(s.paneId));
+    if (running.length === 0) return;
+    let livePaneIds: ReadonlySet<string>;
+    try {
+      livePaneIds = new Set((await client.listPanes()).map((p) => p.paneId));
+    } catch {
+      return; // liveness lookup failed → do not guess
+    }
+    const recovered: string[] = [];
+    for (const entry of running) {
+      if (!livePaneIds.has(entry.paneId)) continue; // zombie sweep already closed those
+      try {
+        await startPoller(entry.paneId, entry.cwd, entry.createdAt, entry.description, `recover-${via}-${entry.paneId}`);
+        recovered.push(`${entry.paneId} (${entry.description})`);
+      } catch {
+        /* one failure must not block the rest */
+      }
+    }
+    if (recovered.length > 0) {
+      try {
+        await injectNotice(
+          `Session recovery (${via}): ${recovered.length} background subagent(s) still running — settlement watch re-armed for: ${recovered.join('; ')}.`,
+        );
+      } catch { /* non-fatal */ }
+    }
+  }
+
+  scoped.on('session_start', async (_event: unknown, eventCtx: unknown) => {
+    registry.rebuild(eventCtx);
+    await registry.sweepZombieRunning();
+    await recoverRunningPollers('session_start');
+  });
+  scoped.on('session_tree', async (_event: unknown, eventCtx: unknown) => {
+    registry.rebuild(eventCtx);
+    await registry.sweepZombieRunning();
+    await recoverRunningPollers('session_tree');
+  });
+
+  /** B1 liveness rewrite for subagent errors: a false no-output result made the model seize work
+   * from a healthy subagent, so probe before the tool result enters model context. */
+  scoped.on('tool_result', async (rawEvent: unknown) => {
+    const event = (rawEvent ?? {}) as { toolName?: string; isError?: boolean; content?: Array<{ type: string; text?: string }> };
+    if (event.toolName !== 'subagent' || !event.isError) return;
+    // Extract only pane ids carried by our own errors; leave unrelated errors untouched.
+    const errText = (event.content ?? []).map((c) => c.text ?? '').join(' ');
+    const paneId = [...subs.keys()].find((id) => errText.includes(id))
+      ?? (errText.match(/\bw[A-Za-z0-9]+:p\d+\b/) ?? [])[0];
+    if (!paneId) return;
+    const entry = subs.get(paneId);
+    if (!entry || entry.status === 'settled' || entry.status === 'consumed') return;
+    const probe = await probeAlive(paneId, entry.cwd);
+    if (!isAlive(probe, Date.now())) return; // keep the original error only when the agent is truly dead
+    // Move a live agent to the poller so its eventual result replaces the false error.
+    if (!pollers.has(paneId)) {
+      entry.background = true;
+      startPoller(paneId, entry.cwd, entry.createdAt, entry.description, lastRequestIdByPane.get(paneId) ?? `probe-${paneId}`);
+      persistSubs();
+    }
+    return {
+      content: [{ type: 'text', text: buildAliveNotice({ paneId, description: entry.description, scenario: 'error-alive', probe }, Date.now()) }],
+    };
+  });
+
+  /** Revive a closed task; resume and automatic send revival share this path. */
   async function reviveEntry(entry: SubEntry): Promise<SubEntry> {
-    // D98: Do not revive a released isolate worktree because its directory is gone and cwd is invalid.
+    // D98: never revive a released isolate worktree — its directory is gone and cwd is invalid.
     if (entry.isolate?.releasedAt != null) {
       throw new Error(`isolate worktree ${entry.isolate.branch} was released (merged) — delegate a new subagent instead`);
     }
     const latest = latestGeneration(readHistory(histFile(entry.cwd)), entry.taskId) ?? entry;
-    // 01a0bd3a: never relaunch the master's own transcript in a worker pane (two pi
-    // processes competing on one jsonl). A mis-attributed ledger entry degrades to a
-    // fresh conversation instead.
-    const ownId = bareSessionId(d.getSessionId());
+    // Never relaunch the master's own transcript in a worker pane (two pi processes competing on
+    // one jsonl): a mis-attributed ledger entry degrades to a fresh conversation instead.
     const resumeFile = latest.sessionFile && /\.jsonl$/.test(latest.sessionFile)
-      && bareSessionId(latest.sessionFile) !== ownId
+      && bareSessionId(latest.sessionFile) !== bareSessionId(d.getSessionId())
       ? latest.sessionFile : null;
-    // D86 trust matches spawn: pass -a only for the master's checkout/worktrees; revive has no tool context, so use process cwd.
+    // D86 trust matches spawn; revive has no tool context, so use the process cwd.
     const approve = await approveFor(entry.cwd, process.cwd());
     const spawned = await spawnPaneInTaskTab(
       { desiredTab: entry.tabName || latest.tabName || null, description: entry.description },
@@ -348,163 +331,36 @@ export default function subagentPlugin(ctx: Context): void {
     );
     const ready = await waitSubReady(entry.cwd, spawned.paneId);
     if (!ready.ok) throw new Error(ready.message);
-    entry.paneId = spawned.paneId;
-    entry.tabId = spawned.tabId;
-    entry.tabName = spawned.tabName;
-    entry.sessionFile = resumeFile;
-    entry.status = 'running';
-    entry.consumedAt = null;
-    entry.revivedFrom = latest.paneId;
-    entry.launchCommand = [launchLine(resumeFile, null, approve)];
-    entry.createdAt = Date.now();
+    Object.assign(entry, {
+      paneId: spawned.paneId,
+      tabId: spawned.tabId,
+      tabName: spawned.tabName,
+      sessionFile: resumeFile,
+      status: 'running' as const,
+      consumedAt: null,
+      revivedFrom: latest.paneId,
+      launchCommand: [launchLine(resumeFile, null, approve)],
+      createdAt: Date.now(),
+    });
     writeHistory(entry, undefined, 'revive');
     return entry;
   }
 
-
-  async function executeSubagentResume(params: Record<string, unknown> | undefined, toolCtx: unknown) {
-      if (!client.available) {
-        return toolError('requires a herdr-managed pane.');
-      }
-      const cwd = (toolCtx as { cwd?: string }).cwd ?? process.cwd();
-      const rawTaskId = String(params?.taskId ?? params?.agentId ?? '').trim();
-      if (!rawTaskId) {
-        return toolError('missing taskId for resume (see action list or delegation ledger).');
-      }
-      const history = readHistory(histFile(cwd));
-      const resolution = resolveTaskIdPrefix(rawTaskId, history.map((e) => e.taskId));
-      if (resolution.kind === 'too_short') {
-        return toolError(`Error: task id prefix "${rawTaskId}" is too short (minimum 4 characters).`);
-      }
-      if (resolution.kind === 'ambiguous') {
-        const list = resolution.candidates.slice(0, 5).join(', ');
-        const more = resolution.candidates.length > 5 ? `, ... (+${resolution.candidates.length - 5} more)` : '';
-        return toolError(`Error: ambiguous task id "${rawTaskId}" matches ${resolution.candidates.length} tasks: ${list}${more}`);
-      }
-      if (resolution.kind === 'not_found') {
-        return toolError(`Error: no history for task "${rawTaskId}" in this workspace.`);
-      }
-      const taskId = resolution.taskId;
-      const latest = latestGeneration(history, taskId);
-      if (!latest) {
-        return toolError(`Error: no history for task "${taskId}" in this workspace.`);
-      }
-      const release = await subSemaphore.acquire();
-      try {
-        // D94: Reuse an existing pane for the same session to avoid competing pi processes.
-        const existing = await findExistingPane(latest.sessionFile);
-        // 01a0bd3a: when the ledger's sessionFile was mis-attributed to the master's own
-        // transcript, this lookup matched the MASTER pane ("reused existing pane with same
-        // session"), registering the master as its own subagent; the poller later consumed
-        // it and GC closed the pane mid-run. Never adopt self — refuse instead, because
-        // falling through to revive would relaunch the master transcript in a new pane.
-        if (existing?.paneId === env?.paneId) {
-          return toolError(
-            `Error: task ${taskId} is attributed to the master's own session (mis-recorded sessionFile in the ledger); it cannot be resumed here — spawn a fresh subagent for this work instead.`,
-          );
-        }
-        if (existing) {
-          const entry: SubEntry = {
-            taskId,
-            kind: latest.kind,
-            paneId: existing.paneId,
-            tabId: existing.tabId,
-            tabName: latest.tabName ?? tabNameForTask(latest.description),
-            cwd,
-            description: latest.description,
-            background: true,
-            status: 'running',
-            sessionFile: latest.sessionFile ?? null,
-            launchCommand: latest.launchCommand,
-            createdAt: Date.now(),
-            revivedFrom: latest.paneId,
-            consumedAt: null,
-          };
-          subs.set(entry.paneId, entry);
-          persistSubs();
-          writeHistory(entry, undefined, 'resume');
-          return {
-            content: [{
-              type: 'text',
-              text: `resumed subagent ${entry.paneId} from task ${taskId} (reused existing pane with same session; pi still running there).`,
-            }],
-            details: { paneId: entry.paneId, taskId },
-          };
-        }
-        // Create a new pane only when no existing one can be reused.
-        const entry: SubEntry = {
-          taskId,
-          kind: latest.kind,
-          paneId: '',
-          tabId: '',
-          tabName: latest.tabName ?? tabNameForTask(latest.description),
-          cwd,
-          description: latest.description,
-          background: true,
-          status: 'running',
-          sessionFile: latest.sessionFile,
-          launchCommand: latest.launchCommand,
-          createdAt: Date.now(),
-          revivedFrom: latest.paneId,
-          consumedAt: null,
-        };
-        await reviveEntry(entry);
-        subs.set(entry.paneId, entry);
-        persistSubs();
-        return {
-          content: [{
-            type: 'text',
-            text: entry.sessionFile
-              ? `resumed subagent ${entry.paneId} from task ${taskId} (session restored).`
-              : `resumed subagent ${entry.paneId} from task ${taskId} (session file missing; fresh conversation).`,
-          }],
-          details: { paneId: entry.paneId, taskId },
-        };
-      } catch (err) {
-        if (err instanceof ToolError) throw err;
-        return toolError(`Error: failed to resume task "${taskId}": ${(err as Error).message}`);
-      } finally {
-        release();
-      }
-  }
-
-  const listActionDeps = {
-    subs: () => subs.values(),
-    probeAlive,
-    readAskFlag,
-  };
-  function resolveSubEntry(
-    rawId: string,
-    cwd?: string,
-  ): { entry: SubEntry } | { error: string } {
-    if (!rawId) {
-      return { error: 'Error: unknown subagent id "" (see action list)' };
-    }
+  /** Resolve a pane id or task-id prefix against the live registry, then the ledger (revives a closed row). */
+  function resolveSubEntry(rawId: string, cwd?: string): { entry: SubEntry } | { error: string } {
+    if (!rawId) return { error: 'Error: unknown subagent id "" (see action list)' };
     const direct = subs.get(rawId);
     if (direct) return { entry: direct };
 
-    const byTaskId = new Map<string, SubEntry>();
-    for (const sub of subs.values()) {
-      const prev = byTaskId.get(sub.taskId);
-      if (!prev || sub.createdAt >= prev.createdAt) byTaskId.set(sub.taskId, sub);
-    }
+    const byTaskId = newestPerTaskId(subs.values());
     const res = resolveTaskIdPrefix(rawId, byTaskId.keys());
-    if (res.kind === 'resolved') {
-      return { entry: byTaskId.get(res.taskId)! };
-    }
-    if (res.kind === 'ambiguous') {
-      const list = res.candidates.slice(0, 5).join(', ');
-      const more = res.candidates.length > 5 ? `, ... (+${res.candidates.length - 5} more)` : '';
-      return { error: `Error: ambiguous subagent id "${rawId}" matches ${res.candidates.length} tasks: ${list}${more}` };
-    }
-    if (res.kind === 'too_short') {
-      return { error: `Error: subagent id prefix "${rawId}" is too short (minimum 4 characters).` };
-    }
+    if (res.kind === 'resolved') return { entry: byTaskId.get(res.taskId)! };
+    if (res.kind === 'ambiguous') return { error: ambiguousIdError('subagent id', rawId, res.candidates) };
+    if (res.kind === 'too_short') return { error: `Error: subagent id prefix "${rawId}" is too short (minimum 4 characters).` };
 
     if (cwd) {
       const hist = readHistory(histFile(cwd));
-      const histTaskIds = Array.from(new Set(hist.map((e) => e.taskId)));
-      const histRes = resolveTaskIdPrefix(rawId, histTaskIds);
+      const histRes = resolveTaskIdPrefix(rawId, Array.from(new Set(hist.map((e) => e.taskId))));
       if (histRes.kind === 'resolved') {
         const latest = latestGeneration(hist, histRes.taskId);
         if (latest) {
@@ -528,147 +384,226 @@ export default function subagentPlugin(ctx: Context): void {
           return { entry };
         }
       }
-      if (histRes.kind === 'ambiguous') {
-        const list = histRes.candidates.slice(0, 5).join(', ');
-        const more = histRes.candidates.length > 5 ? `, ... (+${histRes.candidates.length - 5} more)` : '';
-        return { error: `Error: ambiguous subagent id "${rawId}" matches ${histRes.candidates.length} tasks: ${list}${more}` };
-      }
+      if (histRes.kind === 'ambiguous') return { error: ambiguousIdError('subagent id', rawId, histRes.candidates) };
     }
-
     return { error: `Error: unknown subagent id "${rawId}" (see action list)` };
   }
 
-  async function executeSubagentSend(params: Record<string, unknown> | undefined, toolCtx?: unknown) {
-      const rawId = String(params?.agentId ?? params?.taskId ?? '').trim();
-      const cwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
-      const resolved = resolveSubEntry(rawId, cwd);
-      if ('error' in resolved) {
-        return toolError(resolved.error);
-      }
-      const entry = resolved.entry;
-      const spawnedAt = Date.now();
-      try {
-        // A closed task is revived automatically because the pane is only a temporary host.
-        if (entry.status === 'closed') {
-          await reviveEntry(entry);
-          subs.set(entry.paneId, entry);
-          persistSubs();
-        }
-        // M11 (D46): follow_up uses the extension pipe. B3 adds steering so supplemental instructions reach a long-running worker
-        // within seconds during a tool-call gap; the old followUp queue waited for the entire run and caused 20-minute rework (01a03c0d).
-        const ready = await waitSubReady(entry.cwd, entry.paneId);
-        if (!ready.ok) throw new Error(ready.message);
-        const fuId = `fu-${Date.now()}`;
-        const res = await pipeRequestTo(entry.cwd, entry.paneId, {
-          type: 'follow_up',
-          id: fuId,
-          text: String(params?.message ?? ''),
-          // Reply pipe is the MASTER's (bound at session_start with this session's cwd);
-          // entry.cwd would name a dead pipe for cross-repo workers (01a0c282).
-          from: pipeNameFor(cwd, env?.paneId ?? ''),
-          push: true,
-          steer: true,
-        });
-        if (res.type !== 'ok') {
-          throw new Error(`pipe follow_up rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
-        }
-        lastMachineInjectAt.set(entry.paneId, Date.now()); // B4: attribute working state during the observation window.
-        // Regression hardening (D98 liveness evidence): an exception between status='running' and startPoller could leave a ghost
-        // running entry without a poller, never settling and skipped by GC; roll back to the previous status on failure.
-        const prevStatus = entry.status;
-        entry.status = 'running';
-        persistSubs();
-        try {
-          lastRequestIdByPane.set(entry.paneId, fuId);
-          startPoller(entry.paneId, entry.cwd, spawnedAt, Date.now(), entry.description, fuId);
-        } catch (inner) {
-          entry.status = prevStatus;
-          persistSubs();
-          throw inner;
-        }
-        return { content: [{ type: 'text', text: `Message sent to subagent ${entry.paneId}.` }], details: { paneId: entry.paneId } };
-      } catch (err) {
-        return toolError(`Error: failed to reach subagent ${entry.paneId}: ${(err as Error).message}`);
-      }
+  /** Resolve the target row of an id-carrying action, or fail the tool call with the resolver's message. */
+  function targetOf(params: ToolParams, toolCtx: unknown): { entry: SubEntry; cwd: string } {
+    const cwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
+    const resolved = resolveSubEntry(idParam(params, 'agentId', 'taskId'), cwd);
+    if ('error' in resolved) toolError(resolved.error);
+    return { entry: resolved.entry, cwd };
   }
 
-  async function executeSubagentInterrupt(params: Record<string, unknown> | undefined, toolCtx?: unknown) {
-      const rawId = String(params?.agentId ?? params?.taskId ?? '').trim();
-      const cwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
-      const resolved = resolveSubEntry(rawId, cwd);
-      if ('error' in resolved) {
-        return toolError(resolved.error);
-      }
-      const entry = resolved.entry;
-      if (entry.status === 'closed') {
-        // DSH alignment: an idle or finished target is an idempotent no-op.
-        return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (already idle/closed; no-op).` }], details: {} };
-      }
-      try {
-        const res = await pipeRequestTo(entry.cwd, entry.paneId, {
-          type: 'interrupt',
-          id: `int-${Date.now()}`,
-        });
-        if (res.type !== 'ok') {
-          throw new Error(`pipe interrupt rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
-        }
-        // Do not send a settlement notice for an interrupted turn because the requester already knows.
-        const lastId = lastRequestIdByPane.get(entry.paneId);
-        if (lastId) d.claimSettleNotice(`${entry.paneId}:${lastId}`);
-        return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (fire-and-return).` }], details: { paneId: entry.paneId } };
-      } catch (err) {
-        return toolError(`Error: failed to reach subagent ${entry.paneId}: ${(err as Error).message}`);
-      }
+  /** A closed task is revived automatically: the pane is only a temporary host. */
+  async function ensureLive(entry: SubEntry): Promise<void> {
+    if (entry.status !== 'closed') return;
+    await reviveEntry(entry);
+    subs.set(entry.paneId, entry);
+    persistSubs();
   }
-  async function executeSubagentRole(params: Record<string, unknown> | undefined, toolCtx?: unknown) {
-      const rawId = String(params?.agentId ?? params?.taskId ?? '').trim();
-      const cwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
-      const roleName = String(params?.role ?? '').trim();
-      if (!roleName) {
-        return toolError('Error: action "role" requires a target profile in `role` (same resolution as spawn)');
+
+  async function executeSubagentResume(params: ToolParams, toolCtx: unknown) {
+    if (!client.available) return toolError('requires a herdr-managed pane.');
+    const cwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
+    const rawTaskId = idParam(params, 'taskId', 'agentId');
+    if (!rawTaskId) return toolError('missing taskId for resume (see action list or delegation ledger).');
+    const history = readHistory(histFile(cwd));
+    const resolution = resolveTaskIdPrefix(rawTaskId, history.map((e) => e.taskId));
+    if (resolution.kind === 'too_short') {
+      return toolError(`Error: task id prefix "${rawTaskId}" is too short (minimum 4 characters).`);
+    }
+    if (resolution.kind === 'ambiguous') return toolError(ambiguousIdError('task id', rawTaskId, resolution.candidates));
+    if (resolution.kind === 'not_found') return toolError(`Error: no history for task "${rawTaskId}" in this workspace.`);
+    const taskId = resolution.taskId;
+    const latest = latestGeneration(history, taskId);
+    if (!latest) return toolError(`Error: no history for task "${taskId}" in this workspace.`);
+
+    const release = await subSemaphore.acquire();
+    try {
+      // D94: reuse an existing pane for the same session to avoid competing pi processes.
+      const existing = await findExistingPane(latest.sessionFile);
+      // A ledger sessionFile mis-attributed to the master's own transcript would match the MASTER
+      // pane here, registering the master as its own subagent (later consumed, then closed by GC
+      // mid-run). Never adopt self — refuse instead of reviving our own transcript in a new pane.
+      if (existing?.paneId === env?.paneId) {
+        return toolError(
+          `Error: task ${taskId} is attributed to the master's own session (mis-recorded sessionFile in the ledger); it cannot be resumed here — spawn a fresh subagent for this work instead.`,
+        );
       }
-      const resolved = resolveSubEntry(rawId, cwd);
-      if ('error' in resolved) {
-        return toolError(resolved.error);
-      }
-      const entry = resolved.entry;
-      try {
-        // Same revival semantics as send: the pane is only a host, so a closed task comes back first.
-        if (entry.status === 'closed') {
-          await reviveEntry(entry);
-          subs.set(entry.paneId, entry);
-          persistSubs();
-        }
-        const ready = await waitSubReady(entry.cwd, entry.paneId);
-        if (!ready.ok) throw new Error(ready.message);
-        const res = await pipeRequestTo(entry.cwd, entry.paneId, {
-          type: 'role',
-          id: `role-${Date.now()}`,
-          role: roleName,
-        });
-        if (res.type !== 'ok') {
-          throw new Error(`pipe role rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
-        }
+      const entry: SubEntry = {
+        taskId,
+        kind: latest.kind,
+        paneId: existing?.paneId ?? '',
+        tabId: existing?.tabId ?? '',
+        tabName: latest.tabName ?? tabNameForTask(latest.description),
+        cwd,
+        description: latest.description,
+        background: true,
+        status: 'running',
+        sessionFile: latest.sessionFile ?? null,
+        launchCommand: latest.launchCommand,
+        createdAt: Date.now(),
+        revivedFrom: latest.paneId,
+        consumedAt: null,
+      };
+      if (existing) {
+        subs.set(entry.paneId, entry);
+        persistSubs();
+        writeHistory(entry, undefined, 'resume');
         return {
-          content: [{ type: 'text', text: `Subagent ${entry.paneId}: ${res.detail ?? `switched to ${roleName}`}` }],
-          details: { paneId: entry.paneId, role: roleName },
+          content: [{ type: 'text', text: `resumed subagent ${entry.paneId} from task ${taskId} (reused existing pane with same session; pi still running there).` }],
+          details: { paneId: entry.paneId, taskId },
         };
-      } catch (err) {
-        return toolError(`Error: failed to switch subagent ${entry.paneId} to role ${roleName}: ${(err as Error).message}`);
       }
+      // Create a new pane only when no existing one can be reused.
+      await reviveEntry(entry);
+      subs.set(entry.paneId, entry);
+      persistSubs();
+      return {
+        content: [{
+          type: 'text',
+          text: entry.sessionFile
+            ? `resumed subagent ${entry.paneId} from task ${taskId} (session restored).`
+            : `resumed subagent ${entry.paneId} from task ${taskId} (session file missing; fresh conversation).`,
+        }],
+        details: { paneId: entry.paneId, taskId },
+      };
+    } catch (err) {
+      if (err instanceof ToolError) throw err;
+      return toolError(`Error: failed to resume task "${taskId}": ${(err as Error).message}`);
+    } finally {
+      release();
+    }
   }
-  const outputActionDeps = {
-    client,
-    resolveEntry: (rawId: string, cwd: string) => resolveSubEntry(rawId, cwd),
-    readAskFlag,
-    outputCursors,
-    getCwd: (toolCtx: unknown): string => (toolCtx as { cwd?: string })?.cwd ?? process.cwd(),
-    // Transcript fallback: small worker panes show only the opaque status overlay, so the
-    // pane delta can never carry the final report (01a0c282). No preferred file — let the
-    // resolver start from herdr's per-pane report instead of a possibly stale registry value.
-    readFinalReport: async (paneId: string, entryCwd: string) =>
-      (await session.subSessionState(paneId, entryCwd, 0)).text,
-  };
+
+  async function executeSubagentSend(params: ToolParams, toolCtx: unknown) {
+    const { entry, cwd } = targetOf(params, toolCtx);
+    try {
+      await ensureLive(entry);
+      // Follow_up goes through the extension pipe with steering so supplemental instructions reach
+      // a long-running worker within seconds during a tool-call gap; a plain queue would wait for
+      // the entire run.
+      const ready = await waitSubReady(entry.cwd, entry.paneId);
+      if (!ready.ok) throw new Error(ready.message);
+      const fuId = `fu-${Date.now()}`;
+      const res = await pipeRequestTo(entry.cwd, entry.paneId, {
+        type: 'follow_up',
+        id: fuId,
+        text: String(params?.message ?? ''),
+        // The reply pipe is the MASTER's (bound at session_start with this session's cwd);
+        // entry.cwd would name a dead pipe for cross-repo workers.
+        from: pipeNameFor(cwd, env?.paneId ?? ''),
+        push: true,
+        steer: true,
+      });
+      if (res.type !== 'ok') {
+        throw new Error(`pipe follow_up rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
+      }
+      lastMachineInjectAt.set(entry.paneId, Date.now()); // B4: attribute working state during the observation window
+      // An exception between status='running' and startPoller would leave a ghost running entry
+      // with no poller (never settles, skipped by GC): roll back the status on failure.
+      const prevStatus = entry.status;
+      entry.status = 'running';
+      persistSubs();
+      try {
+        lastRequestIdByPane.set(entry.paneId, fuId);
+        startPoller(entry.paneId, entry.cwd, Date.now(), entry.description, fuId);
+      } catch (inner) {
+        entry.status = prevStatus;
+        persistSubs();
+        throw inner;
+      }
+      return { content: [{ type: 'text', text: `Message sent to subagent ${entry.paneId}.` }], details: { paneId: entry.paneId } };
+    } catch (err) {
+      return toolError(`Error: failed to reach subagent ${entry.paneId}: ${(err as Error).message}`);
+    }
+  }
+
+  async function executeSubagentInterrupt(params: ToolParams, toolCtx: unknown) {
+    const { entry } = targetOf(params, toolCtx);
+    // DSH alignment: an idle or finished target is an idempotent no-op.
+    if (entry.status === 'closed') {
+      return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (already idle/closed; no-op).` }], details: {} };
+    }
+    try {
+      const res = await pipeRequestTo(entry.cwd, entry.paneId, { type: 'interrupt', id: `int-${Date.now()}` });
+      if (res.type !== 'ok') {
+        throw new Error(`pipe interrupt rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
+      }
+      // No settlement notice for an interrupted turn: the requester already knows.
+      const lastId = lastRequestIdByPane.get(entry.paneId);
+      if (lastId) d.claimSettleNotice(`${entry.paneId}:${lastId}`);
+      return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (fire-and-return).` }], details: { paneId: entry.paneId } };
+    } catch (err) {
+      return toolError(`Error: failed to reach subagent ${entry.paneId}: ${(err as Error).message}`);
+    }
+  }
+
+  async function executeSubagentRole(params: ToolParams, toolCtx: unknown) {
+    const roleName = String(params?.role ?? '').trim();
+    if (!roleName) return toolError('Error: action "role" requires a target profile in `role` (same resolution as spawn)');
+    const { entry } = targetOf(params, toolCtx);
+    try {
+      await ensureLive(entry);
+      const ready = await waitSubReady(entry.cwd, entry.paneId);
+      if (!ready.ok) throw new Error(ready.message);
+      const res = await pipeRequestTo(entry.cwd, entry.paneId, { type: 'role', id: `role-${Date.now()}`, role: roleName });
+      if (res.type !== 'ok') {
+        throw new Error(`pipe role rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
+      }
+      return {
+        content: [{ type: 'text', text: `Subagent ${entry.paneId}: ${res.detail ?? `switched to ${roleName}`}` }],
+        details: { paneId: entry.paneId, role: roleName },
+      };
+    } catch (err) {
+      return toolError(`Error: failed to switch subagent ${entry.paneId} to role ${roleName}: ${(err as Error).message}`);
+    }
+  }
+
+  /** Live background registry, newest row per task; closed rows stay visible so send can revive them. */
+  async function executeSubagentList() {
+    const listed = [...subs.values()].filter((sub) => sub.background);
+    if (listed.length === 0) {
+      return { content: [{ type: 'text', text: 'No background subagents started (from this session branch).' }], details: {} };
+    }
+    const byTask = newestPerTaskId(listed);
+    const probes = new Map<string, AliveProbe>();
+    await Promise.all([...byTask.values()].map(async (sub) => {
+      if (sub.status === 'closed') return;
+      try {
+        probes.set(sub.paneId, await probeAlive(sub.paneId, sub.cwd));
+      } catch { /* best effort for display */ }
+    }));
+    const now = Date.now();
+    const lines: string[] = [];
+    for (const sub of byTask.values()) {
+      const tabTag = sub.tabName ? ` [tab: ${sub.tabName}]` : '';
+      const wtTag = sub.isolate ? ` [wt: ${sub.isolate.branch}]` : '';
+      if (sub.status === 'closed') {
+        lines.push(`${sub.taskId.slice(0, 8)} [idle] (${sub.kind}, closed; action send revives)${tabTag}${wtTag} ${sub.description}`);
+        continue;
+      }
+      const state = sub.status === 'settled' ? 'idle' : 'running';
+      const takeoverMark = sub.userTakeover ? ', user-controlled' : '';
+      const probe = probes.get(sub.paneId);
+      const statusTag = probe?.agentStatus ? ` ${probe.agentStatus}` : '';
+      const activityTag = probe?.lastActivityMs != null ? `, active ${agoText(probe.lastActivityMs, now)}` : '';
+      let gateTag = '';
+      if (probe?.agentStatus === 'blocked') {
+        const question = await readAskFlag(sub.paneId);
+        gateTag = question ? ` — AWAITING HUMAN: "${question}"` : ' — AWAITING HUMAN decision';
+      }
+      const cwdTag = probe?.foregroundCwd && probe.foregroundCwd !== sub.cwd
+        ? ` [cwd: ${basename(probe.foregroundCwd) || probe.foregroundCwd}]`
+        : '';
+      lines.push(`${sub.paneId} [${state}${takeoverMark}${statusTag}${activityTag}${gateTag}] (${sub.kind})${tabTag}${wtTag}${cwdTag} ${sub.description}`);
+    }
+    return { content: [{ type: 'text', text: lines.join('\n') }], details: {} };
+  }
+
   const executeSubagentSpawn = createSpawnAction({
     client,
     env,
@@ -686,12 +621,33 @@ export default function subagentPlugin(ctx: Context): void {
     ...(d.logRouting ? { logRouting: d.logRouting } : {}),
   });
 
+  const outputActionDeps = {
+    client,
+    resolveEntry: (rawId: string, cwd: string) => resolveSubEntry(rawId, cwd),
+    outputCursors,
+    getCwd: (toolCtx: unknown): string => (toolCtx as { cwd?: string })?.cwd ?? process.cwd(),
+    // Transcript fallback: small worker panes show only the opaque status overlay, so the pane
+    // delta can never carry the final report. No preferred file — let the resolver start from
+    // herdr's per-pane report instead of a possibly stale registry value.
+    readFinalReport: async (paneId: string, entryCwd: string) =>
+      (await session.subSessionState(paneId, entryCwd, 0)).text,
+  };
+
+  const ACTIONS: Record<string, (params: ToolParams, toolCtx: unknown, onUpdate?: (u: unknown) => void) => Promise<unknown>> = {
+    spawn: (params, toolCtx, onUpdate) => executeSubagentSpawn(params, toolCtx, onUpdate),
+    resume: (params, toolCtx) => executeSubagentResume(params, toolCtx),
+    list: () => executeSubagentList(),
+    send: (params, toolCtx) => executeSubagentSend(params, toolCtx),
+    interrupt: (params, toolCtx) => executeSubagentInterrupt(params, toolCtx),
+    output: (params, toolCtx) => executeSubagentOutput(params, toolCtx, outputActionDeps),
+    role: (params, toolCtx) => executeSubagentRole(params, toolCtx),
+  };
 
   scoped.registerTool({
     name: 'subagent',
     label: 'Subagent',
-    // B4: the model picks tools from the system prompt's snippet/guideline surface; this tool is the
-    // one place where delegation decisions are made, so state them here rather than hoping for recall.
+    // B4: the model picks tools from the system prompt's snippet/guideline surface; delegation
+    // decisions are made here, so state them rather than hoping for recall.
     promptSnippet: 'subagent: delegate a self-contained task to a pi worker pane (spawn/isolate/background/send/output/interrupt/resume/list/role).',
     promptGuidelines: [
       'Use subagent when the work is self-contained and the result is what matters: pipelines that would flood this context, long builds/test runs, or independent parts of a bigger change that can proceed in parallel.',
@@ -725,8 +681,8 @@ export default function subagentPlugin(ctx: Context): void {
       message: Type.Optional(Type.String({ description: '[send] The follow-up message' })),
       max_chars: Type.Optional(Type.Integer({ description: '[output] Maximum characters of output delta to return (default 6000, 100-16000)' })),
     }),
-    // B2: 23/38 real spawns omitted `action` even though it is optional; normalize so the schema the
-    // model is validated against and the code path never disagree, and so `spawn` is explicit in logs.
+    // B2: 23/38 real spawns omitted `action` even though it is optional; normalize so the schema
+    // the model is validated against and the code path never disagree, and so `spawn` is explicit in logs.
     prepareArguments: (args: unknown) => {
       const rec = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>;
       const hasAction = typeof rec.action === 'string' && rec.action.trim() !== '';
@@ -736,16 +692,11 @@ export default function subagentPlugin(ctx: Context): void {
       void toolCallId;
       void signal;
       const action = typeof params?.action === 'string' && params.action.trim() ? params.action.trim() : 'spawn';
-      if (action === 'resume') return executeSubagentResume(params, toolCtx);
-      if (action === 'list') return executeSubagentList(listActionDeps);
-      if (action === 'send') return executeSubagentSend(params, toolCtx);
-      if (action === 'interrupt') return executeSubagentInterrupt(params, toolCtx);
-      if (action === 'output') return executeSubagentOutput(params, toolCtx, outputActionDeps);
-      if (action === 'role') return executeSubagentRole(params, toolCtx);
-      if (action !== 'spawn') {
-        return toolError(`Error: unknown action "${action}" (valid: spawn, resume, list, send, interrupt, output, role)`);
+      const handler = ACTIONS[action];
+      if (!handler) {
+        return toolError(`Error: unknown action "${action}" (valid: ${Object.keys(ACTIONS).join(', ')})`);
       }
-      return executeSubagentSpawn(params, toolCtx, onUpdate);
+      return handler(params, toolCtx, onUpdate);
     },
   });
 }

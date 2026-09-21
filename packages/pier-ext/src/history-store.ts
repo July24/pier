@@ -1,10 +1,7 @@
 /**
- * Workspace history (v1.2, DESIGN.md §13.4).
- *
- * Task history is append-only JSONL partitioned by cwd, mirroring pi session partitioning:
- *   <agentRoot>/herdr-pi/history/--<cwd>--/history.jsonl
- * Records are immutable so GC can remove panes without deleting history. Recovery keeps
- * both the sessionFile and launchCommand snapshots as fallbacks.
+ * Delegation ledger: append-only JSONL partitioned by cwd, mirroring pi's session partitioning
+ * (<agentRoot>/herdr-pi/history/--<cwd>--/history.jsonl). Rows are immutable, so GC can drop panes
+ * without losing history; recovery keeps both the sessionFile and launchCommand snapshots.
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -33,7 +30,6 @@ export interface HistoryEntry {
   kind: string;
   paneId: string;
   tabId: string;
-  /** v1.3: task tab name retained for history review and revival; omitted by older entries. */
   tabName?: string;
   workspaceId: string;
   cwd: string;
@@ -45,19 +41,15 @@ export interface HistoryEntry {
   status: 'running' | 'settled' | 'consumed' | 'closed';
   outcome?: string | null;
   createdAt: number;
-  /** M13c: durable consumption time, which provides the GC TTL basis. */
   consumedAt?: number | null;
   closedAt?: number | null;
-  /** Previous-generation pane ID, retained when work is redone or revived. */
   revivedFrom?: string | null;
-  /** B5: writer marker (spawn / poll-settle / poll-timeout / gc / zombie-sweep …), so
-   * multiple entries in one second remain auditable (ledger row#23/24 proves both writes). */
+  /** Writer marker (spawn / poll-settle / poll-timeout / gc / zombie-sweep …) for auditability. */
   via?: string;
 }
 
-/** B5: inherit outcome for a closed row—when patch omits it, use the latest non-empty value
- * for that taskId, preventing GC bookkeeping from erasing settlement results under the
- * “latest row is state” rule. */
+/** When a patch omits `outcome`, inherit the latest non-empty value for the taskId: GC
+ * bookkeeping must not erase a settlement result under the "latest row is state" rule. */
 export function inheritOutcome(lastOutcome: string | null | undefined, patchOutcome: string | null | undefined): string | null {
   if (patchOutcome !== undefined) return patchOutcome;
   return lastOutcome ?? null;

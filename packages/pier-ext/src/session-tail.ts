@@ -1,10 +1,6 @@
 /**
- * Tail parsing for pi session JSONL (pure library, v1.1 result channel).
- *
- * Since v1.1 (DESIGN.md §12), child-agent results come from the child session file
- * rather than pane text, keeping the authoritative machine-readable source free of
- * echo contamination and scrollback blind spots. This module depends only on the
- * empirically observed pi session format (session-format documentation):
+ * Tail parsing for pi session JSONL (pure): child-agent results come from the child session file,
+ * not pane text. Depends only on the pi session format:
  *   line = {type, id, parentId, message:{role, content:[{type:'text',text}...], timestamp, stopReason}}
  */
 import * as fs from 'node:fs';
@@ -93,16 +89,12 @@ export function hasAssistantAfter(
   });
 }
 /**
- * Return whether the NEWEST assistant message after `sinceTs` ended its turn.
+ * Whether the NEWEST assistant message after `sinceTs` ended its turn.
  *
- * Why (A16): a worker sitting between tool calls (tool result already written, next assistant
- * message still streaming) has "an assistant message" but has NOT finished. Treating any assistant
- * message as activity made the poller announce such workers as finished — three real workers were
- * declared settled while still working on 2026-09-13 and one was later closed mid-task by GC.
- *
- * `stopReason === 'toolUse'` means the model requested tools, so the turn continues; a non-string
- * stopReason (message still streaming / older shapes) is treated as "not ended" on purpose — the
- * cost of waiting is small, the cost of a false settlement is losing supervision of live work.
+ * A worker between tool calls (tool result written, next assistant still streaming) has "an
+ * assistant message" but has NOT finished — announcing it settles loses supervision of live work.
+ * `stopReason === 'toolUse'` means tools were requested, so the turn continues; a non-string
+ * stopReason (still streaming / older shapes) is treated as "not ended" on purpose.
  */
 export function lastAssistantTurnEnded(
   entries: readonly SessionEntryLike[],
@@ -121,9 +113,8 @@ export function lastAssistantTurnEnded(
   return typeof sr === 'string' && sr !== 'toolUse' && sr !== 'pending';
 }
 /**
- * Return whether an initiated toolCall still lacks a result after injection (for example,
- * ask_user_question waiting on human input), meaning settlement has not actually completed
- * (v1.3 M8 settlement-race fix). Parallel calls are tracked by depth.
+ * Whether an initiated toolCall still lacks a result after injection (e.g. ask_user_question
+ * waiting on a human), meaning settlement has not completed. Parallel calls tracked by depth.
  */
 export function hasPendingToolCall(entries: readonly SessionEntryLike[], sinceTs: number): boolean {
   let depth = 0;
@@ -152,10 +143,9 @@ export interface SubSessionState {
   activity: boolean;
   turnEnded: boolean;
   /**
-   * True while the child is inside an OCC compaction cycle: from the inflight marker
-   * until the settled marker is followed by an assistant message (the continuation turn).
-   * OCC's intentional abort lands as stopReason 'error' in this transcript, which the
-   * turnEnded check alone would misread as a finished worker (01a0be1f / wA:p2M).
+   * True while the child is inside an OCC compaction cycle: from the inflight marker until an
+   * assistant message follows the settled marker (the continuation turn). OCC's intentional abort
+   * lands as stopReason 'error', which the turnEnded check alone would misread as finished.
    */
   compacting: boolean;
 }
@@ -163,10 +153,9 @@ export interface SubSessionState {
 /**
  * Whether the transcript currently sits inside an OCC compaction cycle.
  *
- * Last marker wins: inflight as the final marker means the summary request is running;
- * a settled marker means the cycle is over — unless no assistant message follows it yet,
- * in which case the continuation turn has not produced output and the worker is still
- * machine-paused (must not settle, and must not be mistaken for a user takeover either).
+ * Last marker wins: inflight last means the summary request is running; settled last means the
+ * cycle is over — unless no assistant message follows it yet, in which case the continuation turn
+ * has not produced output and the worker is still machine-paused (not settled, not a user takeover).
  */
 export function compactionBusy(entries: readonly SessionEntryLike[]): boolean {
   for (let i = entries.length - 1; i >= 0; i--) {
@@ -184,12 +173,9 @@ export function compactionBusy(entries: readonly SessionEntryLike[]): boolean {
   return false;
 }
 
-/**
- * Derive the settlement state from already-parsed entries.
- *
- * Closing text is by construction terminal (lastAssistantText requires stopReason 'stop').
- * A16: an assistant message alone is not a settlement; the turn must have ENDED.
- */
+/** Derive the settlement state from already-parsed entries. Closing text is terminal by
+ * construction (lastAssistantText requires stopReason 'stop'); an assistant message alone is
+ * not a settlement — the turn must have ENDED. */
 export function deriveSubSessionState(
   entries: readonly SessionEntryLike[],
   sinceTs: number,
@@ -261,6 +247,12 @@ export function bareSessionId(raw: string): string {
   const base = raw.replaceAll('\\', '/').split('/').pop()!.replace(/\.jsonl$/, '');
   const stripped = base.replace(/^\d{4}-\d{2}-\d{2}T[\d-]+Z_/, '');
   return isValidSessionId(stripped) ? stripped : base;
+}
+
+/** Herdr reports session ids and paths interchangeably: accept a `.jsonl` path as-is, else map the id. */
+export function resolveSessionFileValue(cwd: string, agentDir: string, value: string | null | undefined): string | null {
+  if (!value) return null;
+  return /\.jsonl$/i.test(value) ? value : sessionFileById(cwd, agentDir, value);
 }
 
 export function readSessionFile(file: string): SessionEntryLike[] | null {

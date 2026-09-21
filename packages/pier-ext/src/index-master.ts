@@ -9,7 +9,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { Server } from 'node:net';
 import { PiSurface } from './pi-surface.ts';
 import { createCordisApp } from './bootstrap.ts';
-import { disposeSessionRoot } from './subagent-scope.ts';
+import { disposeSessionRoot } from './subagent-poller.ts';
 import terminalPlugin from './plugins/terminal.ts';
 import todoPlugin from './plugins/todo.ts';
 import subagentPlugin from './plugins/subagent.ts';
@@ -18,7 +18,7 @@ import type { JevRuntime } from './jev-client.ts';
 import type { RoutingTelemetryRecord } from './routing-telemetry.ts';
 import type { TodosService } from './todos-service.ts';
 import type { TodoUiSlot } from './plugins/todo.ts';
-import type { SubagentPortBox } from './subagent-port.ts';
+import type { SubagentPortBox } from './subagent-core.ts';
 
 export interface MasterPluginMount {
   pi: ExtensionAPI;

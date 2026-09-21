@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { handlePipeRequest, type MachineRequest } from '../src/index-pipe.ts';
-import { emptySubagentPortBox, type SubagentPort } from '../src/subagent-port.ts';
+import { emptySubagentPortBox, type SubagentPort } from '../src/subagent-core.ts';
 
 function fakePort(over: Partial<SubagentPort> = {}): SubagentPort {
   return {
@@ -131,7 +131,7 @@ test('handlePipeRequest reply (B8): claim key 与 poll-loop 同源（子进程�
   );
 
   assert.deepEqual(claims, [`p2:${sentId}`]);
-  // poll-loop 侧的 key 形状：`${paneId}:${requestId}`（subagent-poll-loop.ts:217）
+  // poll-loop 侧的 key 形状：`${paneId}:${requestId}`(subagent-poller.ts settle path)
   assert.equal(`${'p2'}:${requestIdForPoller}`, claims[0]);
 });
 

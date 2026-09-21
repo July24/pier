@@ -5,7 +5,7 @@
  * development-only path (`--expose-internals` plus PI_HERDR_HMR=1); production has no watcher.
  *
  * Workers bypass this module (C3/D81) because short-lived processes mount manually without
- * loader or HMR; this module and subagent-scope.ts are master-only dynamic imports.
+ * loader or HMR; this module and subagent-poller.ts are master-only dynamic imports.
  *
  * Core modules will gradually become loader entries; manual mounts remain non-hot-reloaded (D80③).
  */

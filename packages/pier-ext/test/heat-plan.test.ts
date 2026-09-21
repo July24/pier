@@ -1,77 +1,121 @@
 /**
- * Spawn-time pane.split ratio: first=old, second=new (herdr split_at).
+ * Spawn-time pane split ratio (heat model mirror) and the grid shape it is derived from.
+ * The heat weights are mirrored in packages/pier-workbench/src/heat-layout.ts — keep in lockstep.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import {
-  FOCUS_SHARE,
-  RATIO_FLOOR,
-  planSpawnSplitRatio,
-  simulateSplit,
-  type LayoutNode,
-} from '../src/plugins/heat-plan.ts';
+import { planSpawnSplitRatio, simulateSplit, type LayoutNode } from '../src/plugins/heat-plan.ts';
+import { paneCells, parseShapeTree, pickGridSplit, type ShapeNode } from '../src/plugins/grid-shape.ts';
 
-function pane(id: string): LayoutNode {
-  return { type: 'pane', pane_id: id };
-}
-function split(direction: 'right' | 'down', first: LayoutNode, second: LayoutNode, ratio = 0.5): LayoutNode {
-  return { type: 'split', direction, ratio, first, second };
-}
+/** Mirror of heat-layout's FOCUS_SHARE (0.72) and split ratio floor (0.10). */
+const FOCUS_SHARE = 0.72;
+const RATIO_FLOOR = 0.1;
 
-test('simulateSplit: first=原格 second=新格', () => {
-  const out = simulateSplit(pane('a'), 'a', 'new', 'down');
-  assert.deepEqual(out, split('down', pane('a'), pane('new')));
+const pane = (id: string): LayoutNode => ({ type: 'pane', pane_id: id });
+const split = (direction: 'right' | 'down', first: LayoutNode, second: LayoutNode, ratio = 0.5): LayoutNode =>
+  ({ type: 'split', direction, ratio, first, second });
+
+const P = (id: string): ShapeNode => ({ type: 'pane', paneId: id });
+const S = (direction: string, first: ShapeNode, second: ShapeNode, ratio = 0.5): ShapeNode =>
+  ({ type: 'split', direction, ratio, first, second });
+
+/* ── heat-plan ──────────────────────────────────────────────────── */
+
+test('simulateSplit: first keeps the original pane, second is the new one', () => {
+  assert.deepEqual(simulateSplit(pane('a'), 'a', 'new', 'down'), split('down', pane('a'), pane('new')));
 });
 
-test('焦点仍在原格（默认不抢焦）：ratio = T^(1/depth) = first 份额', () => {
-  const r = planSpawnSplitRatio({
-    root: pane('a'),
-    targetPaneId: 'a',
-    focusPaneId: 'a',
-    direction: 'down',
-  });
-  assert.equal(r, FOCUS_SHARE);
+test('planSpawnSplitRatio: focus staying on the original cell yields T^(1/depth)', () => {
+  assert.equal(planSpawnSplitRatio({ root: pane('a'), targetPaneId: 'a', focusPaneId: 'a', direction: 'down' }), FOCUS_SHARE);
 });
 
-test('焦点落到新格（second）：ratio = 1-T^(1/depth)', () => {
-  const r = planSpawnSplitRatio({
-    root: pane('a'),
-    targetPaneId: 'a',
-    focusPaneId: '__pier_new__',
-    direction: 'down',
-  });
-  assert.equal(r, 1 - FOCUS_SHARE);
+test('planSpawnSplitRatio: focus moving to the new cell yields 1 - T^(1/depth)', () => {
+  assert.equal(
+    planSpawnSplitRatio({ root: pane('a'), targetPaneId: 'a', focusPaneId: '__pier_new__', direction: 'down' }),
+    1 - FOCUS_SHARE,
+  );
 });
 
-test('off-path 新 split：idle vs idle → 0.5', () => {
+test('planSpawnSplitRatio: off the focus path the split follows the weight share', () => {
   const root = split('right', pane('focus'), pane('side'));
-  const r = planSpawnSplitRatio({
-    root,
-    targetPaneId: 'side',
-    focusPaneId: 'focus',
-    direction: 'down',
-  });
-  assert.equal(r, 0.5);
+  assert.equal(planSpawnSplitRatio({ root, targetPaneId: 'side', focusPaneId: 'focus', direction: 'down' }), 0.5, 'idle vs idle');
+  assert.equal(
+    planSpawnSplitRatio({ root, targetPaneId: 'side', focusPaneId: 'focus', direction: 'down', statuses: { side: 'blocked' } }),
+    3 / 4,
+    'a blocked cell outweighs a new idle one',
+  );
 });
 
-test('off-path blocked 原格 vs 新 idle：first 拿 3/4', () => {
-  const root = split('right', pane('focus'), pane('side'));
-  const r = planSpawnSplitRatio({
-    root,
-    targetPaneId: 'side',
-    focusPaneId: 'focus',
-    direction: 'down',
-    statuses: { side: 'blocked' },
-  });
-  assert.equal(r, 3 / 4);
-});
-
-test('ratio 落在引擎地板内', () => {
-  const r = planSpawnSplitRatio({
-    root: pane('a'),
-    targetPaneId: 'a',
-    focusPaneId: 'a',
-    direction: 'down',
-  });
+test('planSpawnSplitRatio: results stay inside the engine floor', () => {
+  const r = planSpawnSplitRatio({ root: pane('a'), targetPaneId: 'a', focusPaneId: 'a', direction: 'down' });
   assert.ok(r != null && r >= RATIO_FLOOR && r <= 1 - RATIO_FLOOR);
+});
+
+/* ── grid shape ─────────────────────────────────────────────────── */
+
+test('parseShapeTree: nested pane leaves from layout.export, null for junk', () => {
+  const raw = {
+    type: 'split', direction: 'right', ratio: 0.5,
+    first: { type: 'pane', pane: { pane_id: 'a' } },
+    second: {
+      type: 'split', direction: 'down', ratio: 0.5,
+      first: { type: 'pane', pane: { pane_id: 'b' } },
+      second: { type: 'pane', pane: { pane_id: 'c' } },
+    },
+  };
+  const tree = parseShapeTree(raw)!;
+  assert.equal(tree.type, 'split');
+  assert.deepEqual(paneCells(tree).map((c) => c.id), ['a', 'b', 'c']);
+  assert.equal(parseShapeTree({ type: 'pane' }), null, 'no pane id → null');
+  assert.equal(parseShapeTree('garbage'), null);
+});
+
+const splitAt = (node: ShapeNode, target: string, newId: string, direction: 'right' | 'down'): ShapeNode =>
+  node.type === 'pane'
+    ? (node.paneId === target ? S(direction, node, P(newId)) : node)
+    : { ...node, first: splitAt(node.first, target, newId, direction), second: splitAt(node.second, target, newId, direction) };
+
+test('pickGridSplit: successive spawns grow full-width strips (always downward)', () => {
+  let tree: ShapeNode = P('p1');
+  const seen: Array<[string, 'right' | 'down']> = [];
+  const expected: Array<[string, 'right' | 'down']> = [
+    ['p1', 'down'], // 200×50 → split top/bottom
+    ['p1', 'down'], // p1/p2 are both 200×25 → preorder picks p1
+    ['p2', 'down'], // p2 is the largest
+    ['p1', 'down'],
+    ['p3', 'down'],
+  ];
+  for (let i = 0; i < expected.length; i++) {
+    const pick = pickGridSplit(tree);
+    assert.ok(pick, `split #${i + 1}`);
+    seen.push([pick.targetPaneId, pick.direction]);
+    tree = splitAt(tree, pick.targetPaneId, `p${i + 2}`, pick.direction);
+  }
+  assert.deepEqual(seen, expected);
+  const cells = paneCells(tree);
+  assert.equal(cells.length, 6);
+  for (const c of cells) assert.ok(c.w === 200 && c.h >= 6, `${c.id} ${c.w}x${c.h} is not a full-width strip`);
+});
+
+test('pickGridSplit: excluded panes (e.g. the board) are never split targets', () => {
+  const tree = S('right', S('down', P('work'), P('work2')), P('board'));
+  const pick = pickGridSplit(tree, { exclude: new Set(['board']) });
+  assert.deepEqual(pick, { targetPaneId: 'work', direction: 'down' });
+});
+
+test('pickGridSplit: real cell geometry overrides the 200×50 model', () => {
+  const tree = S('right', P('narrow'), P('wide'));
+  const pick = pickGridSplit(tree, {
+    cells: [
+      { id: 'narrow', x: 0, y: 0, w: 10, h: 50 },
+      { id: 'wide', x: 10, y: 0, w: 190, h: 50 },
+    ],
+  });
+  assert.deepEqual(pick, { targetPaneId: 'wide', direction: 'down' });
+});
+
+test('pickGridSplit: nothing left to split returns null; a single pane is always eligible', () => {
+  const tree = S('right', P('a'), P('b'));
+  assert.equal(pickGridSplit(tree, { exclude: new Set(['a', 'b']) }), null);
+  assert.deepEqual(pickGridSplit(P('solo')), { targetPaneId: 'solo', direction: 'down' });
 });
