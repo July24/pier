@@ -76,12 +76,12 @@ export type PipeResponse =
  * Response side of the protocol (`ok` / `error`). Requests never use these tags, so this is a sound
  * discriminator for narrowing a parsed line at the answering end.
  */
-export function isPipeResponse(value: PipeRequest | PipeResponse): value is PipeResponse {
+function isPipeResponse(value: PipeRequest | PipeResponse): value is PipeResponse {
   return value.type === 'ok' || value.type === 'error';
 }
 
 /** Parse one JSON line, returning null for malformed input. */
-export function parsePipeLine(line: string): PipeRequest | PipeResponse | null {
+function parsePipeLine(line: string): PipeRequest | PipeResponse | null {
   const t = (line ?? '').trim();
   if (!t) return null;
   try {
@@ -170,29 +170,7 @@ export async function pipeRequestTo(
   throw lastErr instanceof Error ? lastErr : new Error(`pipe ${names[0] ?? paneId}: unreachable`);
 }
 
-/** Ping with retry (readiness probe). Accepts one name or new+legacy candidates. */
-export async function pingUntilReady(
-  pipeName: string | readonly string[],
-  timeoutMs: number,
-  intervalMs = 1000,
-): Promise<boolean> {
-  const names = typeof pipeName === 'string' ? [pipeName] : pipeName;
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    for (const name of names) {
-      try {
-        const res = await pipeRequest(name, { type: 'ping', id: `ping-${Date.now()}` }, 3000);
-        if (res.type === 'ok') return true;
-      } catch {
-        /* not ready on this name */
-      }
-    }
-    await new Promise((r) => setTimeout(r, intervalMs));
-  }
-  return false;
-}
-
-export type PipeMessageHandler = (req: PipeRequest) => Promise<PipeResponse>;
+type PipeMessageHandler = (req: PipeRequest) => Promise<PipeResponse>;
 
 /**
  * Server: one line in → handler → one line out → close.
