@@ -1,13 +1,11 @@
 /**
  * Proxy the pi ExtensionAPI registration surface (D79).
  *
- * pi 0.86+ `pi.on()` returns an unsubscribe, so event handlers are truly removed when their
- * generation retires (RFC docs/rfc-pi-0.86-dynamic-tools.md §5). Tools and commands have no
- * unregister API: tools overwrite by name, so retired generations keep tombstoned wrappers there.
- *
- * HMR emits reload after mounting the replacement (d87), so mounting a key retires older
- * generations immediately; the ledger then collects only generations registered through the reload
- * boundary, while explicit disposal retires every generation.
+ * pi 0.86+ `pi.on()` returns an unsubscribe, so event handlers are truly removed when their generation
+ * retires (RFC docs/rfc-pi-0.86-dynamic-tools.md §5). Tools and commands have no unregister API: tools
+ * overwrite by name, so retired generations keep tombstoned wrappers there. HMR emits reload after
+ * mounting the replacement, so mounting a key retires older generations immediately; the ledger then
+ * collects only generations registered through the reload boundary.
  */
 import type { DisposeLedger } from './ledger.ts';
 
@@ -28,7 +26,6 @@ interface Group {
   alive: boolean;
   /** Monotonic mount generation used by the ledger disposer to determine its collection boundary. */
   epoch: number;
-  /** pi 0.86+ `pi.on()` unsubscribes for this generation; drained on retirement. */
   unsubscribes: Array<() => void>;
 }
 
@@ -39,7 +36,6 @@ function retireGroup(group: Group): void {
     try {
       off();
     } catch {
-      /* Best effort: a failing unsubscribe must not abort the rest of retirement. */
     }
   }
   group.unsubscribes.length = 0;
@@ -66,9 +62,8 @@ export class PiSurface<P extends object> {
     return this.pi;
   }
 
-  /** Get a module-scoped registration surface. Each call creates a new generation, retiring older
-   *  ones for the same key; the ledger registers each key once and again only after its entry is
-   *  consumed. */
+  /** Get a module-scoped registration surface; each call creates a new generation, retiring older ones
+   *  for the same key. The ledger registers each key once and again only after its entry is consumed. */
   forModule(key: string): ScopedSurface {
     this.epochCounter += 1;
     const epoch = this.epochCounter;
@@ -107,9 +102,8 @@ export class PiSurface<P extends object> {
         );
       },
       registerCommand: (name, options) => {
-        // pi stores commands as Map<name> (verified in the dist implementation), so same-name
-        // registration replaces safely; the handler tombstone is a symmetry safeguard even though
-        // replacement means the old handler will no longer be called.
+        // pi stores commands as Map<name>, so same-name registration replaces safely; the handler
+        // tombstone is a symmetry safeguard even though the old handler will no longer be called.
         const handler = options.handler as ((...a: unknown[]) => unknown) | undefined;
         const wrapped = handler
           ? (...a: unknown[]) => (group!.alive ? handler(...a) : undefined)
@@ -118,9 +112,8 @@ export class PiSurface<P extends object> {
           .registerCommand?.(name, wrapped ? { ...options, handler: wrapped } : options);
       },
       on: (event, handler) => {
-        // Pass-through while alive, tombstone after retirement; when pi (0.86+) returns an
-        // unsubscribe, retirement also removes the registration so HMR churn cannot grow the
-        // dispatch list. The `on` view of generic P is the same unchecked DI seam as above.
+        // Pass-through while alive, tombstone after retirement; when pi (0.86+) returns an unsubscribe,
+        // retirement also removes the registration so HMR churn cannot grow the dispatch list.
         const wrapped = (...a: unknown[]) => (group!.alive ? handler(...a) : undefined);
         const unsubscribe: unknown = (
           this.pi as { on?: (e: string, h: (...a: unknown[]) => unknown) => unknown }
@@ -132,7 +125,6 @@ export class PiSurface<P extends object> {
     };
   }
 
-  /** Retire all generations for a key during explicit disposal; return false when the key is absent. */
   disposeModule(key: string): boolean {
     const had = this.groups.has(key);
     for (const g of this.generations.get(key) ?? []) retireGroup(g);
@@ -142,7 +134,6 @@ export class PiSurface<P extends object> {
     return had;
   }
 
-  /** Number of live module groups, for tests and diagnostics. */
   get moduleCount(): number {
     return this.groups.size;
   }

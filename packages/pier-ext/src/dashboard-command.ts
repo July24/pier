@@ -11,10 +11,8 @@ export interface DashboardCommandDeps {
   getHeldLocks?: () => readonly string[];
 }
 
-/**
- * Presentation of the todo states in the standalone view: `SUMMARY_ORDER` fixes the summary-line
- * order, `LIVE_ROWS` adds the detail line that follows it. `abandoned` is counted but not shown.
- */
+/** SUMMARY_ORDER fixes the summary-line order; LIVE_ROWS adds the detail line below it.
+ * `abandoned` is counted in the total but never listed. */
 const SUMMARY_ORDER = [
   { status: 'completed', label: 'done' },
   { status: 'in_progress', label: 'working' },
@@ -78,7 +76,6 @@ export function installDashboardCommand(deps: DashboardCommandDeps): void {
     handler: async (_args, ctx) => {
       const ui = (ctx as { ui?: { notify?: (text: string, level?: string) => void } }).ui;
 
-      // Level 1 / Level 2: Herdr environment
       if (deps.client.available && deps.env) {
         try {
           const res = await deps.client.openPluginPane({
@@ -94,7 +91,7 @@ export function installDashboardCommand(deps: DashboardCommandDeps): void {
           }
           return;
         } catch {
-          // If plugin is not installed or socket error occurs, fall through to Level 3 local view
+          // Plugin missing or socket error: fall through to the Level 3 local view.
         }
       }
 

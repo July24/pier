@@ -119,7 +119,6 @@ function listJsonFiles(dir: string): string[] {
   }
 }
 
-/** Collects the whole snapshot for the guide/command. */
 export function collectConfigSnapshot(deps: ConfigGuideDeps = {}): ConfigGuideSnapshot {
   const env = deps.env ?? process.env;
   const cwd = deps.cwd ?? process.cwd();
@@ -251,8 +250,6 @@ function defaultRepoRoot(): string {
   return resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 }
 
-/* ── rendering used by the command ──────────────────────────────────────── */
-
 export type GuideView = 'index' | 'check' | ConfigPlaneId | 'all';
 
 /** Renders one `/pier-config` view: the plane index, one/all plane listings, or the check report. */
@@ -316,8 +313,6 @@ export function guideReportMarkdown(
   const checkSection = ['', '## Checks', '', ...renderGuide(snapshot, 'check').map((l) => `- ${l.trim()}`)];
   return `${body}\n${filesSection.join('\n')}\n${checkSection.join('\n')}\n`;
 }
-
-/* ── command ────────────────────────────────────────────────────────────── */
 
 export interface ConfigCommandDeps {
   pi: ExtensionAPI;
@@ -415,8 +410,7 @@ export function installConfigCommand(deps: ConfigCommandDeps): void {
 
       if (sub === 'doctor') {
         // B9/B10: one place for every pier option (canonical name, effective value, source) and the
-        // errors deliberately swallowed this session — otherwise a failing best-effort path stays
-        // invisible until something else breaks.
+        // errors deliberately swallowed this session — otherwise a failing best-effort path stays invisible.
         emit([
           'pier doctor',
           '',
@@ -441,7 +435,6 @@ export function installConfigCommand(deps: ConfigCommandDeps): void {
         return;
       }
 
-      // Bare `/pier-config`: index + hand the guided change to the agent.
       emit([...renderGuide(snapshot, 'index'), '', 'asking the agent to guide the change...'].join('\n'));
       try {
         // Call on the receiver: the ExtensionAPI method must not be detached from `pi`.

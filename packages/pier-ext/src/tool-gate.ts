@@ -1,7 +1,7 @@
 /**
  * Worker execution enforcement (C7, D76/D77/D82) — pure. RuntimeRoleManifest is THE runtime manifest
- * shape; the file format lives in role-manifest.ts and the composed/persisted shapes derive from
- * this one (manifest-compose.ts, role-state.ts).
+ * shape; the file format lives in role-manifest.ts and the composed/persisted shapes derive from it
+ * (manifest-compose.ts, role-state.ts).
  */
 import type { PermissionAction, UnknownToolStance } from './role-manifest.ts';
 
@@ -10,7 +10,7 @@ export interface RuntimeRoleManifest {
   version?: string;
   tools: string[];
   permissions: Record<string, PermissionAction>;
-  /** D82: stance for tools outside `tools`; 'allow' keeps user-installed extensions visible. */
+  /** Stance for tools outside `tools`; 'allow' keeps user-installed extensions visible (D82). */
   unknownTools?: UnknownToolStance;
   services?: {
     todos?: {
@@ -68,9 +68,9 @@ export function planToolGate(toolName: string, manifest: RuntimeRoleManifest | n
 }
 
 /**
- * Filter `universe` down to what the stance exposes: 'allow' keeps every tool but the explicit
- * deny rules (D82 user-installed-extension axis), 'deny' intersects with the manifest.
- * Shared by planActiveTools (visibility) and role-state's switch planning (all-tools universe).
+ * 'allow' keeps every tool but the explicit deny rules (D82 user-installed-extension axis); 'deny'
+ * intersects with the manifest. Shared by planActiveTools (visibility) and role-state's switch
+ * planning (all-tools universe).
  */
 export function filterToolsByStance(
   manifestTools: readonly string[],

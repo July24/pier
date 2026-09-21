@@ -41,7 +41,6 @@ export interface MasterPluginMount {
   appendRoutingLog?: (row: RoutingTelemetryRecord) => void;
 }
 
-
 async function loadEntry(
   sessionRoot: Context,
   useLoader: boolean,
@@ -65,8 +64,7 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
   // strip-types) and misses pi's typebox alias. HMR-only; production uses plugin().
   const useLoader = cordisApp.loaderReady && cordisApp.hmrActive;
 
-  // Pipe server is created in the common segment; closing it from a core
-  // plugin would kill it on hmr reload (d87).
+  // Pipe server is created in the common segment; closing it from a core plugin would kill it on hmr reload (d87).
   sessionRoot.effect(() => () => {
     if (m.pipeServerBox.current) {
       try { m.pipeServerBox.current.close(); } catch { /* already closed */ }

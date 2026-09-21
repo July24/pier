@@ -23,7 +23,6 @@ export interface SessionEntryLike {
   message?: SessionMessageLike | unknown;
   [k: string]: unknown;
 }
-/** Parse line by line tolerantly, skipping malformed or non-JSON records. */
 export function parseSessionEntries(text: string): SessionEntryLike[] {
   const entries: SessionEntryLike[] = [];
   for (const line of (text ?? '').split(/\r?\n/)) {
@@ -33,7 +32,6 @@ export function parseSessionEntries(text: string): SessionEntryLike[] {
       const obj = JSON.parse(t);
       if (obj && typeof obj === 'object') entries.push(obj as SessionEntryLike);
     } catch {
-      /* Skip truncated or malformed records. */
     }
   }
   return entries;
@@ -59,10 +57,8 @@ function textOf(m: SessionMessageLike): string {
     .join('\n')
     .trim();
 }
-/**
- * Return the latest finalized assistant text (stopReason === 'stop'), excluding toolUse intermediates.
- * sinceTs filters out messages that predate the injection point.
- */
+/** Latest finalized assistant text (`stopReason === 'stop'`), excluding toolUse intermediates;
+ * `sinceTs` filters out messages predating the injection point. */
 export function lastAssistantText(
   entries: readonly SessionEntryLike[],
   opts: { sinceTs?: number } = {},
@@ -89,12 +85,10 @@ export function hasAssistantAfter(
   });
 }
 /**
- * Whether the NEWEST assistant message after `sinceTs` ended its turn.
- *
- * A worker between tool calls (tool result written, next assistant still streaming) has "an
- * assistant message" but has NOT finished — announcing it settles loses supervision of live work.
- * `stopReason === 'toolUse'` means tools were requested, so the turn continues; a non-string
- * stopReason (still streaming / older shapes) is treated as "not ended" on purpose.
+ * Whether the NEWEST assistant message after `sinceTs` ended its turn: a worker between tool calls
+ * has "an assistant message" but has NOT finished, so announcing it settled loses supervision of
+ * live work. `stopReason === 'toolUse'` means tools were requested; a non-string stopReason (still
+ * streaming / older shapes) counts as "not ended" on purpose.
  */
 export function lastAssistantTurnEnded(
   entries: readonly SessionEntryLike[],
@@ -112,10 +106,8 @@ export function lastAssistantTurnEnded(
   const sr = newest.stopReason;
   return typeof sr === 'string' && sr !== 'toolUse' && sr !== 'pending';
 }
-/**
- * Whether an initiated toolCall still lacks a result after injection (e.g. ask_user_question
- * waiting on a human), meaning settlement has not completed. Parallel calls tracked by depth.
- */
+/** Whether an initiated toolCall still lacks a result after injection (e.g. ask_user_question
+ * waiting on a human), meaning settlement has not completed. */
 export function hasPendingToolCall(entries: readonly SessionEntryLike[], sinceTs: number): boolean {
   let depth = 0;
   for (const entry of entries) {
@@ -134,28 +126,23 @@ export function hasPendingToolCall(entries: readonly SessionEntryLike[], sinceTs
   return depth > 0;
 }
 
-
-
 /** Derived settlement state of one child session, from the inject point onward. */
 export interface SubSessionState {
   text: string | null;
   pendingTool: boolean;
   activity: boolean;
   turnEnded: boolean;
-  /**
-   * True while the child is inside an OCC compaction cycle: from the inflight marker until an
-   * assistant message follows the settled marker (the continuation turn). OCC's intentional abort
-   * lands as stopReason 'error', which the turnEnded check alone would misread as finished.
-   */
+  /** True while the child is inside an OCC compaction cycle: from the inflight marker until an
+   * assistant message follows the settled marker. OCC's intentional abort lands as stopReason
+   * 'error', which the turnEnded check alone would misread as finished. */
   compacting: boolean;
 }
 
 /**
- * Whether the transcript currently sits inside an OCC compaction cycle.
- *
- * Last marker wins: inflight last means the summary request is running; settled last means the
- * cycle is over — unless no assistant message follows it yet, in which case the continuation turn
- * has not produced output and the worker is still machine-paused (not settled, not a user takeover).
+ * Whether the transcript currently sits inside an OCC compaction cycle. Last marker wins: inflight
+ * last means the summary request is running; settled last means the cycle is over — unless no
+ * assistant message follows it yet, in which case the worker is still machine-paused (not settled,
+ * not a user takeover).
  */
 export function compactionBusy(entries: readonly SessionEntryLike[]): boolean {
   for (let i = entries.length - 1; i >= 0; i--) {
@@ -173,9 +160,8 @@ export function compactionBusy(entries: readonly SessionEntryLike[]): boolean {
   return false;
 }
 
-/** Derive the settlement state from already-parsed entries. Closing text is terminal by
- * construction (lastAssistantText requires stopReason 'stop'); an assistant message alone is
- * not a settlement — the turn must have ENDED. */
+/** Closing text is terminal by construction (lastAssistantText requires stopReason 'stop'); an
+ * assistant message alone is not a settlement — the turn must have ENDED. */
 export function deriveSubSessionState(
   entries: readonly SessionEntryLike[],
   sinceTs: number,
@@ -215,10 +201,8 @@ export function listSessionFiles(cwd: string, agentDir: string, limit = 4): stri
   return files.slice(0, limit).map((f) => f.file);
 }
 
-/**
- * Locate a session file by id (`<ts>_<id>.jsonl`).
- * Searches pi core's own directory name first, then pier's legacy flattened dirs.
- */
+/** Locate a session file by id (`<ts>_<id>.jsonl`): pi core's directory name first, then pier's
+ * legacy flattened dirs. */
 export function sessionFileById(cwd: string, agentDir: string, id: string): string | null {
   const suffix = `_${id}.jsonl`;
   for (const name of piSessionDirCandidates(cwd)) {
@@ -237,11 +221,10 @@ export function sessionFileById(cwd: string, agentDir: string, id: string): stri
 }
 
 /**
- * Normalize a session path or id to the bare id used across herdr-pi state
- * (`<timestamp>_<uuid>.jsonl` → `<uuid>`; `sub-session.jsonl` stays whole).
- * Only pi's real transcript prefix is stripped, so arbitrary ids like
- * PI_SESSION_FILE=sess_idx_prune survive untouched. Same-normalization
- * comparisons (own session vs candidate paths) must go through here.
+ * Normalize a session path or id to the bare id used across herdr-pi state (`<timestamp>_<uuid>.jsonl`
+ * → `<uuid>`; `sub-session.jsonl` stays whole). Only pi's real transcript prefix is stripped, so
+ * arbitrary ids like PI_SESSION_FILE=sess_idx_prune survive untouched. Same-normalization comparisons
+ * (own session vs candidate paths) must go through here.
  */
 export function bareSessionId(raw: string): string {
   const base = raw.replaceAll('\\', '/').split('/').pop()!.replace(/\.jsonl$/, '');

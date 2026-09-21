@@ -1,10 +1,8 @@
 /**
- * Role manifest file format + validator. The contract document is
- * `schemas/role-manifest.schema.json`; validation is hand-written with zero dependencies so workers
- * carry no ajv overhead.
- *
- * Strict: unknown top-level keys are reported (a typo like "rulez" must not silently fail) and every
- * issue is collected in one pass so a manifest can be repaired in one go.
+ * Role manifest file format + validator; the contract document is `schemas/role-manifest.schema.json`.
+ * Validation is hand-written with zero dependencies so workers carry no ajv overhead. Strict: unknown
+ * top-level keys are reported (a typo like "rulez" must not silently fail) and every issue is
+ * collected in one pass so a manifest can be repaired in one go.
  */
 export type PermissionAction = 'allow' | 'ask' | 'deny';
 export type TodosMode = 'serial' | 'parallel';
@@ -13,26 +11,20 @@ export type UnknownToolStance = 'allow' | 'deny';
 
 export interface RoleManifest {
   role: string;
-  /** Semantic version x.y.z (for tracing manifest evolution; P2). */
   version: string;
-  /**
-   * WS-D10: `provider/model` routing by role. Omitted means follow the process default
-   * (spawn injects `--provider/--model`).
-   */
+  /** WS-D10: `provider/model` routing by role; omitted means follow the process default (spawn injects `--provider/--model`). */
   model?: string;
   description?: string;
   /** P0 per-role guidelines (RFC §4.6): constraints a tool set cannot express; injected as a prompt section. */
   guidelines?: string[];
   manifest: {
-    /** Baseline tools (non-empty; must include todo_write + ask_user_question for coordination). */
     tools: string[];
     /** Three-state permissions; `*` supplies the default; omitted means `{"*":"allow"}`. */
     rules?: Record<string, PermissionAction>;
     /**
-     * D82 stance for tools outside the manifest (default deny). master/worker = allow — install
-     * grants the user's extension access — while custom roles default to deny. Separate axis from
-     * `rules['*']`: visibility vs enforcement. Excluded families (worker's subagent/terminal) need an
-     * explicit deny to stay blocked under allow.
+     * D82 stance for tools outside the manifest (default deny; master/worker = allow — install grants
+     * the user's extension access). Separate axis from `rules['*']`: visibility vs enforcement.
+     * Excluded families (worker's subagent/terminal) need an explicit deny to stay blocked under allow.
      */
     unknownTools?: UnknownToolStance;
   };
@@ -65,35 +57,29 @@ export function validateRoleManifest(input: unknown): ValidateResult {
     return { ok: false, code: 'INVALID_ROLE_CONFIG', issues: ['role 档案必须是 JSON 对象'] };
   }
 
-  /* ── Top-level keys ── */
   const KNOWN_TOP = new Set(['role', 'version', 'model', 'description', 'guidelines', 'manifest', 'services']);
   for (const k of Object.keys(input)) {
     if (!KNOWN_TOP.has(k)) issues.push(`未知顶层键 "${k}"（契约外字段，检查拼写）`);
   }
 
-  /* ── role name ── */
   if (typeof input.role !== 'string' || !ROLE_NAME_RE.test(input.role)) {
     issues.push(`role 必须是 [a-z0-9-]+ 字符串，收到 ${JSON.stringify(input.role)}`);
   }
 
-  /* ── version (P2 semver) ── */
   if (typeof input.version !== 'string' || !SEMVER_RE.test(input.version)) {
     issues.push(`version 必须是 x.y.z 三段数字（如 1.0.0），收到 ${JSON.stringify(input.version)}`);
   }
 
-  /* ── model (WS-D10: provider/model role routing; optional) ── */
   if (input.model !== undefined) {
     if (typeof input.model !== 'string' || !/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(input.model)) {
       issues.push(`model 必须是 provider/model 形态（如 opencode-go/muse-spark-1.2-contributor），收到 ${JSON.stringify(input.model)}`);
     }
   }
 
-  /* ── optional description ── */
   if (input.description !== undefined && typeof input.description !== 'string') {
     issues.push('description 必须是字符串');
   }
 
-  /* ── optional guidelines (P0: per-role behavior constraints) ── */
   if (input.guidelines !== undefined) {
     if (!Array.isArray(input.guidelines)) {
       issues.push('guidelines 必须是字符串数组');
@@ -106,7 +92,6 @@ export function validateRoleManifest(input: unknown): ValidateResult {
     }
   }
 
-  /* ── manifest ── */
   const m = input.manifest;
   if (!isPlainObject(m)) {
     issues.push('manifest 必须是对象');
@@ -116,12 +101,10 @@ export function validateRoleManifest(input: unknown): ValidateResult {
       if (!KNOWN_MANIFEST.has(k)) issues.push(`manifest 内未知键 "${k}"`);
     }
 
-    // D82 unknownTools: enum validation; omitted means deny (safe default).
     if (m.unknownTools !== undefined && m.unknownTools !== 'allow' && m.unknownTools !== 'deny') {
       issues.push(`manifest.unknownTools 必须是 allow/deny，收到 ${JSON.stringify(m.unknownTools)}`);
     }
 
-    // tools must be a unique, non-empty string array containing coordination tools; an empty array also reports the omissions.
     const tools = m.tools;
     if (!Array.isArray(tools) || !tools.every((t) => typeof t === 'string' && TOOL_KEY_RE.test(t))) {
       issues.push('manifest.tools 必须是非空字符串数组（工具名 [a-z0-9_-]）');
@@ -136,7 +119,6 @@ export function validateRoleManifest(input: unknown): ValidateResult {
       }
     }
 
-    // rules accept three-state values; each key must be a tool name or *.
     if (m.rules !== undefined) {
       if (!isPlainObject(m.rules)) {
         issues.push('manifest.rules 必须是对象');
@@ -151,7 +133,6 @@ export function validateRoleManifest(input: unknown): ValidateResult {
     }
   }
 
-  /* ── services ── */
   if (input.services !== undefined) {
     if (!isPlainObject(input.services)) {
       issues.push('services 必须是对象');

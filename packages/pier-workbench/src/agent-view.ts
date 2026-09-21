@@ -1,7 +1,5 @@
-/**
- * Sidebar agent view registration for Herdr (protocol 22 `agent.view.set`): no agent-kind filter
- * (every harness stays visible) plus attention-first ordering.
- */
+/** Sidebar agent view registration for Herdr (protocol 22 `agent.view.set`): no agent-kind filter
+ * (every harness stays visible) plus attention-first ordering. */
 
 export type AgentViewBuiltinField =
   | 'status' | 'workspace_id' | 'tab_id' | 'pane_id' | 'agent' | 'seen' | 'state_change_seq';
@@ -10,7 +8,6 @@ export type AgentViewBuiltinSortField =
   | 'workspace_order' | 'tab_order' | 'pane_order' | 'attention'
   | 'status' | 'agent' | 'seen' | 'state_change_seq';
 
-/** A custom field token, or one of herdr's builtins. */
 export type AgentViewField = AgentViewBuiltinField | { token: string };
 export type AgentViewSortField = AgentViewBuiltinSortField | { token: string };
 
@@ -41,11 +38,8 @@ export interface BuildAgentViewOptions {
 }
 
 /**
- * Builds validated parameters for agent.view.set.
- *
- * The default filter is null — no harness restriction. `agent.view.set` replaces Herdr's built-in
- * Agents projection for the whole UI, so any harness missing from a filter silently disappears from the
- * sidebar: a `pi`-only filter used to hide every omp pane (D105). Only the ordering is opinionated.
+ * Builds validated parameters for agent.view.set. Default filter null — the call replaces Herdr's built-in
+ * Agents projection UI-wide, so any harness a filter excludes silently disappears from the sidebar.
  */
 export function buildAgentViewSetParams(options?: BuildAgentViewOptions): AgentViewSetParams {
   return {

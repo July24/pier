@@ -1,12 +1,10 @@
 /**
- * B10 environment naming. Two prefixes grew side by side — `PI_HERDR_*` (older tuning knobs) and
- * `PIER_*` (newer ones) — so this module fixes one rule and enforces it in code:
+ * B10 environment naming. `PIER_*` is the canonical namespace for *pier options* (timeouts, windows,
+ * toggles); the historical `PI_HERDR_*` spelling stays accepted as a fallback alias.
  *
- *  - `PIER_*` is the canonical namespace for *pier options* (timeouts, windows, toggles); the
- *    historical `PI_HERDR_*` spelling stays accepted as a fallback alias.
- *  - `PI_HERDR_SUBAGENT`, `PI_HERDR_ROLE_MANIFEST`, `PI_HERDR_TUI`, `PI_HERDR_META_KEY` stay as they
- *    are: those are *contracts* handed to the child process by pier itself (or read by pi/herdr), and
- *    renaming them would split running workers from their parent.
+ * `PI_HERDR_SUBAGENT`, `PI_HERDR_ROLE_MANIFEST`, `PI_HERDR_TUI`, `PI_HERDR_META_KEY` stay as they are:
+ * those are *contracts* handed to the child process by pier itself (or read by pi/herdr), and renaming
+ * them would split running workers from their parent.
  *
  * `pierOption()` is the single reader; this registry is also the single source of the numeric
  * bounds/defaults behind `runtimePolicy` (runtime-policy.ts) and the `/pier-config` catalog
@@ -26,7 +24,6 @@ export type PolicyField =
   | 'readinessTimeoutMs';
 
 export interface OptionSpec {
-  /** Canonical name. */
   readonly name: string;
   /** Historical `PI_HERDR_*` spelling still accepted. */
   readonly legacy?: string;
@@ -62,10 +59,7 @@ export const PIER_OPTIONS: readonly OptionSpec[] = [
   { name: 'PIER_ISOLATE_SWEEP_ORPHANS', legacy: 'PI_HERDR_ISOLATE_SWEEP_ORPHANS', fallback: '', description: 'opt-in sweeping of isolate worktrees this session never registered' },
 ];
 
-/**
- * Read a pier option: canonical name first, then the legacy alias, then the fallback.
- * An empty string counts as unset for both names (shells export empty vars easily).
- */
+/** Canonical name → legacy alias → fallback; an empty string counts as unset for both. */
 export function pierOption(
   name: string,
   env: NodeJS.ProcessEnv = process.env,
@@ -79,7 +73,6 @@ export function pierOption(
   return undefined;
 }
 
-/** `/pier-config` catalog rows: name, effective value and where it came from. */
 export function pierOptionRows(env: NodeJS.ProcessEnv = process.env): Array<{
   name: string;
   value: string;
@@ -97,10 +90,8 @@ export function pierOptionRows(env: NodeJS.ProcessEnv = process.env): Array<{
   });
 }
 
-/**
- * Human-readable option table for `/pier-config doctor`, one line per option:
- * `NAME = value (source) — description`. Legacy env names are called out so a stale export is visible.
- */
+/** `/pier-config doctor` table, one line per option: `NAME = value (source) — description`; legacy env
+ *  names are called out so a stale export is visible. */
 export function formatOptionRows(env: NodeJS.ProcessEnv = process.env): string[] {
   return pierOptionRows(env).map((row) => {
     const source = row.source === 'default' ? 'default' : row.source === 'env' ? 'env' : 'env (legacy name)';

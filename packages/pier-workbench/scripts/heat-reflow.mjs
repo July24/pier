@@ -1,8 +1,6 @@
 #!/usr/bin/env node
-/**
- * Herdr hook (pane.created / pane.focused / pane.closed / pane.agent_status_changed): focus heat reflow.
- * Bypasses cordis — a user-mode plugin checkout has no node_modules.
- */
+/** Herdr hook (pane.created / pane.focused / pane.closed / pane.agent_status_changed): focus heat reflow.
+ * Bypasses cordis — a user-mode plugin checkout has no node_modules. */
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { request as rpc } from './herdr-rpc.mjs';

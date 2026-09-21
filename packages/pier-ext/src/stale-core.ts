@@ -1,46 +1,43 @@
 /**
- * Pure core for todo staleness (anti-freeze behavior: a fully completed list once froze for 16h /
- * 37 turns while new work went untracked).
+ * Anti-freeze core: a fully completed list that new work never updates must stop impersonating
+ * current state.
  *
  *  - stale (A): open==0 and ≥ STALE_TURNS turns since the last write → the read hook injects a
- *    rate-limited, capped stale warning;
- *  - archived (B): open==0 and wall-clock age ≥ STALE_CLOCK_MS → treat the list as absent (injection
- *    and title projection stop rereading details; /todos still shows it, session JSONL stays authoritative);
- *  - title (D): when archived, pane/sidebar renders `✓N done <age>` instead of impersonating current state.
+ *    rate-limited, capped warning;
+ *  - archived (B): open==0 and age ≥ STALE_CLOCK_MS → the list is treated as absent;
+ *  - title (D): an archived list renders `✓N done <age>` instead of impersonating current state.
  *
- * A list with open items (pending/in_progress/blocked) is never stale — agent_settled covers unfinished
- * work. Unknown lastWriteAt (old sessions) conservatively suppresses the clock axis; turns is unaffected.
+ * A list with open items is never stale — agent_settled covers unfinished work. Unknown
+ * lastWriteAt (old sessions) conservatively suppresses the clock axis; turns is unaffected.
  */
 import { countTodos, type TodoItem } from './vocab.ts';
 
-/** A: turn-based expiry threshold (user turns counted from the last todo write). */
+/** A: turn-based expiry threshold, counted from the last todo write. */
 export const STALE_TURNS = 6;
 
-/** B: wall-clock archive threshold (age of the last write for a completed list). */
+/** B: age of the last write above which a completed list is archived. */
 export const STALE_CLOCK_MS = 60 * 60 * 1000;
 
-/** A: maximum stale warnings injected during one stalled period. */
+/** A: cap on stale warnings injected during one stalled period. */
 export const STALE_NOTICE_MAX = 3;
 
 export type StalenessKind = 'fresh' | 'stale' | 'archived';
 
 export interface Staleness {
   kind: StalenessKind;
-  /** open = pending + in_progress + blocked (abandoned does not count as unfinished). */
+  /** open = pending + in_progress + blocked (abandoned is not unfinished). */
   open: number;
-  /** now - lastWriteAt; unknown lastWriteAt → null. */
   ageMs: number | null;
 }
 
-/** Open items: stale/archived apply only to fully completed (or fully abandoned) lists with open==0. */
 export function openTodos(items: readonly TodoItem[]): number {
   const c = countTodos(items);
   return c.pending + c.inProgress + c.blocked;
 }
 
 /**
- * Staleness from two axes (turns → stale; wall clock → archived, clock taking precedence).
- * Empty list → fresh (a separate guard owns empty-list handling); null lastWriteAt → never stale.
+ * Clock (archived) takes precedence over turns (stale). Empty list → fresh (a separate guard owns
+ * empty-list handling); null lastWriteAt → never stale.
  */
 export function evaluateStaleness(opts: {
   items: readonly TodoItem[];
@@ -57,7 +54,7 @@ export function evaluateStaleness(opts: {
   return st;
 }
 
-/** For title/mirror paths without turn information: only the wall-clock archive axis. */
+/** Title/mirror paths have no turn information: only the wall-clock archive axis. */
 export function isArchived(
   items: readonly TodoItem[],
   lastWriteAt: number | null,
@@ -66,7 +63,7 @@ export function isArchived(
   return evaluateStaleness({ items, lastWriteAt, turnsSinceWrite: null, now }).kind === 'archived';
 }
 
-/** Age display: <60m → `Nm`; <48h → `Nh` (floor); otherwise `Nd`. */
+/** <60m → `Nm`; <48h → `Nh` (floor); otherwise `Nd`. */
 export function formatAge(ms: number): string {
   if (ms < 60 * 60_000) return `${Math.max(1, Math.floor(ms / 60_000))}m`;
   if (ms < 48 * 3_600_000) return `${Math.floor(ms / 3_600_000)}h`;

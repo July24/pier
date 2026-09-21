@@ -2,12 +2,9 @@
  * D104 config catalog core (pure).
  *
  * Single source of truth for the five pier configuration planes: knob descriptors, effective-value
- * provenance (env > workspace > user > default) and text rendering for `/pier-config show|check|doc`.
- * The `env` plane is derived from the `PIER_OPTIONS` registry (pier-options.ts), so the catalog
- * cannot disagree with the runtime readers.
- *
- * No I/O here; reading the real files/env and registering the command live in config-command.ts.
- * test/config-catalog.test.ts diffs the efficiency knobs against schemas/efficiency-config.schema.json.
+ * provenance (env > workspace > user > default) and rendering for `/pier-config show|check|doc`. The
+ * `env` plane derives from the `PIER_OPTIONS` registry, so it cannot disagree with the runtime readers;
+ * no I/O here (config-command.ts does the reading) and test/config-catalog.test.ts guards the mirror.
  */
 
 import { PIER_OPTIONS } from './pier-options.ts';
@@ -28,9 +25,7 @@ export interface ConfigKnob {
   readonly min?: number;
   /** Historical spellings still accepted for an env knob (B10: canonical `PIER_*` first). */
   readonly aliases?: readonly string[];
-  /** One-line effect/impact, shown by `show`. */
   readonly impact: string;
-  /** Where to read more (docs/schema anchor). */
   readonly docRef?: string;
   /** True when pier only reads the value (owned by pi / herdr). */
   readonly readOnly?: boolean;
@@ -42,7 +37,6 @@ export interface ConfigPlane {
   readonly owner: 'pier' | 'pi' | 'workbench';
   /** Human-facing path templates, in precedence order. */
   readonly files: readonly string[];
-  /** What to do to change this plane. */
   readonly editHint: string;
 }
 
@@ -121,8 +115,7 @@ const PI_KNOBS: readonly ConfigKnob[] = [
   { plane: 'pi', key: 'compaction.keepRecentTokens', kind: 'number', impact: 'Inherited as the OCC retention window when not set in the efficiency config', docRef: 'docs/efficiency-trial.md', readOnly: true },
 ];
 
-/** Runtime policy / behaviour env knobs, derived from the `PIER_OPTIONS` registry: `min` decides
- *  whether a knob is numeric, and `fallback`/`description` become its default and impact line. */
+/** Runtime policy / behaviour env knobs, derived from the `PIER_OPTIONS` registry. */
 const ENV_KNOBS: readonly ConfigKnob[] = PIER_OPTIONS.map((option) => ({
   plane: 'env' as const,
   key: option.name,
@@ -138,7 +131,6 @@ const ENV_KNOBS: readonly ConfigKnob[] = PIER_OPTIONS.map((option) => ({
 /** Every knob the catalog can resolve (roles/boot are per-file planes: their schemas are the reference). */
 export const CONFIG_KNOBS: readonly ConfigKnob[] = Object.freeze([...EFFICIENCY_KNOBS, ...PI_KNOBS, ...ENV_KNOBS]);
 
-/** Dotted-path getter for parsed JSON layers. */
 export function readDotted(obj: unknown, dotted: string): unknown {
   let cursor: unknown = obj;
   for (const part of dotted.split('.')) {
@@ -160,7 +152,6 @@ export function formatValue(value: unknown): string {
   return JSON.stringify(value);
 }
 
-/** Renders a knob value, masking secret-looking keys. */
 export function redactValue(key: string, value: unknown): string {
   if (SECRET_LIKE.test(key) && value !== undefined && value !== '') return '***';
   return formatValue(value);
@@ -172,7 +163,6 @@ export interface ResolvedKnob {
   readonly knob: ConfigKnob;
   readonly value: string;
   readonly source: ConfigSource;
-  /** Env var that actually supplied the value when it is an alias of `knob.key`. */
   readonly via?: string;
   /** Set when a workspace layer exists but was ignored (untrusted project). */
   readonly note?: string;
@@ -196,7 +186,6 @@ function resolveFileKnob(knob: ConfigKnob, layers: RawConfigLayers): ResolvedKno
   const userValue = readDotted(layers.user, knob.key);
   if (workspaceValue !== undefined) {
     if (layers.workspaceTrusted) return { knob, value: redactValue(knob.key, workspaceValue), source: 'workspace' };
-    // Untrusted workspace layer exists but is ignored by the loader: surface both facts.
     return userValue === undefined
       ? { knob, value: redactValue(knob.key, knob.defaultValue), source: 'default', note: 'workspace value ignored (untrusted project)' }
       : { knob, value: redactValue(knob.key, userValue), source: 'user', note: 'workspace layer ignored (untrusted project)' };
@@ -205,7 +194,6 @@ function resolveFileKnob(knob: ConfigKnob, layers: RawConfigLayers): ResolvedKno
   return { knob, value: redactValue(knob.key, knob.defaultValue), source: 'default' };
 }
 
-/** Resolves efficiency + pi knobs from parsed layers. */
 export function resolveConfigKnobs(layers: RawConfigLayers): ResolvedKnob[] {
   const out = EFFICIENCY_KNOBS.map((knob) => resolveFileKnob(knob, layers));
 
@@ -239,15 +227,12 @@ export function resolveEnvKnobs(env: Record<string, string | undefined> = {}): R
   });
 }
 
-/* ── checks ─────────────────────────────────────────────────────────────── */
-
 export interface CheckReport {
   readonly plane: ConfigPlaneId;
   readonly ok: boolean;
   readonly issues: readonly string[];
 }
 
-/** Validates env knobs against catalog bounds (mirrors the runtime warn-and-default behaviour). */
 export function checkEnvKnobs(env: Record<string, string | undefined> = {}): string[] {
   const issues: string[] = [];
   for (const knob of ENV_KNOBS) {
@@ -265,14 +250,11 @@ export function checkEnvKnobs(env: Record<string, string | undefined> = {}): str
   return issues;
 }
 
-/* ── rendering ──────────────────────────────────────────────────────────── */
-
 function sourceLabel(entry: ResolvedKnob): string {
   const base = entry.via ? `${entry.source} via ${entry.via}` : entry.source;
   return entry.note ? `${base} (${entry.note})` : base;
 }
 
-/** Short non-default summary of one plane: "3 set (env 1, workspace 1, user 1)". */
 export function summarizePlane(entries: readonly ResolvedKnob[]): string {
   const changed = entries.filter((e) => e.source !== 'default');
   if (changed.length === 0) return 'all defaults';
@@ -281,7 +263,6 @@ export function summarizePlane(entries: readonly ResolvedKnob[]): string {
   return `${changed.length} set (${[...bySource].map(([s, n]) => `${s} ${n}`).join(', ')})`;
 }
 
-/** Index lines for `/pier-config` (kept short: one line per plane). */
 export function renderIndex(lines: {
   efficiency: readonly ResolvedKnob[];
   pi: readonly ResolvedKnob[];
@@ -302,7 +283,6 @@ export function renderIndex(lines: {
   ];
 }
 
-/** Full listing of one plane's knobs. */
 export function renderPlane(entries: readonly ResolvedKnob[]): string[] {
   const out: string[] = [];
   for (const entry of entries) {
@@ -315,7 +295,6 @@ export function renderPlane(entries: readonly ResolvedKnob[]): string[] {
   return out;
 }
 
-/** Validated-issue lines for `check`. */
 export function renderCheck(reports: readonly CheckReport[]): string[] {
   const out: string[] = [];
   for (const report of reports) {
@@ -332,7 +311,6 @@ export interface ReportMeta {
   readonly piVersion?: string;
 }
 
-/** Machine-truth markdown report (`/pier-config doc`). */
 export function renderReport(entries: readonly ResolvedKnob[], meta: ReportMeta): string {
   const lines = [
     '# pier config report',

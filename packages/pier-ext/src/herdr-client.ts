@@ -11,9 +11,7 @@
  *    idle|working|blocked|unknown ('done' is server-derived and is not reported by the client);
  *  - pane.report_metadata reports {pane_id, source, title?, state_labels?, clear_*, tokens?, ttl_ms?}
  *    (ttl_ms is capped at 24 h by the server; the first report of a session also clears legacy
- *    pi-herdr chunk tokens to null);
- *  - agent.list {} → {type:'agent_list', agents: AgentInfo[]};
- *  - agent.wait {target, until[], timeout_ms?} → the matching agent, or an error on timeout.
+ *    pi-herdr chunk tokens to null).
  *
  * Reporting failures stay silent and never affect the main pi flow; without herdr the Noop client
  * keeps pi independent (DESIGN.md §4.1).
@@ -25,7 +23,6 @@ import * as net from 'node:net';
 
 /* ── Types ──────────────────────────────────────────────────────────── */
 
-/** Herdr agent semantic state; schema has five observed states and 'done' is server-derived. */
 export type HerdrAgentState = 'idle' | 'working' | 'blocked' | 'done' | 'unknown';
 
 export interface HerdrEnv {
@@ -94,7 +91,6 @@ export type OpenPluginPaneResult =
   | { mode: 'pane'; paneId: string }
   | { mode: 'fallback_tab'; tabId?: string; paneId?: string };
 
-/** TabInfo projection; fields mirror the observed tab schema. */
 export interface TabInfo {
   tabId: string;
   workspaceId: string;
@@ -116,17 +112,13 @@ export function detectHerdrEnv(env: NodeJS.ProcessEnv = process.env): HerdrEnv |
   };
 }
 
-/** Resolve herdr socket target (Windows named-pipe prefix vs Unix path). */
 export function herdrSocketTarget(socketPath: string, platform: NodeJS.Platform = process.platform): string {
   if (platform !== 'win32') return socketPath;
   return socketPath.startsWith('\\\\.\\pipe\\') ? socketPath : `\\\\.\\pipe\\${socketPath}`;
 }
 
-/**
- * B5: herdr can be configured but unreachable (server stopped, stale/typo'd HERDR_SOCKET_PATH).
- * A raw errno ("connect ENOENT /Users/…/herdr.sock") tells the model nothing to act on, so tool
- * layers append this one sentence. Returns null when the failure is not a transport failure.
- */
+/** B5: herdr configured but unreachable (stopped server, stale HERDR_SOCKET_PATH) — tool layers append
+ * this sentence because a raw errno tells the model nothing. Null when the failure is not transport. */
 export function herdrUnavailableHint(err: unknown): string | null {
   const msg = String((err as { message?: unknown })?.message ?? err);
   if (!/ENOENT|ECONNREFUSED|ECONNRESET|EPIPE|ENOTCONN|not connected|socket|connect |timeout/i.test(msg)) {
@@ -134,7 +126,6 @@ export function herdrUnavailableHint(err: unknown): string | null {
   }
   return `herdr unreachable (${msg}) — check that the herdr server is running and HERDR_SOCKET_PATH matches its socket`;
 }
-
 
 /** Wire protocol this client is written against (herdr 0.9.1). See test/fixtures/herdr-contract.json. */
 export const HERDR_PROTOCOL_EXPECTED = 22;
@@ -167,45 +158,36 @@ export interface HerdrClientLike {
   reportDisplayAgent(name: string | null): Promise<void>;
   /**
    * D95: ask_user_question waiting marker (tokens['pi-ask']; null clears it). The sidebar/heatmap
-   * grades blocked + pi-ask as the ask level, distinct from plain block.
+   * grade blocked + pi-ask as the ask level, distinct from plain block.
    */
   reportAskFlag(text: string | null): Promise<void>;
   listAgents(): Promise<AgentInfo[]>;
   /** Inject text into a pane terminal (pi editor input + Enter); the PTY channel is used only to start launchLine. */
   sendPaneText(paneId: string, text: string): Promise<void>;
-  /** Wait for an agent state server-side; return the matched state, null on timeout, and throw on error. */
+  /** Server-side wait; null on timeout, throws on any other error. */
   waitAgent(paneId: string, until: HerdrAgentState[], timeoutMs: number): Promise<HerdrAgentState | null>;
   /** Query the child-agent session path (agent_session.value, kind=path); return null when absent. */
   getAgentSessionPath(paneId: string): Promise<string | null>;
-  /** Split a new shell pane in the current tab and return its pane ID. */
   splitPane(opts: { direction?: 'left' | 'right' | 'up' | 'down'; cwd?: string; env?: Record<string, string>; targetPaneId?: string; focus?: boolean; ratio?: number }): Promise<string>;
   /** Close a pane; herdr kills its process tree and closes an empty tab. */
   closePane(paneId: string): Promise<void>;
-  /** Create a tab with a root shell pane, returning tabId/paneId for group-tab infrastructure. */
   createTab(opts: { workspaceId: string; label?: string; cwd?: string; env?: Record<string, string> }): Promise<{ tabId: string; paneId: string }>;
-  /** List all panes with their tab ownership. */
   listPanes(): Promise<PaneListItem[]>;
-  /** D91: Export the tab layout tree, locating it by paneId or tabId; best effort returns null on failure. */
+  /** D91: layout tree by paneId or tabId; null on failure. */
   exportLayout(opts?: { paneId?: string; tabId?: string }): Promise<{ tabId: string | null; zoomed: boolean; root: unknown; focusedPaneId: string | null } | null>;
   /** 0.9.1: live pane rects for the tab containing paneId. Best effort returns null. */
   paneLayout(opts?: { paneId?: string }): Promise<PaneLayoutSnapshot | null>;
-  /** v1.3: List tabs (tab.list); fields follow the observed schema. */
   tabList(): Promise<TabInfo[]>;
-  /** v1.3: Close a tab (tab.close), cascading to its panes. */
+  /** v1.3: tab.close cascades to the tab's panes. */
   tabClose(tabId: string): Promise<void>;
   /** 0.9.1: Launch a manifest pane entrypoint with placement (popup/tab/split/overlay/zoomed). */
   openPluginPane(opts: OpenPluginPaneOptions): Promise<OpenPluginPaneResult>;
-  /** 0.9.1: Query agent explain diagnostics. */
   agentExplain(target: string): Promise<Record<string, unknown> | null>;
-  /** 0.9.1: Query server version via ping. Cached in memory. */
   getServerVersion(): Promise<string | null>;
-  /** M14: Send a key combination (pane.send_keys; Herdr key combos include ctrl+c, enter, and esc). */
+  /** pane.send_keys; herdr key combos include ctrl+c, enter, and esc. */
   sendPaneKeys(paneId: string, keys: string[]): Promise<void>;
-  /** M14: Read the pane output buffer; recent preserves ANSI data for T6 detection by default. */
   readPane(paneId: string, opts?: ReadOptions): Promise<ReadBuffer>;
-  /** Read the agent output buffer via herdr 0.9 agent.read RPC. */
   readAgent(target: string, opts?: ReadOptions): Promise<ReadBuffer>;
-  /** M14: Wait for output to match a substring or regex; return discriminated result on match/timeout/unavailable. */
   waitForOutput(paneId: string, match: { type: 'substring' | 'regex'; value: string }, timeoutMs: number): Promise<WaitForOutputResult>;
   close(): void;
 }
@@ -226,8 +208,7 @@ function findIdIn(obj: unknown, key: string, depth = 0): string | null {
 
 /* ── Noop ──────────────────────────────────────────────────────────── */
 
-/** Stand-in for a process outside a herdr pane: queries answer empty, pane creation throws the
- * reason, reporting is a no-op. */
+/** Stand-in outside a herdr pane: queries answer empty, pane creation throws, reporting is a no-op. */
 export class NoopHerdrClient implements HerdrClientLike {
   readonly available = false;
   async reportAgent(): Promise<void> {}
@@ -272,8 +253,7 @@ export class HerdrClient implements HerdrClientLike {
     return herdrSocketTarget(this.env.socketPath);
   }
 
-  /** One connection per control request: the server replies with a single {id, result} | {id, error}
-   * line and closes, so reading that line finishes the request. */
+  /** One connection per control request: the reply is a single {id,result}|{id,error} line. */
   private request(method: string, params: Record<string, unknown>, timeoutMs = 15000): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const sock = net.createConnection(this.target());
@@ -342,7 +322,6 @@ export class HerdrClient implements HerdrClientLike {
         ...(message ? { message } : {}),
       });
     } catch {
-      /* Reported state is a mirror; never affects pi. */
     }
   }
 
@@ -380,7 +359,6 @@ export class HerdrClient implements HerdrClientLike {
         ttl_ms: 86400000,
       });
     } catch {
-      /* Silent best effort: the title projection must never affect pi's main flow. */
     }
   }
 
@@ -388,7 +366,6 @@ export class HerdrClient implements HerdrClientLike {
     const keys = Object.keys(tokens);
     if (keys.length === 0) return;
     try {
-      // schema maxProperties=16, so split into independent best-effort requests.
       for (let i = 0; i < keys.length; i += LOCK_BATCH_LIMIT) {
         const batch: Record<string, string | null> = {};
         for (const k of keys.slice(i, i + LOCK_BATCH_LIMIT)) batch[k] = tokens[k];
@@ -412,7 +389,6 @@ export class HerdrClient implements HerdrClientLike {
         ...(name ? { display_agent: name } : { clear_display_agent: true }),
       });
     } catch {
-      /* Silent best effort: sidebar identity is supplementary. */
     }
   }
 
@@ -425,7 +401,6 @@ export class HerdrClient implements HerdrClientLike {
         ttl_ms: 86400000,
       });
     } catch {
-      /* Silent best effort: the human-gate marker is supplementary. */
     }
   }
 
@@ -671,7 +646,6 @@ export class HerdrClient implements HerdrClientLike {
         return result.version;
       }
     } catch {
-      /* Version is diagnostic only. */
     }
     return null;
   }
@@ -680,10 +654,7 @@ export class HerdrClient implements HerdrClientLike {
     await this.request('pane.send_keys', { pane_id: paneId, keys });
   }
 
-  /**
-   * Shared pane.read / agent.read decode. Observed envelope: {type:'<method>', read:{text, revision,
-   * truncated, …}} — the payload is nested under `read`, and older servers answer it flat.
-   */
+  /** Shared pane.read/agent.read decode: payload nested under `read` (older servers answer it flat). */
   private async readBuffer(
     method: 'pane.read' | 'agent.read',
     target: { pane_id: string } | { target: string },

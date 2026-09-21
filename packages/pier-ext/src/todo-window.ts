@@ -1,7 +1,6 @@
 /**
- * Activity-anchored todo window shared by the pi widget and the slim overlay. The widget passes a
- * budget of unwrapped render lines, the overlay supplies its own `fits` so wrapping can consume extra
- * rows; either way the in-progress row stays visible.
+ * Activity-anchored todo window for the pi widget and the slim overlay: the widget passes a budget of
+ * unwrapped render lines, the overlay supplies its own `fits`; the in-progress row stays visible.
  */
 import { countTodos, type TodoItem, type TodoStatus } from './vocab.ts';
 
@@ -39,9 +38,8 @@ export function renderTodoGroups(items: readonly TodoItem[]): string[] {
 }
 
 /**
- * Expand around the active anchor while `fits(start, end)` holds: the first in_progress item,
- * else the last open one, growing toward the tail first so upcoming work wins. All-completed
- * lists shrink from the head instead.
+ * Expand around the active anchor while `fits(start, end)` holds: the first in_progress item, else the
+ * last open one, growing toward the tail first. All-completed lists shrink from the head instead.
  */
 export function anchorTodoRange(
   items: readonly TodoItem[],

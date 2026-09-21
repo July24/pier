@@ -1,10 +1,10 @@
 /**
  * Bootstrap the master Cordis tree (D78 mount topology, D80 ecosystem adoption, D81 split).
  *
- * Loads the group, timer and HMR plugins in order so declarations resolve, with HMR as a
- * development-only path (`--expose-internals` plus PIER_HMR=1); production has no watcher.
- * Workers bypass this module (C3/D81): short-lived processes mount manually, and this module plus
- * subagent-poller.ts are the master-only dynamic imports.
+ * Loads group, timer and HMR plugins in order so declarations resolve, with HMR as a development-only
+ * path (`--expose-internals` plus PIER_HMR=1); production has no watcher. Workers bypass this module
+ * (C3/D81): short-lived processes mount manually, and this module plus subagent-poller.ts are the
+ * master-only dynamic imports.
  */
 import { Context } from '@deepseek-ai/cordis';
 import Loader from '@deepseek-ai/cordis-plugin-loader';
@@ -21,9 +21,8 @@ export interface BootstrapHooks {
 export interface CordisApp {
   /** Root owns subagent scopes and lifecycle effects. */
   root: Context;
-  /** False preserves the bare-tree fallback, matching the baseline behavior. */
+  /** False means the loader was not mounted (bare-tree fallback). */
   loaderReady: boolean;
-  /** HMR is enabled only in the development posture. */
   hmrActive: boolean;
   /** Shared ledger compensates HMR disposal and handles session_shutdown cleanup. */
   ledger: DisposeLedger;
@@ -75,8 +74,8 @@ export async function createCordisApp(hooks: BootstrapHooks = {}): Promise<Cordi
       });
       hmrActive = true;
       console.error('[pi-herdr] hmr active (dev posture: --expose-internals + PI_HERDR_HMR=1)');
-      // D80⑤/d87: HMR already disposes old fiber effects; disposeKey additionally retires the older
-      // pi-surface generations while keeping generations registered after the reload boundary alive.
+      // HMR already disposes old fiber effects; disposeKey additionally retires the older pi-surface
+      // generations while keeping generations registered after the reload boundary alive (D80⑤/d87).
       // Cordis' own HMR boundary event (not part of pi's typed Events map).
       (root as unknown as { on(name: string, fn: (reloads: unknown) => void): void }).on('hmr/reload', (reloads: unknown) => {
         try {

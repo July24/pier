@@ -8,11 +8,9 @@ import type { PermissionAction, UnknownToolStance } from './role-manifest.ts';
 import type { RuntimeRoleManifest } from './tool-gate.ts';
 import { filterToolsByStance } from './tool-gate.ts';
 
-/**
- * Shape persisted in ROLE_MANIFEST_CUSTOM_TYPE entries: the runtime manifest plus the payload
- * version and the switch provenance. `version` is the payload discriminator and `manifestVersion`
- * the manifest semver — replay must not confuse the two.
- */
+/** Shape persisted in ROLE_MANIFEST_CUSTOM_TYPE entries: the runtime manifest plus the payload version and
+ *  the switch provenance. `version` is the payload discriminator and `manifestVersion` the manifest semver
+ *  — replay must not confuse the two. */
 export type RoleManifestRecord = Omit<RuntimeRoleManifest, 'version'> & {
   version: 1;
   manifestVersion?: string;
@@ -34,11 +32,9 @@ export function initialRoleState(manifest: RuntimeRoleManifest | null): RoleStat
   return { manifest, origin: 'env', switchedBy: null, switchedAt: null };
 }
 
-/**
- * Last `pi-herdr.role-manifest` record on the branch, or null. Session entries are pi JSONL
- * objects ({ type: 'custom', customType, data }); unknown shapes are skipped, not fatal —
- * replay must never break session startup.
- */
+/** Last `pi-herdr.role-manifest` record on the branch, or null. Session entries are pi JSONL objects
+ *  ({ type: 'custom', customType, data }); unknown shapes are skipped, not fatal — replay must never break
+ *  session startup. */
 export function latestRoleManifestRecord(entries: readonly unknown[]): RoleManifestRecord | null {
   let found: RoleManifestRecord | null = null;
   for (const raw of entries) {
@@ -76,7 +72,6 @@ export function latestRoleManifestRecord(entries: readonly unknown[]): RoleManif
   return found;
 }
 
-/** Rebuild a runtime manifest from a persisted record (resume replay path). */
 export function manifestFromRecord(rec: RoleManifestRecord): RuntimeRoleManifest {
   return {
     role: rec.role,
@@ -111,12 +106,10 @@ export function planRoleSwitch(oldTools: readonly string[], newTools: readonly s
   return { widening: added.length > 0, added, removed };
 }
 
-/**
- * Active set for a switch, over ALL registered tools rather than the current active set: a switch
- * may re-admit tools an earlier session_start prune removed, which intersection semantics would
- * lose. Stance handling is shared with planActiveTools (tool-gate.ts); the empty result is NOT a
- * no-op here — a switch to a role with no overlap is a legitimate shrink.
- */
+/** Active set for a switch, over ALL registered tools rather than the current active set: a switch may
+ *  re-admit tools an earlier session_start prune removed, which intersection semantics would lose. Stance
+ *  handling is shared with planActiveTools (tool-gate.ts); the empty result is NOT a no-op here — a switch
+ *  to a role with no overlap is a legitimate shrink. */
 export function planSwitchActiveTools(
   manifestTools: readonly string[],
   registeredToolNames: readonly string[],

@@ -6,12 +6,11 @@
  *
  * Requires fullscreen TUI mode (buildLaunchParts injects it): the composite layer sits above the
  * document, so only the alt-screen path can be covered. Registered only inside a herdr pane
- * (PIER_SLIM_FRAME=0 opts out), as one process-local singleton whose overlay stays resident —
+ * (PIER_SLIM_FRAME=0 opts out), as a process-local singleton whose overlay stays resident —
  * `done()` is never called, so the pending promise is swallowed and never awaited.
  *
- * Resize watchdog (D98): the component owns a SIGWINCH listener plus a 1 s poll, because
- * long-running sessions stop re-rendering on resize (an idle master shrunk by heat froze on a
- * stale clipped frame). Sizes are read live per render; both stop in dispose().
+ * Resize watchdog (D98): a SIGWINCH listener plus a 1 s poll, since long-running sessions stop
+ * re-rendering on resize; sizes are read live per render, both stop in dispose().
  */
 
 import { isArchived } from './stale-core.ts';
@@ -20,8 +19,7 @@ import { anchorTodoRange, formatTodoSummary, renderTodoGroups } from './todo-win
 import { pierOption } from './pier-options.ts';
 import { styledWidth, wrapStyled } from './ansi-text.ts';
 
-/** Minimum usable TUI dimensions (pi interactive-mode layout: editor 3 rows + footer 1 + transcript ≥3 + spacing).
- * Below either threshold the pane cannot display a readable TUI, so the overlay covers it. */
+/** Minimum usable TUI dimensions (pi interactive-mode layout: editor 3 rows + footer 1 + transcript ≥3 + spacing). */
 
 export const SLIM_MIN_COLS = 24;
 export const SLIM_MIN_ROWS = 12;
@@ -39,8 +37,6 @@ export function isSlimFrame(cols: number, rows: number): boolean {
   return cols < SLIM_MIN_COLS || rows < SLIM_MIN_ROWS;
 }
 
-/* ── Width-aware wrapping lives in ansi-text (styledWidth / wrapStyled); the frame content is plain text ── */
-
 /** Frame lines: wrap the title, center it vertically, clamp to rows. Every line is padded to the
  *  full visible width — row-wise compositing would otherwise let the TUI underneath show through
  *  blank lines and leak the flicker this frame exists to hide. No title → one centered `·`. */
@@ -54,7 +50,6 @@ export function frameLines(
   return padFrame(body, { width, rows, colorize: opts.colorize ?? ((s: string) => s), vAlign: 'center' });
 }
 
-/** Row-wise compose: pad to full width, place `content` at the top or vertically centered, clamp to rows. */
 function padFrame(
   content: readonly string[],
   opts: { width: number; rows: number; colorize: (s: string) => string; vAlign: 'center' | 'top' },
@@ -94,8 +89,6 @@ export interface SlimFrameInput {
   now?: number;
 }
 
-/** Choose overlay content: the todo window when the pane can show ≥3 wrapped rows at ≥16 cols,
- *  otherwise the pane title (or SLIM_EMPTY_COPY when the list is empty). */
 export function slimContentLines(
   input: SlimFrameInput & { width: number; rows: number; colorize?: (s: string) => string },
 ): string[] {
@@ -138,8 +131,6 @@ export function slimContentLines(
   if (packed.length < SLIM_TODO_MIN_ROWS) return titleFrame();
   return padFrame(packed, { width, rows, colorize, vAlign: 'top' });
 }
-
-/* ── Overlay component plus registration/update (process-local singleton) ─────────────────────────── */
 
 interface FrameTui {
   requestRender(): void;
@@ -220,7 +211,6 @@ class SlimFrameComponent {
     this.tui.requestRender();
   };
 
-  /** Start the D98 watchdog (idempotent). SIGWINCH covers the delivered signal; the poll covers lost ones. */
   startResizeWatchdog(): void {
     if (this.poll) return;
     const size = this.viewportSize();
@@ -247,7 +237,6 @@ class SlimFrameComponent {
     }
   }
 }
-
 
 /** Test injection point (reset module state); dispose first so an undisposed component's watchdog cannot leak. */
 export function resetForTest(): void {
@@ -289,14 +278,12 @@ export function registerSlimFrame(eventCtx: unknown): void {
         },
       },
     );
-    // Never call done(), leaving the Promise pending so the overlay stays resident; swallow rejection and never await it.
     Promise.resolve(pending).catch(() => {});
   } catch {
     /* Silently degrade on pi versions without overlay support. */
   }
 }
 
-/** Update overlay snapshot. Title remains the fallback; items drive the todo window. */
 export function updateSlimFrame(input: SlimFrameInput): void {
   active?.setSnapshot(input.title ?? '', input.items ?? [], input.lastWriteAt ?? null);
 }

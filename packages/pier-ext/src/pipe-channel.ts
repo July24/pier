@@ -1,15 +1,14 @@
 /**
- * M11 separates the human/machine channels (D45–D47) by having the pi extension
- * create its own Windows named pipe.
+ * M11 separates the human/machine channels (D45–D47) by having the pi extension create its own
+ * Windows named pipe.
  *
  *  - Controller (client): one connection per request, matching the herdr client;
- *  - Child pane (server): when PI_HERDR_SUBAGENT=1, the extension starts a server at
- *    session_start and injects prompt/follow_up through pi.sendUserMessage (visible in TUI);
- *  - Completion data is not sent back; authoritative state lives in herdr, session JSONL,
- *    and history (D47).
+ *  - Child pane (server): when PI_HERDR_SUBAGENT=1, the extension starts a server at session_start
+ *    and injects prompt/follow_up through pi.sendUserMessage (visible in TUI);
+ *  - Completion data is not sent back; authoritative state lives in herdr, session JSONL, and
+ *    history (D47).
  *
- * This file contains only pure transport-layer logic for isolated tests; index.ts
- * performs pi injection in the server callback.
+ * Only pure transport-layer logic here; index.ts performs pi injection in the server callback.
  */
 import * as net from 'node:net';
 import * as fs from 'node:fs';
@@ -72,15 +71,12 @@ export type PipeResponse =
   | { type: 'ok'; id: string; detail?: string }
   | { type: 'error'; id: string; message: string };
 
-/**
- * Response side of the protocol (`ok` / `error`). Requests never use these tags, so this is a sound
- * discriminator for narrowing a parsed line at the answering end.
- */
+/** Response side of the protocol (`ok` / `error`): requests never use these tags, so this is a sound
+ * discriminator when narrowing a parsed line at the answering end. */
 function isPipeResponse(value: PipeRequest | PipeResponse): value is PipeResponse {
   return value.type === 'ok' || value.type === 'error';
 }
 
-/** Parse one JSON line, returning null for malformed input. */
 function parsePipeLine(line: string): PipeRequest | PipeResponse | null {
   const t = (line ?? '').trim();
   if (!t) return null;
@@ -88,15 +84,12 @@ function parsePipeLine(line: string): PipeRequest | PipeResponse | null {
     const obj = JSON.parse(t);
     if (obj && typeof obj === 'object' && typeof obj.type === 'string') return obj as PipeRequest | PipeResponse;
   } catch {
-    /* Malformed line. */
   }
   return null;
 }
 
-/**
- * One connection, one request: connect → write JSON line → wait for JSON line → close.
- * Timeout / connect failure / bad frame throw (caller retries).
- */
+/** One connection, one request: connect → write JSON line → wait for JSON line → close. Timeout /
+ * connect failure / bad frame throw (caller retries). */
 export function pipeRequest(
   pipeName: string,
   payload: PipeRequest,
@@ -149,9 +142,6 @@ export function pipeRequest(
   });
 }
 
-/**
- * Try new then legacy pipe names so a new client can still reach an old server.
- */
 export async function pipeRequestTo(
   cwd: string,
   paneId: string,
@@ -172,21 +162,16 @@ export async function pipeRequestTo(
 
 type PipeMessageHandler = (req: PipeRequest) => Promise<PipeResponse>;
 
-/**
- * Server: one line in → handler → one line out → close.
- * Returns the server (caller closes it).
- */
+/** Server: one line in → handler → one line out → close. Returns the server (caller closes it). */
 export function startPipeServer(
   pipeName: string,
   handler: PipeMessageHandler,
   onError?: (err: Error) => void,
 ): net.Server {
   const socketPath = pipePathFor(pipeName);
-  // Why: On POSIX, a crash or ungraceful shutdown leaves the UNIX domain socket file behind.
-  // Subsequent listen calls fail with EADDRINUSE unless the stale socket is unlinked before bind.
-  // Windows named pipes live in kernel namespace (\\.\pipe\...) and require no unlinking.
-  // Best-effort on purpose: if the path cannot be removed (EACCES/EISDIR/ENAMETOOLONG) the
-  // subsequent listen reports the real failure through onError instead of a synchronous throw here.
+  // POSIX leaves the UNIX domain socket behind after a crash, and the next listen fails with
+  // EADDRINUSE unless it is unlinked before bind (Windows named pipes need no unlink). Best-effort:
+  // if unlink fails, listen reports the real error through onError.
   if (process.platform !== 'win32') {
     try {
       fs.unlinkSync(socketPath);
@@ -228,9 +213,8 @@ export function startPipeServer(
   if (onError) {
     server.on('error', onError);
   } else {
-    // Always attach a listener: an EventEmitter 'error' event with no listener throws and would
-    // take the whole extension host down on a transient listen failure (EADDRINUSE/ENOTDIR).
-    // Callers that care pass onError to make the failure observable (F04).
+    // Always attach a listener: an EventEmitter 'error' with no listener throws and would take the
+    // whole extension host down on a transient listen failure; pass onError to observe it (F04).
     server.on('error', () => { /* swallowed by design; pass onError to observe */ });
   }
   if (process.platform !== 'win32') {
@@ -238,7 +222,6 @@ export function startPipeServer(
       try {
         fs.unlinkSync(socketPath);
       } catch {
-        /* best effort */
       }
     });
   }

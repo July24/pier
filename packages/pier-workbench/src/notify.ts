@@ -1,8 +1,6 @@
 /**
- * Notification payload builder for Herdr's notification.show API (protocol 22).
- *
- * NotificationShowParams = { title: string, body?: string | null, position?: ToastHerdrPosition | null,
- * sound?: 'none' | 'done' | 'request' }.
+ * Notification payload builder for Herdr's notification.show API (protocol 22): `{ title, body?, position?,
+ * sound? }` — the full type is NotificationShowParams below.
  */
 
 export interface NotificationShowParams {
@@ -20,10 +18,8 @@ export interface NotificationOptions {
 /** Valid notification sounds (protocol 22 enum). */
 const SOUNDS: Record<string, true> = { none: true, done: true, request: true };
 
-/**
- * Validates an agent status event and builds notification.show params, or null when the event is
- * malformed or gated out. Tight gate: only pi agents in the blocked state are notified.
- */
+/** Builds notification.show params from an agent status event, or null when malformed/gated out.
+ * Tight gate: only pi agents in the blocked state are notified. */
 export function buildNotificationParams(
   rawEvent: unknown,
   options?: NotificationOptions

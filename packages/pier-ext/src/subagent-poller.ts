@@ -1,7 +1,6 @@
 /**
  * Background settlement poller: takeover, blocked gate, observation window, vacuum — plus its
- * per-subagent Cordis scope. Planners are pure; `createPoller` owns the herdr/session I/O loop
- * (30s observation window vs 60s takeover-idle window are policy values, see runtime-policy).
+ * per-subagent Cordis scope. `createPoller` owns the I/O loop (the window values are runtime-policy).
  */
 import { appendFileSync } from 'node:fs';
 import { Context } from '@deepseek-ai/cordis';
@@ -96,13 +95,11 @@ export function planVacuumTick(input: {
 }
 
 /**
- * Closing text (only a terminal assistant message produces it) OR an ENDED turn settles. Merely
- * having an assistant message — the state between tool calls, while the next message streams — must
- * NOT qualify, or live workers get announced as finished.
- *
- * OCC compaction hold: a compacting child (or one machine-paused before its continuation turn) is
- * not settleable even with closing text — that turn was aborted on purpose and the continuation is
- * coming, so an early wake would be a false settlement.
+ * Closing text (only a terminal assistant message produces it) OR an ENDED turn settles; a mere
+ * assistant message — the state between tool calls — must NOT qualify, or live workers get announced
+ * as finished. OCC compaction hold: a compacting child is not settleable even with closing text, since
+ * that turn was aborted on purpose and the continuation is coming — an early wake would be a false
+ * settlement.
  */
 export function isSettlementCandidate(input: {
   text: string | null;
@@ -116,7 +113,6 @@ export function isSettlementCandidate(input: {
   return !input.pendingTool && input.turnEnded === true;
 }
 
-/** Combined settlement notice, with the optional git worktree stat line appended. */
 export function buildSettlementNoticeText(
   agentLabel: string,
   closing: string | null,
@@ -159,8 +155,7 @@ export async function mountSubagentScope(
   paneId: string,
   hooks: ScopeHooks = {},
 ) {
-  // One argument only: the pinned cordis version takes just the plugin object; the pane id
-  // identifies the scope through the plugin name and the effect label.
+  // One argument only: the pinned cordis version takes just the plugin object; the pane id is the scope name.
   return root.plugin({
     name: `subagent:${paneId}`,
     apply(ctx: Context) {
@@ -173,7 +168,6 @@ export async function disposeSessionRoot(root: Context): Promise<void> {
   try {
     await root.fiber.dispose();
   } catch {
-    /* second dispose is a no-op */
   }
 }
 
@@ -193,11 +187,8 @@ export interface PollerHost {
   reconcileOnSettlement(description: string, outcome: 'settled' | 'failed'): string[];
   withReconcileNotes(base: string, notes: readonly string[]): string;
   claimSettleNotice(key: string): boolean;
-  /** Optional sleep seam for timing control without real delays */
   sleep?: (ms: number) => Promise<void>;
-  /** Optional clock seam for deterministic virtual timestamps */
   now?: () => number;
-  /** Optional runtime policy overrides for testing */
   policy?: Partial<RuntimePolicy>;
   /** Optional jev seam for the settle attribution check; absent → legacy wording (fail-open). */
   jev?: { ask: JevRuntime['ask']; getMinConfidence: () => number };
@@ -274,7 +265,6 @@ export function createPoller(h: PollerHost): Poller {
               h.persistSubs();
             }
           } catch {
-            /* status probe failure must not stop the poller */
           }
           if (entry.userTakeover) {
             await doSleep(TAKEOVER_RECHECK_MS);
@@ -304,9 +294,8 @@ export function createPoller(h: PollerHost): Poller {
         if (gate.kind === 'clear-gate') h.blockedGateNotified.delete(paneId);
 
         if (state === 'idle' || state === 'done') {
-          // Spawn can mis-attribute entry.sessionFile (herdr's report lags, and the mtime fallback
-          // records the newest PRE-EXISTING session), freezing settlement detection until the vacuum
-          // timeout. Re-attribute from herdr's per-pane report before judging.
+          // Spawn can mis-attribute entry.sessionFile (herdr's report lags; the mtime fallback records
+          // the newest PRE-EXISTING session), freezing settlement detection until the vacuum timeout.
           if (entry.sessionFile) {
             const fixed = await h.session.reattributeStaleSessionFile(paneId, cwd, current.injectTs, entry.sessionFile);
             if (fixed && fixed !== entry.sessionFile) {
@@ -338,7 +327,6 @@ export function createPoller(h: PollerHost): Poller {
             try {
               agentStatus = (await h.client.listAgents()).find((a) => a.paneId === paneId)?.status ?? null;
             } catch {
-              /* observation continues */
             }
             const obs = planObservationTick({
               observationStartedAt: entry.observationStartedAt,
@@ -368,9 +356,8 @@ export function createPoller(h: PollerHost): Poller {
             entry.observationStartedAt = null;
 
             // Null closing text is ambiguous — a mis-attributed transcript reads like a worker that
-            // died silent. Deterministic signal first: with NO readable candidate at all (activity
-            // false) "left no closing message" would be a lie. Otherwise ask jev to classify the tail
-            // we did read; fail-open keeps the legacy wording byte-identical.
+            // died silent. Deterministic signal first: no readable candidate at all (activity false)
+            // makes "left no closing message" a lie; otherwise ask jev to classify the tail we read.
             let nullReason: SettlementNullReason = 'silent';
             if (closing == null) {
               if (!s.activity) {
@@ -410,7 +397,6 @@ export function createPoller(h: PollerHost): Poller {
               try {
                 await h.injectNotice(notice);
               } catch {
-                /* list_agents can recover */
               }
             }
             return;

@@ -1,31 +1,27 @@
 /**
- * M16 pure core for progress visibility: conservative output only, no new D3 protocol. The progress
- * badge (N/M plus optional ETA) rides in the pane title, the tool badge (🔧 tool) goes through
- * report_agent.message, and rates follow kimi estimator semantics. An untrustworthy estimate falls
- * back to plain `N/M` — never a misleading ETA.
+ * M16 progress visibility: conservative output only, no new D3 protocol. The progress badge
+ * (N/M plus optional ETA) rides in the pane title, the tool badge (🔧 tool) goes through
+ * report_agent.message, and an untrustworthy estimate falls back to plain `N/M` — never a
+ * misleading ETA.
  */
 
 import { countTodos, type TodoItem } from './vocab.ts';
 
 /** Minimum completed points needed for an ETA (<2 cannot establish a rate). */
 export const ETA_MIN_SAMPLES = 2;
-/** Completion freshness gate: an older latest completion means the data is stale and no ETA is estimated. */
+/** An older latest completion means the data is stale and no ETA is estimated. */
 export const PROGRESS_STALE_MS = 5 * 60_000;
-/** Number of recent completion points used for rate fitting. */
 const RATE_SAMPLE_POINTS = 5;
 
 export interface EtaEstimate {
-  /** Remaining steps. */
   remaining: number;
-  /** Estimated remaining time (milliseconds). */
   etaMs: number;
   confidence: 'ok';
 }
 
 /**
- * Estimate ETA from completion timestamps and remaining steps.
- *  - Fewer than 2 points, or a stale latest point, → null;
- *  - Rate = latest K(≤5) points, (k-1) / (t_k - t_1); eta = remaining / rate.
+ * Fewer than 2 points, or a stale latest point, → null.
+ * Rate = latest K(≤5) points, (k-1) / (t_k - t_1); eta = remaining / rate.
  */
 export function estimateEta(opts: {
   completedAt: readonly number[];
@@ -71,7 +67,7 @@ export function planToolBadge(runningToolNames: readonly string[]): string | nul
   return runningToolNames.length === 1 ? `🔧 ${first}` : `🔧 ${first} +${runningToolNames.length - 1}`;
 }
 
-/** Progress input derived from a list: completed count over all tracked work. */
+/** Completed count over all tracked work (abandoned excluded). */
 export function progressOf(items: readonly TodoItem[]): { completed: number; total: number } {
   const c = countTodos(items);
   return { completed: c.completed, total: c.completed + c.pending + c.inProgress + c.blocked };

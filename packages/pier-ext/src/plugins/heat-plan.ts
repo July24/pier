@@ -1,9 +1,8 @@
 /**
  * Controlled mirror of workbench heat-layout for spawn-time pane.split ratio — do NOT merge with
- * pier-workbench/src/heat-layout.ts (npm pi-pier has no workbench, and the workbench checkout has
- * no pi-pier). Only planSpawnSplitRatio / simulateSplit / SPAWN_PLACEHOLDER_ID / fromShapeTree /
- * LayoutNode are the interface; the weights stay in lockstep with
- * packages/pier-workbench/test/heat-grid.test.ts.
+ * pier-workbench/src/heat-layout.ts (npm pi-pier has no workbench, and the workbench checkout has no
+ * pi-pier). Only planSpawnSplitRatio / simulateSplit / SPAWN_PLACEHOLDER_ID / fromShapeTree / LayoutNode
+ * are the interface; the weights stay in lockstep with packages/pier-workbench/test/heat-grid.test.ts.
  *
  * herdr src/layout.rs split_at: first = original, second = new, ratio = first share.
  */
@@ -29,7 +28,6 @@ export type LayoutNode =
 type AgentStatusMap = Record<string, string>;
 type AskFlagMap = Record<string, boolean>;
 
-/** parseShapeTree (paneId) → LayoutNode (pane_id). */
 export function fromShapeTree(node: ShapeNode): LayoutNode {
   if (node.type === 'pane') return { type: 'pane', pane_id: node.paneId };
   const direction = node.direction === 'down' || node.direction === 'vertical' ? 'down' : 'right';

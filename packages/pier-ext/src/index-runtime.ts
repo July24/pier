@@ -1,10 +1,6 @@
 /**
- * Index process-mode planner (master vs worker, master-manifest gate).
- *
- * Why: index.ts mixed env branching with cordis/plugin mounting. The mode
- * decision is a pure function of process env and must stay testable without
- * booting the composition root.
- */
+ * Index process-mode planner (master vs worker, master-manifest gate): a pure function of
+ * process env that must stay testable without booting the composition root. */
 import { detectHerdrEnv } from './herdr-client.ts';
 
 export interface IndexMode {

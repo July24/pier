@@ -1,15 +1,13 @@
 /**
- * D101 ObservationPack core: pure algorithms for large-observation detection, deterministic ids,
- * complete-line excerpts, UTF-8-safe chunk slicing, and rolling prefix cache economics. Storage I/O
- * lives in efficiency-store.ts.
+ * ObservationPack cores: large-observation detection, deterministic ids, complete-line excerpts,
+ * UTF-8-safe chunk slicing, rolling prefix cache economics. Storage I/O is in efficiency-store.ts.
  */
 import { createHash } from 'node:crypto';
 import { TOKEN_ACCOUNT_CACHE_RATIO } from './compact-economics-core.ts';
 import { FAILURE_SIGNAL } from './reducer-core.ts';
 
-// Fallbacks used only when a caller omits a field; DEFAULT_EFFICIENCY_CONFIG.observationPack in
-// efficiency-config-core.ts is the canonical set (thresholdBytes lives there alone — every pack
-// decision goes through resolved config).
+// Fallbacks used only when a caller omits a field; DEFAULT_EFFICIENCY_CONFIG.observationPack is the
+// canonical set (thresholdBytes lives there alone — every pack decision goes through resolved config).
 const DEFAULT_FULL_SENDS = 2;
 const DEFAULT_EXCERPT_BYTES = 1024;
 const CHARS_PER_TOKEN = 4;
@@ -62,7 +60,6 @@ export function completeLineExcerpt(text: string, budgetBytes: number, fromEnd: 
     const line = lines[i]!;
     // The head keeps terminated lines only; the tail also keeps the log's final unterminated line.
     if (!fromEnd && !line.endsWith('\n')) break;
-    // A leading partial line (cut by the window) is dropped unless it starts at a line boundary.
     if (fromEnd && i === 0 && start > 0 && text[start - 1] !== '\n') break;
     const lineBytes = Buffer.byteLength(line, 'utf8');
     if (selectedBytes + lineBytes > budgetBytes) break;
@@ -145,7 +142,6 @@ export interface RecallSliceResult {
   eof: boolean;
 }
 
-/** Trims a multi-byte UTF-8 sequence that would be cut at the buffer boundary. */
 function trimUtf8End(buffer: Buffer, limit: number): number {
   let end = limit;
   while (end > 0 && end < buffer.length && ((buffer[end] ?? 0) & 0xc0) === 0x80) {
@@ -154,7 +150,7 @@ function trimUtf8End(buffer: Buffer, limit: number): number {
   return end;
 }
 
-/** Slice a buffer at byte offsets without cutting a UTF-8 character. */
+/** Byte offsets, never cutting a UTF-8 character. */
 export function sliceBufferChunk(
   buf: Buffer,
   offset: number,
@@ -186,9 +182,8 @@ export function sliceBufferChunk(
 }
 
 /**
- * Is replacing an earlier message with a placeholder profitable under rolling prefix cache models?
- * `cacheWriteReadRatio` must already be resolved by the caller via `resolveCacheRatioFromCost`
- * (the same value OCC uses) — a raw `'auto'` here would silently diverge from OCC's resolution.
+ * `cacheWriteReadRatio` must already be resolved by the caller via `resolveCacheRatioFromCost` (the
+ * same value OCC uses); a raw `'auto'` would silently diverge from OCC's resolution.
  */
 export function shouldPackForCache(opts: {
   removedTokens: number;

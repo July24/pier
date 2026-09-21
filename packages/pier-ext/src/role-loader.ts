@@ -1,15 +1,14 @@
 /**
- * Role manifest loading, three layers in order: workspace `<cwd>/.pi-herdr/roles/` (travels with
- * the clone) → user `~/.pi/agent/herdr-pi/roles/` → bundled `src/roles/`.
+ * Role manifest loading, three layers in order: workspace `<cwd>/.pi-herdr/roles/` (travels with the clone)
+ * → user `~/.pi/agent/herdr-pi/roles/` → bundled `src/roles/`.
  *
- * Reserved built-in names (master / worker-default) may not be overridden by a user layer: tests and
- * the D82 stance are anchored to the bundled manifests, so allowing overrides would break them.
+ * Reserved built-in names (master / worker-default) may not be overridden by a user layer: tests and the D82
+ * stance are anchored to the bundled manifests.
  *
- * Role names are restricted to [a-z0-9-] (no path traversal; invalid names never touch disk) and the
- * manifest `role` field must match the filename to prevent attaching the wrong manifest.
- * Errors: unreadable = ROLE_NOT_FOUND (only after every layer missed); parsed-but-invalid
- * JSON/validation/name = INVALID_ROLE_CONFIG at the hit layer — falling through would silently hide
- * a user editing a manifest incorrectly.
+ * Role names are restricted to [a-z0-9-] (no path traversal; invalid names never touch disk) and the manifest
+ * `role` field must match the filename. Errors: unreadable = ROLE_NOT_FOUND (only after every layer missed);
+ * parsed-but-invalid JSON/validation/name = INVALID_ROLE_CONFIG at the hit layer — falling through would
+ * silently hide a user editing a manifest incorrectly.
  */
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -19,7 +18,6 @@ import { userRolesDir, workspaceRolesDir as layoutWorkspaceRolesDir } from './st
 
 export { userRolesDir };
 
-/** Bundled manifest directory (`src/roles/`). */
 export const ROLES_DIR = join(dirname(fileURLToPath(import.meta.url)), 'roles');
 
 /** Workspace-level directory (the default base is the process cwd, i.e. the master's working directory). */
@@ -27,7 +25,6 @@ export function workspaceRolesDir(baseDir?: string): string {
   return layoutWorkspaceRolesDir(baseDir ?? process.cwd());
 }
 
-/** Reserved built-in names (no user layer may override them). */
 export const RESERVED_ROLE_NAMES: readonly string[] = ['master', 'worker-default'];
 
 const ROLE_NAME_RE = /^[a-z0-9-]+$/;
@@ -61,36 +58,28 @@ const defaultLayerRead: LayerReader = (dir, fileName) => {
 export interface LoadRoleOptions {
   /** Inject one reader (legacy shape: only the bundled layer is hit, for test compatibility). */
   read?: RoleReader;
-  /** Inject layered readers (v1.1). */
   layerRead?: LayerReader;
   /** Base directory for the workspace layer (defaults to process.cwd()). */
   baseDir?: string;
-  /**
-   * Direct built-in lookup: used by master's self-application (WS-D7). Reserved names skip user layers and
-   * collision checks and always load the bundled manifest. Otherwise, a workspace master.json could cause
-   * self-application to fail open and silently lose master's manifest (the boundary caught by d11 live testing).
-   */
+  /** Direct built-in lookup (master self-application, WS-D7): reserved names skip user layers and
+   *  collision checks and always load the bundled manifest — otherwise a workspace master.json could make
+   *  self-application fail open and silently lose master's manifest. */
   builtinDirect?: boolean;
 }
 
-/** Resolve lookup layers in order: workspace → user-global → bundled (each layer has {label, dir}). */
 export function roleLayers(opts?: { baseDir?: string; userDir?: string }): Array<{ label: string; dir: string }> {
   const base = opts?.baseDir && isAbsolute(opts.baseDir) ? opts.baseDir
     : resolve(opts?.baseDir ?? process.cwd());
   return [
     { label: 'workspace (.pi-herdr/roles/)', dir: workspaceRolesDir(base) },
-    // userDir exists so tests can isolate from the real ~/.pi (a role file on the
-    // dev machine once flipped a hermetic assertion).
+    // userDir lets tests isolate from the real ~/.pi.
     { label: `user (${'~/.pi/agent/herdr-pi/roles/'})`, dir: opts?.userDir ?? userRolesDir() },
     { label: 'builtin (src/roles/)', dir: ROLES_DIR },
   ];
 }
 
-/**
- * Role names defined by the two user layers (workspace → user), deduped and sorted. Built-ins are
- * not listed here — they are exactly RESERVED_ROLE_NAMES, which no user layer may override.
- * A layer directory that does not exist simply contributes nothing.
- */
+  /** User-layer role names (workspace → user), deduped and sorted; built-ins are not listed — they are
+   *  exactly RESERVED_ROLE_NAMES, which no user layer may override. */
 export function listRoleNames(baseDir?: string, userDir?: string): string[] {
   const names = new Set<string>();
   for (const layer of roleLayers({ baseDir, userDir }).slice(0, 2)) {
@@ -113,7 +102,6 @@ export function loadRoleConfig(name: string, opts?: LoadRoleOptions): RoleManife
   }
   const fileName = `${name}.json`;
 
-  // Legacy single reader: use bundled-layer semantics so existing tests/composer injection paths remain intact.
   if (opts?.read && !opts.layerRead) {
     let text: string;
     try {
@@ -128,11 +116,9 @@ export function loadRoleConfig(name: string, opts?: LoadRoleOptions): RoleManife
   const layerRead = opts?.layerRead ?? defaultLayerRead;
   let layers = roleLayers({ baseDir: opts?.baseDir });
 
-  // Direct built-in lookup (self-application): inspect only the bundled layer, ignoring user-layer bait/collisions.
   if (opts?.builtinDirect && RESERVED_ROLE_NAMES.includes(name)) {
     layers = [layers[2]];
   } else if (RESERVED_ROLE_NAMES.includes(name)) {
-    // Reserved built-in name: reject workspace/user collisions instead of silently overriding built-in semantics.
     for (const layer of layers.slice(0, 2)) {
       if (layerRead(layer.dir, fileName) != null) {
         throw new RoleLoaderError(

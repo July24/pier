@@ -26,7 +26,6 @@ export class ManifestError extends Error {
   }
 }
 
-/** Return contract of composeForRole: the role profile plus the composed effective manifest. */
 export interface ComposedForRole {
   role: RoleManifest;
   manifest: ComposedManifest;

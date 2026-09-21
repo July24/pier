@@ -1,7 +1,7 @@
 /**
  * D100 Online Context Compact economics & feasibility core: pure decision-making, request horizon
- * estimation, cache debt tracking, and native compaction feasibility preflights.
- * Zero dependencies except pi's public cut-point helper.
+ * estimation, cache debt tracking and native compaction feasibility preflights — no dependencies
+ * except pi's public cut-point helper.
  */
 
 import { findCutPoint, sessionEntryToContextMessages, type SessionEntry } from '@earendil-works/pi-coding-agent';
@@ -23,10 +23,10 @@ export const DEFAULT_COMPACTION_ECONOMICS: CompactionEconomics = Object.freeze({
 });
 
 /**
- * Token-account cache ratio: a compaction request re-reads the whole current context once
- * (writeTokens), so breakeven = writeTokens / savingTokens ⇔ ratio 2. This is the `auto` fallback
- * when no usable cache pricing exists, and it is a floor: a ratio ≤ 1 would zero the incremental
- * cost and compact even on the last boundary with nothing left to amortize.
+ * Token-account cache ratio: a compaction request re-reads the whole context once (writeTokens), so
+ * breakeven = writeTokens / savingTokens ⇔ ratio 2. This is the `auto` fallback when no usable cache
+ * pricing exists, and a floor: ratio ≤ 1 would zero the incremental cost and compact even on the last
+ * boundary with nothing left to amortize.
  */
 export const TOKEN_ACCOUNT_CACHE_RATIO = 2.0;
 
@@ -169,9 +169,8 @@ export function decideCompaction(input: {
 
   const firstCompaction = input.priorCompactionCount === 0;
   const horizonRequests = horizon?.expectedRemainingRequests ?? null;
-  // The first-compaction relaxation absorbs cold-start sample noise, but only when work remains:
-  // with zero remaining boundaries the horizon is 1, and scaling it to 2 would burn a full-context
-  // summarization for zero future benefit.
+  // The first-compaction relaxation absorbs cold-start sample noise, but only when work remains: with
+  // zero remaining boundaries the horizon is 1, and scaling it to 2 would burn a full-context summary.
   const relaxFirstCompaction = firstCompaction && input.remainingBoundaries > 0;
   const effectiveHorizonRequests = horizon === null
     ? null
@@ -242,15 +241,12 @@ export function decideCompaction(input: {
 }
 
 /**
- * Resolve the cache write/read cost ratio for compaction decisions:
- *  1. explicit numeric config → as-is (e.g. 12.5 for Anthropic-style pricing);
- *  2. model cost metadata: cacheWrite>0 && cacheRead>0 → write/read; cacheWrite==0 && cacheRead>0
- *     && input>0 → input/cacheRead (implicit cache: rewriting the prefix bills at the input price);
- *  3. provider-family fallback (gemini ≈ 4, grok/deepseek ≈ 10);
- *  4. TOKEN_ACCOUNT_CACHE_RATIO.
- * Returns null only for an explicitly invalid numeric config. `auto` must never resolve to null:
- * a zero-price table means "no local cacheWrite SKU", not "no cache", and null would disable OCC
- * for every model in actual use.
+ * Resolve the cache write/read cost ratio for compaction decisions, in order: explicit numeric config
+ * (as-is, e.g. 12.5 for Anthropic-style pricing), model cost metadata (write/read, or input/cacheRead
+ * when cache writes are billed at the input price), provider-family fallback (gemini ≈ 4, grok/deepseek
+ * ≈ 10), then TOKEN_ACCOUNT_CACHE_RATIO. Returns null only for an explicitly invalid numeric config:
+ * `auto` must never resolve to null, since a zero-price table means "no local cacheWrite SKU", not
+ * "no cache", and null would disable OCC for every model in actual use.
  */
 export function resolveCacheRatioFromCost(
   ratioConfig: number | 'auto',

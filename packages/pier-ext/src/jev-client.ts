@@ -1,8 +1,7 @@
 /**
  * Jev decision layer — direct HTTP client (RFC docs/rfc-jev-integration.md §5). Not the official SDK
  * (@typesafe-ai/sdk): its retry machinery has no total-latency budget (timeouts retried by default,
- * Retry-After honored up to 60s), which is incompatible with pier's fail-open budgets, and the call
- * surface is one endpoint and three question types.
+ * Retry-After honored up to 60s), which is incompatible with pier's fail-open budgets.
  *
  * Every ask() resolves (never throws): errors, timeouts, 429s and low confidence at the call site
  * all mean unanswered, and the caller fails open.
@@ -23,8 +22,8 @@ export interface JevAskMeta {
   /** Site-specific static fields for telemetry; must never contain request bodies. */
   extra?: Record<string, unknown>;
   /**
-   * Post-answer decision fields for telemetry (choices/scores/final verdicts — the data threshold
-   * tuning needs; still never request bodies). Called exactly once per ask.
+   * Post-answer decision fields for telemetry (choices/scores/final verdicts — what threshold tuning
+   * needs; still never request bodies). Called exactly once per ask.
    */
   enrich?: (outcome: { ok: boolean; answers: Record<string, JevAnswer> | null }) => Record<string, unknown>;
 }
@@ -81,7 +80,7 @@ export function createJevRuntime(getConfig: () => JevConfig, deps: JevRuntimeDep
     try {
       await appendEfficiencyLog(efficiencyLogPath(sessionRoot, 'jev'), record);
     } catch {
-      // Telemetry is best effort; never surface logging failures.
+      /* Never surfaced to the caller. */
     }
   }
 

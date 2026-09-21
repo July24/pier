@@ -1,8 +1,6 @@
 /**
- * Subagent spawn domain: git/worktree I/O, task-tab pane placement, launch line, readiness wait,
- * and the `spawn` action (isolate creation, prompt injection, foreground wait).
- *
- * Placement is serialized by a mutex (concurrent spawns raced on tab lookup).
+ * Subagent spawn domain: git/worktree I/O, tab placement, launch line, readiness wait, and the `spawn`
+ * action; placement is serialized by a mutex (concurrent spawns raced on tab lookup).
  */
 import { execFile as nodeExecFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -60,15 +58,13 @@ export interface GitError extends Error {
   readonly stderr?: string;
 }
 
-/** Injectable execFile (tests drive git without a real process). */
 export type GitExecFile = (
   file: string,
   args: readonly string[],
   options: { timeout: number; encoding: 'utf8'; maxBuffer: number },
 ) => Promise<{ stdout: string; stderr: string }>;
 
-/** Output ceiling for one git call (execFile's 1MB default is exceeded by a large checkout, and
- * `status --porcelain` then fails ENOBUFS into a silently missing stat line). */
+/** Output ceiling for one git call: a large checkout blows past execFile's 1MB default (ENOBUFS). */
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 
 export interface GitAdapter {
@@ -207,7 +203,6 @@ interface ReadyFailure {
   readonly reason: 'pane-gone' | 'timeout';
   readonly elapsedMs: number;
   readonly timeoutMs: number;
-  /** Some agent states the wait observed (working/idle/…), for the "agent never reported" case. */
   readonly lastStatus?: string | null;
   readonly tail?: string | null;
   readonly hint?: string | null;
@@ -239,9 +234,8 @@ export function readyBackoffMs(attempt: number, baseMs = READY_BASE_INTERVAL_MS,
   return Math.min(capMs, baseMs * 2 ** n);
 }
 
-/** Failure text for the model. The three cases stay distinguishable: the pane died (usually a
- * crash — the tail carries the reason), the pane is alive but never opened its pipe, and the pane
- * is alive and working, just slower than the timeout. */
+/** Failure text for the model; the three cases stay distinguishable: pane died (the tail carries the
+ * reason), pane alive but never opened its pipe, pane alive and just slower than the timeout. */
 export function readyFailureText(failure: ReadyFailure): string {
   const seconds = Math.round(failure.elapsedMs / 1000);
   const head = failure.reason === 'pane-gone'
@@ -398,7 +392,6 @@ export function createSpawner(h: SpawnerHost): Spawner {
       alive = pane != null;
       status = pane?.agentStatus ?? null;
     } catch {
-      /* keep null: an unreachable socket must not be read as a dead child */
     }
     let tail: string | null = null;
     try {
@@ -608,12 +601,10 @@ export function createSpawnAction(h: SpawnActionHost) {
           permissions: manifest.permissions,
           unknownTools: manifest.unknownTools,
           services: role.services ?? {},
-          // Without guidelines the worker's parseRuntimeManifest yields none and the pier-role
-          // prompt section silently no-ops for exactly the spawned workers that matter.
+          // Without guidelines parseRuntimeManifest yields none and the pier-role prompt section silently no-ops.
           ...(role.guidelines?.length ? { guidelines: role.guidelines } : {}),
         }),
-        // Role resolution base: the worker's /pier-role and pipe switch must resolve workspace
-        // .pi-herdr/roles/ against the MASTER's checkout, not the worker pane's own cwd.
+        // Role base: /pier-role and the pipe switch resolve .pi-herdr/roles/ against the MASTER's checkout.
         PI_HERDR_ROLE_BASE: masterCwd,
       };
       if (typeof role.model === 'string' && role.model.trim()) roleModel = role.model.trim();
@@ -661,24 +652,21 @@ export function createSpawnAction(h: SpawnActionHost) {
       };
       const ready = await waitSubReady(cwd, paneId);
       if (!ready.ok) throw new Error(ready.message);
-      // herdr's per-pane report lags right after spawn, and the mtime fallback would then
-      // attribute the registry to the newest PRE-EXISTING session in cwd. Only a file written
-      // after the pane existed can be this worker's; otherwise leave null for the poller.
+      // herdr's per-pane report lags right after spawn, so the mtime fallback would otherwise adopt
+      // the newest PRE-EXISTING session in cwd; only a file written after the pane existed counts.
       entry.sessionFile = await resolveSessionFile(paneId, cwd, undefined, { minMtimeMs: spawnedAt - 2_000 });
       subs.set(paneId, entry);
       h.persistSubs();
       onUpdate?.(makeProgressUpdate(`subagent ready in pane ${paneId}; injecting prompt via pipe…`));
-      // M11: inject through the extension pipe, reserving the PTY keyboard channel for the human.
-      // Injection and injectTs must stay together: without them a spawn leaves a ghost running
-      // ledger entry and a worker with no task context.
+      // M11: inject through the extension pipe, reserving the PTY keyboard channel for the human;
+      // injection and injectTs must stay together or the spawn leaves a ghost running ledger entry.
       const injectTs = Date.now();
       const injected = await pipeRequestTo(cwd, paneId, {
         type: 'prompt',
         id: `prompt-${taskId}`,
         text: spec.prompt,
-        // The pipe name MUST be scoped by the MASTER's cwd: the pipe server binds
-        // pipeNameFor(master session cwd, own paneId). The worker's cwd (e.g. a cross-repo
-        // delegation) names a pipe nobody listens on and the reply becomes a dead letter.
+        // The pipe name MUST be scoped by the MASTER's cwd: the server binds pipeNameFor(master
+        // session cwd, own paneId); the worker's cwd names a pipe nobody listens on.
         from: pipeNameFor(masterCwd, env?.paneId ?? ''),
         push: background,
       });
@@ -686,7 +674,6 @@ export function createSpawnAction(h: SpawnActionHost) {
         throw new Error(`pipe prompt rejected: ${injected.type === 'error' ? injected.message : 'unknown response'}`);
       }
       h.lastMachineInjectAt.set(paneId, injectTs); // attribute working state during the observation window
-      /** Hand supervision to the poller: the caller gets a settle notice instead of a blocking wait. */
       const handToPoller = (requestId: string): void => {
         entry.background = true;
         h.lastRequestIdByPane.set(paneId, requestId);
@@ -703,8 +690,7 @@ export function createSpawnAction(h: SpawnActionHost) {
         };
       }
 
-      // Foreground waiting uses a content gate plus a patience threshold before backgrounding:
-      // an idle-as-settled hard window consumed healthy subagents that produced results right after.
+      // Foreground waiting: content gate + patience threshold before backgrounding an idle pane.
       const patienceDeadline = Date.now() + runtimePolicy.foregroundPatienceMs;
       let text: string | null = null;
       let settledKind: 'settled' | 'timeout' = 'timeout';
@@ -761,15 +747,13 @@ export function createSpawnAction(h: SpawnActionHost) {
         details: { paneId, taskId, background, role: kind },
       };
     } catch (err) {
-      // A mid-spawn failure must remove the ledger entry and close its pane, or a ghost running
-      // entry never settles (D96 reminder storms, sends landing in an empty session).
+      // A mid-spawn failure must remove the ledger entry and close its pane, or a ghost entry never settles.
       if (paneId) {
         subs.delete(paneId);
         h.persistSubs();
         void client.closePane(paneId).catch(() => { /* GC covers board exceptions */ });
       }
-      // D98: if isolate startup never becomes ready there is no work to preserve — best-effort
-      // removal of the worktree and branch; failure stays silent (harmless, still visible to git).
+      // D98: an isolate whose startup never became ready has no work to preserve.
       if (isolateMeta) {
         const { branch, worktreePath } = isolateMeta;
         void git.runGit(masterCwd, ['worktree', 'remove', '--force', worktreePath])

@@ -2,9 +2,8 @@
 /**
  * Herdr [[startup]] hook (v1.3 M7, D28): replay the bootstrapped war-room layout after a session restore.
  *
- * For every boot record (newest per workspace, F05): rebuild the main tab via layout.apply when the tab is
- * gone, split + re-inject when the pane is gone, re-inject when the pane survived as a plain shell, skip
- * when a pi master is still alive. One-shot — herdr startup hooks are not daemons.
+ * Per record (newest per workspace, F05): layout.apply rebuilds a missing tab, pane.split revives a missing
+ * pane, a plain-shell survivor is re-injected, a live pi master is skipped. Not a daemon — one-shot.
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -42,12 +41,12 @@ async function main() {
   for (const rec of records) {
     const wsPanes = panes.filter((p) => p.workspace_id === rec.workspace_id);
     let tab = null;
-    try { tab = (await request('tab.get', { tab_id: rec.tab_id }))?.tab ?? null; } catch { /* tab gone */ }
+    try { tab = (await request('tab.get', { tab_id: rec.tab_id }))?.tab ?? null; } catch {}
 
     if (!tab) {
       // Closing the last tab closes the workspace, so a missing tab can only be rebuilt while the ws lives.
       let ws = null;
-      try { ws = (await request('workspace.get', { workspace_id: rec.workspace_id }))?.workspace ?? null; } catch { /* workspace gone */ }
+      try { ws = (await request('workspace.get', { workspace_id: rec.workspace_id }))?.workspace ?? null; } catch {}
       if (!ws) {
         console.log(`[restore-layout] ws ${rec.workspace_id} gone; skip`);
         continue;

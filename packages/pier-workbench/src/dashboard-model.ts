@@ -1,7 +1,5 @@
-/**
- * Pure model and formatting logic for the Pier Ops Dashboard: turns Herdr's session snapshot into
- * formatted lines. No I/O and no global state, so the whole surface is offline-unit-testable.
- */
+/** Pure model/formatting for the Pier Ops Dashboard: a Herdr session snapshot in, formatted lines out.
+ * No I/O and no global state, so the whole surface stays offline-unit-testable. */
 
 export interface SnapshotWorkspace {
   workspace_id: string;
@@ -91,13 +89,11 @@ export function normalizeSnapshot(raw: unknown): SessionSnapshotData | null {
   };
 }
 
-/** Pads or truncates a string to an exact width. */
 function pad(str: string, width: number): string {
   if (str.length > width) return str.slice(0, width - 1) + '…';
   return str.padEnd(width, ' ');
 }
 
-/** Generates the formatted dashboard lines from snapshot data. */
 export function composeDashboardLines(
   rawSnapshot: unknown,
   options?: ComposeDashboardOptions

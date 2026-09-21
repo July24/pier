@@ -1,8 +1,7 @@
 /**
  * D100 Online Context Compact Coordinator: tracks tool-sourced todo completion boundaries, evaluates
- * KV-cache economics and window protection on turn_end, aborts the in-flight turn, then runs pi's
- * native compaction and continues the task. State persists to session entries, so branch rebuilds
- * restore the same pacing samples and debt.
+ * KV-cache economics and window protection on turn_end, aborts the in-flight turn, runs pi's native
+ * compaction, then continues the task. State persists to session entries (branch rebuilds restore it).
  */
 
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
@@ -16,10 +15,9 @@ import { swallow } from './swallow.ts';
 export const COMPACT_STATE_CUSTOM_TYPE = 'pi-herdr.efficiency-state';
 export const COMPACTION_CONTINUE_TYPE = 'pi-herdr.compaction-continue';
 /**
- * Cross-session compaction markers. OCC aborts the in-flight turn, and that abort lands in the
- * child transcript as an assistant message with stopReason 'error', which a supervising master's
- * poller would read as a settled turn. The inflight/settled pair gives it a deterministic
- * "do not settle" window that pane state cannot provide (a pane reports idle while compacting).
+ * Cross-session compaction markers: OCC's abort lands in the child transcript as an assistant
+ * message with stopReason 'error', which a master's poller would read as a settled turn. The
+ * inflight/settled pair gives it a "do not settle" window pane state cannot provide (pane shows idle).
  */
 export const COMPACTION_INFLIGHT_TYPE = 'pi-herdr.compaction-inflight';
 export const COMPACTION_SETTLED_TYPE = 'pi-herdr.compaction-settled';
@@ -38,7 +36,6 @@ interface CoordinatorState {
   positiveContextDeltaCount: number;
   lastContextTokens: number | null;
   currentBoundaryRequestCount: number;
-  /** P1-3: consecutive summarization failures (token-cap class) driving exponential backoff. */
   consecutiveCompactionFailures: number;
   /** P1-3: turn-end compact decisions to skip after a failure (each abort costs an in-flight turn). */
   compactBackoffTurnEnds: number;
@@ -73,7 +70,6 @@ function initialCoordinatorState(): CoordinatorState {
   };
 }
 
-/** Last valid state marker wins; missing fields keep defaults and invalid markers are skipped. */
 export function restoreCoordinatorState(entries: readonly unknown[]): CoordinatorState {
   const base = initialCoordinatorState();
   if (!Array.isArray(entries)) return base;
@@ -93,7 +89,6 @@ export function restoreCoordinatorState(entries: readonly unknown[]): Coordinato
   return base;
 }
 
-/** Mean positive context growth per provider request; null until the first sample. */
 function averageContextIncrement(state: CoordinatorState): number | null {
   return state.positiveContextDeltaCount > 0
     ? state.positiveContextDeltaTotal / state.positiveContextDeltaCount
@@ -166,14 +161,11 @@ export class CompactCoordinator {
       event.source === undefined;
     if (!fromHuman) return;
 
-    // A fresh human prompt is a correction: drop the pending plan.
     this.selectedCompaction = null;
     this.intentionalAbort = false;
     this.pendingBoundaryCompleted = false;
-    // completedBoundaryRequestCounts deliberately survives: it measures requests-per-boundary
-    // pacing, which holds across human turns. Clearing it zeroed the mean and pinned
-    // expectedRemainingRequests at 1 after every prompt, so OCC never saw a horizon worth
-    // compacting under.
+    // completedBoundaryRequestCounts deliberately survives: it measures requests-per-boundary pacing,
+    // which holds across human turns — clearing it pinned expectedRemainingRequests at 1 every prompt.
     this.state.carriedDebtTokens = 0;
     this.state.epoch++;
   }
@@ -283,7 +275,6 @@ export class CompactCoordinator {
       try {
         await opts.onBeforeCompact(sessionRoot, opts.ctx);
       } catch {
-        /* Batch packing errors must not block compaction. */
       }
     }
 
@@ -309,7 +300,6 @@ export class CompactCoordinator {
     await settled.promise;
   }
 
-  /** Successful compaction: fold it into the state, persist the markers in poller order, resume. */
   private finishCompaction(
     opts: { ctx: ExtensionContext; pi: ExtensionAPI; config: OnlineContextCompactConfig },
     decision: CompactionDecision,
@@ -350,7 +340,6 @@ export class CompactCoordinator {
     this.intentionalAbort = false;
   }
 
-  /** Failed or cancelled compaction: release the inflight hold, then resume or stay stopped. */
   private failCompaction(
     opts: { ctx: ExtensionContext; pi: ExtensionAPI; config: OnlineContextCompactConfig },
     decision: CompactionDecision,
@@ -388,8 +377,7 @@ export class CompactCoordinator {
     this.state.compactBackoffTurnEnds = Math.min(2 ** this.state.consecutiveCompactionFailures, 4);
 
     // OCC aborted the turn on purpose, so a failed compaction would leave the session parked on an
-    // aborted message; the notice must be visible (a silent failure left a 209K-token session aware
-    // of nothing).
+    // aborted message; the notice must be visible rather than a silent failure.
     const approxTokens = this.state.lastContextTokens;
     this.sendContinuation(
       opts.pi,
@@ -401,9 +389,8 @@ export class CompactCoordinator {
     );
   }
 
-  /** Best-effort session entry write: onAgentSettled runs detached and appendEntry is a synchronous
-   *  file append, so a full disk must not become an unhandled rejection (a missing marker only
-   *  delays one settlement notice). */
+  /** Best-effort session entry write: onAgentSettled runs detached, so a full disk must not become an
+   *  unhandled rejection (a missing marker only delays one settlement notice). */
   private appendMarker(pi: ExtensionAPI, customType: string, data: unknown): void {
     try {
       pi.appendEntry(customType, data);
@@ -417,7 +404,6 @@ export class CompactCoordinator {
     try {
       pi.sendMessage({ customType: COMPACTION_CONTINUE_TYPE, content, display }, { triggerTurn: true });
     } catch {
-      /* Ignore continuation failure. */
     }
   }
 

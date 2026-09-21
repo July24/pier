@@ -9,13 +9,13 @@ import { historyFilePath, preferredHistoryFile } from './storage-layout.ts';
 
 export { historyFilePath, preferredHistoryFile };
 
-/** Legacy short/resident entries normalize to task; missing values do too, while role names pass through unchanged. */
+/** Legacy short/resident entries normalize to task, as do missing values; role names pass through. */
 export function normalizeEntryKind(kind: string | null | undefined): string {
   if (!kind || kind === 'short' || kind === 'resident') return 'task';
   return kind;
 }
 
-/** O6: only a .jsonl path is accepted during settlement, so invalid reports cannot overwrite a valid path. */
+/** Only a .jsonl path is accepted, so an invalid report cannot overwrite a valid one. */
 export function applyReportedSessionFile(
   current: string | null,
   reported: string | null | undefined,
@@ -26,7 +26,6 @@ export function applyReportedSessionFile(
 
 export interface HistoryEntry {
   taskId: string;
-  /** 'task' or a role name; disk reads normalize short/resident to task for compatibility. */
   kind: string;
   paneId: string;
   tabId: string;
@@ -48,8 +47,10 @@ export interface HistoryEntry {
   via?: string;
 }
 
-/** When a patch omits `outcome`, inherit the latest non-empty value for the taskId: GC
- * bookkeeping must not erase a settlement result under the "latest row is state" rule. */
+/**
+ * When a patch omits `outcome`, inherit the latest non-empty value for the taskId: GC bookkeeping
+ * must not erase a settlement result under the "latest row is state" rule.
+ */
 export function inheritOutcome(lastOutcome: string | null | undefined, patchOutcome: string | null | undefined): string | null {
   if (patchOutcome !== undefined) return patchOutcome;
   return lastOutcome ?? null;
@@ -74,7 +75,6 @@ function coerceHistoryEntry(obj: unknown): HistoryEntry | null {
   return { ...raw, kind: normalizeEntryKind(raw.kind) };
 }
 
-/** Parse line by line; skip junk JSON and records missing taskId/status. */
 export function parseHistoryEntries(text: string): HistoryEntry[] {
   const entries: HistoryEntry[] = [];
   for (const line of (text ?? '').split(/\r?\n/)) {
@@ -99,7 +99,7 @@ export type HistoryReadResult =
   | { status: 'missing' }
   | { status: 'unreadable'; error: Error };
 
-/** Distinguish missing vs permission/IO failure. readHistory still returns [] for both. */
+/** Distinguish missing vs permission/IO failure; readHistory still returns [] for both. */
 export function inspectHistory(file: string): HistoryReadResult {
   try {
     if (!fs.existsSync(file)) return { status: 'missing' };
@@ -110,7 +110,6 @@ export function inspectHistory(file: string): HistoryReadResult {
   }
 }
 
-/** Read a history file; missing or unreadable yields []. */
 export function readHistory(file: string): HistoryEntry[] {
   const r = inspectHistory(file);
   return r.status === 'ok' ? r.entries : [];
@@ -118,7 +117,7 @@ export function readHistory(file: string): HistoryEntry[] {
 
 export type HistoryWriteResult = { ok: true } | { ok: false; error: Error };
 
-/** Append one entry. Failures are logged and returned so the ledger is not silently lost. */
+/** Failures are logged and returned so the ledger is not silently lost. */
 export function appendHistory(file: string, entry: HistoryEntry): HistoryWriteResult {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -131,7 +130,6 @@ export function appendHistory(file: string, entry: HistoryEntry): HistoryWriteRe
   }
 }
 
-/** Group all generations of each taskId in ascending createdAt order for review. */
 export function generationsByTask(entries: readonly HistoryEntry[]): Map<string, HistoryEntry[]> {
   const map = new Map<string, HistoryEntry[]>();
   for (const e of entries) {
@@ -143,7 +141,7 @@ export function generationsByTask(entries: readonly HistoryEntry[]): Map<string,
   return map;
 }
 
-/** Return the newest generation for taskId, which is the one used for resume. */
+/** Newest generation for taskId — the one used for resume. */
 export function latestGeneration(entries: readonly HistoryEntry[], taskId: string): HistoryEntry | null {
   const gens = generationsByTask(entries).get(taskId);
   if (!gens || gens.length === 0) return null;

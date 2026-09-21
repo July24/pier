@@ -1,12 +1,10 @@
 /**
- * Human-gate reporting: coalesces every blocking prompt (pier's ask tool, pi's
- * own ctx.ui dialogs, external herdr:blocked producers) into ONE blocked edge.
+ * Human-gate reporting: coalesces every blocking prompt (pier's ask tool, pi's own ctx.ui dialogs,
+ * external herdr:blocked producers) into ONE blocked edge.
  *
- * Depth semantics: only the 0→1 transition reports blocked (and marks the ask
- * flag); only the 1→0 transition restores working/idle. While the depth is
- * positive, working/idle reports are dropped so the pane stays blocked for the
- * whole dialog.
- */
+ * Depth semantics: only the 0→1 transition reports blocked (and marks the ask flag); only the 1→0
+ * transition restores working/idle. While the depth is positive, working/idle reports are dropped
+ * so the pane stays blocked for the whole dialog. */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import type { HerdrClientLike } from './herdr-client.ts';
 

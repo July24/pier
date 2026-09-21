@@ -1,8 +1,6 @@
 #!/usr/bin/env node
-/**
- * Pier Ops Dashboard entrypoint: a herdr plugin pane (or CLI tool with --once).
- * Fetches session.snapshot over the herdr socket and renders an auto-refreshing dashboard.
- */
+/** Pier Ops Dashboard entrypoint: a herdr plugin pane, or a CLI tool with --once. Fetches session.snapshot
+ * over the herdr socket and renders an auto-refreshing dashboard. */
 import { request } from './herdr-rpc.mjs';
 import { composeDashboardLines } from '../src/dashboard-model.ts';
 
@@ -42,7 +40,6 @@ async function closePopupSafe() {
   try {
     await request('popup.close', {}, 1000);
   } catch {
-    // Best effort, ignore if not a popup
   }
 }
 
@@ -67,7 +64,6 @@ async function runLoop() {
         if (key === 'q' || key === 'Q' || key === '\u001b' || key === '\u0003') void cleanup();
       });
     } catch {
-      // Non-critical fallback if raw mode fails
     }
   }
 

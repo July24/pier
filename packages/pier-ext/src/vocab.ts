@@ -38,7 +38,6 @@ export const REPORT_AGENT_SOURCE = 'pi-herdr';
 /** First-upgrade key used to clear the old 16-key chunked tokens (M13b). */
 export const PI_HERDR_META_KEY = 'pi-herdr';
 
-/** Model-facing todo tool name (DSH-compatible). */
 export const TODO_TOOL_NAME = 'todo_write';
 
 /** Snapshot key in tool-result details (persisted in session JSONL). */
@@ -48,12 +47,11 @@ export const TODO_DETAILS_KEY = 'pi-herdr.todo';
 export function formatTodoConfirmation(items: readonly TodoItem[]): string {
   const c = countTodos(items);
   const base = `Updated todo list: ${c.pending} pending, ${c.inProgress} in progress, ${c.completed} completed.`;
-  // A4: append blocked only when non-zero — the model must not read "nothing pending" while
-  // items sit blocked on a human. Zero keeps the DSH-aligned wording intact.
+  // Append blocked only when non-zero — the model must not read "nothing pending" while items sit
+  // blocked on a human. Zero keeps the DSH-aligned wording intact.
   return c.blocked > 0 ? `${base.slice(0, -1)}, ${c.blocked} blocked.` : base;
 }
 
-/** abandoned is deliberately uncounted; blocked is its own column (D34/D91). */
 const COUNTED_STATUSES: Partial<Record<TodoStatus, keyof TodoCounts>> = {
   pending: 'pending',
   in_progress: 'inProgress',

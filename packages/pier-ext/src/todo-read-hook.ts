@@ -1,8 +1,8 @@
 /**
- * D69: plan the todo read hook (before_agent_start + display:false). Stale-core keeps a fully
- * completed list from being recited forever: stale (turn-based) warns with the old entries as rewrite
- * references, rate-limited and capped; archived (wall-clock) treats the list as absent, sharing the
- * guard cadence with empty lists.
+ * Plan the todo read hook (before_agent_start + display:false). Stale-core keeps a fully completed list
+ * from being recited forever: stale (turn-based) warns with the old entries as rewrite references,
+ * rate-limited and capped; archived (wall-clock) treats the list as absent, sharing the guard cadence
+ * with empty lists.
  */
 import { boundedView, currentActivity, type TodoItem } from './todo-core.ts';
 import { countTodos } from './vocab.ts';
@@ -25,8 +25,8 @@ interface TodoReadPlan {
   effect: TodoReadEffect;
   /** Current archive state, independent of injection, so callers can refresh widget/title projections. */
   archived: boolean;
-  /** R1: clear the in-memory list when injecting the archive notice; the caller persists the empty JSONL.
-   * Keeping a dead list would suppress the empty guard that resumes tracking after an idle gap. */
+  /** Clear the in-memory list when injecting the archive notice (the caller persists the empty JSONL);
+   * a kept dead list would suppress the empty guard that resumes tracking after an idle gap. */
   clearArchived: boolean;
   message: {
     customType: string;
@@ -41,10 +41,8 @@ export function planTodoReadHook(opts: {
   lastEmptyGuardTurn: number | null;
   /** stale-core clock anchor (TodosService.lastWriteAt). */
   lastWriteAt: number | null;
-  /** Turns since the last todo write, when known in this process. */
   turnsSinceWrite: number | null;
   now: number;
-  /** Number of stale warnings injected during the current idle period. */
   staleNotices: number;
   lastStaleGuardTurn: number | null;
 }): TodoReadPlan {
@@ -80,9 +78,8 @@ export function planTodoReadHook(opts: {
   if (st.kind === 'archived') {
     const c = countTodos(opts.items);
     const age = st.ageMs == null ? '' : ` ${formatAge(st.ageMs)} ago`;
-    // R2: idle periods do not consume turns, so give one rewrite window with the old entries as
-    // reference before the terminal notice — a list archived without warning had its final notice
-    // (and five todo_write calls) ignored in 01a03c0d.
+    // Idle periods do not consume turns, so give one rewrite window with the old entries as reference
+    // before the terminal notice.
     if (opts.staleNotices === 0 && guardDue) {
       const lines = opts.items.map((it) => `  ${TODO_MARKS[it.status]} ${it.content}`);
       const head = `todos ✓${c.completed} (all completed, last updated${age}) — about to be archived`;
@@ -95,8 +92,8 @@ export function planTodoReadHook(opts: {
         message: msg([head, ...lines, warn].join('\n')),
       };
     }
-    // R1/R3: the terminal notice carries no details and no "skip tracking" escape hatch — multi-step
-    // work must get a fresh list, single-step Q&A is allowed to proceed untracked.
+    // The terminal notice carries no details and no "skip tracking" escape hatch — multi-step work
+    // must get a fresh list, single-step Q&A may proceed untracked.
     return {
       inject: guardDue,
       effect: 'archive-notice',

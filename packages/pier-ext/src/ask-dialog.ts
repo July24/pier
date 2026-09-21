@@ -19,7 +19,6 @@ interface DialogOption {
 
 export interface DialogConfig {
   options: readonly DialogOption[];
-  /** Render the trailing free-text row. */
   allowOther: boolean;
   /** 0-based recommended option: the cursor starts on it, and multi mode also starts with it
    *  checked so a bare enter agrees with single mode in both modes. */
@@ -52,7 +51,6 @@ export function createDialogState(config: DialogConfig): DialogState {
     config.recommended !== undefined
     && config.recommended >= 0
     && config.recommended < config.options.length;
-  // No valid recommendation means row 0 for the cursor only — nothing pre-checked.
   const start = hasRecommended ? config.recommended! : 0;
   return {
     cursor: start,
@@ -60,7 +58,6 @@ export function createDialogState(config: DialogConfig): DialogState {
   };
 }
 
-/** Total rows including the optional Other row; the cursor wraps inside this. */
 export function rowCount(config: DialogConfig): number {
   return config.options.length + (config.allowOther ? 1 : 0);
 }
@@ -118,8 +115,6 @@ export function stepDialog(state: DialogState, key: DialogKey, config: DialogCon
   }
 }
 
-/* ── Key resolution ────────────────────────────────────────────────── */
-
 /** The slice of pi's KeybindingsManager custom factories receive as 3rd arg. */
 export interface KeybindingsLike {
   matches(data: string, keybinding: string): boolean;
@@ -137,7 +132,6 @@ const KEY_RESOLUTION: ReadonlyArray<{ key: DialogKey; binding?: string; sequence
   { key: 'cancel', binding: 'tui.select.cancel', sequences: ['\x1b', '\x03'] },
 ];
 
-/** Map one raw input chunk to a dialog key using the host bindings plus the literal fallbacks. */
 export function resolveDialogKey(data: string, keybindings?: KeybindingsLike): DialogKey {
   for (const entry of KEY_RESOLUTION) {
     if (entry.binding !== undefined && keybindings?.matches?.(data, entry.binding) === true) return entry.key;
@@ -145,8 +139,6 @@ export function resolveDialogKey(data: string, keybindings?: KeybindingsLike): D
   }
   return data === 'a' || data === 'A' ? 'all' : 'ignore';
 }
-
-/* ── TUI component ─────────────────────────────────────────────────── */
 
 export interface MinimalTheme {
   fg(color: string, text: string): string;
@@ -163,19 +155,17 @@ interface DialogUiOptions {
   title: string;
   config: DialogConfig;
   theme: MinimalTheme;
-  /** pi's keybindings manager (ctx.ui.custom factory 3rd arg); optional in tests. */
   keybindings?: KeybindingsLike;
   /** Aborting cancels the dialog so the ask tool result and herdr gate settle. */
   signal?: AbortSignal;
   /** pi's ctrl+o tool-output expansion, when the host exposes it. */
   toggleToolsExpanded?: () => void;
-  /** Called with the outcome; the host resolves ctx.ui.custom. */
   done(outcome: DialogOutcome): void;
   requestRender?: () => void;
 }
 
-/** Numbered line for the typed-prompt fallback list (`1. Label (Recommended) — description`); the
- *  dialog itself renders unnumbered rows. */
+/** Numbered line for the typed-prompt fallback list (`1. Label (Recommended) — description`); the dialog
+ *  itself renders unnumbered rows. */
 export function numberedOptionLine(option: DialogOption, index: number, recommended?: number): string {
   const marker = recommended === index ? RECOMMENDED_SUFFIX : '';
   const description = option.description ? ` — ${option.description}` : '';
@@ -235,8 +225,7 @@ export function dialogFooter(
   const cancelHint = hint(theme, cancel, 'cancel');
   const parts = config.multi ? [navigate, toggle, all, action, cancelHint] : [navigate, action, cancelHint];
   const fits = (segs: string[]): boolean => styledWidth(segs.join('  ') + chip) <= (width ?? Infinity);
-  // Narrow panes shed the most guessable extras first (a-all, navigate, then
-  // the cancel hint); the action keys and the live count are the floor.
+  // Narrow panes shed the most guessable extras first; the action keys and the live count are the floor.
   for (const droppable of config.multi ? [all, navigate, cancelHint] : [navigate]) {
     if (fits(parts)) break;
     parts.splice(parts.indexOf(droppable), 1);
@@ -258,8 +247,7 @@ export function createDialogComponent(opts: DialogUiOptions): DialogComponent {
   return {
     render(width: number): string[] {
       const border = opts.theme.fg('border', '─'.repeat(Math.max(1, width)));
-      // Content wraps inside a 1-col margin each side, like pi's Text(text, 1, 0),
-      // so long labels and descriptions keep their tail instead of clipping.
+      // Content wraps inside a 1-col margin each side (like pi's Text(text, 1, 0)) instead of clipping.
       const inner = Math.max(1, width - 2);
       const pad = (line: string): string => ` ${line}`;
       return [

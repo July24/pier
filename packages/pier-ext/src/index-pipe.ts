@@ -1,5 +1,4 @@
-/** Common-segment pipe request handler (prompt / interrupt / reply): a thin adapter over the
- *  subagent port and notice buffer, kept out of index.ts's session lifecycle wiring. */
+/** Common-segment pipe request handler (prompt / interrupt / reply) over the subagent port and notice buffer. */
 import { formatSettlementNotice } from './vocab.ts';
 import type { PipeRequest, PipeResponse } from './pipe-channel.ts';
 import type { SubagentPortBox } from './subagent-core.ts';

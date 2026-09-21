@@ -1,7 +1,6 @@
 /**
- * Subagent board hygiene: durable registry projection + startup/zombie recovery, tab and pane
- * collection, and the isolate-worktree sweep. Predicates live in gc-core.ts; this adapter owns
- * herdr close I/O, isolate git commands, and the ticker.
+ * Subagent board hygiene: registry projection + recovery, tab/pane collection, isolate-worktree sweep.
+ * Predicates live in gc-core.ts; this adapter owns herdr close I/O, isolate git commands, and the ticker.
  */
 import { appendFileSync, existsSync, rmSync } from 'node:fs';
 import type { Context } from '@deepseek-ai/cordis';
@@ -25,13 +24,10 @@ interface SubagentRegistryHost {
 interface SubagentRegistry {
   /** Append the registry snapshot to the session branch; duplicate snapshots are skipped. */
   persist(): void;
-  /** Replay `pi-herdr.subs` entries from the session branch into the live map. */
   rebuild(eventCtx: unknown): void;
-  /** Close running rows whose pane herdr no longer lists. */
   sweepZombieRunning(): Promise<void>;
 }
 
-/** Durable registry projection and startup recovery, separate from tool actions. */
 export function createSubagentRegistry(host: SubagentRegistryHost): SubagentRegistry {
   let lastSnapshot = '';
 
@@ -43,8 +39,7 @@ export function createSubagentRegistry(host: SubagentRegistryHost): SubagentRegi
       lastSnapshot = snapshot;
       host.pi.appendEntry?.(SUBS_CUSTOM_TYPE, registry);
     } catch (err) {
-      // Session logging must not break delegation, but a ghost running subagent is the symptom of
-      // a silent failure here, so keep the reason queryable.
+      // Session logging must not break delegation; a silent failure here shows up as a ghost running row.
       swallow('subagent.persist-subs', err);
     }
   }
@@ -165,8 +160,7 @@ export function createGcController(h: GcHost): GcController {
     );
     for (const e of candidates) {
       if (termPaneIds.has(e.paneId) || pendingNoticeIds.has(e.paneId)) continue;
-      // A poisoned registry entry once let GC close the master's own pane while its workers were
-      // still running. Never collect self, whatever the registry says.
+      // Never collect self, whatever the registry says: a poisoned entry once closed the master's pane.
       if (h.env?.paneId && e.paneId === h.env.paneId) continue;
       if (!shouldClosePane({
         consumedAt: e.consumedAt ?? null,
@@ -198,7 +192,6 @@ export function createGcController(h: GcHost): GcController {
     const wtPorcelain = await h.git.runGit(masterCwd, ['worktree', 'list', '--porcelain']);
     if (wtPorcelain === null) return;
     const wtByBranch = parseWorktreePorcelain(wtPorcelain);
-    // Session-owned isolates: settled or consumed entries whose worktree was not released yet.
     const sessionOwned = [...h.subs.values()]
       .filter((e) => e.isolate && e.isolate.releasedAt == null && e.status !== 'running')
       .map((e) => ({ branch: e.isolate!.branch, worktreePath: e.isolate!.worktreePath }));

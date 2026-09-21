@@ -1,9 +1,8 @@
 /**
  * M23 heat layout planner (D91 Tier 3: in-place grid heat).
  *
- * Panes NEVER move position (zero swaps) — only split ratios change: the focused pane expands in place
- * and the remaining cells shrink. Geometry: herdr's ratio is the split node's first child share
- * (0.8.2 split_rect: first_w = width * ratio), clamped by the engine to [0.10, 0.90].
+ * Panes NEVER move position (zero swaps) — only split ratios change. Geometry: herdr's ratio is the split
+ * node's first child share (0.8.2 split_rect: first_w = width * ratio), engine-clamped to [0.10, 0.90].
  */
 export const MAX_AUTO_LAYOUT_PANES = 10;
 export const PANE_MIN_AGE_MS = 3000;
@@ -27,7 +26,6 @@ export type LayoutNode =
   | { type: 'pane'; pane_id: string }
   | { type: 'split'; direction: 'right' | 'down'; ratio: number; first: LayoutNode; second: LayoutNode };
 
-/** Grid planner produces only ratio ops (zero swaps is the foundational rule of this tier). */
 export type HeatOp = { kind: 'ratio'; path: boolean[]; ratio: number };
 
 export type HeatPlan =
@@ -95,14 +93,11 @@ export function shouldFireDebounced(opts: { stored: string; incoming: string }):
   return opts.stored === opts.incoming;
 }
 
-/* ════════ Tier 3 (D91): in-place grid heat ════════ */
-
 /** paneId -> agent status ('blocked' | 'working' | 'idle' | 'done' | 'unknown' | ...). */
 export type AgentStatusMap = Record<string, string>;
 /** paneId -> whether waiting on ask_user_question (human gate; tokens['pi-ask'] non-empty). */
 export type AskFlagMap = Record<string, boolean>;
 
-/** Flatten tree (pre-order). */
 export function flattenPanes(node: LayoutNode): string[] {
   return node.type === 'pane' ? [node.pane_id] : [...flattenPanes(node.first), ...flattenPanes(node.second)];
 }
@@ -152,9 +147,9 @@ function weightedEqualize(node: LayoutNode, path: boolean[], statuses: AgentStat
 }
 
 /**
- * In-place grid heat: the focused pane takes r = T^(1/depth) at each level along its path (ratio=r when
- * first is on the focus side, else 1-r), compounding to T total tab share; off-path subtrees divide their
- * remaining share by status weight. Every split yields exactly one ratio op and panes never move.
+ * In-place grid heat: the focused pane takes r = T^(1/depth) at each level along its path (ratio = r when
+ * first is on the focus side, else 1 - r), compounding to T total tab share; off-path subtrees divide their
+ * remaining share by status weight.
  */
 export function planGridHeat(opts: {
   root: LayoutNode;
@@ -163,7 +158,6 @@ export function planGridHeat(opts: {
   zoomed?: boolean;
   enabled?: boolean;
   statuses?: AgentStatusMap;
-  /** D95: ask_user_question waiting flag (human gate, distinguishing pure blocked). */
   askFlags?: AskFlagMap;
 }): HeatPlan {
   if (opts.enabled === false) return { type: 'skip', reason: 'disabled' };
@@ -174,11 +168,9 @@ export function planGridHeat(opts: {
 
   const statuses = opts.statuses ?? {};
   const askFlags = opts.askFlags ?? {};
-  // D95 slim threshold: non-focused panes >= threshold -> idle/working weight * 0.6 (blocked/ask unaffected)
   const slim = opts.paneCount - 1 >= SLIM_THRESHOLD;
   const steps = findPath(opts.root, opts.focusPaneId) ?? [];
 
-  // One walk down the focus path: on-path ratios wait for r, off-path siblings split by status weight.
   const onPathPaths: boolean[][] = [];
   const offPath: Array<{ node: LayoutNode; path: boolean[] }> = [];
   let path: boolean[] = [];
@@ -202,7 +194,6 @@ export function planGridHeat(opts: {
   return { type: 'apply', ops };
 }
 
-/** Shared by tests/live runs: calculates area share of each pane from the exported tree (pre-order). */
 export function paneAreaShares(root: LayoutNode): Record<string, number> {
   const shares: Record<string, number> = {};
   const walk = (node: LayoutNode, share: number): void => {

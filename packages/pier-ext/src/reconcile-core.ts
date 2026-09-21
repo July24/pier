@@ -1,15 +1,15 @@
 /**
- * M17: pure planner for automatic todo↔subagent reconciliation, run after a settlement push and
- * before the followUp is injected.
+ * Pure planner for automatic todo↔subagent reconciliation, run after a settlement push and before
+ * the followUp is injected.
  *
  * Match description ↔ todo.content after normalize (lowercase + collapse whitespace) at tiers
  * exact → prefix → substring, the same family as D38 fuzzyFind.
  *  - Auto-complete only a settled subagent's unique best candidate at exact/prefix, at most one item;
  *  - Unblock blocked items whose blocker matches at any tier (blockers are phrases like "waiting for
  *    X to finish", so substring matters and a soft return to pending is safe);
- *  - Low confidence / ambiguity / failure leaves the list untouched and adds a prompt line (P2: never
+ *  - Low confidence / ambiguity / failure leaves the list untouched and adds a prompt line (never
  *    check off a guess);
- *  - Edits persist through the D38 authoritative path (pi-herdr.todo-edit), so branch replay reproduces them.
+ *  - Edits persist through the authoritative pi-herdr.todo-edit path, so branch replay reproduces them.
  */
 
 import { applyTodoEdits, type TodoEdit, type TodoItem } from './todo-core.ts';
@@ -17,18 +17,15 @@ import { applyTodoEdits, type TodoEdit, type TodoItem } from './todo-core.ts';
 type ReconcileOutcome = 'settled' | 'failed';
 type MatchTier = 'exact' | 'prefix' | 'substring' | null;
 interface ReconcilePlan {
-  /** List after applying edits (original reference when there are no edits). */
   items: TodoItem[];
   /** Edits persisted through the authoritative path (at most one done plus any unblocks). */
   edits: TodoEdit[];
   /** Item automatically checked off (at most one). */
   completed: TodoItem | null;
-  /** Best matching tier for auto-completion (null when there are no candidates). */
   tier: MatchTier;
   unblocked: TodoItem[];
-  /** Prompt lines appended to the settlement notice (empty when none). */
   noteLines: string[];
-  /** Match-rate metric, collected with the settlement notice in session JSONL (P2). */
+  /** Match-rate metric, collected with the settlement notice in session JSONL. */
   metric: {
     description: string;
     outcome: ReconcileOutcome;

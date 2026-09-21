@@ -7,10 +7,9 @@ export const READ_MAX_CHARS = 8000;
 export const READINESS_TIMEOUT_MS = 30_000;
 export const SILENCE_IDLE_MS = 2000;
 /** POSIX / PowerShell / Nushell / Zsh prompt tail.
- * Why: macOS default zsh prompt ends with `%` (e.g. `user@host ~ % `), while sh/bash use `$`
- * (or `#` for root) and nushell/starship use `❯`. Anchoring to line tail (\s*$) prevents false
- * matches on percentage values in ordinary command output (e.g. `downloaded 50%`), as interactive
- * prompts terminate at the prompt symbol without trailing text.
+ * sh/bash end with `$` (root `#`), macOS zsh with `%`, nushell/starship with `❯`; anchoring to the
+ * line tail (\s*$) avoids matching percentage values in ordinary output (`downloaded 50%`), since
+ * interactive prompts end at the prompt symbol with no trailing text.
  */
 export const PROMPT_TAIL_RE = /[$>#❯%]\s*$/;
 
@@ -41,10 +40,8 @@ const PROMPT_STRATEGIES: Record<string, PromptStrategy> = {
   'powershell.exe': POWERSHELL_PROMPT,
 };
 
-/**
- * Explicit `PIER_TERMINAL_PROMPT` wins over `$SHELL`; the default stays POSIX so panes without
- * explicit configuration never flip strategy.
- */
+/** Explicit `PIER_TERMINAL_PROMPT` wins over `$SHELL`; the default stays POSIX so unconfigured panes
+ *  never flip strategy. */
 export function promptStrategyFor(env: NodeJS.ProcessEnv = process.env): PromptStrategy {
   // B10: canonical PIER_TERMINAL_PROMPT, legacy PI_HERDR_TERMINAL_PROMPT alias.
   const prompt = pierOption('PIER_TERMINAL_PROMPT', env)?.trim().toLowerCase();
@@ -300,9 +297,9 @@ export interface ShellInitPlan {
 /**
  * Plan the shell init command: `set +H` disables history expansion in managed bash/zsh shells, where `!`
  * in ordinary commands (`!|`, `if [ ! -f ... ]`, `!$`) otherwise triggers `zsh: event not found: \|` and
- * wedges the shell. PowerShell rejects the syntax and does not use `!` for history expansion, so it is
- * skipped. Limit: applies to the top-level shell only; a nested `bash -i` re-enables its own defaults.
- * Init is only worth sending once the shell is at its prompt and has not been initialized yet.
+ * wedges the shell. PowerShell rejects the syntax and has no `!` history expansion, so it is skipped.
+ * Limit: the top-level shell only — a nested `bash -i` re-enables its own defaults; init is only worth
+ * sending once the shell is at its prompt and has not been initialized yet.
  */
 export function planShellInit(opts: {
   strategy?: PromptStrategy;
@@ -349,8 +346,8 @@ export function foldTerminalsRegistry(
 }
 
 /* ── Idle-terminal nudge: turn-end self-cleanup for shells the model forgot to close ──
- * Terminals are persistent by design, so a shell whose work finished lingers as a dead split.
- * Decision core here, delivery wiring in plugins/terminal (mirrors the todo stop-reminder). */
+ * Terminals persist by design, so a finished shell lingers as a dead split; delivery wiring mirrors
+ * the todo stop-reminder in plugins/terminal. */
 
 /** Cap idle-terminal nudges for the lifetime of the process (same shape as TODO_REMINDERS_MAX). */
 export const TERM_REMINDERS_MAX = 2;
@@ -366,7 +363,6 @@ export function terminalReminderGraceMs(): number {
   return Number(pierOption('PIER_TERM_GRACE_MS') ?? 30_000) || 30_000;
 }
 
-/** Custom message type for the idle-terminal nudge (registerMessageRenderer may restyle it). */
 export const TERM_REMINDER_CUSTOM_TYPE = 'pi-herdr.term-reminder';
 
 export interface IdleTerminalInput {
@@ -379,9 +375,7 @@ export interface IdleTerminalInput {
 }
 
 export interface IdleTerminalReminderPlan {
-  /** Whether a nudge should be injected. */
   due: boolean;
-  /** Complete injected content, or null when due is false. */
   content: string | null;
   /** Nudge count after successful injection, or the original count when due is false. */
   nextReminders: number;
@@ -394,10 +388,8 @@ function noIdleInject(reminders: number): IdleTerminalReminderPlan {
 }
 
 /**
- * Due only when an OPEN terminal is idle past the threshold AND has never been nudged: a nudged
- * terminal must stay nudged (persisted in the ledger), or a farewell exchange can loop. Shells
- * still hosting long-running work were touched recently, so the idle filter keeps legitimate
- * dev-server terminals out of the nudge.
+ * Due only when an OPEN terminal is idle past the threshold and never nudged; the idle filter also
+ * keeps dev-server shells touched recently out of the nudge.
  */
 export function planIdleTerminalReminder(
   input: { open: readonly IdleTerminalInput[]; now: number; reminders: number },

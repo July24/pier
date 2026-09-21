@@ -1,7 +1,6 @@
 /**
- * Heat reflow domain logic for the pane.focused / created / closed / agent_status_changed hooks.
- * All herdr access is injected via `ReflowDeps`; the planner lives in heat-layout.ts. Hook processes
- * deliberately do not use cordis — a user-mode GitHub checkout has no node_modules.
+ * Heat reflow domain logic for the pane focused/created/closed/agent_status_changed hooks; herdr access is
+ * injected via `ReflowDeps`, and hook processes cannot use cordis — a user-mode checkout has no node_modules.
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -53,7 +52,6 @@ type ReflowState = Record<string, any>;
 /** Which event asked for the reflow — only the status mode consults the drag hold. */
 type ReflowMode = 'focus' | 'count' | 'status';
 
-/** Read JSON, returning `fallback` for a missing/partial/invalid file (never throws). */
 export function readJsonSafe<T>(file: string, fallback: T): T {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf8')) as T;
@@ -62,11 +60,8 @@ export function readJsonSafe<T>(file: string, fallback: T): T {
   }
 }
 
-/**
- * F15: hook processes run concurrently (one per event), so a plain writeFileSync can interleave and
- * leave truncated JSON behind — which reads back as "the plugin forgot every tab". Write a unique temp
- * file in the same directory and rename over the target: rename is atomic, readers see a whole document.
- */
+/** F15: concurrent hook processes interleave plain writes and leave truncated JSON behind — write a unique
+ * temp file in the same directory and rename over the target, since rename is atomic. */
 export function writeJsonAtomic(file: string, value: unknown): void {
   const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true });
@@ -77,18 +72,15 @@ export function writeJsonAtomic(file: string, value: unknown): void {
     fs.renameSync(tmp, file);
   } catch {
     // Windows can refuse the replace while another process holds the file: fall back to a direct write.
-    try { fs.unlinkSync(tmp); } catch { /* already gone */ }
+    try { fs.unlinkSync(tmp); } catch {}
     fs.writeFileSync(file, json);
   }
 }
 
 /**
- * Whether the tab belongs to pier. Passes through when the dep is omitted; a snapshot failure counts as
- * not in set (conservative no-op).
- *
- * Sticky war-room tabs: `state.tabs[tabId]` is written only after a pi-gated apply succeeded, so a
- * recorded tab stays in the set after every pi process exits back to a shell — an all-shell main tab
- * keeps its focus zoom instead of being reclassified as foreign (Scenario B).
+ * Passes through when the dep is omitted; a snapshot failure counts as not-in-set (conservative no-op).
+ * Sticky war-room tabs: `state.tabs[tabId]` is written only after a pi-gated apply, so an all-shell main
+ * tab keeps its focus zoom instead of being reclassified as foreign (Scenario B).
  */
 async function isPiTab(deps: ReflowDeps, tabId: string): Promise<boolean> {
   if (!deps.piTabIds) return true;
@@ -96,12 +88,8 @@ async function isPiTab(deps: ReflowDeps, tabId: string): Promise<boolean> {
   try { return (await deps.piTabIds()).has(tabId); } catch { return false; }
 }
 
-/**
- * The one reflow path shared by all four events: publish the debounce token (a newer event overwrites it
- * and cancels this run), export the layout, apply the pi-tab gate, then plan and apply the ratio ops.
- *
- * Count/status reflows inherit the tab's last focused pane as the focus; a focus event passes its own.
- */
+/** The one reflow path shared by all four events. Count/status reflows inherit the tab's last focused pane
+ * as the focus; a focus event passes its own. */
 async function reflowTab(
   deps: ReflowDeps,
   opts: {
@@ -166,7 +154,6 @@ async function onCreated(deps: ReflowDeps, paneId: string): Promise<void> {
   // D95: record the pane -> tab mapping (pane.closed carries no tab_id, so close needs the reverse lookup).
   if (deps.ev.tabId) state.panes[paneId].tabId = deps.ev.tabId;
   deps.saveState(state);
-  // A new pane changes the pane count -> reflow (positions stay, dimensions are recomputed by tier weight).
   await onCountChanged(deps);
 }
 
@@ -201,10 +188,8 @@ async function onFocused(deps: ReflowDeps): Promise<void> {
   });
 }
 
-/**
- * Tier 2 semantic bridge (D90-F): an agent status change reflows the secondary panes while the focus
- * stays fixed. Event-driven, never polled (D3).
- */
+/** Tier 2 semantic bridge (D90-F): an agent status change reflows the secondary panes, focus fixed.
+ * Event-driven, never polled (D3). */
 async function onAgentStatusChanged(deps: ReflowDeps): Promise<void> {
   const paneId = deps.ev.paneId;
   if (!paneId) return;
@@ -236,7 +221,7 @@ export function askFlagsFromListResult(result: unknown): AskFlagMap {
  */
 export function parseEventEnv(env: Record<string, string | undefined> = process.env): ReflowEvent {
   let event: Record<string, any> = {};
-  try { event = JSON.parse(env.HERDR_PLUGIN_EVENT_JSON ?? '{}'); } catch { /* empty */ }
+  try { event = JSON.parse(env.HERDR_PLUGIN_EVENT_JSON ?? '{}'); } catch {}
   const hook = env.HERDR_PLUGIN_EVENT ?? event.type ?? '';
   const data = event.data ?? event;
   const pane = data.pane && typeof data.pane === 'object' ? data.pane : {};
@@ -262,7 +247,6 @@ const ROUTES: Array<[string, (deps: ReflowDeps) => Promise<void>]> = [
   ['paneagentstatuschanged', onAgentStatusChanged],
 ];
 
-/** Domain workflow (independently unit testable). */
 export async function runReflow(deps: ReflowDeps): Promise<void> {
   const kind = `${deps.ev.hook}${deps.ev.type}`.toLowerCase().replace(/[._]/g, '');
   const route = ROUTES.find(([name]) => kind.includes(name));

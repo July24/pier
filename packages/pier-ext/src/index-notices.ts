@@ -1,20 +1,15 @@
 /**
- * D92 settlement-notice buffer: `sendUserMessage(followUp)` only delivers when
- * the agent has no more tool calls, so a long master run would queue every
- * settlement and flood at the end. Buffer while busy; flush at turn_end
- * (steer) / agent_settled (followUp), collapsing large batches.
- */
+ * D92 settlement-notice buffer: `sendUserMessage(followUp)` only delivers when the agent has no
+ * more tool calls, so a long master run would queue every settlement and flood at the end. Buffer
+ * while busy; flush at turn_end (steer) / agent_settled (followUp), collapsing large batches. */
 
 export type NoticeSendMode = 'steer' | 'followUp';
 
 export const NOTICE_MAX_SHOWN = 3;
 
-/**
- * Collapse a batch into one message body.
- * - empty → null (do not inject)
- * - ≤max → originals joined with `\n\n` (single-item byte-identical to the old format)
- * - >max → first max originals + a tail pointing at history / subagent list
- */
+/** Collapse a batch into one message body: empty → null; above the cap, the first max originals plus
+ *  a tail pointing at history / subagent list. A single-item batch stays byte-identical to the
+ *  direct-send format. */
 export function collapseNotices(contents: readonly string[], max = NOTICE_MAX_SHOWN): string | null {
   if (contents.length === 0) return null;
   if (contents.length <= max) return contents.join('\n\n');
@@ -34,10 +29,9 @@ export function createNoticeBuffer(opts: {
   isBusy: () => boolean;
   send: (content: string, mode: NoticeSendMode) => Promise<void>;
   /**
-   * P0-2 (RFC docs/rfc-jev-integration.md §3): relevance reorder of a collapsed
-   * batch before truncation. Only consulted above the show cap; returning null
-   * (or omitting the hook) keeps arrival order. Implementations must not throw.
-   */
+   * P0-2 (RFC docs/rfc-jev-integration.md §3): relevance reorder of a collapsed batch before truncation.
+   * Only consulted above the show cap; returning null (or omitting the hook) keeps arrival order.
+   * Implementations must not throw. */
   rank?: (contents: readonly string[]) => Promise<readonly string[] | null>;
 }): NoticeBuffer {
   const pending: string[] = [];

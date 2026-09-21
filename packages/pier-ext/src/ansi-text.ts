@@ -1,16 +1,14 @@
 /**
  * ANSI-aware text measurement and clipping for pier's TUI surfaces.
  *
- * Why a local implementation: the todo widget, the pinned pane title and the
- * ask_user_question multi-select all need width-correct clipping, but importing
- * `visibleWidth`/`truncateToWidth` from pi-tui would make those paths depend on a
- * package that may be absent in stripped installs. The table below only has to be
- * right for ASCII plus the CJK/emoji ranges that actually appear in user content.
+ * Local implementation: the todo widget, the pinned pane title and the ask_user_question multi-select
+ * all need width-correct clipping, but importing `visibleWidth`/`truncateToWidth` from pi-tui would
+ * make those paths depend on a package that may be absent in stripped installs. The table below only
+ * has to be right for ASCII plus the CJK/emoji ranges that actually appear in user content.
  */
 
 const SGR = /\x1b\[[0-9;]*m/y;
 
-/** Approximate terminal cell width of one code point (0, 1 or 2). */
 export function charWidth(cp: number): number {
   if (cp < 32) return 0;
   if (cp >= 0x7f && cp < 0xa0) return 0;
@@ -35,7 +33,7 @@ export function charWidth(cp: number): number {
   return 1;
 }
 
-/** Rendered cell width of a string that may contain SGR sequences (zero width). */
+/** Rendered cell width; SGR sequences count as zero cells. */
 export function styledWidth(line: string): number {
   let width = 0;
   let i = 0;
@@ -53,10 +51,7 @@ export function styledWidth(line: string): number {
   return width;
 }
 
-/**
- * Cut a styled line to `width` cells without breaking escape sequences.
- * Wide glyphs count as two cells, so CJK content stays inside the frame.
- */
+/** Cut to `width` cells without breaking escape sequences; wide glyphs count as two cells. */
 export function truncateStyled(line: string, width: number): string {
   if (width <= 0) return '';
   if (styledWidth(line) <= width) return line;
@@ -83,10 +78,9 @@ export function truncateStyled(line: string, width: number): string {
 }
 
 /**
- * Wrap a styled line to `width` cells, preferring space breaks and never
- * splitting a wide glyph or an escape sequence. Open SGR codes are re-emitted
- * at continuation starts so a style spanning the break (a dim description)
- * survives the wrap; emitted lines end with a reset when a style is open.
+ * Wrap to `width` cells, preferring space breaks and never splitting a wide glyph or an escape
+ * sequence. Open SGR codes are re-emitted at continuation starts so a style spanning the break (a
+ * dim description) survives; emitted lines end with a reset when a style is open.
  */
 export function wrapStyled(line: string, width: number): string[] {
   if (width <= 0) return [''];
@@ -109,8 +103,7 @@ export function wrapStyled(line: string, width: number): string[] {
     const w = charWidth(cp);
     const chunk = cp > 0xffff ? line.slice(i, i + 2) : line[i]!;
     if (used + w > width && used > 0) {
-      // A space that overflows breaks right there; otherwise rewind to the
-      // last space so words stay whole.
+      // A space that overflows breaks there; otherwise rewind to the last space so words stay whole.
       const atSpace = chunk === ' ';
       const head = !atSpace && spaceAt > 0 ? current.slice(0, spaceAt) : current;
       const tail = !atSpace && spaceAt > 0 ? current.slice(spaceAt + 1) : '';

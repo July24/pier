@@ -2,11 +2,10 @@
 /**
  * Herdr hook (workspace.created / worktree.opened): bootstrap the pier main tab (v1.3 M7, D28).
  *
- * workspace.create already ships a tab + root pane (the workspace_created envelope carries
- * workspace/tab/root_pane), so the hook does not create one. It only skips when the workspace already has
- * a pi master pane (agent=pi or a ▶/⏳ title prefix), injects the pi launch command into the root pane via
- * pane.send_text + CR, renames the tab, and appends a boot.jsonl record for the [[startup]] restore hook.
- * Failures degrade to logs + non-zero exit; hook errors never reach the herdr server.
+ * workspace.create already ships the tab + root pane (the workspace_created envelope carries
+ * workspace/tab/root_pane), so this only skips when a pi master exists, injects the launch command into the
+ * root pane via pane.send_text + CR, renames the tab, and appends a boot.jsonl record for the [[startup]]
+ * restore hook. Failures degrade to logs + non-zero exit; hook errors never reach the herdr server.
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -30,7 +29,7 @@ async function main() {
   }
 
   let event = {};
-  try { event = JSON.parse(process.env.HERDR_PLUGIN_EVENT_JSON ?? '{}'); } catch { /* empty payload */ }
+  try { event = JSON.parse(process.env.HERDR_PLUGIN_EVENT_JSON ?? '{}'); } catch {}
   const wsId = event?.workspace?.workspace_id ?? deepFind(event, 'workspace_id') ?? '';
   if (!wsId) {
     console.error('[bootstrap] no workspace_id in event payload');

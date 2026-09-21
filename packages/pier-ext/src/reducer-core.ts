@@ -1,8 +1,5 @@
-/**
- * D102 Evidence-Preserving Reducer core: diagnostic-command recognition, secret filtering, receipt
- * schema checking and byte-for-byte quote verification. Pure — storage I/O lives in
- * efficiency-store.ts.
- */
+/** D102 Evidence-Preserving Reducer core: diagnostic-command recognition, secret filtering, receipt
+ * schema checking, byte-for-byte quote verification (storage I/O lives in efficiency-store.ts). */
 
 import { createHash } from 'node:crypto';
 
@@ -17,11 +14,8 @@ export const DEFAULT_MAX_CHARS = 600_000;
 export const DEFAULT_MAX_OUTPUT_TOKENS = 2048;
 export const DEFAULT_TIMEOUT_MS = 5000;
 
-/**
- * Diagnostic (test/build) command gate for EPR. Any shell separator is accepted on either side so
- * subshells and chains (`(npm test)`, `npm test&&echo ok`, `pytest;`) still match, while a word
- * character after the keyword (`makefile`, `coqtop`, `npm run test`) must not.
- */
+/** EPR diagnostic (test/build) gate: any shell separator matches on either side, so subshells and
+ * chains like `(npm test)`/`npm test&&echo ok`/`pytest;` still match, while `makefile`/`coqtop` must not. */
 export const DIAGNOSTIC_COMMAND =
   /(?:^|[;&|()\s])(?:lake\s+build|lake\s+env\s+lean|lean|coq|cargo(?:\s+(?:build|test|check))?|zig\s+build|pytest|python(?:3)?\s+-m\s+(?:pytest|unittest|py_compile)|ctest|cmake\s+--build|ninja|make|npm\s+test|pnpm\s+test|yarn\s+test|go\s+test|bazel\s+test|node\s+--test|npx\s+tsx\s+--test|vitest|jest|mvn|mvnw|gradle|gradlew)(?:[;&|()\s]|$)/i;
 
@@ -29,11 +23,9 @@ export const FAILURE_SIGNAL =
   /error|failed|failure|fatal|exception|panic|timeout|unsolved|type mismatch|assert/i;
 
 /**
- * Credential heuristics for the EPR fail-open gate. Precision comes from the VALUE shape, not the
- * keyword: after the separator the text must carry a token-looking run — a known credential prefix
- * (sk-, ghp_, github_pat_, xox*, AKIA, eyJ) or >= 15 contiguous token characters with a digit.
- * Keywords alone matched test names, JSON keys (`"Authorization":[]`), URL paths and function
- * calls, which blocked pier's own `npm test` output on every trial run.
+ * Credential heuristics for the EPR fail-open gate: precision comes from the VALUE shape, not the
+ * keyword — after the separator the text must carry a token-looking run (a known credential prefix
+ * such as sk-, ghp_, github_pat_, xox*, AKIA or eyJ, or >= 15 contiguous token characters with a digit).
  */
 export const LIKELY_SECRET =
   /(?:api[_-]?key|api[_-]?secret|access[_-]?token|refresh[_-]?token|secret[_-]?key|client[_-]?secret|authorization|bearer|password|passwd|secret)[^\n]{0,40}[=:][\s"']*(?:bearer\s+|basic\s+)?[\s"']*(?:(?:sk-|ghp_|github_pat_|xox[baprs]-|AKIA|eyJ)[A-Za-z0-9_-]{10,}|(?=[A-Za-z0-9_\-.+~]*[0-9])[A-Za-z0-9_\-.+~]{15,})/i;
@@ -67,12 +59,10 @@ export function isDiagnosticCommand(command: string): boolean {
 
 /**
  * Recover the untruncated-log path from Pi's inline notice (`[Output truncated. Full output: …]`,
- * `[Showing lines 1-2000 of 5000. Full output: …]`, …). `details.fullOutputPath` carries the same
- * value, but a replayed or re-shaped event can keep only the text, and verifying a receipt against a
- * truncated preview would be wrong.
+ * `[Showing lines 1-2000 of 5000. Full output: …]`): a replayed or re-shaped event can keep only that
+ * text, and verifying a receipt against a truncated preview would be wrong.
  *
- * The returned path is NOT trusted: callers must still gate it (see `readBashFullOutput`, which
- * requires a `pi-bash-*.log` basename resolving to a regular non-symlink file inside tmpdir).
+ * The returned path is NOT trusted: callers must still gate it (see `readBashFullOutput`).
  */
 export function fullOutputPathFromNotice(text: string): string | undefined {
   // Only a bracketed notice counts, and Pi appends it at the very end — so take the LAST match.
@@ -106,10 +96,8 @@ export function extractLikelySecretMatch(text: string): string | undefined {
   return `${snippet.slice(0, sep + 1)} <redacted:${value.length} chars,sha8=${sha256Hex(value).slice(0, 8)}>`;
 }
 
-/**
- * Reducer models frequently wrap their JSON in a Markdown fence even when told not to; strip it
- * before parsing (3/8 trial attempts failed as invalid-json for the same command that succeeded).
- */
+/** Reducer models frequently wrap their JSON in a Markdown fence even when told not to; strip it
+ * before parsing, or the receipt is rejected as invalid-json. */
 function stripReceiptJsonFences(raw: string): string {
   const trimmed = raw.trim();
   const fenced = /^```[a-zA-Z0-9_-]*\s*\n([\s\S]*?)\n?```$/.exec(trimmed);
@@ -167,9 +155,6 @@ export function reducerInputPrompt(opts: {
   ].join('\n');
 }
 
-/**
- * Validates receipt byte for byte against the actual source text.
- */
 export function validateReceipt(
   rawJson: string,
   sourceHash: string,
@@ -295,9 +280,9 @@ export function formatReceiptText(opts: {
 }
 
 /**
- * Usage shapes accepted from / returned to pi. pi renders a tool result's `usage` through
- * `addUsageToTotals`, which reads `usage.cost.total` WITHOUT a guard, so a partial object crashes
- * the whole pi process. Always emit the complete `UsageTotals` below; see docs/session-format.md.
+ * Usage shapes accepted from / returned to pi: `addUsageToTotals` reads `usage.cost.total` WITHOUT a
+ * guard, so a partial object crashes the whole pi process. Always emit the complete `UsageTotals`
+ * below; see docs/session-format.md.
  */
 export interface UsageLike {
   input?: number;
@@ -318,7 +303,6 @@ export interface UsageTotals {
   cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
 }
 
-/** Sum two (possibly partial) usage records into one complete `UsageTotals`. */
 export function mergeUsage(a?: UsageLike, b?: UsageLike): UsageTotals {
   const sum = (x?: number, y?: number): number => (x ?? 0) + (y ?? 0);
   return {

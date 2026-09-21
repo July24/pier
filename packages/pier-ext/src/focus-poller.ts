@@ -12,7 +12,6 @@ export const FOCUS_POLL_DEFAULT_MS = 1500;
 /** Herdr 0.9.1+: native pane.focused is authoritative; default poller off to avoid a delayed second reflow. */
 export const FOCUS_POLL_HERDR_091_MS = 0;
 
-/** Check if Herdr server version is 0.9.1 or later. */
 export function isHerdr091OrLater(version?: string | null): boolean {
   if (!version) return false;
   const m = /^(\d+)\.(\d+)\.(\d+)/.exec(version.trim());
@@ -26,12 +25,11 @@ export function isHerdr091OrLater(version?: string | null): boolean {
   return false;
 }
 
-/** Determine default poll cadence based on Herdr server version. */
 export function resolveDefaultFocusPollMs(herdrVersion?: string | null): number {
   return isHerdr091OrLater(herdrVersion) ? FOCUS_POLL_HERDR_091_MS : FOCUS_POLL_DEFAULT_MS;
 }
-/** Minimum gap between two reflow triggers: re-clicking the same pane must not spawn a process per
- *  click; the workbench debounces per tab (150 ms) on top of this. */
+/** Min gap between reflow triggers: re-clicking the same pane must not spawn a process per click (the
+ *  workbench debounces 150 ms per tab on top of this). */
 export const FOCUS_FIRE_MIN_INTERVAL_MS = 700;
 
 export interface FocusSample {
@@ -119,8 +117,6 @@ export function planFocusTick(opts: {
     state: { ...next, lastFireAt: opts.now },
   };
 }
-
-/* ─────────────────────────── runner ─────────────────────────── */
 
 export interface FocusPollerDeps {
   /** Layout of the caller's own tab (the client already exposes `layout.export`). */
@@ -223,6 +219,5 @@ export function spawnReflow(opts: SpawnReflowOpts): void {
     child.on?.('error', () => { /* Missing script / dead exec: polling must never break pi. */ });
     child.unref?.();
   } catch {
-    /* Best-effort: focus heat is a comfort feature; the click still focuses the pane. */
   }
 }

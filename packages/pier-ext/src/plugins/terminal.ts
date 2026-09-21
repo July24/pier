@@ -1,9 +1,8 @@
 /**
  * M14 terminal loader entry for the D78 mount tree and D81 responsibility split.
- *
- * A Cordis loader plugin so the terminal surface stays hot-swappable: services provide the
- * tombstone-aware pi surface, the herdr client/environment and the state slot used by index GC.
- * terminal-core holds the pure, independently testable logic.
+ * A Cordis loader plugin so the terminal surface stays hot-swappable: services provide the tombstone-aware
+ * pi surface, the herdr client/environment and the state slot used by index GC; terminal-core holds the
+ * pure, independently testable logic.
  */
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
@@ -39,7 +38,6 @@ import {
 import { swallow } from '../swallow.ts';
 import { pierOption } from '../pier-options.ts';
 
-/** Raw tool arguments: every field is validated inside the action handlers. */
 type ToolParams = Record<string, unknown> | undefined;
 
 /** Terminal tool actions; the tool schema union and the handler map are both keyed by this list. */
@@ -67,9 +65,8 @@ export default function terminalPlugin(ctx: Context): void {
   // Keying the surface by this file lets HMR tombstone and replace exactly this registration.
   const scoped = surface.forModule(import.meta.url);
 
-  /* ── M14 resident terminal tools ──────────────────────────────────
-   * Dedicated herdr panes preserve shell state without reusing the pi TUI pane, and active
-   * terminal panes remain exempt from index GC. Workers omit this master-side entry. */
+  /* M14 resident terminal tools: dedicated herdr panes preserve shell state without reusing the pi TUI pane,
+   * and active terminal panes remain exempt from index GC. Workers omit this master-side entry. */
 
   let terminals: TerminalEntry[] = [];
 
@@ -102,7 +99,6 @@ export default function terminalPlugin(ctx: Context): void {
     persistTerminals();
   }
 
-  // Expose active panes so index GC does not collect resident terminal shells.
   state.activePaneIds = () => activeTerminalPaneIds(terminals);
 
   scoped.on('session_start', async (_event: unknown, eventCtx: unknown) => {
@@ -155,9 +151,8 @@ export default function terminalPlugin(ctx: Context): void {
       reminders: idleReminders,
     });
     if (!plan.due || plan.content == null) return;
-    // Goodbye-loop guard: mark the covered terminals nudged NOW (persisted), and deliver the notice
-    // as a queued followUp WITHOUT triggerTurn — a reminder must never wake the agent, or the loop
-    // wake → polite goodbye → settle → nudge → wake … never ends.
+    // Goodbye-loop guard: mark the covered terminals nudged NOW (persisted), and deliver the notice as a
+    // queued followUp WITHOUT triggerTurn — a reminder must never wake the agent, or the loop never ends.
     const now = Date.now();
     const ids = new Set(plan.ids);
     terminals = terminals.map((t) => (ids.has(t.terminalId) ? { ...t, nudgedAt: now } : t));
@@ -175,7 +170,6 @@ export default function terminalPlugin(ctx: Context): void {
             { deliverAs: 'followUp' },
           );
         } catch {
-          /* Delivery failure is non-fatal; the cap already bounds retries. */
         }
       })();
     }, terminalReminderGraceMs());
@@ -255,7 +249,6 @@ export default function terminalPlugin(ctx: Context): void {
       const read = await client.readPane(paneId, { stripAnsi: false });
       return classifyReadiness(stripAnsi(read.text), { silentMs: 0, prompt });
     } catch {
-      /* Readiness is advisory, so probe failures still leave a usable terminal. */
       return 'busy';
     }
   }
@@ -269,7 +262,6 @@ export default function terminalPlugin(ctx: Context): void {
       await client.sendPaneText(entry.paneId, init.command);
       return true;
     } catch {
-      /* Shell init is best-effort: the terminal works without it. */
       return false;
     }
   }
@@ -319,9 +311,8 @@ export default function terminalPlugin(ctx: Context): void {
       persistTerminals();
     }
     if (params?.wait_prompt === true) {
-      // Orchestration convention: read before writing. Text typed while a previous command still
-      // owns the foreground gets queued and fires later, which reads as "the shell ignored me".
-      // Refuse with the observed readiness instead of guessing.
+      // Orchestration convention: read before writing. Text typed while a previous command still owns the
+      // foreground gets queued and fires later, which reads as "the shell ignored me"; refuse with the observed readiness.
       const readiness = await probeReadiness(entry.paneId);
       if (readiness !== 'prompt') {
         return fail(
@@ -364,14 +355,12 @@ export default function terminalPlugin(ctx: Context): void {
       return fail(herdrUnavailableHint(e) ?? `wait failed (pane may be closed): ${(e as Error).message}`);
     }
     if (!waitResult.matched) {
-      // wait-for-text convention: on timeout, hand back the recent tail so the model can decide
-      // the next move instead of re-polling blind.
+      // wait-for-text convention: on timeout, hand back the recent tail instead of re-polling blind.
       let tail = '';
       try {
         const read = await client.readPane(entry.paneId, { stripAnsi: false });
         tail = stripAnsi(read.text).slice(-WAIT_TAIL_CHARS);
       } catch {
-        /* The pane is gone; the timeout text alone still tells the model it is stuck. */
       }
       const reason = waitResult.reason === 'timeout' ? 'timeout' : 'wait unavailable';
       return {
@@ -385,9 +374,8 @@ export default function terminalPlugin(ctx: Context): void {
     };
   }
 
-  /** T5: a direct `pane_id` read is limited to panes in this session's own tab or to self-created
-   *  terminal panes, so one task can never read another's pane. Returns the error text instead of
-   *  throwing, keeping the tool's hard-failure policy at the call site. */
+  /** T5: a direct `pane_id` read is limited to panes in this session's own tab or to self-created terminal
+   *  panes, so one task can never read another's pane. Returns the error text instead of throwing. */
   async function resolveDirectPaneId(paneId: string): Promise<{ ok: true; paneId: string } | { ok: false; error: string }> {
     let panes;
     try {

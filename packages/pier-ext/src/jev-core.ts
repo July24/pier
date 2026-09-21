@@ -1,9 +1,8 @@
 /**
  * Jev decision layer — pure core (RFC docs/rfc-jev-integration.md).
  *
- * Question/answer shapes mirror the closed set of POST /v1/systemone
- * (https://docs.typesafe.ai/api): noul / choice / score. No I/O here; the HTTP client and the
- * jev.jsonl telemetry live in jev-client.ts.
+ * Question/answer shapes mirror the closed set of POST /v1/systemone (https://docs.typesafe.ai/api):
+ * noul / choice / score. No I/O here; the HTTP client and jev.jsonl telemetry live in jev-client.ts.
  *
  * RFC design rules: arithmetic, counting and thresholds stay in code; state carries only what each
  * question needs; instructions are English (CJK is weaker, hence the stricter P0-2 gate); and any
@@ -153,9 +152,7 @@ export interface DiagnosticGateVerdict {
   readonly hit: boolean;
   readonly reason: string;
   readonly confidence: number | null;
-  /** Selected cmd_kind option (telemetry); null when the answer was malformed. */
   readonly choice: string | null;
-  /** diagnostic_output noul value (telemetry); null when the answer was malformed. */
   readonly noul: number | null;
 }
 export function evaluateDiagnosticGate(
@@ -204,8 +201,7 @@ export function noticeRankRequest(input: {
 }): JevRequest {
   const questions: Record<string, JevQuestion> = {};
   for (let i = 0; i < input.notices.length; i++) {
-    // Question keys are NOT sent to the model, so identical instructions would collapse every
-    // notice into one question (observed live: five identical answers). Name the state index.
+    // Question keys are NOT sent to the model: identical instructions would collapse every notice into one.
     questions[`notice_${i}_rank`] = {
       type: 'score',
       instructions: `How urgently does the master agent need to see settlements[${i}] right now, given in_progress_todos?`,
@@ -230,10 +226,10 @@ export function noticeRankRequest(input: {
 const NOTICE_FAIL_PIN_THRESHOLD = 0.7;
 
 /**
- * Display order: pinned failures first, then descending composed relevance (stable on ties ->
- * arrival order). Per-item confidence gate: an item below the gate sinks to the routine bucket
- * instead of voiding the batch. All items gated -> null. The fail pin ignores the score gate:
- * noul answers carry no confidence field and failure visibility is the safety property.
+ * Display order: pinned failures first, then descending composed relevance (stable on ties -> arrival
+ * order); the per-item confidence gate sinks an item to the routine bucket instead of voiding the
+ * batch, and all items gated -> null. The fail pin ignores the score gate: noul answers carry no
+ * confidence field and failure visibility is the safety property.
  */
 export function composeNoticeRanking(
   noticeCount: number,
@@ -317,7 +313,6 @@ export function buildExcerptWindows(text: string, halfBudgetBytes: number): Exce
       out.push({ id: 'first_signal', label: 'first failure-signal region', text: firstWindow.text });
     }
 
-    // Densest cluster: anchor at every signal line, extend greedily while in budget.
     let best: LineWindow | null = null;
     for (const anchor of signalLines) {
       const window = buildLineWindow(lines, anchor, halfBudgetBytes, signalLines);
@@ -376,9 +371,8 @@ export function evaluateExcerptPick(
     : null;
 }
 
-/** Local privacy gate for the excerpt-pick request: its state (head/tail excerpts + candidate
- * windows) is sent for EVERY packed output, a path the EPR secret gate never covers, so
- * credential-shaped text in any part keeps the whole request local. */
+/** Local privacy gate for the excerpt-pick request: its state is sent for EVERY packed output — a path
+ *  the EPR secret gate never covers — so any credential-shaped text keeps the whole request local. */
 export function excerptAskIsSafe(
   middleWindows: readonly ExcerptWindow[],
   headExcerpt: string,
@@ -397,7 +391,6 @@ const SETTLE_FINAL_MIN_NOUL = 0.6;
 
 export type SettleNullVerdict = 'silent' | 'attribution-suspect' | 'extraction-failed';
 
-/** State is the delegated task plus the transcript tail we actually read. */
 export function settleVerdictRequest(input: { description: string; tail: string }): JevRequest {
   return {
     state: { task: input.description, transcriptTail: input.tail },

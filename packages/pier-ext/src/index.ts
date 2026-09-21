@@ -1,16 +1,10 @@
 /**
  * pi-herdr extension entry point and composition root.
  *
- * Layout map:
- *  - index-runtime.ts  process mode (worker / bare pi / herdr master)
- *  - index-roles.ts    role runtime: manifest state, gate, /pier-role, branch replay
- *  - index-gates.ts    human-gate (blocked) reporting
- *  - index-pipe.ts     extension pipe protocol handler
- *  - index-notices.ts  settlement-notice buffer
- *  - index-locks.ts    cross-pane write locks
- *  - index-master.ts   master mount (cordis loader + terminal/todo/subagent)   [dynamic]
- *  - index-worker.ts   worker/bare-pi mount (todo only)                        [dynamic]
- *  - plugins/*.ts      cordis plugin entries; pure logic lives in top-level *-core.ts
+ * Layout: index-runtime.ts picks the process mode (worker / bare pi / herdr master);
+ * index-roles.ts the role runtime, index-gates.ts human-gate reporting, index-pipe.ts the
+ * pipe protocol handler, index-notices.ts the notice buffer, index-locks.ts write locks;
+ * index-master.ts / index-worker.ts are the dynamic master / todo-only mounts.
  *
  * pi contract: onUpdate must have AgentToolResult shape (a string crashes the TUI); tool-result
  * details persist in session JSONL and getBranch() replay implements branch rollback.
@@ -81,7 +75,6 @@ function focusPollIntervalMs(env: NodeJS.ProcessEnv = process.env, herdrVersion?
     : defaultMs;
 }
 
-/** Sessions dir used when mapping a bare session id to its transcript path. */
 function agentSessionsDir(): string {
   return process.env.PI_CODING_AGENT_DIR ? join(process.env.PI_CODING_AGENT_DIR, 'sessions') : platformPaths.sessionsDir;
 }
@@ -146,14 +139,11 @@ export default async function (pi: ExtensionAPI) {
     console.error(`[pi-herdr] transcript renderers: ${rendererTypes.length ? rendererTypes.join(', ') : 'none'}`);
   }
 
-  /* ── shared session state ── */
   let agentActive = false;
   let lastStopReason: string | null = null;
   let latestCtx: { abort?: () => void } | null = null;
-  /** M16: completion timestamps used as rate-estimation input. */
   const completedStamps: number[] = [];
   const subagentPort = emptySubagentPortBox();
-  /** D96 notice dedup anchor. */
   let d96NoticeKey: string | null = null;
   let d96NoticeAt = 0;
 
@@ -193,7 +183,6 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
-  /** Project the todo snapshot to pane title, slim frame and sidebar tokens. */
   function mirrorTodos(): void {
     if (!client.available) return;
     const label = sessionId || (env ? `pane:${env.paneId}` : '');
@@ -222,7 +211,6 @@ export default async function (pi: ExtensionAPI) {
             { version: 1, edits: plan.edits, ts: Date.now() },
           );
         } catch {
-          /* Best effort persistence; in-memory state still advances. */
         }
         todos.applyEdits(plan.edits, { source: 'reconcile' });
         mirrorTodos();
@@ -280,7 +268,6 @@ export default async function (pi: ExtensionAPI) {
     locksHandle = installWriteLocks(pi, { client, env, hard: process.env[WRITE_LOCK_ENV] === '1' });
   }
 
-  /* ── notice buffer (flush wiring rides the turn lifecycle below) ── */
   const sendUserMessageAs = (content: string, mode: 'steer' | 'followUp'): Promise<void> =>
     (pi as unknown as { sendUserMessage?: (content: string, opts?: { deliverAs?: string; triggerTurn?: boolean }) => Promise<void> })
       .sendUserMessage?.(content, { deliverAs: mode, triggerTurn: true }) ?? Promise.resolve();
@@ -357,7 +344,6 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
-  /** D50: when this pane settles, push a summary + session path to a machine request awaiting a reply. */
   async function pushSettleReply(): Promise<void> {
     const req = pendingMachineRequest;
     if (!req || !req.push || !req.from) return;
@@ -383,7 +369,6 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
-  /* ── session lifecycle ── */
   const sessionFocusPoller: { current: FocusPoller | null } = { current: null };
 
   pi.on('session_start', async (event, ctx) => {
@@ -404,8 +389,7 @@ export default async function (pi: ExtensionAPI) {
     if ((event as { reason?: string } | undefined)?.reason !== 'resume') todoUi.renderWidget(ctx);
     // D97: narrow-frame overlay is meaningful only inside herdr; re-register (session switching resets it).
     if (env) registerSlimFrame(ctx);
-    // P2-5: resume folds todos/compaction state from the branch like session_tree;
-    // a fresh session folds nothing.
+    // P2-5: resume folds todos/compaction state from the branch like session_tree; a fresh session folds nothing.
     rebuildFromBranch(ctx);
     mirrorTodos();
     roles.syncFromBranch(ctx);
@@ -449,7 +433,6 @@ export default async function (pi: ExtensionAPI) {
     mirrorTodos();
   });
 
-  /* ── turn lifecycle ── */
   pi.on('turn_start', async () => {
     agentActive = true;
     // A11: reset so a previous turn's abort cannot taint this one.
@@ -592,7 +575,6 @@ export default async function (pi: ExtensionAPI) {
       try {
         await pruneSessionObjects(sessionRoot);
       } catch {
-        /* Pruning is opportunistic. */
       }
     }
     client.close();

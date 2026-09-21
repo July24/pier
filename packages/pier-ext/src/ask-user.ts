@@ -1,9 +1,7 @@
 /**
- * ask_user_question I/O: normalize params, select+Other dialog, result envelope.
- *
- * The herdr gate (blocked / pi-ask / widget collapse) stays in index.ts; this module owns the
- * questionnaire — authored options plus a runtime Other row, so the model cannot forget a free-text
- * escape and Esc is a real decline.
+ * ask_user_question I/O: normalize params, select+Other dialog, result envelope. The herdr gate
+ * (blocked / pi-ask / widget collapse) stays in index.ts; this module owns the questionnaire — authored
+ * options plus a runtime Other row, so the model cannot forget a free-text escape and Esc is a real decline.
  */
 import { Type } from 'typebox';
 import { OTHER_ROW_LABEL, numberedOptionLine, runSelectDialog } from './ask-dialog.ts';
@@ -184,8 +182,7 @@ function parseOptions(raw: unknown): { ok: true; options: AskOption[] } | { ok: 
   for (const item of raw) {
     const rec = asRecord(item);
     const rawLabel = typeof rec?.label === 'string' ? rec.label.trim() : '';
-    // B3: models often repeat the marker the UI appends (label: 'Redis (Recommended)' rendered as
-    // "Redis (Recommended) (Recommended)"). Only a trailing bracketed marker is stripped.
+    // B3: models repeat the marker the UI appends ("Redis (Recommended)"); strip only a trailing one.
     const label = rawLabel.replace(/\s*[([]\s*recommended\s*[)\]]\s*$/i, '').trim();
     if (!label) {
       return fail(
@@ -328,13 +325,11 @@ async function askOtherText(ui: AskUi, question: AskQuestion, signal?: AbortSign
 }
 
 /**
- * Interpret one typed answer.
- *
- * Single-select: a listed line or its number takes that option, the Other number opens the free-text
- * prompt, anything else is a custom answer — but only on the typed fallback, since a real select
- * dialog can only return a listed row. Multi-select: comma/space separated numbers, the Other number
- * alone opens free text, an empty submission is an empty selection. Returns 'other' to ask for free
- * text, undefined to decline.
+ * Interpret one typed answer. Single-select: a listed line or its number takes that option, the Other
+ * number opens the free-text prompt, anything else is a custom answer — but only on the typed fallback,
+ * since a real select dialog can only return a listed row. Multi-select: comma/space separated numbers,
+ * the Other number alone opens free text, an empty submission is an empty selection. Returns 'other' to
+ * ask for free text, undefined to decline.
  */
 function parseTypedPicks(
   question: AskQuestion,
@@ -359,8 +354,7 @@ function parseTypedPicks(
       ? [withId(question, { question: question.question, kind: 'custom', answer: OTHER_ANSWER, customInput: trimmed })]
       : undefined;
   }
-  // The Other row is listed with a number like every authored option; typing it alone opens the
-  // free-text prompt. Mixed with choice numbers it stays on the free-text/decline handling below.
+  // The Other row is numbered like the authored options; typing it alone opens the free-text prompt.
   if (trimmed.split(/[,\s]+/).length === 1 && parseChoice(trimmed, lines) === otherIndex) return 'other';
   const tokens = trimmed.split(/[,\s]+/).filter((tok) => tok.length > 0);
   const indices = tokens.map((tok) => {
@@ -376,7 +370,6 @@ function parseTypedPicks(
     }
     return [withId(question, { question: question.question, kind: 'multi', answer: null, selected })];
   }
-  // Unparsable input is a free-text answer only when the free-text row was offered.
   return question.allowOther
     ? [withId(question, { question: question.question, kind: 'custom', answer: OTHER_ANSWER, customInput: trimmed })]
     : undefined;

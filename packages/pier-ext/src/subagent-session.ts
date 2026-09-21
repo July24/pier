@@ -1,9 +1,8 @@
 /**
- * Child-session transcript I/O + incremental pane-output observation for subagents.
- *
- * Path resolution, settlement text, and liveness probes share one candidate order (reported
- * path/id before recent-file fallback, excluding the master's own session and sessions claimed
- * by other live panes), so settlement text can never cross sessions.
+ * Child-session transcript I/O + pane-output observation for subagents. Path resolution, settlement
+ * text and liveness probes share one candidate order (reported path/id before recent-file fallback,
+ * excluding the master's own session and sessions claimed by other live panes), so settlement text
+ * can never cross sessions.
  */
 import { accessSync, constants, statSync } from 'node:fs';
 import type { HerdrAgentState, HerdrClientLike } from './herdr-client.ts';
@@ -30,15 +29,12 @@ const OUTPUT_TAIL_CHARS = 500;
 export type SubagentStatus = 'running' | 'idle' | 'blocked' | 'settled';
 
 export interface SubagentOutputCursor {
-  /** Suffix of previous full text used for boundary matching */
   tail: string;
   fullLength: number;
-  /** Fingerprint of the last session-transcript report already delivered for this pane;
-   * deduplicates the transcript fallback across polls (present only after such a delivery). */
+  /** Fingerprint of the last transcript report delivered to this pane; deduplicates the fallback across polls. */
   reportTail?: string;
 }
 
-/** Bound text to a character budget, retaining the tail (most recent output). */
 function boundText(text: string, maxChars: number): { text: string; truncated: boolean } {
   if (text.length <= maxChars) return { text, truncated: false };
   return { text: text.slice(text.length - maxChars), truncated: true };
@@ -49,10 +45,9 @@ function extractTail(text: string, tailChars = OUTPUT_TAIL_CHARS): string {
 }
 
 /**
- * Incremental delta between the previous cursor and the current full buffer. The initial read
- * returns bounded full text; an append yields the text after the previous tail. Ambiguous repeats,
- * scrolled-off boundaries and clear-screens degrade to full text with `restart: true` — for a
- * fullscreen TUI that is the normal steady state, not a crash signal.
+ * Incremental delta between the previous cursor and the current full buffer: an initial read returns
+ * bounded full text, an append the text after the previous tail; ambiguous repeats and scrolled-off
+ * boundaries degrade to full text with `restart: true`.
  */
 export function computeSubagentOutputDelta(
   prevCursor: SubagentOutputCursor | null | undefined,
@@ -157,10 +152,9 @@ export interface SessionIo {
   probeAlive(paneId: string, cwd: string): Promise<AliveProbe>;
   subSessionState(paneId: string, cwd: string, sinceTs: number, preferred?: string | null): Promise<SubSessionState>;
   readSettleTail(paneId: string, cwd: string, preferred?: string | null, maxChars?: number): Promise<string | null>;
-  /** Re-attribute a registry sessionFile with no writes since `sinceTs`: keep `preferred` when it is
-   * fresh, otherwise accept herdr's per-pane report when that is fresh. An existing value is only
-   * ever replaced by the authoritative report; null means "nothing fresh is known, keep the old one"
-   * (never an mtime guess). */
+  /** Re-attribute a registry sessionFile with no writes since `sinceTs`: keep `preferred` when fresh,
+   * else accept herdr's per-pane report when fresh. An existing value is only replaced by the
+   * authoritative report; null means "keep the old one" (never an mtime guess). */
   reattributeStaleSessionFile(paneId: string, cwd: string, sinceTs: number, preferred: string | null): Promise<string | null>;
 }
 
@@ -169,7 +163,6 @@ interface FileStamp {
   mtimeMs: number;
 }
 
-/** Cheap change fingerprint; null when the path is missing or is not a readable regular file. */
 function stampOf(file: string): FileStamp | null {
   try {
     const s = statSync(file);
@@ -234,11 +227,10 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     return { reported, taken };
   }
 
-  /** Ordered candidates: pipe self-report, herdr report, then the newest session files. */
+  /** Ordered candidates: pipe self-report (authoritative), herdr's report, then the newest session files. */
   async function resolveSessionFileCandidates(paneId: string, cwd: string, preferred?: string | null): Promise<string[]> {
     // A sub's sessionFile must never resolve to the master's own transcript (compare via
-    // bareSessionId: herdr reports ids and paths interchangeably); a poisoned entry once made
-    // `resume` adopt the master pane as its own subagent and GC close it mid-run.
+    // bareSessionId: herdr reports ids and paths interchangeably).
     const own = bareSessionId(h.getSessionId());
     const { reported, taken } = await reportedAndTaken(paneId);
     const out: string[] = [];
@@ -249,18 +241,15 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
       if (taken.has(id)) return;
       out.push(file);
     };
-    // The pipe self-report (entry.sessionFile) is authoritative for this pane.
     push(resolveSessionFileValue(cwd, h.sessionsDir(), preferred));
     push(resolveSessionFileValue(cwd, h.sessionsDir(), reported));
     for (const f of listSessionFiles(cwd, h.sessionsDir(), 4)) push(f);
     return out;
   }
 
-  /** Candidate files that are readable right now, with their change stamp. */
   async function* readableCandidates(paneId: string, cwd: string, preferred?: string | null): AsyncGenerator<{ file: string; stamp: FileStamp }> {
     for (const file of await resolveSessionFileCandidates(paneId, cwd, preferred)) {
-      // herdr often reports a .jsonl path before the worker creates the file; callers assume a
-      // readable candidate, so vanished paths are skipped rather than surfaced.
+      // herdr reports .jsonl paths before the file exists; vanished paths are skipped, never surfaced.
       const stamp = stampOf(file);
       if (stamp) yield { file, stamp };
     }
@@ -273,7 +262,6 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     opts?: ResolveSessionFileOpts,
   ): Promise<string | null> {
     for await (const { file, stamp } of readableCandidates(paneId, cwd, preferred)) {
-      // No write since the request → this candidate cannot hold the run's transcript.
       if (opts?.minMtimeMs != null && stamp.mtimeMs < opts.minMtimeMs) continue;
       return file;
     }
@@ -291,8 +279,7 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     const own = bareSessionId(h.getSessionId());
     const { reported, taken } = await reportedAndTaken(paneId);
     // Own/taken exclusions apply to `preferred` too: a registry value pointing at the master's own
-    // transcript is always "fresh", so the freshness gate can never veto it. Such a value falls
-    // through to herdr's report instead of returning null (null means "keep the old one").
+    // transcript is always "fresh", so the gate cannot veto it and herdr's report takes over.
     const preferredId = preferred ? bareSessionId(preferred) : null;
     const preferredHeld = preferredId != null && ((own != null && preferredId === own) || taken.has(preferredId));
     const preferredStamp = preferred ? stampOf(preferred) : null;
@@ -361,7 +348,6 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
         if (a.foregroundCwd) probe.foregroundCwd = a.foregroundCwd;
       }
     } catch {
-      /* agent.list is status-only; absence is not death */
     }
     for await (const { stamp } of readableCandidates(paneId, cwd)) {
       if (probe.lastActivityMs == null || stamp.mtimeMs > probe.lastActivityMs) probe.lastActivityMs = stamp.mtimeMs;
@@ -379,7 +365,6 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
       const cached = stateCache.get(file, stamp, sinceTs);
       if (cached) return cached;
       const entries = readSessionFile(file);
-      // An empty/unparsable file has no state to cache; the next candidate may still have one.
       if (!entries?.length) continue;
       const state = deriveSubSessionState(entries, sinceTs);
       stateCache.set(file, stamp, sinceTs, state);
@@ -439,7 +424,6 @@ async function readSubagentOutput(client: HerdrClientLike, paneId: string): Prom
     try {
       return await client.readAgent(paneId, { source: 'recent', stripAnsi: true });
     } catch {
-      /* fall through to pane.read */
     }
   }
   return await client.readPane(paneId, { source: 'recent', stripAnsi: true });
@@ -469,12 +453,10 @@ export async function executeSubagentOutput(
   let agentState: HerdrAgentState | null = null;
   let askFlag: string | null = null;
   try {
-    // One query carries both the status and the human-gate flag of this pane.
     const agent = (await deps.client.listAgents()).find((candidate) => candidate.paneId === entry.paneId);
     agentState = agent?.status ?? null;
     askFlag = agent?.tokens?.['pi-ask'] ?? null;
   } catch {
-    /* Output stays useful without live status. */
   }
 
   const status = resolveSubagentStatus({ localStatus: entry.status, herdrStatus: agentState, hasAskFlag: Boolean(askFlag) });
@@ -506,7 +488,6 @@ export async function executeSubagentOutput(
         deltaResult.nextCursor.reportTail = fingerprint;
       }
     } catch {
-      /* Transcript unavailable — the pane delta is still returned. */
     }
   }
   deps.outputCursors.set(entry.paneId, deltaResult.nextCursor);

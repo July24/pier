@@ -1,30 +1,21 @@
 /**
- * Centralized runtime policy and timeouts.
- *
- * Every field comes from the `PIER_OPTIONS` registry (canonical/legacy env names, bounds and
- * default), so the numbers cannot drift from `/pier-config doctor`; an out-of-range or unparsable
- * value warns once and falls back to the registry default.
+ * Every field is fed by the `PIER_OPTIONS` registry, so the numbers cannot drift from
+ * `/pier-config doctor`; an out-of-range value warns and falls back to the registry default.
  */
 import { PIER_OPTIONS, pierOption, type PolicyField } from './pier-options.ts';
 
 export interface RuntimePolicy {
-  /** Subagent overall timeout (ms) */
   readonly subagentTimeoutMs: number
-  /** Subagent GC tick interval (ms) */
   readonly gcTickMs: number
-  /** Poll interval for subagent state observation (ms) */
   readonly pollIntervalMs: number
-  /** Settlement notice window / machine-inject grace / takeover idle (ms) */
+  /** Settlement notice window / machine-inject grace / takeover idle */
   readonly settlementWindowMs: number
-  /** Post-settle observation window before auto-consume (ms) */
+  /** Post-settle observation window before auto-consume */
   readonly observationWindowMs: number
-  /** Foreground patience before background promotion (ms) */
   readonly foregroundPatienceMs: number
-  /** Default session TTL (seconds) */
   readonly sessionTtlSeconds: number
-  /** Git operation timeout (ms) */
   readonly gitTimeoutMs: number
-  /** Subagent pane pipe readiness wait (ms) */
+  /** Subagent pane pipe readiness wait */
   readonly readinessTimeoutMs: number
 }
 
@@ -53,8 +44,5 @@ export function createRuntimePolicy(overrides?: Partial<RuntimePolicy>): Runtime
   return policy;
 }
 
-/**
- * Singleton runtime policy for production use.
- * Tests should inject via createRuntimePolicy().
- */
+/** Singleton for production; tests inject via createRuntimePolicy(). */
 export const runtimePolicy = createRuntimePolicy()

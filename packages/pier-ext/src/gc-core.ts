@@ -1,7 +1,4 @@
-/**
- * Task-tab GC decisions (D29 rules as a pure function; M22 dropped resident exemption).
- * No I/O, no pi/herdr — unit-testable.
- */
+/** Task-tab GC decisions (D29 rules as a pure function; no I/O, no pi/herdr). */
 export type GcEntryKind = string;
 export type GcEntryStatus = 'running' | 'settled' | 'consumed' | 'closed';
 
@@ -17,14 +14,8 @@ function isFinished(status: GcEntryStatus): boolean {
   return status === 'consumed' || status === 'closed' || status === 'settled';
 }
 
-/**
- * Close a task tab only when every condition holds:
- *  - ≥1 work pane (the main tab with no delegated entries never closes);
- *  - every work pane is settled/consumed/closed (kind is not an exemption);
- *  - grace TTL elapsed (`ttlMs=0` means never auto-close);
- *  - no blocked pane (human-gate exemption);
- *  - remaining panes are idle/done/unknown (non-work panes may be unknown).
- */
+/** Close a task tab only when every work pane finished, the grace TTL elapsed (`ttlMs=0` means never
+ *  auto-close), no pane is blocked and the rest are idle/done/unknown. */
 export function shouldCloseTaskTab(opts: {
   entries: readonly GcEntryLike[];
   paneStatuses: readonly string[];
@@ -39,12 +30,8 @@ export function shouldCloseTaskTab(opts: {
   return true;
 }
 
-/**
- * Pane-level collection (orphan / compat path):
- *  - consumed before the previous turn (grace so the settlement notice is still visible);
- *  - herdr status idle/done (unknown/working/blocked retry next turn);
- *  - missing pane (status undefined) → record closed (caller handles the write).
- */
+/** Pane-level collection (orphan / compat path): consumed before the previous turn (grace so the
+ *  settlement notice is still visible); missing pane → record closed (caller handles the write). */
 export function shouldClosePane(opts: {
   consumedAt: number | null;
   herdrStatus: string | undefined;
@@ -55,15 +42,11 @@ export function shouldClosePane(opts: {
   return (opts.consumedAt ?? 0) > 0 && opts.consumedAt! < opts.prevTurnStart;
 }
 
-/* ── Isolate worktree collection (why the rules are this narrow) ──────
- * `refs/heads/pier/*` is NOT proof of pier ownership: a worker session lives in such a
- * worktree, its branch is trivially an ancestor of its own HEAD and clean once it commits,
- * so a namespace-wide sweep deletes the worktree its own process is running in.
- * Only branches registered in THIS session's registry are candidates, cwd is never a
- * candidate, and untracked `pier/*` branches need an explicit opt-in.
- */
+/* Isolate worktree collection is deliberately narrow: `refs/heads/pier/*` is NOT proof of pier
+ * ownership — a worker session lives in such a worktree, so a namespace-wide sweep deletes the
+ * worktree its own process is running in. Only THIS session's registered branches are candidates,
+ * cwd never is, and untracked `pier/*` branches need an explicit opt-in. */
 
-/** True when `path` is `parent` or lives inside it (both resolved, no I/O). */
 export function isPathInside(path: string, parent: string): boolean {
   const norm = (p: string): string => p.replace(/[\\/]+/g, '/').replace(/\/+$/, '');
   const child = norm(path);
@@ -87,20 +70,14 @@ export interface IsolateSweepPlan {
   skipped: IsolateSweepSkip[];
 }
 
-/**
- * Decide which isolate worktrees this session may collect.
- * Pure: callers pass git output, the subagent registry and the process cwd.
- */
+/** Pure: callers pass git output, the subagent registry and the process cwd. */
 export function planIsolateSweep(input: {
-  /** Every `refs/heads/pier/*` branch name. */
   branches: readonly string[];
   /** branch → worktree path, from `git worktree list --porcelain`. */
   worktreesByBranch: ReadonlyMap<string, string>;
-  /** Branches of isolate entries in this session's registry. */
   registeredBranches: ReadonlySet<string>;
   /** Branches created but not yet registered (worktree add → subs.set window). */
   pendingBranches: ReadonlySet<string>;
-  /** Session-owned isolates that may be collected, with their recorded path. */
   sessionOwned: ReadonlyArray<{ branch: string; worktreePath: string }>;
   /** Path to protect (normally process.cwd()). */
   cwd: string;

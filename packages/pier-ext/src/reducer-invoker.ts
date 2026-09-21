@@ -70,10 +70,8 @@ type ReducerModelOutput = {
   usage?: UsageLike;
 };
 
-/** A resolved reducer target: pi's model handle plus the telemetry label for it. */
 type ReducerModel = NonNullable<ExtensionContext['model']>;
 
-/** The reduction candidate: the log block, where the full log lives, and the size limits it must clear. */
 interface ReducerCandidate {
   command: string;
   block: { type: string; text?: string; [k: string]: unknown };
@@ -87,10 +85,8 @@ type ReducerLog = (record: Record<string, unknown>) => Promise<void>;
 
 let untrustedWarningEmitted = false;
 
-/**
- * Steps 1–5. The trust boundary sits BEFORE the jev gate: an untrusted project must not send commands
- * to a third-party API even with user-level EPR on, and a refusing host must not be second-guessed.
- */
+/** Steps 1–5: the trust boundary sits BEFORE the jev gate — an untrusted project must not send
+ * commands to a third-party API even with user-level EPR on, and a refusing host must not be second-guessed. */
 function resolveCandidate(
   event: ToolResultEventLike,
   ctx: ExtensionContext,
@@ -143,10 +139,9 @@ function resolveCandidate(
 }
 
 /**
- * Step 6, jev first (RFC §3 P0-1): every candidate is classified by jev, and the regex list decides
- * only when jev is absent, fails or answers below the confidence gate. A confident jev rejection is
- * authoritative even for regex-listed commands; credential-shaped command lines stay local and are
- * judged by the regex list alone.
+ * Step 6, jev first (RFC §3 P0-1): a confident jev rejection is authoritative even for regex-listed
+ * commands; the regex list decides only when jev is absent, fails or answers below the confidence
+ * gate (credential-shaped command lines stay local).
  */
 async function isDiagnosticCandidate(
   command: string,
@@ -159,8 +154,7 @@ async function isDiagnosticCandidate(
     questionId: 'epr-diagnostic-gate',
     timeoutMs: 1500, // cold TLS handshake hit 1002ms and timed out at 1s, warm calls run 250-770ms
     sessionId,
-    // regex_hit makes the flip's regression surface observable: how often and in which direction
-    // jev overrides the regex list (jev.jsonl).
+    // regex_hit makes the flip observable: how often and in which direction jev overrides the regex list (jev.jsonl).
     extra: { site: 'epr-gate', commandSha256: sha256Hex(command), regexHit },
     enrich: ({ answers }) => {
       if (!answers) return {};
@@ -173,16 +167,14 @@ async function isDiagnosticCandidate(
       };
     },
   });
-  if (!result.ok) return regexHit; // jev failed — regex fallback
+  if (!result.ok) return regexHit;
   const verdict = evaluateDiagnosticGate(result.answers, gate.getMinConfidence());
   if (verdict.hit) return true;
   return isDiagnosticGateUnanswered(verdict) ? regexHit : false;
 }
 
-/**
- * Step 7: the untruncated source. Both failure modes write the same `truncated-source` evidence row,
- * which lands only for candidates that got here — gate-rejected commands never read a file.
- */
+/** Step 7: the untruncated source; both failure modes write the same `truncated-source` evidence
+ * row, which lands only for candidates that got here — gate-rejected commands never read a file. */
 async function readSource(
   candidate: ReducerCandidate,
   config: EvidencePreservingReducerConfig,
@@ -238,16 +230,13 @@ function resolveReducerModel(
   const source = model ? 'configured' : 'session-fallback';
   if (!model) model = ctx.model;
   if (!model || typeof ctx.modelRegistry?.complete !== 'function') return undefined;
-  // Unified provider/id label: split labels fragmented per-model grouping in the 2026-09-17 logs.
   const label =
     model.provider && model.id ? `${model.provider}/${model.id}` : (config.model ?? 'unknown');
   return { model, label, source };
 }
 
-/**
- * Step 9: in-process model call under a total-latency budget, through pi's own completion so the
- * reducer runs on the session's provider auth. Failure text is returned for telemetry.
- */
+/** Step 9: in-process model call under a total-latency budget through pi's own completion, so the
+ * reducer runs on the session's provider auth; failure text is returned for telemetry. */
 async function invokeReducer(
   ctx: ExtensionContext,
   config: EvidencePreservingReducerConfig,
@@ -308,8 +297,7 @@ export async function handleReducerToolResult(
   const sourceBytes = Buffer.byteLength(body, 'utf8');
   if (sourceBytes < minBytes || body.length > maxChars) return undefined;
 
-  // Step 9: credential heuristic. `secretSnippet` names the shape that tripped the gate — the
-  // 2026-09-17 trial had 10 fallbacks with no evidence of what matched (test names vs real secrets).
+  // Step 9: credential heuristic; `secretSnippet` names the shape that tripped the gate.
   if (containsLikelySecret(body)) {
     await log({
       sourceBytes,
@@ -350,7 +338,6 @@ export async function handleReducerToolResult(
     reducerInputPrompt({ command, isError: event.isError, sourceHash, sourceBytes, sourceLines, body }),
   );
   if ('error' in invocation) {
-    // Fail-open, but not silent: earlier trials lost attempts with no jsonl trace at all.
     await fallbackRow('invoke-failed', invocation.durationMs, { error: invocation.error });
     return undefined;
   }
@@ -369,11 +356,9 @@ export async function handleReducerToolResult(
       : '';
   if (!modelOutput.trim()) return undefined;
 
-  // Step 10: byte-for-byte quotation validation against the archived source.
   const validated = validateReceipt(modelOutput, sourceHash, body, event.isError);
   if (!validated.ok) {
-    // invalid-json rows used to carry no evidence of what the model actually returned (fences?
-    // truncation? prose?), so keep a sanitized head.
+    // Keep a sanitized head: invalid-json rows must show what the model actually returned.
     const head = validated.reason === 'invalid-json' ? { rawOutputHead: JSON.stringify(modelOutput.slice(0, 200)) } : {};
     await fallbackRow(validated.reason, durationMs, head);
     return undefined;
@@ -392,7 +377,7 @@ export async function handleReducerToolResult(
     totalTokens: output.usage?.totalTokens,
   });
   const receiptBytes = Buffer.byteLength(receipt, 'utf8');
-  if (receiptBytes >= sourceBytes) return undefined; // Must be smaller to be worth the swap.
+  if (receiptBytes >= sourceBytes) return undefined;
 
   await log({
     sourceBytes,
@@ -410,7 +395,6 @@ export async function handleReducerToolResult(
   return {
     content: event.content.map((b): { type: 'text'; text: string } =>
       (b === block ? { ...b, text: receipt } : b) as { type: 'text'; text: string }),
-    // Complete pi `Usage` (see mergeUsage): pi's footer reads `usage.cost.total` unguarded.
     usage: mergeUsage(event.usage, output.usage),
   };
 }
@@ -431,6 +415,5 @@ async function logReducerAttempt(
       ...record,
     });
   } catch {
-    /* Telemetry is best-effort. */
   }
 }

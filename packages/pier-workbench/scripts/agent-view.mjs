@@ -13,7 +13,7 @@ if (process.argv.includes('--dry-run')) {
   process.exit(0);
 }
 
-if (!process.env.HERDR_SOCKET_PATH) process.exit(0); // Best-effort: nothing to register without a socket.
+if (!process.env.HERDR_SOCKET_PATH) process.exit(0);
 
 request('agent.view.set', params, 3000)
   .then(() => process.exit(0))

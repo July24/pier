@@ -60,11 +60,10 @@ export function writePathsOfTool(toolName: string, input: unknown): string[] {
 }
 
 /**
- * B7: write-locks only see the write/edit tools, so a `bash` command that redirects into a file
- * bypasses the beacon entirely (`> file`, `>> file`, `tee file`, `sed -i`, `truncate -s 0`).
- * We do not try to parse shell: this extracts the *obvious* targets so the lock layer can raise a
- * soft warning, and the limitation stays documented rather than implied. Unknown syntax yields no
- * paths — a false negative is cheap, a false block is not.
+ * B7: write-locks only see the write/edit tools, so a `bash` command that redirects into a file bypasses
+ * the beacon entirely (`> file`, `>> file`, `tee file`, `sed -i`, `truncate -s 0`). We do not try to parse
+ * shell: this extracts the *obvious* targets so the lock layer can warn (never block) — a false negative is
+ * cheap, a false block is not.
  */
 export function bashWriteTargets(command: unknown): string[] {
   if (typeof command !== 'string' || command.trim() === '') return [];
@@ -117,10 +116,8 @@ function formatBashLockHint(normPath: string, holders: readonly string[]): strin
     + `Write-locks only cover the write/edit tools, so this write was not blocked: re-read the file before your next edit.`;
 }
 
-/**
- * Every *other* pane currently holding a beacon for this path (deduped, in list order).
- * Several panes can hold the same path, so callers get the whole list.
- */
+/** Every *other* pane holding a beacon for this path (deduped, in list order — several panes can hold
+ *  the same path, so callers get the whole list). */
 export function findLockHolders(
   agents: readonly LockAgentView[],
   ownPaneId: string,
@@ -165,8 +162,6 @@ export function planWriteGuard(opts: {
   cwd: string;
   hard: boolean;
 }): WriteGuardPlan {
-  // B7: bash redirects are invisible to the write tools, so warn (never block) when their obvious
-  // targets collide with a lock beacon held by another pane.
   const isBash = opts.toolName === 'bash';
   const raw = isBash
     ? bashWriteTargets((opts.input as { command?: unknown } | null | undefined)?.command)

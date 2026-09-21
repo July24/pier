@@ -1,9 +1,5 @@
-/**
- * Todo-only plugin mount (bare cordis root, no loader/hmr).
- *
- * Used by worker panes and by standalone pi outside herdr, so bootstrap/subagent/terminal
- * stay out of those processes.
- */
+/** Todo-only plugin mount (bare cordis root, no loader/hmr). Used by worker panes and by standalone
+ *  pi outside herdr, so bootstrap/subagent/terminal stay out of those processes. */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Context } from '@deepseek-ai/cordis';
 import { PiSurface } from './pi-surface.ts';

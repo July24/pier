@@ -51,9 +51,8 @@ export function request(method, params = {}, timeoutMs = 15000) {
 }
 
 /**
- * boot-config.json (pi node/cli paths, tab label, hmr flag) comes from HERDR_PLUGIN_CONFIG_DIR in
- * user mode — the herdr-managed checkout is replaced on reinstall — and from the script directory in
- * dev/link mode. Null when neither candidate parses.
+ * boot-config.json (pi node/cli paths, tab label, hmr flag): HERDR_PLUGIN_CONFIG_DIR in user mode (the
+ * managed checkout is replaced on reinstall), the script directory in dev/link mode; null if neither parses.
  */
 export function readBootConfig(scriptDir) {
   const candidates = [
@@ -61,7 +60,7 @@ export function readBootConfig(scriptDir) {
     path.join(scriptDir, 'boot-config.json'),
   ].filter(Boolean);
   for (const file of candidates) {
-    try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* try next candidate */ }
+    try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
   }
   return null;
 }

@@ -1,13 +1,12 @@
 /**
- * D100-D103 efficiency configuration: schema, validation, multi-tier resolution and the
- * two files pier itself reads for it.
+ * D100-D103 efficiency configuration: schema, validation, multi-tier resolution and the two files
+ * pier itself reads for it.
  *
- * Contract:
- *  - Unknown keys are rejected (typo guard); all issues are collected in one pass.
- *  - A project-level config requires `isProjectTrusted: true` (security boundary).
- *  - Workspace config shallow-replaces user config; env (`PI_HERDR_*` / `PIER_JEV_*`) wins over both.
- *  - Fail-open: a config that fails validation disables the affected mechanism and warns on one
- *    line instead of crashing the session; an unknown top-level key disables every mechanism.
+ * Contract: unknown keys are rejected (typo guard — all issues collected in one pass); a project-level
+ * config requires `isProjectTrusted: true` (security boundary); workspace config shallow-replaces user
+ * config while env (`PI_HERDR_*` / `PIER_JEV_*`) wins over both; and a config that fails validation
+ * disables the affected mechanism with a one-line warning instead of crashing the session (an unknown
+ * top-level key disables every mechanism).
  */
 
 import { existsSync, readFileSync } from 'node:fs';
@@ -44,9 +43,8 @@ export interface EvidencePreservingReducerConfig {
 }
 
 /**
- * Jev decision layer (RFC docs/rfc-jev-integration.md). Optional System One classification calls
- * that upgrade hand-written heuristics; every call site fails open to the existing heuristic on
- * any error, timeout, or low confidence.
+ * Jev decision layer (RFC docs/rfc-jev-integration.md): optional System One classification calls that
+ * upgrade hand-written heuristics; every call site fails open on any error, timeout, or low confidence.
  */
 export interface JevConfig {
   enabled: boolean;
@@ -88,8 +86,6 @@ export const DEFAULT_EFFICIENCY_CONFIG: EfficiencyConfig = Object.freeze({
   jev: Object.freeze({ enabled: false, logEnabled: false, model: 'jev-1.13.0', timeoutMs: 2000, minConfidence: 0.6 }),
 });
 
-/* ── schema ─────────────────────────────────────────────────────────────── */
-
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
@@ -101,7 +97,6 @@ interface FieldSpec {
   readonly kind: FieldKind;
   /** Lower bound for `int`/`number`; also printed in the issue message. */
   readonly min?: number;
-  /** Upper bound for a bounded `number`. */
   readonly max?: number;
   /** Issue text for a bound that must not be printed as a plain JS number ("1.0"). */
   readonly minText?: string;
@@ -169,7 +164,6 @@ function issueFor(section: string, field: FieldSpec): string {
   }
 }
 
-/** Writes one validated field onto `target`; `undefined` (absent) always counts as valid. */
 function applyField(target: Record<string, unknown>, field: FieldSpec, raw: unknown): boolean {
   if (raw === undefined) return true;
   const min = field.min ?? Number.NEGATIVE_INFINITY;
@@ -259,8 +253,6 @@ export function validateEfficiencyConfig(raw: unknown): ValidateConfigResult {
   return { ok: issues.length === 0, config, issues };
 }
 
-/* ── env overrides ──────────────────────────────────────────────────────── */
-
 function parseEnvBool(val: string): boolean | undefined {
   const s = val.trim().toLowerCase();
   if (s === '1' || s === 'true' || s === 'on') return true;
@@ -273,7 +265,6 @@ interface EnvOverride {
   readonly section: SectionSpec['name'];
   readonly key: string;
   readonly kind: 'bool' | 'string' | 'ratio' | 'int' | 'unit';
-  /** Lower bound for `int` (also printed in the warning). */
   readonly min?: number;
   /** Set only when the config left the key unset (foreign-convention fallback). */
   readonly fallbackOnly?: boolean;
@@ -373,8 +364,6 @@ export function resolveEfficiencyConfig(opts: ResolveConfigOptions = {}): Effici
   return resolved;
 }
 
-/* ── files pier reads ───────────────────────────────────────────────────── */
-
 function defaultUserEfficiencyConfigDir(): string {
   return join(homedir(), '.pi', 'agent', 'herdr-pi');
 }
@@ -402,7 +391,6 @@ function readCompactionSettings(filePath: string): PiCompactionSettings {
   return result;
 }
 
-/** Parse a JSON file, reporting a broken file through `onError` instead of throwing. */
 function readJsonConfig(filePath: string, onError?: (error: unknown) => void): unknown {
   if (!existsSync(filePath)) return undefined;
   try {
@@ -433,7 +421,6 @@ export function loadEfficiencyConfigFromDisk(opts: {
   onWarning?: (msg: string) => void;
   /** Override the Pi agent dir used to read native `settings.json` (tests/isolation). */
   agentDir?: string;
-  /** Override the user-level efficiency config file path (tests/isolation). */
   userConfigPath?: string;
 } = {}): EfficiencyConfig {
   const cwd = opts.cwd ?? process.cwd();

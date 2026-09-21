@@ -1,9 +1,7 @@
 /**
- * D101-D103 efficiency storage: content-addressed objects (ObservationPack / EPR), telemetry
- * appends and the un-truncated bash log reader.
- *
- * Integrity: directories 0700, files 0600, O_NOFOLLOW everywhere, session ids regex-validated, and
- * an EEXIST collision is re-verified (size + sha256) instead of trusted.
+ * D101-D103 efficiency storage: content-addressed objects (ObservationPack / EPR), telemetry appends
+ * and the un-truncated bash log reader. Integrity: directories 0700, files 0600, O_NOFOLLOW everywhere,
+ * session ids regex-validated, and an EEXIST collision is re-verified (size + sha256) instead of trusted.
  */
 
 import { constants } from 'node:fs';
@@ -92,7 +90,6 @@ export async function pruneObjectsDirectory(
           totalBytes += s.size;
         }
       } catch {
-        // Unreadable entry: skip.
       }
     }
 
@@ -115,7 +112,6 @@ export async function pruneObjectsDirectory(
           if (k.startsWith(f.path)) verifiedObjectCache.delete(k);
         }
       } catch {
-        // Already gone / not removable: leave it to the next pass.
       }
     }
     return removedCount;
@@ -124,7 +120,6 @@ export async function pruneObjectsDirectory(
   }
 }
 
-/** Prune both content-addressed object dirs of one session root; returns total removed files. */
 export async function pruneSessionObjects(
   sessionRoot: string,
   limits: { maxFiles?: number; maxTotalBytes?: number } = {},
@@ -166,7 +161,6 @@ export async function storeContentAddressedObject(
     verifiedObjectCache.add(`${filePath}:${contentBytes}:${writtenStat.mtimeMs}:${hash}`);
   } catch (err) {
     if (err instanceof Error && 'code' in err && err.code === 'EEXIST') {
-      // Verify existing file integrity
       const existingHandle = await open(filePath, READ_OBJECT_FLAGS);
       try {
         const existingStat = await existingHandle.stat();
@@ -244,7 +238,6 @@ export async function appendEfficiencyLog(
   const dir = dirname(logPath);
   await mkdir(dir, { recursive: true, mode: 0o700 });
 
-  // Rotate log if exceeds maximum size to prevent unbounded disk growth
   try {
     const s = await stat(logPath);
     if (s.size > MAX_EFFICIENCY_LOG_BYTES) {
@@ -253,7 +246,6 @@ export async function appendEfficiencyLog(
       await rename(logPath, oldPath);
     }
   } catch {
-    // No log yet (or not stat-able): nothing to rotate.
   }
 
   let handle;
@@ -265,9 +257,7 @@ export async function appendEfficiencyLog(
   }
 }
 
-/**
- * Safely reads Pi's untruncated bash output from temporary file.
- */
+/** Safely reads Pi's untruncated bash output from temporary file. */
 export async function readBashFullOutput(
   rawPath: string | null | undefined,
   maxChars: number,
@@ -286,7 +276,6 @@ export async function readBashFullOutput(
     const fileStat = await stat(realFile);
     if (!fileStat.isFile() || fileStat.isSymbolicLink()) return null;
 
-    // Check size within reasonable limit
     if (fileStat.size > maxChars * 4) return null;
 
     let handle = await open(realFile, READ_OBJECT_FLAGS);

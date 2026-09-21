@@ -1,7 +1,5 @@
-/**
- * Pure helpers behind the restore-layout hook, so the restore decision is testable without a live
- * herdr socket (the script stays a thin socket wrapper).
- */
+/** Pure helpers behind the restore-layout hook, so the restore decision stays testable without a live
+ * herdr socket (the script remains a thin socket wrapper). */
 
 export interface BootRecord {
   workspace_id: string;
@@ -31,9 +29,8 @@ export function parseBootRecords(text: string): BootRecord[] {
 }
 
 /**
- * F05: boot.jsonl is append-only — a workspace opened, closed and reopened has several records, and
- * walking every one of them rebuilds the same main tab repeatedly (duplicate master panes). Keep the
- * newest record per workspace: file order is append order, and it carries the ids valid at shutdown.
+ * F05: boot.jsonl is append-only: a reopened workspace has several records, so keep the newest per
+ * workspace — replaying older ones rebuilds the same main tab repeatedly (duplicate master panes).
  */
 export function latestBootRecordPerWorkspace(records: readonly BootRecord[]): BootRecord[] {
   const byWorkspace = new Map<string, BootRecord>();

@@ -1,14 +1,13 @@
 /**
  * D97: Always split the largest cell downward so spawned panes remain full-width strips.
  *
- * Heat reflow narrows unfocused cells, but full-width strips keep the slim-frame title
- * readable on one line. The previous grid topology produced narrow vertical cells whose
- * titles wrapped into unreadable columns. The overlay threshold complements both layouts:
- * new strips cross the row limit, while existing columns cross the column limit.
+ * Heat reflow narrows unfocused cells, but full-width strips keep the slim-frame title readable on
+ * one line. The overlay threshold complements both layouts: new strips cross the row limit, while
+ * existing columns cross the column limit.
  *
- * herdr 0.8.2 defines ratio as the first child's share. Because layout.apply creates a
- * new shell rather than attaching an existing pane, spawn-time incremental splits must
- * establish this topology; heat reflow owns only later sizing.
+ * herdr 0.8.2 defines ratio as the first child's share. Because layout.apply creates a new shell
+ * rather than attaching an existing pane, spawn-time incremental splits must establish this
+ * topology; heat reflow owns only later sizing.
  */
 
 export type ShapeNode =
@@ -71,9 +70,8 @@ export function paneCells(root: ShapeNode, width = 200, height = 50): PaneCell[]
 }
 
 /**
- * Split the largest eligible cell downward; preorder tie-breaking keeps the choice stable.
- * At D97's 200x50 model and ten-pane cap, strips eventually become slim title frames by design.
- * Exclusions protect resident non-agent panes such as the board from worker splits.
+ * Split the largest eligible cell downward; preorder tie-breaking keeps the choice stable, and exclusions
+ * protect resident non-agent panes such as the board from worker splits.
  */
 export function pickGridSplit(
   root: ShapeNode,

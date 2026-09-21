@@ -1,10 +1,9 @@
 /**
  * D78/D81 todo loader entry.
- *
- * A Cordis plugin keeps the master surface hot-swappable while workers mount the one-shot subset
- * directly; injected services preserve the D79 registration boundary and keep session-owned todo
- * state in index. This module owns the tool, command, widget, read hook, and master stop reminder —
- * reconciliation, mirroring, and agent reporting stay in the session state layer (cycle avoidance).
+ * A Cordis plugin keeps the master surface hot-swappable while workers mount the one-shot subset directly;
+ * injected services preserve the D79 registration boundary and keep session-owned todo state in index. This
+ * module owns the tool, command, widget, read hook, and master stop reminder — reconciliation, mirroring, and
+ * agent reporting stay in the session state layer (cycle avoidance).
  */
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
@@ -20,7 +19,6 @@ import { TODO_EDIT_CUSTOM_TYPE, completionTransitions, fuzzyFind, listsEqual, ma
 import { anchorTodoRange, formatTodoSummary, renderTodoGroups } from '../todo-window.ts';
 import { swallow } from '../swallow.ts';
 
-/** Raw tool arguments: every field is validated inside the action handlers. */
 type ToolParams = Record<string, unknown> | undefined;
 
 export interface TodoUiSlot {
@@ -28,7 +26,6 @@ export interface TodoUiSlot {
   renderWidget: (ctx: unknown) => void;
   /** Re-render from the last seen context without a fresh event (human-gate open/close). */
   rerenderWidget?: () => void;
-  /** Cancel any pending unfinished-todo reminder timer. */
   cancelReminder?: () => void;
 }
 
@@ -73,18 +70,16 @@ const OP_VERBS: Record<TodoEditOp, string> = {
 };
 
 /**
- * Keep the active task visible within WIDGET_MAX_LINES rather than truncating to a fixed head or
- * tail: the window anchors on the first in-progress item, then the last open item, then recent
- * completions, and a +N line points to /todos when the full plan cannot fit.
+ * Keep the active task visible within WIDGET_MAX_LINES rather than truncating to a fixed head or tail:
+ * the window anchors on the first in-progress item, then the last open item, then recent completions.
  */
 export function widgetLines(
   items: readonly TodoItem[],
   opts?: { archivedAgeMs?: number | null; blockedDepth?: number | null },
 ): string[] {
   if (items.length === 0) return [];
-  // Human gate open (ask_user_question waiting): the question and editor own the fixed area, so the
-  // widget collapses to one summary line — otherwise a 10-line widget plus a multi-line question
-  // leaves almost no scrollable transcript.
+  // Human gate open (ask_user_question waiting): the question and editor own the fixed area, so the widget
+  // collapses to one summary line — a 10-line widget plus a multi-line question would leave no scrollable transcript.
   if ((opts?.blockedDepth ?? 0) > 0) {
     return [`${formatTodoSummary(items)} · /todos 全量`];
   }
@@ -140,7 +135,6 @@ export default function todoPlugin(ctx: Context): void {
     }
   }
 
-  // Let index lifecycle hooks call the current plugin implementation.
   state.renderWidget = renderWidget;
   state.rerenderWidget = () => renderWidget(lastEventCtx);
 
@@ -172,8 +166,7 @@ export default function todoPlugin(ctx: Context): void {
       staleNotices += 1;
       lastStaleGuardTurn = todoReadTurn;
     }
-    // Empty, archive, and R2 rewrite notices share one cadence so adjacent notices do not each
-    // consume the grace window.
+    // Empty, archive, and R2 rewrite notices share one cadence so adjacent notices do not each consume the grace window.
     if (plan.inject && (plan.effect === 'empty-guard' || plan.archived)) {
       lastEmptyGuardTurn = todoReadTurn;
     }
@@ -184,8 +177,7 @@ export default function todoPlugin(ctx: Context): void {
       try {
         appendEntry(TODO_EDIT_CUSTOM_TYPE, { version: 1, edits, ts: Date.now() });
       } catch (err) {
-        // The in-memory clear must proceed, but a silent failure here is how the archive/replay
-        // path broke unnoticed before (SA-13).
+        // The in-memory clear must proceed even when this persistence fails.
         swallow('todo.persist-archive', err);
       }
       todos.replace([], { source: 'archive' });
@@ -373,7 +365,6 @@ export default function todoPlugin(ctx: Context): void {
         ui?.notify?.(`"${content}" ${OP_VERBS[edit.op]}`, 'info');
         return;
       }
-      // /todos is the unbounded view because the widget intentionally prioritizes active context.
       const body = renderTodoGroups(todos.items);
       if (body.length === 0) {
         ui?.notify?.('todo list is empty', 'info');

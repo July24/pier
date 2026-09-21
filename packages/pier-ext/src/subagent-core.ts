@@ -1,11 +1,9 @@
 /**
- * Subagent domain: registry rows, launch lines, liveness notices, tab/worktree planning,
- * isolate decisions, task-id resolution, execute planners, and the outbound port types.
- * Pure — no Cordis, no herdr client, no fs (planners only decide; adapters do I/O).
+ * Subagent domain: registry rows, launch lines, liveness notices, tab/worktree planning, isolate
+ * decisions, task-id resolution, and the outbound port types. Pure: planners decide, adapters do I/O.
  */
 import { normalizeEntryKind } from './history-store.ts';
 
-/** Shared backoff sleep for the subagent adapters (poll loops, readiness probes, GC pacing). */
 export function sleep(ms: number): Promise<void> {
   const { promise, resolve } = Promise.withResolvers<void>();
   setTimeout(resolve, ms);
@@ -90,9 +88,9 @@ export interface AliveProbe {
 }
 
 /**
- * A subagent outlives its "no output" result: a working/blocked agent is alive regardless of
- * session age, otherwise recent session writes decide. `paneExists: false` is death — an
- * unavailable probe must be reported as such by the caller, not guessed here.
+ * A subagent outlives its "no output" result: a working/blocked agent is alive regardless of session
+ * age, otherwise recent session writes decide. `paneExists: false` is death — an unavailable probe is
+ * the caller's to report, not guessed here.
  */
 export function isAlive(probe: AliveProbe, nowMs: number, staleAfterMs = 120_000): boolean {
   if (!probe.paneExists) return false;
@@ -248,7 +246,6 @@ export function makeProgressUpdate(msg: string) {
   return { content: [{ type: 'text' as const, text: msg }], details: {} as Record<string, never> };
 }
 
-/** First non-empty id parameter, stringified; callers pass their key order. */
 export function idParam(params: Record<string, unknown> | undefined, ...keys: string[]): string {
   for (const key of keys) {
     const v = params?.[key];
@@ -257,7 +254,6 @@ export function idParam(params: Record<string, unknown> | undefined, ...keys: st
   return '';
 }
 
-/** Shared wording for an ambiguous id prefix, at most five candidates listed. */
 export function ambiguousIdError(label: 'task id' | 'subagent id', query: string, candidates: readonly string[]): string {
   const head = candidates.slice(0, 5).join(', ');
   const more = candidates.length > 5 ? `, ... (+${candidates.length - 5} more)` : '';
@@ -363,7 +359,6 @@ export function buildLaunchParts(
 
 const ISOLATE_SLUG_MAX = 40;
 
-/** Branch/dir name for a fresh isolate worktree, ascii-folded from the description. */
 export function planIsolateWorktree(opts: {
   description: string;
   taskHex: string;
@@ -528,8 +523,7 @@ type TaskIdResolutionResult =
   | { kind: 'too_short'; query: string }
   | { kind: 'not_found'; query: string };
 
-/** Resolve a full or short task ID against known candidates: exact matches at any length, prefix
- *  matches need four characters, ambiguity is reported with sorted candidates. */
+/** Resolve a full or short task ID: exact matches at any length, prefix matches need four characters. */
 export function resolveTaskIdPrefix(
   query: string,
   candidates: Iterable<string>,

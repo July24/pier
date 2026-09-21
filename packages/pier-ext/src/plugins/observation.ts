@@ -46,7 +46,6 @@ function toolResultContent(msg: unknown): { texts: string[]; charLength: number 
   return { texts, charLength: texts.length - 1 + texts.reduce((n, text) => n + text.length, 0) };
 }
 
-/** Id + placeholder for a candidate message, derived from name/call/text (no I/O). */
 function buildPlaceholder(
   toolName: string,
   toolCallId: string,
@@ -88,7 +87,6 @@ async function logObservation(sessionRoot: string, fields: Record<string, unknow
       ...fields,
     });
   } catch {
-    /* Telemetry is best-effort. */
   }
 }
 
@@ -140,9 +138,8 @@ export function createCompactionBatchPackHook(deps: {
   };
 }
 
-/** Shared packing primitive: derive id/placeholder, archive the object, memoize it, and append the
- * `observation.jsonl` record exactly once — memo + telemetry in one place keeps the projection and
- * batch paths from diverging. Returns the placeholder, or null when the object could not be stored. */
+/** Shared packing primitive: memo + telemetry live here so the projection and batch paths cannot
+ * diverge. Returns the placeholder, or null when the object could not be stored. */
 async function packOneMessage(opts: {
   sessionRoot: string;
   toolName: string;
@@ -204,7 +201,6 @@ async function packOneMessage(opts: {
 /** One packable message: a non-error tool result with text-only content that is not yet packed. */
 interface PackCandidate { toolName: string; toolCallId: string; text: string; textBytes: number; charLength: number }
 
-/** Eligibility shared by the projection path and the compaction batch path; null = leave untouched. */
 function packCandidateAt(messages: readonly unknown[], index: number, sessionRoot: string): PackCandidate | null {
   const msg = messages[index] as ContextMessage | undefined;
   const content = toolResultContent(msg);
@@ -252,7 +248,6 @@ export async function batchPackObservations(opts: {
     ? await Promise.all(candidates.map((c) => picker(c.text, obsConfig.excerptBytes)))
     : [];
 
-  // Pass 3 — pack with the prefetched excerpts (store failures pack fewer).
   let packedCount = 0;
   for (let i = 0; i < candidates.length; i++) {
     const candidate = candidates[i]!;
@@ -268,7 +263,6 @@ export async function batchPackObservations(opts: {
   return packedCount;
 }
 
-/** `obs_recall` body: page through a stored observation, self-healing the memo when storage is gone. */
 async function runRecall(
   params: { id?: unknown; offset?: unknown } | undefined,
   ctx: ExtensionContext,
@@ -350,7 +344,6 @@ interface ObservationPackDeps {
   pickMiddleExcerpt?: PickMiddleExcerpt;
 }
 
-/** `context` interceptor: replace eligible large tool results with their memoized/stored placeholders. */
 async function projectPlaceholders(
   event: ContextEvent,
   ctx: ExtensionContext,
@@ -362,7 +355,6 @@ async function projectPlaceholders(
   const obsConfig: ObservationPackConfig = effConfig.observationPack;
   if (!obsConfig.enabled) return undefined;
 
-  // Role visibility gate: a role denied obs_recall would get an unusable handle, so skip entirely.
   const manifest = deps.getRuntimeManifest ? deps.getRuntimeManifest() : null;
   if (manifest && planToolGate(RECALL_TOOL_NAME, manifest).kind === 'deny') return undefined;
 
@@ -400,7 +392,6 @@ async function projectPlaceholders(
       continue;
     }
 
-    // Active use window: leave the full text alone until the message has been sent fullSends times.
     const sendCount = priorAssistantCounts[i] ?? 0;
     if (sendCount < obsConfig.fullSends) continue;
 

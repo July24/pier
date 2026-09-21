@@ -1,9 +1,6 @@
 /**
  * Role runtime for the composition root: manifest state, mid-session switching,
  * the mandatory tool gate, `/pier-role`, and branch replay.
- *
- * All role concerns live here; index.ts constructs this runtime and forwards
- * the pipe `role` request to applyRoleSwitch.
  */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { readdirSync, readFileSync } from 'node:fs';
@@ -34,10 +31,9 @@ function reportDisplayAgent(pi: RolePi, name: string): void {
 }
 
 /**
- * WS-D7: the master pane applies its own manifest through the same mandatory
- * chain as subagents. The builtin `master` role is read directly so a workspace
- * master.json decoy cannot affect self-application; a malformed manifest fails
- * open to no-role state.
+ * WS-D7: the master pane applies its own manifest through the same mandatory chain as
+ * subagents. The builtin `master` role is read directly so a workspace master.json decoy
+ * cannot affect self-application; a malformed manifest fails open to no-role state.
  */
 export function composeMasterRuntime(): RuntimeRoleManifest | null {
   try {
@@ -61,7 +57,6 @@ export interface RoleRuntimeDeps {
 
 export interface RoleRuntime {
   readonly state: RoleState;
-  /** Badge shown while idle: `role <name> v<version> (N tools)`. */
   idleBadge(): string | null;
   /** Replay the branch-point role record and re-anchor side effects (D77 visible layer, sidebar identity, badge). */
   syncFromBranch(ctx: unknown): void;
@@ -81,14 +76,11 @@ export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
     (roleBadge = `role ${m.role} v${m.version ?? '?'} (${m.tools.length} tools)`);
 
   /**
-   * Same-origin sync (RFC docs/rfc-pi-0.86-dynamic-tools.md §4.3): reconcile
-   * roleState against the CURRENT branch point on session_start (resume) and
-   * session_tree — pi's tool deltas revert the loadout at the branch point, so
-   * the gate manifest must follow or it would keep the post-switch tools.
-   * Replay only when the last record names a DIFFERENT role (name equality
-   * tolerates on-disk drift and keeps the env value authoritative on resume);
-   * the anchor entry is written only on change so resume replay still works.
-   */
+   * Same-origin sync (RFC docs/rfc-pi-0.86-dynamic-tools.md §4.3): reconcile roleState against the CURRENT
+   * branch point on session_start (resume) and session_tree — pi's tool deltas revert the loadout at the
+   * branch point, so the gate manifest must follow or it would keep the post-switch tools. Replay only
+   * when the last record names a DIFFERENT role (name equality tolerates on-disk drift and keeps the env
+   * value authoritative on resume); the anchor entry is written only on change so resume replay still works. */
   function syncFromBranch(ctx: unknown): void {
     if (!roleState.manifest) return;
     try {
@@ -158,13 +150,11 @@ export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
           try {
             files.push({ name: f, text: readFileSync(join(layer.dir, f), 'utf8') });
           } catch {
-            /* Unreadable file counts neither as parsed nor invalid. */
           }
         }
       }
       appendRoutingLog(scanRoleAxisUsage({ now: Date.now(), files }));
     } catch {
-      /* The scan is best-effort. */
     }
   }
 
@@ -216,7 +206,6 @@ export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
         ts: Date.now(),
       });
     } catch {
-      /* Best effort recording; the switch itself is already effective. */
     }
     reportDisplayAgent(rolePi, next.role === 'worker-default' ? 'worker' : next.role);
     const diff = [
@@ -247,7 +236,6 @@ export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
       try {
         pi.appendEntry(APPROVAL_NEEDED_CUSTOM_TYPE, { role: manifest.role, tool, ts: Date.now() });
       } catch {
-        /* Best effort. */
       }
     }
     return undefined;

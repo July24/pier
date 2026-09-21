@@ -17,7 +17,7 @@ try {
 }
 
 const params = buildNotificationParams(event);
-if (!params) process.exit(0); // Gated out (not pi, not blocked, malformed).
+if (!params) process.exit(0);
 if (!process.env.HERDR_SOCKET_PATH) process.exit(2);
 
 request('notification.show', params, 5000).catch(() => process.exit(1));

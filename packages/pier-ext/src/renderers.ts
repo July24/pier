@@ -1,35 +1,32 @@
 /**
- * TUI renderers for pier's own session custom entries and reminder messages: those transcript rows
- * are raw JSON without a renderer, which buries the one line that matters. Pure string builders plus
- * an ANSI-aware truncator, so no pi-tui import is needed and older pi builds degrade to "no renderer".
+ * TUI renderers for pier's own session custom entries and reminder messages: raw JSON rows bury the
+ * one line that matters. Pure string builders plus an ANSI-aware truncator, so no pi-tui import is
+ * needed and older pi builds degrade to "no renderer".
  */
 import { TODO_EDIT_CUSTOM_TYPE, type TodoEditPayload } from './todo-core.ts';
 import { SUBS_CUSTOM_TYPE, type SubsRegistry } from './subagent-core.ts';
 import { TERMINALS_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE, type TerminalsRegistry } from './terminal-core.ts';
 import { TODO_REMINDER_CUSTOM_TYPE } from './todo-reminder-core.ts';
 
-// Width handling lives in ansi-text.ts so the ask_user_question UI can reuse it without pulling the
-// todo/subagent/terminal cores into its import graph.
+// Width handling lives in ansi-text.ts so ask_user_question can reuse it without this import graph.
 import { truncateStyled } from './ansi-text.ts';
 
 /** Role manifest entry is written by index.ts; keep the literal here to avoid an import cycle. */
 export const ROLE_MANIFEST_CUSTOM_TYPE = 'pi-herdr.role-manifest';
-/** Soft-approval trace written by the worker manifest gate in index.ts. */
+/** Soft-approval trace from the worker manifest gate in index.ts. */
 export const APPROVAL_NEEDED_CUSTOM_TYPE = 'pi-herdr.approval-needed';
 
-/** Structural subset of pi's Theme that the builders actually use. */
+/** Structural subset of pi's Theme actually used here. */
 export interface RenderTheme {
   fg(color: string, text: string): string;
   bold(text: string): string;
 }
 
-/** Structural subset of pi's Component; enough for `registerEntryRenderer`. */
 export interface RenderComponent {
   render(width: number): string[];
   invalidate(): void;
 }
 
-/** Entry and message renderers share this signature: the payload, the expanded flag, the theme. */
 type Renderer = (payload: unknown, options: { expanded: boolean }, theme: RenderTheme) => RenderComponent | undefined;
 
 export interface RendererApi {
@@ -37,15 +34,11 @@ export interface RendererApi {
   registerMessageRenderer?(customType: string, renderer: Renderer): void;
 }
 
-/* ── Pure line builders ────────────────────────────────────────────── */
-
-/** Single-line summary text: whitespace collapsed, ellipsis-clipped to `max` characters. */
 function clip(text: string, max: number): string {
   const flat = text.replace(/\s+/g, ' ').trim();
   return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
 
-/** Component wrapper: render is a no-op transform except for width clipping. */
 function card(lines: readonly string[]): RenderComponent {
   return {
     render: (width: number) => lines.map((line) => truncateStyled(line, width)),
@@ -155,13 +148,11 @@ function reminderLines(message: unknown, theme: RenderTheme, label: string, expa
   return [head, ...content.split('\n').map((line) => theme.fg('dim', line))];
 }
 
-/* ── Installation ──────────────────────────────────────────────────── */
-
 type LineBuilder = (data: unknown, theme: RenderTheme, expanded: boolean) => string[];
 
 /** Register pier's transcript renderers and return the custom types actually registered, so the
  *  caller can log coverage and tests can assert the degrade path. Each registration is individually
- *  guarded: a pi build without the API or a throwing renderer must never break tool registration. */
+ *  guarded: a pi build without the API must never break tool registration. */
 export function installRenderers(pi: unknown): string[] {
   const api = pi as RendererApi;
   const registered: string[] = [];
@@ -181,7 +172,7 @@ export function installRenderers(pi: unknown): string[] {
       api.registerMessageRenderer(type, (msg, options, theme) => card(build(msg, theme, options.expanded)));
       registered.push(type);
     } catch {
-      /* Best effort; the message still reaches the model. */
+      /* A throwing renderer must not break message registration. */
     }
   };
 

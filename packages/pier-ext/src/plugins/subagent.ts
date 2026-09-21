@@ -1,9 +1,8 @@
 /**
- * subagent — master-only plugin entry: tool registration, action dispatch, the resume / send /
- * interrupt / output / role / list actions, and port binding.
- *
- * Inbound deps arrive via `pi-herdr.subagent-deps`; outbound pipe/settle queries bind atomically
- * onto `port.current`. Settlement reconcile stays in index session state and is consumed here.
+ * subagent — master-only plugin entry: tool registration, action dispatch, the resume / send / interrupt /
+ * output / role / list actions, and port binding. Inbound deps arrive via `pi-herdr.subagent-deps`; outbound
+ * pipe/settle queries bind atomically onto `port.current`. Settlement reconcile stays in index session state
+ * and is consumed here.
  */
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
@@ -46,7 +45,6 @@ import { createGcController, createSubagentRegistry } from '../subagent-gc.ts';
 import { createSessionIo, executeSubagentOutput, type SubagentOutputCursor } from '../subagent-session.ts';
 import type { RoutingTelemetryRecord } from '../routing-telemetry.ts';
 
-/** Raw tool arguments: every field is validated inside the action handlers. */
 type ToolParams = Record<string, unknown> | undefined;
 
 interface SubagentEnv {
@@ -67,8 +65,7 @@ interface SubagentDeps {
   reconcileOnSettlement: (description: string, outcome: 'settled' | 'failed') => string[];
   withReconcileNotes: (base: string, notes: readonly string[]) => string;
   claimSettleNotice: (key: string) => boolean;
-  /** Settlement notice injector from index: buffer while busy, flush at turn_end.
-   * Tests may omit it and fall back to pi.sendUserMessage(followUp). */
+  /** Settlement notice injector from index: buffer while busy, flush at turn_end. */
   deliverNotice?: (content: string, paneId?: string) => Promise<void>;
   /** Panes whose settlement notice is still buffered (GC exemption). */
   noticePending?: () => ReadonlySet<string>;
@@ -124,7 +121,6 @@ export default function subagentPlugin(ctx: Context): void {
   const outputCursors = new Map<string, SubagentOutputCursor>();
   /** D98: excludes branches during the worktree-add-to-registry race from orphan collection. */
   const pendingIsolateBranches = new Set<string>();
-  /** Latest machine request per pane, for interrupt claims and poll deduplication. */
   const lastRequestIdByPane = new Map<string, string>();
   /** Deduplicates gate notices while blocked but permits a later, distinct human question. */
   const blockedGateNotified = new Set<string>();
@@ -171,9 +167,8 @@ export default function subagentPlugin(ctx: Context): void {
     applyReplySession(paneId, sessionFile) {
       const entry = subs.get(paneId);
       if (!entry) return;
-      // Workers self-report a BARE session id over the pipe; the .jsonl-only guard in
-      // applyReportedSessionFile would discard it and freeze a mis-attributed sessionFile
-      // forever. Map the id to its transcript path first so the self-report corrects the ledger.
+      // Workers self-report a BARE session id over the pipe; the .jsonl-only guard in applyReportedSessionFile
+      // would discard it and freeze a mis-attributed sessionFile forever, so map the id to its transcript path.
       const reported = resolveSessionFileValue(entry.cwd, defaultAgentSessionsDir(), sessionFile);
       const next = applyReportedSessionFile(entry.sessionFile, reported);
       if (next === entry.sessionFile) return;
@@ -240,9 +235,8 @@ export default function subagentPlugin(ctx: Context): void {
   const { readAskFlag, probeAlive } = session;
   const { spawnPaneInTaskTab, launchLine, approveFor, waitSubReady, findExistingPane } = spawn;
 
-  /** P0-2: re-arm pollers for live running panes after a master restart, or settle notices stop
-   * arriving and ledger rows stay 'running'. The `recover-*` requestId is never echoed by a worker,
-   * so this poller's settle claim wins. */
+  /** P0-2: re-arm pollers for live running panes after a master restart, or settle notices stop arriving
+   * and ledger rows stay 'running'. The `recover-*` requestId is never echoed by a worker, so this claim wins. */
   async function recoverRunningPollers(via: string): Promise<void> {
     if (!client.available) return;
     const running = [...subs.values()].filter((s) => s.background && s.status === 'running' && !pollers.has(s.paneId));
@@ -260,7 +254,6 @@ export default function subagentPlugin(ctx: Context): void {
         await startPoller(entry.paneId, entry.cwd, entry.createdAt, entry.description, `recover-${via}-${entry.paneId}`);
         recovered.push(`${entry.paneId} (${entry.description})`);
       } catch {
-        /* one failure must not block the rest */
       }
     }
     if (recovered.length > 0) {
@@ -308,7 +301,6 @@ export default function subagentPlugin(ctx: Context): void {
     };
   });
 
-  /** Revive a closed task; resume and automatic send revival share this path. */
   async function reviveEntry(entry: SubEntry): Promise<SubEntry> {
     // D98: never revive a released isolate worktree — its directory is gone and cwd is invalid.
     if (entry.isolate?.releasedAt != null) {
@@ -367,7 +359,6 @@ export default function subagentPlugin(ctx: Context): void {
     };
   }
 
-  /** Resolve a pane id or task-id prefix against the live registry, then the ledger (revives a closed row). */
   function resolveSubEntry(rawId: string, cwd?: string): { entry: SubEntry } | { error: string } {
     if (!rawId) return { error: 'Error: unknown subagent id "" (see action list)' };
     const direct = subs.get(rawId);
@@ -395,7 +386,6 @@ export default function subagentPlugin(ctx: Context): void {
     return { error: `Error: unknown subagent id "${rawId}" (see action list)` };
   }
 
-  /** Resolve the target row of an id-carrying action, or fail the tool call with the resolver's message. */
   function targetOf(params: ToolParams, toolCtx: unknown): { entry: SubEntry; cwd: string } {
     const cwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
     const resolved = resolveSubEntry(idParam(params, 'agentId', 'taskId'), cwd);
@@ -403,7 +393,6 @@ export default function subagentPlugin(ctx: Context): void {
     return { entry: resolved.entry, cwd };
   }
 
-  /** A closed task is revived automatically: the pane is only a temporary host. */
   async function ensureLive(entry: SubEntry): Promise<void> {
     if (entry.status !== 'closed') return;
     await reviveEntry(entry);
@@ -431,9 +420,8 @@ export default function subagentPlugin(ctx: Context): void {
     try {
       // D94: reuse an existing pane for the same session to avoid competing pi processes.
       const existing = await findExistingPane(latest.sessionFile);
-      // A ledger sessionFile mis-attributed to the master's own transcript would match the MASTER
-      // pane here, registering the master as its own subagent (later consumed, then closed by GC
-      // mid-run). Never adopt self — refuse instead of reviving our own transcript in a new pane.
+      // A ledger sessionFile mis-attributed to the master's own transcript would match the MASTER pane here,
+      // registering the master as its own subagent (later consumed, then closed by GC mid-run) — never adopt self.
       if (existing?.paneId === env?.paneId) {
         return toolError(
           `Error: task ${taskId} is attributed to the master's own session (mis-recorded sessionFile in the ledger); it cannot be resumed here — spawn a fresh subagent for this work instead.`,
@@ -453,7 +441,6 @@ export default function subagentPlugin(ctx: Context): void {
         persistSubs();
         writeHistory(entry, undefined, 'resume');
       } else {
-        // Create a new pane only when no existing one can be reused.
         await reviveEntry(entry);
         subs.set(entry.paneId, entry);
         persistSubs();
@@ -473,16 +460,14 @@ export default function subagentPlugin(ctx: Context): void {
     }
   }
 
-  /** The shared spine of every id-carrying action: revive a closed row, wait for its pipe, send one
-   *  request, fold any failure into the action's error wording. `interrupt` passes `ready: false`
-   *  (a closed target is an idempotent no-op, not something to revive). */
+  /** The shared spine of every id-carrying action: revive a closed row, wait for its pipe, send one request,
+   *  fold failures into the error wording. `interrupt` passes `ready: false` (a closed target is a no-op). */
   async function pipeAction(
     entry: SubEntry,
     opts: {
       /** One request from the closed pipe protocol; its `type`/`id` drive the reply and settle keys. */
       build(): PipeRequest;
       ok(res: Extract<PipeResponse, { type: 'ok' }>, reqId: string): unknown;
-      /** Failure wording; takes the (possibly revived) pane id so the text matches the live target. */
       fail?(paneId: string): string;
       ready?: false;
     },
@@ -542,7 +527,6 @@ export default function subagentPlugin(ctx: Context): void {
 
   async function executeSubagentInterrupt(params: ToolParams, toolCtx: unknown) {
     const { entry } = targetOf(params, toolCtx);
-    // DSH alignment: an idle or finished target is an idempotent no-op.
     if (entry.status === 'closed') {
       return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (already idle/closed; no-op).` }], details: {} };
     }
@@ -635,9 +619,8 @@ export default function subagentPlugin(ctx: Context): void {
     resolveEntry: (rawId: string, cwd: string) => resolveSubEntry(rawId, cwd),
     outputCursors,
     getCwd: (toolCtx: unknown): string => (toolCtx as { cwd?: string })?.cwd ?? process.cwd(),
-    // Transcript fallback: small worker panes show only the opaque status overlay, so the pane
-    // delta can never carry the final report. No preferred file — let the resolver start from
-    // herdr's per-pane report instead of a possibly stale registry value.
+    // Transcript fallback: small worker panes show only the opaque status overlay, so the pane delta can never
+    // carry the final report. No preferred file — start from herdr's per-pane report, not a stale registry value.
     readFinalReport: async (paneId: string, entryCwd: string) =>
       (await session.subSessionState(paneId, entryCwd, 0)).text,
   };
