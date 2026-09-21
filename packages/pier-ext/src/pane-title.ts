@@ -1,35 +1,29 @@
 /**
  * Projects the pane todo snapshot into a herdr pane header/sidebar (M22, D62/D68).
  *
- * The pi session JSONL remains authoritative; this layer only condenses the snapshot into a title and blocked badge.
- * herdr truncates title/state_label to 80 characters, so truncate locally to avoid cutting an emoji in half.
+ * The pi session JSONL stays authoritative; herdr truncates title/state_label to 80 characters, so
+ * truncate locally to avoid cutting an emoji in half.
  */
 import { countTodos, PI_HERDR_META_KEY, type TodoItem } from './vocab.ts';
 import { formatAge, isArchived } from './stale-core.ts';
 
 /** herdr's character limit for title/state_label (from official documentation and schema measurements). */
 const TITLE_MAX = 80;
-/**
- * Valid state_labels keys are only idle|working|blocked|done|unknown
- * (herdr socket-api; the early WIRE `todo` value was rejected as invalid_state_label).
- */
+/** Valid state_labels keys are only idle|working|blocked|done|unknown (herdr socket-api; the early
+ *  WIRE `todo` value was rejected as invalid_state_label). */
 export const BLOCKED_LABEL_KEY = 'blocked';
 
-/**
- * D93: custom sidebar token for the todo summary (referenced as `$pi-todo` by herdr `[ui.sidebar.agents]`).
- * Keep its value in the same format and source as the pane title (`▶i ○p ■b ✓c (N/M) · activity`).
- */
+/** D93: custom sidebar token for the todo summary, referenced as `$pi-todo` by herdr
+ *  `[ui.sidebar.agents]`; its value keeps the pane-title format (`▶i ○p ■b ✓c (N/M) · activity`). */
 const SIDEBAR_TODO_TOKEN = 'pi-todo';
 /** D95: token marking an ask_user_question wait (the workbench heat scale uses it to distinguish ask from block). */
 export const SIDEBAR_ASK_TOKEN = 'pi-ask';
 
-/**
- * D93: build the pi-todo token patch for report_metadata. A title becomes the token value so the sidebar
- * can render `$pi-todo`; no todo becomes an empty string so herdr's patch semantics remove the key.
+/** D93: build the pi-todo token patch for report_metadata (a title is the token value, no todo is an
+ *  empty string because herdr's patch semantics remove empty keys).
  *
- * D96: never merge the stale cleanup in here — stale(16) + pi-todo(1) exceeds herdr's
- * tokens maxProperties=16, and the rejected request drops both title and tokens.
- */
+ *  D96: never merge the stale cleanup in here — stale(16) + pi-todo(1) exceeds herdr's tokens
+ *  maxProperties=16 and the rejected request would drop both the title and the tokens. */
 export function sidebarTodoTokens(title: string | null): Record<string, string> {
   return { [SIDEBAR_TODO_TOKEN]: title ?? '' };
 }
@@ -41,12 +35,12 @@ function clipTitle(s: string): string {
 }
 
 /**
- * `▶i ○p ■b ✓c (N/M [~eta]) · <activity>` (D91 unifies the four black-and-white status glyphs).
- * activity is the first in_progress item, then fallbackDescription, then only the counts.
- * Empty list → null, which callers translate into clear_title. progressSuffix (M16) comes from formatProgressSuffix.
+ * `▶i ○p ■b ✓c (N/M [~eta]) · <activity>` (D91 unifies the four status glyphs). activity is the
+ * first in_progress item, then fallbackDescription, then only the counts. Empty list → null, which
+ * callers translate into clear_title; progressSuffix (M16) comes from formatProgressSuffix.
  *
- * Anti-freeze (stale-core D): once all work is complete and the wall clock expires (archived), the dead list
- * degrades to `✓N done <age>` instead of presenting itself as a weighted current-state view.
+ * Anti-freeze (stale-core D): once all work completed and the wall clock expired (archived), the
+ * dead list degrades to `✓N done <age>` instead of presenting itself as a current-state view.
  */
 export function formatPaneTitle(
   items: readonly TodoItem[],
@@ -77,9 +71,8 @@ export function formatBlockedLabel(items: readonly TodoItem[]): string | null {
   return clipTitle(text);
 }
 
-/**
- * The first post-upgrade report clears the old 16-key chunks (herdr merges tokens by key, so omitted nulls remain—M13b).
- */
+/** The first post-upgrade report clears the old 16-key chunks (herdr merges tokens by key, so omitted
+ *  nulls would otherwise remain — M13b). */
 export function staleTokenClearance(): Record<string, null> {
   const tokens: Record<string, null> = { [PI_HERDR_META_KEY]: null };
   for (let i = 0; i < STALE_CHUNK_COUNT; i++) {

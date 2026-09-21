@@ -16,10 +16,10 @@ import { swallow } from './swallow.ts';
 export const COMPACT_STATE_CUSTOM_TYPE = 'pi-herdr.efficiency-state';
 export const COMPACTION_CONTINUE_TYPE = 'pi-herdr.compaction-continue';
 /**
- * Cross-session compaction markers. OCC aborts the in-flight turn, and that abort lands in the child
- * transcript as an assistant message with stopReason 'error', which a supervising master's poller
- * would read as a settled turn. The inflight/settled pair gives it a deterministic "do not settle"
- * window that pane state cannot provide (a pane reports idle while compacting).
+ * Cross-session compaction markers. OCC aborts the in-flight turn, and that abort lands in the
+ * child transcript as an assistant message with stopReason 'error', which a supervising master's
+ * poller would read as a settled turn. The inflight/settled pair gives it a deterministic
+ * "do not settle" window that pane state cannot provide (a pane reports idle while compacting).
  */
 export const COMPACTION_INFLIGHT_TYPE = 'pi-herdr.compaction-inflight';
 export const COMPACTION_SETTLED_TYPE = 'pi-herdr.compaction-settled';
@@ -388,8 +388,8 @@ export class CompactCoordinator {
     this.state.compactBackoffTurnEnds = Math.min(2 ** this.state.consecutiveCompactionFailures, 4);
 
     // OCC aborted the turn on purpose, so a failed compaction would leave the session parked on an
-    // aborted message; the notice is visible because a silent failure left a 209K-token session
-    // running unaware (01a0bd3a).
+    // aborted message; the notice must be visible (a silent failure left a 209K-token session aware
+    // of nothing).
     const approxTokens = this.state.lastContextTokens;
     this.sendContinuation(
       opts.pi,
@@ -401,11 +401,9 @@ export class CompactCoordinator {
     );
   }
 
-  /**
-   * Best-effort session entry write: onAgentSettled runs detached, and appendEntry bottoms out in a
-   * synchronous file append — a full disk or a torn-down session must not become an unhandled
-   * rejection. A missing marker only costs the master a delayed settlement, never a crash.
-   */
+  /** Best-effort session entry write: onAgentSettled runs detached and appendEntry is a synchronous
+   *  file append, so a full disk must not become an unhandled rejection (a missing marker only
+   *  delays one settlement notice). */
   private appendMarker(pi: ExtensionAPI, customType: string, data: unknown): void {
     try {
       pi.appendEntry(customType, data);

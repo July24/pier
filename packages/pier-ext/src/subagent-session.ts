@@ -3,7 +3,7 @@
  *
  * Path resolution, settlement text, and liveness probes share one candidate order (reported
  * path/id before recent-file fallback, excluding the master's own session and sessions claimed
- * by other live panes) so settlement text can never cross sessions.
+ * by other live panes), so settlement text can never cross sessions.
  */
 import { accessSync, constants, statSync } from 'node:fs';
 import type { HerdrAgentState, HerdrClientLike } from './herdr-client.ts';
@@ -17,7 +17,7 @@ import {
   type SessionEntryLike,
   type SubSessionState,
 } from './session-tail.ts';
-import { idParam, type AliveProbe, type SubEntry } from './subagent-core.ts';
+import { idParam, sleep, type AliveProbe, type SubEntry } from './subagent-core.ts';
 import { toolError } from './tool-error.ts';
 
 /* ── subagent output delta (pure) ───────────────────────────────── */
@@ -32,7 +32,6 @@ export type SubagentStatus = 'running' | 'idle' | 'blocked' | 'settled';
 export interface SubagentOutputCursor {
   /** Suffix of previous full text used for boundary matching */
   tail: string;
-  /** Length of previous full text */
   fullLength: number;
   /** Fingerprint of the last session-transcript report already delivered for this pane;
    * deduplicates the transcript fallback across polls (present only after such a delivery). */
@@ -50,11 +49,10 @@ function extractTail(text: string, tailChars = OUTPUT_TAIL_CHARS): string {
 }
 
 /**
- * Incremental delta between the previous cursor and the current full buffer.
- *
- * Initial read returns bounded full text; an append yields the text after the previous tail
- * (ambiguous repeats, scrolled-off boundaries and clear-screens degrade to full text with
- * `restart: true` — for a fullscreen TUI that is the normal steady state, not a crash signal).
+ * Incremental delta between the previous cursor and the current full buffer. The initial read
+ * returns bounded full text; an append yields the text after the previous tail. Ambiguous repeats,
+ * scrolled-off boundaries and clear-screens degrade to full text with `restart: true` — for a
+ * fullscreen TUI that is the normal steady state, not a crash signal.
  */
 export function computeSubagentOutputDelta(
   prevCursor: SubagentOutputCursor | null | undefined,
@@ -160,9 +158,9 @@ export interface SessionIo {
   subSessionState(paneId: string, cwd: string, sinceTs: number, preferred?: string | null): Promise<SubSessionState>;
   readSettleTail(paneId: string, cwd: string, preferred?: string | null, maxChars?: number): Promise<string | null>;
   /** Re-attribute a registry sessionFile with no writes since `sinceTs`: keep `preferred` when it is
-   * fresh, otherwise accept herdr's per-pane report when that is fresh. Never falls back to mtime
-   * heuristics, so an existing value is only ever replaced by the authoritative report; null means
-   * "nothing fresh is known", i.e. keep the old value. */
+   * fresh, otherwise accept herdr's per-pane report when that is fresh. An existing value is only
+   * ever replaced by the authoritative report; null means "nothing fresh is known, keep the old one"
+   * (never an mtime guess). */
   reattributeStaleSessionFile(paneId: string, cwd: string, sinceTs: number, preferred: string | null): Promise<string | null>;
 }
 
@@ -183,11 +181,8 @@ function stampOf(file: string): FileStamp | null {
   }
 }
 
-/**
- * Memo of values derived from a session file, invalidated by (size, mtime, sinceTs).
- * Worker sessions reach tens of MB (read + parse + derive ≈ 200ms) and the poll loop re-derives
- * the same state every tick, so an unchanged append-only file must not be parsed twice.
- */
+/** Memo of values derived from a session file, invalidated by (size, mtime, sinceTs): worker
+ * sessions reach tens of MB, and the poll loop re-derives the same state every tick. */
 class DerivedCache<T> {
   private readonly entries = new Map<string, { key: string; value: T }>();
   private readonly limit: number;
@@ -211,20 +206,12 @@ class DerivedCache<T> {
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  setTimeout(resolve, ms);
-  return promise;
-}
-
 export function createSessionIo(h: SessionIoHost): SessionIo {
   const stateCache = new DerivedCache<SubSessionState>();
   const finalTextCache = new DerivedCache<string | null>();
 
-  /**
-   * herdr's report for this pane plus the sessions claimed by other panes. One `agent.list`
-   * serves both, so the poll hot paths pay a single RPC.
-   */
+  /** herdr's report for this pane plus the sessions claimed by other panes; one `agent.list`
+   *  serves both, so the poll hot paths pay a single RPC. */
   async function reportedAndTaken(paneId: string): Promise<{ reported: string | null; taken: Set<string> }> {
     const taken = new Set<string>();
     let reported: string | null = null;
@@ -249,9 +236,9 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
 
   /** Ordered candidates: pipe self-report, herdr report, then the newest session files. */
   async function resolveSessionFileCandidates(paneId: string, cwd: string, preferred?: string | null): Promise<string[]> {
-    // A sub's sessionFile must never resolve to the master's own transcript: comparing via
-    // bareSessionId because herdr reports ids and paths interchangeably. A poisoned entry once
-    // made `resume` adopt the master pane as its own subagent and GC close it mid-run.
+    // A sub's sessionFile must never resolve to the master's own transcript (compare via
+    // bareSessionId: herdr reports ids and paths interchangeably); a poisoned entry once made
+    // `resume` adopt the master pane as its own subagent and GC close it mid-run.
     const own = bareSessionId(h.getSessionId());
     const { reported, taken } = await reportedAndTaken(paneId);
     const out: string[] = [];
@@ -401,8 +388,8 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     return { text: null, pendingTool: false, activity: false, turnEnded: false, compacting: false };
   }
 
-  /** Last assistant text of the best candidate regardless of stopReason: state for the settle
-   * attribution judgment, which asks what the tail we READ looks like, not whether it is final. */
+  /** Last assistant text of the best candidate regardless of stopReason: the settle attribution
+   *  judgment asks what the tail we READ looks like, not whether it is final. */
   async function readSettleTail(
     paneId: string,
     cwd: string,
@@ -466,9 +453,8 @@ export async function executeSubagentOutput(
     resolveEntry: (rawId: string, cwd: string) => { entry: SubEntry } | { error: string };
     outputCursors: Map<string, SubagentOutputCursor>;
     getCwd: (toolCtx: unknown) => string;
-    /** Last finalized assistant text from the worker's transcript. The pane read alone cannot
-     * recover it when the fullscreen TUI shows only the status overlay, so idle/settled polls
-     * fall back to this. Optional for tests. */
+    /** Last finalized assistant text from the worker's transcript: the pane read alone cannot
+     * recover it when the fullscreen TUI shows only the status overlay. Optional for tests. */
     readFinalReport?: (paneId: string, entryCwd: string) => Promise<string | null>;
   },
 ) {

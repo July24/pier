@@ -1,10 +1,5 @@
-/**
- * M18 file write-lock installer (soft veto / hard block).
- *
- * Why: lock acquire/release/command lived in the composition root next to
- * unrelated session wiring. The installer owns the three pi hooks and the
- * held-lock set; fail-open on agent.list remains the collaboration policy.
- */
+/** M18 file write-lock installer (soft veto / hard block): owns the three pi hooks and the
+ *  held-lock set; fail-open on agent.list is the collaboration policy. */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import {
   acquireTokensFor,

@@ -15,8 +15,8 @@
  *  - agent.list {} → {type:'agent_list', agents: AgentInfo[]};
  *  - agent.wait {target, until[], timeout_ms?} → the matching agent, or an error on timeout.
  *
- * Design (DESIGN.md §4.1): without herdr, fall back to Noop so pi remains independent;
- * failures in reporting calls stay silent and never affect the main pi flow.
+ * Reporting failures stay silent and never affect the main pi flow; without herdr the Noop client
+ * keeps pi independent (DESIGN.md §4.1).
  */
 import { REPORT_AGENT_SOURCE, type TodoItem } from './vocab.ts';
 import { BLOCKED_LABEL_KEY, SIDEBAR_ASK_TOKEN, formatBlockedLabel, formatPaneTitle, sidebarTodoTokens, staleTokenClearance } from './pane-title.ts';
@@ -166,24 +166,24 @@ export interface HerdrClientLike {
   /** D93: sidebar agent display name (display_agent is the role name); null clears it. Persists, no TTL. */
   reportDisplayAgent(name: string | null): Promise<void>;
   /**
-   * D95: ask_user_question waiting marker (tokens['pi-ask']; null clears it). Sidebar/heatmap grading
-   * distinguishes blocked + pi-ask (ask level) from plain blocked (block level).
+   * D95: ask_user_question waiting marker (tokens['pi-ask']; null clears it). The sidebar/heatmap
+   * grades blocked + pi-ask as the ask level, distinct from plain block.
    */
   reportAskFlag(text: string | null): Promise<void>;
   listAgents(): Promise<AgentInfo[]>;
-  /** Inject text into a pane terminal (pi editor input + Enter); send_text+CR reaches it directly and is used only to start launchLine. */
+  /** Inject text into a pane terminal (pi editor input + Enter); the PTY channel is used only to start launchLine. */
   sendPaneText(paneId: string, text: string): Promise<void>;
   /** Wait for an agent state server-side; return the matched state, null on timeout, and throw on error. */
   waitAgent(paneId: string, until: HerdrAgentState[], timeoutMs: number): Promise<HerdrAgentState | null>;
   /** Query the child-agent session path (agent_session.value, kind=path); return null when absent. */
   getAgentSessionPath(paneId: string): Promise<string | null>;
-  /** v1.2: Split a new shell pane in the current tab, placing it in the group tab; return its pane ID. */
+  /** Split a new shell pane in the current tab and return its pane ID. */
   splitPane(opts: { direction?: 'left' | 'right' | 'up' | 'down'; cwd?: string; env?: Record<string, string>; targetPaneId?: string; focus?: boolean; ratio?: number }): Promise<string>;
-  /** v1.2: Close a pane; observed behavior kills its process tree and herdr closes an empty tab. */
+  /** Close a pane; herdr kills its process tree and closes an empty tab. */
   closePane(paneId: string): Promise<void>;
-  /** v1.2: Create a tab with a root shell pane, returning tabId/paneId for group-tab infrastructure. */
+  /** Create a tab with a root shell pane, returning tabId/paneId for group-tab infrastructure. */
   createTab(opts: { workspaceId: string; label?: string; cwd?: string; env?: Record<string, string> }): Promise<{ tabId: string; paneId: string }>;
-  /** v1.2: List all panes with tab ownership for group-tab additions. */
+  /** List all panes with their tab ownership. */
   listPanes(): Promise<PaneListItem[]>;
   /** D91: Export the tab layout tree, locating it by paneId or tabId; best effort returns null on failure. */
   exportLayout(opts?: { paneId?: string; tabId?: string }): Promise<{ tabId: string | null; zoomed: boolean; root: unknown; focusedPaneId: string | null } | null>;
@@ -226,6 +226,8 @@ function findIdIn(obj: unknown, key: string, depth = 0): string | null {
 
 /* ── Noop ──────────────────────────────────────────────────────────── */
 
+/** Stand-in for a process outside a herdr pane: queries answer empty, pane creation throws the
+ * reason, reporting is a no-op. */
 export class NoopHerdrClient implements HerdrClientLike {
   readonly available = false;
   async reportAgent(): Promise<void> {}
@@ -233,56 +235,26 @@ export class NoopHerdrClient implements HerdrClientLike {
   async reportLockTokens(): Promise<void> {}
   async reportDisplayAgent(): Promise<void> {}
   async reportAskFlag(): Promise<void> {}
-  async listAgents(): Promise<AgentInfo[]> {
-    return [];
-  }
   async sendPaneText(): Promise<void> {}
-  async waitAgent(): Promise<null> {
-    return null;
-  }
-  async getAgentSessionPath(): Promise<null> {
-    return null;
-  }
-  async splitPane(): Promise<string> {
-    throw new Error('subagent requires a herdr-managed pane');
-  }
   async closePane(): Promise<void> {}
-  async createTab(): Promise<{ tabId: string; paneId: string }> {
-    throw new Error('subagent requires a herdr-managed pane');
-  }
-  async listPanes(): Promise<PaneListItem[]> {
-    return [];
-  }
-  async exportLayout(): Promise<null> {
-    return null;
-  }
-  async paneLayout(): Promise<null> {
-    return null;
-  }
-  async tabList(): Promise<TabInfo[]> {
-    return [];
-  }
   async tabClose(): Promise<void> {}
-  async openPluginPane(): Promise<OpenPluginPaneResult> {
-    throw new Error('plugin pane requires a herdr-managed pane');
-  }
-  async agentExplain(): Promise<null> {
-    return null;
-  }
-  async getServerVersion(): Promise<null> {
-    return null;
-  }
   async sendPaneKeys(): Promise<void> {}
-  async readPane(): Promise<ReadBuffer> {
-    return { text: '', revision: 0, truncated: false };
-  }
-  async readAgent(): Promise<ReadBuffer> {
-    return { text: '', revision: 0, truncated: false };
-  }
-  async waitForOutput(): Promise<WaitForOutputResult> {
-    return { matched: false, reason: 'unavailable' };
-  }
   close(): void {}
+  async listAgents(): Promise<AgentInfo[]> { return []; }
+  async listPanes(): Promise<PaneListItem[]> { return []; }
+  async tabList(): Promise<TabInfo[]> { return []; }
+  async waitAgent(): Promise<null> { return null; }
+  async getAgentSessionPath(): Promise<null> { return null; }
+  async exportLayout(): Promise<null> { return null; }
+  async paneLayout(): Promise<null> { return null; }
+  async agentExplain(): Promise<null> { return null; }
+  async getServerVersion(): Promise<null> { return null; }
+  async readPane(): Promise<ReadBuffer> { return { text: '', revision: 0, truncated: false }; }
+  async readAgent(): Promise<ReadBuffer> { return { text: '', revision: 0, truncated: false }; }
+  async waitForOutput(): Promise<WaitForOutputResult> { return { matched: false, reason: 'unavailable' }; }
+  async splitPane(): Promise<string> { throw new Error('subagent requires a herdr-managed pane'); }
+  async createTab(): Promise<{ tabId: string; paneId: string }> { throw new Error('subagent requires a herdr-managed pane'); }
+  async openPluginPane(): Promise<OpenPluginPaneResult> { throw new Error('plugin pane requires a herdr-managed pane'); }
 }
 
 /* ── Implementation ────────────────────────────────────────────────── */
@@ -300,10 +272,8 @@ export class HerdrClient implements HerdrClientLike {
     return herdrSocketTarget(this.env.socketPath);
   }
 
-  /**
-   * One connection per control request: the server replies with a single {id, result} | {id, error}
-   * line and closes. Reading that complete line finishes the request.
-   */
+  /** One connection per control request: the server replies with a single {id, result} | {id, error}
+   * line and closes, so reading that line finishes the request. */
   private request(method: string, params: Record<string, unknown>, timeoutMs = 15000): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const sock = net.createConnection(this.target());
@@ -372,13 +342,12 @@ export class HerdrClient implements HerdrClientLike {
         ...(message ? { message } : {}),
       });
     } catch {
-      /* Silent best effort. */
+      /* Reported state is a mirror; never affects pi. */
     }
   }
 
-  // D-2: herdr's native pi integration owns the session path, so pier never sends
-  // pane.report_agent_session (single writer). The activity badge stays on report_agent, whose
-  // `state` is required and whose todo/role text is pier-only data.
+  // Single writer: herdr's native pi integration owns the session path, so pier never sends
+  // pane.report_agent_session; the activity badge stays on report_agent.
 
   async reportMetadata(meta: { session: string; items: readonly TodoItem[]; progressSuffix?: string | null; lastWriteAt?: number | null }): Promise<void> {
     try {
@@ -667,15 +636,8 @@ export class HerdrClient implements HerdrClientLike {
       // 0.9.0 serde rejects unknown `popup` as "unknown variant" / invalid_params — not a dedicated
       // invalid_placement code. Any popup failure retries as tab; tab failure surfaces to Level 3.
       if (opts.placement !== 'popup') throw err;
-      const fallbackRes = (await this.request('plugin.pane.open', {
-        plugin_id: opts.pluginId,
-        entrypoint: opts.entrypoint,
-        placement: 'tab',
-        ...(opts.focus !== undefined ? { focus: opts.focus } : {}),
-        ...(opts.cwd ? { cwd: opts.cwd } : {}),
-        ...(opts.env ? { env: opts.env } : {}),
-        ...(opts.workspaceId ? { workspace_id: opts.workspaceId } : {}),
-      })) as Record<string, unknown> | null;
+      const { width: _width, height: _height, target_pane_id: _target, ...base } = params;
+      const fallbackRes = (await this.request('plugin.pane.open', { ...base, placement: 'tab' })) as Record<string, unknown> | null;
       return {
         mode: 'fallback_tab',
         paneId: findIdIn(fallbackRes, 'pane_id') ?? undefined,
@@ -709,7 +671,7 @@ export class HerdrClient implements HerdrClientLike {
         return result.version;
       }
     } catch {
-      /* ignore */
+      /* Version is diagnostic only. */
     }
     return null;
   }

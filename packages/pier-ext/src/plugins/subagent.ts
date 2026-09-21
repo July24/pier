@@ -36,7 +36,7 @@ import {
 } from '../history-store.ts';
 import { platformPaths } from '../platform-paths.ts';
 import { toolError, ToolError } from '../tool-error.ts';
-import { pipeNameFor, pipeRequestTo } from '../pipe-channel.ts';
+import { pipeNameFor, pipeRequestTo, type PipeRequest, type PipeResponse } from '../pipe-channel.ts';
 import type { TerminalStateSlot } from './terminal.ts';
 import { bareSessionId, resolveSessionFileValue } from '../session-tail.ts';
 import { createGitIo, createSpawnAction, createSpawner } from '../subagent-spawn.ts';
@@ -98,7 +98,6 @@ const SUBAGENT_DESCRIPTION = [
   '[send] `agentId` + `message`: follow-up to a background subagent. If working, delivered at next tool-call gap (steer, seconds); if idle, wakes a new turn. After settle, send to wake it; do not spawn a duplicate.',
 ].join(' ');
 
-/** Subagent concurrency limit (max parallel delegations) */
 const SUBAGENT_CONCURRENCY = 4;
 
 function defaultAgentSessionsDir(): string {
@@ -241,9 +240,9 @@ export default function subagentPlugin(ctx: Context): void {
   const { readAskFlag, probeAlive } = session;
   const { spawnPaneInTaskTab, launchLine, approveFor, waitSubReady, findExistingPane } = spawn;
 
-  /** P0-2: a restarted master used to lose every running subagent's poller — settle notices
-   * stopped arriving and ledger rows stayed 'running'. Re-arm pollers for live running panes;
-   * the `recover-*` requestId is never echoed by a worker, so this poller's settle claim wins. */
+  /** P0-2: re-arm pollers for live running panes after a master restart, or settle notices stop
+   * arriving and ledger rows stay 'running'. The `recover-*` requestId is never echoed by a worker,
+   * so this poller's settle claim wins. */
   async function recoverRunningPollers(via: string): Promise<void> {
     if (!client.available) return;
     const running = [...subs.values()].filter((s) => s.background && s.status === 'running' && !pollers.has(s.paneId));
@@ -284,8 +283,8 @@ export default function subagentPlugin(ctx: Context): void {
     await recoverRunningPollers('session_tree');
   });
 
-  /** B1 liveness rewrite for subagent errors: a false no-output result made the model seize work
-   * from a healthy subagent, so probe before the tool result enters model context. */
+  /** B1: probe liveness before a "no output" subagent error enters model context, so the model
+   * stops seizing work from a healthy subagent. */
   scoped.on('tool_result', async (rawEvent: unknown) => {
     const event = (rawEvent ?? {}) as { toolName?: string; isError?: boolean; content?: Array<{ type: string; text?: string }> };
     if (event.toolName !== 'subagent' || !event.isError) return;
@@ -346,6 +345,28 @@ export default function subagentPlugin(ctx: Context): void {
     return entry;
   }
 
+  /** Rebuild a registry row from its latest ledger row; `over` carries the caller's own fields
+   *  (status, pane identity, timestamps) so the ledger projection cannot drift between callers. */
+  function entryFromHistory(h: HistoryEntry, over: Partial<SubEntry>): SubEntry {
+    return {
+      taskId: h.taskId,
+      kind: h.kind,
+      paneId: h.paneId,
+      tabId: h.tabId,
+      tabName: h.tabName ?? '',
+      cwd: h.cwd,
+      description: h.description,
+      background: true,
+      status: 'closed',
+      sessionFile: h.sessionFile,
+      launchCommand: h.launchCommand,
+      createdAt: h.createdAt,
+      consumedAt: h.consumedAt ?? null,
+      revivedFrom: h.paneId,
+      ...over,
+    };
+  }
+
   /** Resolve a pane id or task-id prefix against the live registry, then the ledger (revives a closed row). */
   function resolveSubEntry(rawId: string, cwd?: string): { entry: SubEntry } | { error: string } {
     if (!rawId) return { error: 'Error: unknown subagent id "" (see action list)' };
@@ -364,22 +385,7 @@ export default function subagentPlugin(ctx: Context): void {
       if (histRes.kind === 'resolved') {
         const latest = latestGeneration(hist, histRes.taskId);
         if (latest) {
-          const entry: SubEntry = {
-            taskId: latest.taskId,
-            kind: latest.kind,
-            paneId: latest.paneId,
-            tabId: latest.tabId,
-            tabName: latest.tabName ?? '',
-            cwd: latest.cwd,
-            description: latest.description,
-            background: true,
-            status: 'closed',
-            sessionFile: latest.sessionFile,
-            launchCommand: latest.launchCommand,
-            createdAt: latest.createdAt,
-            consumedAt: latest.consumedAt ?? null,
-            revivedFrom: latest.paneId,
-          };
+          const entry = entryFromHistory(latest, {});
           subs.set(entry.paneId, entry);
           return { entry };
         }
@@ -433,42 +439,30 @@ export default function subagentPlugin(ctx: Context): void {
           `Error: task ${taskId} is attributed to the master's own session (mis-recorded sessionFile in the ledger); it cannot be resumed here — spawn a fresh subagent for this work instead.`,
         );
       }
-      const entry: SubEntry = {
-        taskId,
-        kind: latest.kind,
+      const entry = entryFromHistory(latest, {
         paneId: existing?.paneId ?? '',
         tabId: existing?.tabId ?? '',
         tabName: latest.tabName ?? tabNameForTask(latest.description),
         cwd,
-        description: latest.description,
-        background: true,
         status: 'running',
-        sessionFile: latest.sessionFile ?? null,
-        launchCommand: latest.launchCommand,
         createdAt: Date.now(),
-        revivedFrom: latest.paneId,
         consumedAt: null,
-      };
+      });
       if (existing) {
         subs.set(entry.paneId, entry);
         persistSubs();
         writeHistory(entry, undefined, 'resume');
-        return {
-          content: [{ type: 'text', text: `resumed subagent ${entry.paneId} from task ${taskId} (reused existing pane with same session; pi still running there).` }],
-          details: { paneId: entry.paneId, taskId },
-        };
+      } else {
+        // Create a new pane only when no existing one can be reused.
+        await reviveEntry(entry);
+        subs.set(entry.paneId, entry);
+        persistSubs();
       }
-      // Create a new pane only when no existing one can be reused.
-      await reviveEntry(entry);
-      subs.set(entry.paneId, entry);
-      persistSubs();
+      const how = existing
+        ? 'reused existing pane with same session; pi still running there'
+        : entry.sessionFile ? 'session restored' : 'session file missing; fresh conversation';
       return {
-        content: [{
-          type: 'text',
-          text: entry.sessionFile
-            ? `resumed subagent ${entry.paneId} from task ${taskId} (session restored).`
-            : `resumed subagent ${entry.paneId} from task ${taskId} (session file missing; fresh conversation).`,
-        }],
+        content: [{ type: 'text', text: `resumed subagent ${entry.paneId} from task ${taskId} (${how}).` }],
         details: { paneId: entry.paneId, taskId },
       };
     } catch (err) {
@@ -479,47 +473,71 @@ export default function subagentPlugin(ctx: Context): void {
     }
   }
 
-  async function executeSubagentSend(params: ToolParams, toolCtx: unknown) {
-    const { entry, cwd } = targetOf(params, toolCtx);
+  /** The shared spine of every id-carrying action: revive a closed row, wait for its pipe, send one
+   *  request, fold any failure into the action's error wording. `interrupt` passes `ready: false`
+   *  (a closed target is an idempotent no-op, not something to revive). */
+  async function pipeAction(
+    entry: SubEntry,
+    opts: {
+      /** One request from the closed pipe protocol; its `type`/`id` drive the reply and settle keys. */
+      build(): PipeRequest;
+      ok(res: Extract<PipeResponse, { type: 'ok' }>, reqId: string): unknown;
+      /** Failure wording; takes the (possibly revived) pane id so the text matches the live target. */
+      fail?(paneId: string): string;
+      ready?: false;
+    },
+  ): Promise<unknown> {
     try {
-      await ensureLive(entry);
-      // Follow_up goes through the extension pipe with steering so supplemental instructions reach
-      // a long-running worker within seconds during a tool-call gap; a plain queue would wait for
-      // the entire run.
-      const ready = await waitSubReady(entry.cwd, entry.paneId);
-      if (!ready.ok) throw new Error(ready.message);
-      const fuId = `fu-${Date.now()}`;
-      const res = await pipeRequestTo(entry.cwd, entry.paneId, {
+      if (opts.ready !== false) {
+        await ensureLive(entry);
+        const ready = await waitSubReady(entry.cwd, entry.paneId);
+        if (!ready.ok) throw new Error(ready.message);
+      }
+      const payload = opts.build();
+      const res = await pipeRequestTo(entry.cwd, entry.paneId, payload);
+      if (res.type !== 'ok') {
+        throw new Error(`pipe ${payload.type} rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
+      }
+      return opts.ok(res, payload.id);
+    } catch (err) {
+      const what = opts.fail?.(entry.paneId) ?? `failed to reach subagent ${entry.paneId}`;
+      return toolError(`Error: ${what}: ${(err as Error).message}`);
+    }
+  }
+
+  /** Follow_up goes through the extension pipe with steering so supplemental instructions reach a
+   * long-running worker within seconds during a tool-call gap; a plain queue waits for the run. */
+  function executeSubagentSend(params: ToolParams, toolCtx: unknown) {
+    const { entry, cwd } = targetOf(params, toolCtx);
+    return pipeAction(entry, {
+      build: () => ({
         type: 'follow_up',
-        id: fuId,
+        id: `fu-${Date.now()}`,
         text: String(params?.message ?? ''),
         // The reply pipe is the MASTER's (bound at session_start with this session's cwd);
         // entry.cwd would name a dead pipe for cross-repo workers.
         from: pipeNameFor(cwd, env?.paneId ?? ''),
         push: true,
         steer: true,
-      });
-      if (res.type !== 'ok') {
-        throw new Error(`pipe follow_up rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
-      }
-      lastMachineInjectAt.set(entry.paneId, Date.now()); // B4: attribute working state during the observation window
-      // An exception between status='running' and startPoller would leave a ghost running entry
-      // with no poller (never settles, skipped by GC): roll back the status on failure.
-      const prevStatus = entry.status;
-      entry.status = 'running';
-      persistSubs();
-      try {
-        lastRequestIdByPane.set(entry.paneId, fuId);
-        startPoller(entry.paneId, entry.cwd, Date.now(), entry.description, fuId);
-      } catch (inner) {
-        entry.status = prevStatus;
+      }),
+      ok: (_res, reqId) => {
+        lastMachineInjectAt.set(entry.paneId, Date.now()); // B4: attribute working state during the observation window
+        // An exception between status='running' and startPoller would leave a ghost running entry
+        // with no poller (never settles, skipped by GC): roll back the status on failure.
+        const prevStatus = entry.status;
+        entry.status = 'running';
         persistSubs();
-        throw inner;
-      }
-      return { content: [{ type: 'text', text: `Message sent to subagent ${entry.paneId}.` }], details: { paneId: entry.paneId } };
-    } catch (err) {
-      return toolError(`Error: failed to reach subagent ${entry.paneId}: ${(err as Error).message}`);
-    }
+        try {
+          lastRequestIdByPane.set(entry.paneId, reqId);
+          startPoller(entry.paneId, entry.cwd, Date.now(), entry.description, reqId);
+        } catch (inner) {
+          entry.status = prevStatus;
+          persistSubs();
+          throw inner;
+        }
+        return { content: [{ type: 'text', text: `Message sent to subagent ${entry.paneId}.` }], details: { paneId: entry.paneId } };
+      },
+    });
   }
 
   async function executeSubagentInterrupt(params: ToolParams, toolCtx: unknown) {
@@ -528,39 +546,30 @@ export default function subagentPlugin(ctx: Context): void {
     if (entry.status === 'closed') {
       return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (already idle/closed; no-op).` }], details: {} };
     }
-    try {
-      const res = await pipeRequestTo(entry.cwd, entry.paneId, { type: 'interrupt', id: `int-${Date.now()}` });
-      if (res.type !== 'ok') {
-        throw new Error(`pipe interrupt rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
-      }
-      // No settlement notice for an interrupted turn: the requester already knows.
-      const lastId = lastRequestIdByPane.get(entry.paneId);
-      if (lastId) d.claimSettleNotice(`${entry.paneId}:${lastId}`);
-      return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (fire-and-return).` }], details: { paneId: entry.paneId } };
-    } catch (err) {
-      return toolError(`Error: failed to reach subagent ${entry.paneId}: ${(err as Error).message}`);
-    }
+    return pipeAction(entry, {
+      ready: false,
+      build: () => ({ type: 'interrupt', id: `int-${Date.now()}` }),
+      ok: () => {
+        // No settlement notice for an interrupted turn: the requester already knows.
+        const lastId = lastRequestIdByPane.get(entry.paneId);
+        if (lastId) d.claimSettleNotice(`${entry.paneId}:${lastId}`);
+        return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (fire-and-return).` }], details: { paneId: entry.paneId } };
+      },
+    });
   }
 
   async function executeSubagentRole(params: ToolParams, toolCtx: unknown) {
     const roleName = String(params?.role ?? '').trim();
     if (!roleName) return toolError('Error: action "role" requires a target profile in `role` (same resolution as spawn)');
     const { entry } = targetOf(params, toolCtx);
-    try {
-      await ensureLive(entry);
-      const ready = await waitSubReady(entry.cwd, entry.paneId);
-      if (!ready.ok) throw new Error(ready.message);
-      const res = await pipeRequestTo(entry.cwd, entry.paneId, { type: 'role', id: `role-${Date.now()}`, role: roleName });
-      if (res.type !== 'ok') {
-        throw new Error(`pipe role rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
-      }
-      return {
+    return pipeAction(entry, {
+      fail: (id) => `failed to switch subagent ${id} to role ${roleName}`,
+      build: () => ({ type: 'role', id: `role-${Date.now()}`, role: roleName }),
+      ok: (res) => ({
         content: [{ type: 'text', text: `Subagent ${entry.paneId}: ${res.detail ?? `switched to ${roleName}`}` }],
         details: { paneId: entry.paneId, role: roleName },
-      };
-    } catch (err) {
-      return toolError(`Error: failed to switch subagent ${entry.paneId} to role ${roleName}: ${(err as Error).message}`);
-    }
+      }),
+    });
   }
 
   /** Live background registry, newest row per task; closed rows stay visible so send can revive them. */
@@ -681,8 +690,8 @@ export default function subagentPlugin(ctx: Context): void {
       message: Type.Optional(Type.String({ description: '[send] The follow-up message' })),
       max_chars: Type.Optional(Type.Integer({ description: '[output] Maximum characters of output delta to return (default 6000, 100-16000)' })),
     }),
-    // B2: 23/38 real spawns omitted `action` even though it is optional; normalize so the schema
-    // the model is validated against and the code path never disagree, and so `spawn` is explicit in logs.
+    // B2: `action` is optional in the schema; normalize it so the validated arguments and the
+    // code path never disagree and `spawn` is explicit in logs.
     prepareArguments: (args: unknown) => {
       const rec = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>;
       const hasAction = typeof rec.action === 'string' && rec.action.trim() !== '';

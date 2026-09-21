@@ -1,9 +1,5 @@
-/**
- * Common-segment pipe request handler (prompt / interrupt / reply).
- *
- * Why: index.ts owned the NDJSON switch next to session lifecycle. The
- * dispatch is a pure-ish adapter over the subagent port and notice buffer.
- */
+/** Common-segment pipe request handler (prompt / interrupt / reply): a thin adapter over the
+ *  subagent port and notice buffer, kept out of index.ts's session lifecycle wiring. */
 import { formatSettlementNotice } from './vocab.ts';
 import type { PipeRequest, PipeResponse } from './pipe-channel.ts';
 import type { SubagentPortBox } from './subagent-core.ts';
@@ -61,11 +57,10 @@ export async function handlePipeRequest(
     }
     case 'reply': {
       s.port.current?.applyReplySession(req.paneId, req.sessionFile);
-      // B8: the claim key is `${paneId}:${requestId}` and the poll loop claims exactly the same shape
-      // (subagent-poller.ts settle path). The two agree because a child echoes the id of the pipe
-      // request it answered (`id: req.id` in index.ts's settle push), and the parent hands that same
-      // id to startPoller (`prompt-<taskId>` / `fu-<ts>` in plugins/subagent.ts). Keep both sides in step:
-      // a mismatch here surfaces as two "finished" notices for one settlement.
+      // B8: the claim key `${paneId}:${requestId}` must match the poll loop's (subagent-poller.ts):
+      // a child echoes the id of the pipe request it answered (`id: req.id` in index.ts's settle
+      // push) and the parent hands that same id to startPoller (`prompt-<taskId>` / `fu-<ts>`).
+      // A mismatch surfaces as two "finished" notices for one settlement.
       if (s.claimSettleNotice(`${req.paneId}:${req.id}`)) {
         const notes = s.port.current?.reconcileOnReply(req.paneId) ?? [];
         const statLine = await s.port.current?.settleStatLine(req.paneId) ?? null;

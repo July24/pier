@@ -1,8 +1,7 @@
 /**
  * TUI renderers for pier's own session custom entries and reminder messages: those transcript rows
  * are raw JSON without a renderer, which buries the one line that matters. Pure string builders plus
- * an ANSI-aware truncator, so this module needs no pi-tui import and degrades to "no renderer" on
- * older pi builds.
+ * an ANSI-aware truncator, so no pi-tui import is needed and older pi builds degrade to "no renderer".
  */
 import { TODO_EDIT_CUSTOM_TYPE, type TodoEditPayload } from './todo-core.ts';
 import { SUBS_CUSTOM_TYPE, type SubsRegistry } from './subagent-core.ts';
@@ -81,10 +80,8 @@ function todoEditLines(data: unknown, theme: RenderTheme, expanded: boolean): st
   ];
 }
 
-/**
- * Registry card, shared by the subagent and terminal registries: a titled count line, plus one row
- * per entry when expanded. An empty or malformed registry renders a single dim placeholder.
- */
+/** Registry card, shared by the subagent and terminal registries: a titled count line plus one row
+ *  per entry when expanded; an empty or malformed registry renders one dim placeholder. */
 function registryLines<T>(
   items: readonly T[] | undefined,
   theme: RenderTheme,
@@ -162,13 +159,9 @@ function reminderLines(message: unknown, theme: RenderTheme, label: string, expa
 
 type LineBuilder = (data: unknown, theme: RenderTheme, expanded: boolean) => string[];
 
-/**
- * Register pier's transcript renderers. Returns the custom types actually registered, so the caller
- * can log coverage and tests can assert the degrade path.
- *
- * Each registration is individually guarded: a pi build without the API (pre-0.80.4) or a throwing
- * renderer must never break tool registration.
- */
+/** Register pier's transcript renderers and return the custom types actually registered, so the
+ *  caller can log coverage and tests can assert the degrade path. Each registration is individually
+ *  guarded: a pi build without the API or a throwing renderer must never break tool registration. */
 export function installRenderers(pi: unknown): string[] {
   const api = pi as RendererApi;
   const registered: string[] = [];

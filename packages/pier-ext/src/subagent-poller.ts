@@ -11,7 +11,7 @@ import { runtimePolicy, type RuntimePolicy } from './runtime-policy.ts';
 import type { JevRuntime } from './jev-client.ts';
 import { evaluateSettleVerdict, settleAskIsSafe, settleVerdictRequest } from './jev-core.ts';
 import { formatSettlementNotice, type SettlementNullReason } from './vocab.ts';
-import { buildBlockedGateNotice, type SubEntry } from './subagent-core.ts';
+import { buildBlockedGateNotice, sleep, type SubEntry } from './subagent-core.ts';
 import type { SessionIo } from './subagent-session.ts';
 import type { GitIo } from './subagent-spawn.ts';
 
@@ -96,13 +96,13 @@ export function planVacuumTick(input: {
 }
 
 /**
- * Closing text (only a terminal assistant message produces it) OR an ENDED turn settles.
- * Merely having an assistant message — the state a worker is in between tool calls, while the
- * next message streams — must NOT qualify, or live workers get announced as finished.
+ * Closing text (only a terminal assistant message produces it) OR an ENDED turn settles. Merely
+ * having an assistant message — the state between tool calls, while the next message streams — must
+ * NOT qualify, or live workers get announced as finished.
  *
- * OCC compaction hold: while the child compacts (or sits machine-paused before its continuation
- * turn) it is NOT settleable even with closing text — that turn was aborted on purpose and the
- * continuation is coming, so an early wake would be a false settlement.
+ * OCC compaction hold: a compacting child (or one machine-paused before its continuation turn) is
+ * not settleable even with closing text — that turn was aborted on purpose and the continuation is
+ * coming, so an early wake would be a false settlement.
  */
 export function isSettlementCandidate(input: {
   text: string | null;
@@ -178,12 +178,6 @@ export async function disposeSessionRoot(root: Context): Promise<void> {
 }
 
 /* ── poll loop ──────────────────────────────────────────────────── */
-
-function sleep(ms: number): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  setTimeout(resolve, ms);
-  return promise;
-}
 
 export interface PollerHost {
   client: HerdrClientLike;
@@ -310,10 +304,9 @@ export function createPoller(h: PollerHost): Poller {
         if (gate.kind === 'clear-gate') h.blockedGateNotified.delete(paneId);
 
         if (state === 'idle' || state === 'done') {
-          // Spawn can mis-attribute entry.sessionFile (herdr's report lags and the mtime fallback
-          // records the newest PRE-EXISTING session), freezing settlement detection until the
-          // vacuum timeout. Re-attribute from herdr's per-pane report before judging; only a null
-          // value falls back to the mtime-bounded resolve.
+          // Spawn can mis-attribute entry.sessionFile (herdr's report lags, and the mtime fallback
+          // records the newest PRE-EXISTING session), freezing settlement detection until the vacuum
+          // timeout. Re-attribute from herdr's per-pane report before judging.
           if (entry.sessionFile) {
             const fixed = await h.session.reattributeStaleSessionFile(paneId, cwd, current.injectTs, entry.sessionFile);
             if (fixed && fixed !== entry.sessionFile) {
@@ -374,11 +367,10 @@ export function createPoller(h: PollerHost): Poller {
             }
             entry.observationStartedAt = null;
 
-            // Null closing text is ambiguous — a mis-attributed transcript reads the same as a
-            // worker that truly died silent. Deterministic signal first: with NO readable
-            // candidate at all (activity false), "left no closing message" would be a lie — that
-            // is an attribution failure by definition. Otherwise ask jev to classify the tail we
-            // did read; fail-open keeps the legacy wording byte-identical.
+            // Null closing text is ambiguous — a mis-attributed transcript reads like a worker that
+            // died silent. Deterministic signal first: with NO readable candidate at all (activity
+            // false) "left no closing message" would be a lie. Otherwise ask jev to classify the tail
+            // we did read; fail-open keeps the legacy wording byte-identical.
             let nullReason: SettlementNullReason = 'silent';
             if (closing == null) {
               if (!s.activity) {

@@ -1,9 +1,5 @@
-/**
- * Master-process plugin mount (cordis loader + terminal/todo/subagent).
- *
- * Why: worker must never load bootstrap/subagent-poller (C3). This module is
- * dynamically imported only from the master branch of index.ts.
- */
+/** Master-process plugin mount (cordis loader + terminal/todo/subagent), dynamically imported from
+ *  the master branch of index.ts only: a worker must never load bootstrap/subagent-poller (C3). */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Server } from 'node:net';

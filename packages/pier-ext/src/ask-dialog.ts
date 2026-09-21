@@ -1,8 +1,8 @@
 /**
  * ask_user_question dialog: one pier-owned selector for single- and multi-select questions, rendered
- * through `ctx.ui.custom`. Both modes share it because the chrome — border rules, accent+bold title,
- * `→ ` cursor, dim descriptions, keyHint-style footer (dim key + muted verb) — must not diverge;
- * only the checkbox column, the hints and the selection counter are mode-specific.
+ * through `ctx.ui.custom`. Both modes share it so the chrome — border rules, accent+bold title,
+ * `→ ` cursor, dim descriptions, keyHint footer — cannot diverge; only the checkbox column, the
+ * hints and the selection counter are mode-specific.
  */
 import { styledWidth, truncateStyled, wrapStyled } from './ansi-text.ts';
 
@@ -21,11 +21,8 @@ export interface DialogConfig {
   options: readonly DialogOption[];
   /** Render the trailing free-text row. */
   allowOther: boolean;
-  /**
-   * 0-based recommended option. The cursor starts on it; multi mode also starts
-   * with it checked so a bare enter agrees with single mode's "take the
-   * recommendation" in both modes.
-   */
+  /** 0-based recommended option: the cursor starts on it, and multi mode also starts with it
+   *  checked so a bare enter agrees with single mode in both modes. */
   recommended?: number;
   /** true = toggle list (space toggles, enter confirms the set); false = pick-one (enter/space takes the cursor row). */
   multi: boolean;
@@ -129,12 +126,9 @@ export interface KeybindingsLike {
   getKeys(keybinding: string): string[];
 }
 
-/**
- * Key resolution, in order (first match wins). `binding` is the host action id consulted when the
- * factory received a keybindings manager; `sequences` are the raw fallbacks used when it did not
- * (older hosts, direct construction in tests). Mirrors pi's defaults; j/k are included so vim keys
- * work in both paths, like pi's own selector. `toggle` has no pi action of its own.
- */
+/** Key resolution, in order (first match wins). `binding` is the host action id consulted when the
+ *  factory received a keybindings manager; `sequences` are the raw fallbacks used when it did not
+ *  (older hosts, tests). Mirrors pi's defaults, plus j/k for vim keys; `toggle` has no pi action. */
 const KEY_RESOLUTION: ReadonlyArray<{ key: DialogKey; binding?: string; sequences: readonly string[] }> = [
   { key: 'up', binding: 'tui.select.up', sequences: ['\x1b[A', '\x1bOA', 'k'] },
   { key: 'down', binding: 'tui.select.down', sequences: ['\x1b[B', '\x1bOB', 'j'] },
@@ -180,10 +174,8 @@ interface DialogUiOptions {
   requestRender?: () => void;
 }
 
-/**
- * Numbered line for the typed-prompt fallback list (`1. Label (Recommended) — description`);
- * the dialog itself renders unnumbered rows.
- */
+/** Numbered line for the typed-prompt fallback list (`1. Label (Recommended) — description`); the
+ *  dialog itself renders unnumbered rows. */
 export function numberedOptionLine(option: DialogOption, index: number, recommended?: number): string {
   const marker = recommended === index ? RECOMMENDED_SUFFIX : '';
   const description = option.description ? ` — ${option.description}` : '';
@@ -301,11 +293,8 @@ export function createDialogComponent(opts: DialogUiOptions): DialogComponent {
   };
 }
 
-/**
- * Run the dialog through `ctx.ui.custom`.
- * Returns null when the host cannot render custom components (RPC mode / older pi),
- * so the caller can fall back to the host select dialog or the typed prompt.
- */
+/** Run the dialog through `ctx.ui.custom`. Returns null when the host cannot render custom components
+ *  (RPC mode / older pi), so the caller can fall back to the select dialog or the typed prompt. */
 export async function runSelectDialog(
   custom: (factory: unknown) => Promise<unknown>,
   title: string,

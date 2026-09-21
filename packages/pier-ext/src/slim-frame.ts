@@ -1,30 +1,17 @@
 /**
- * D97 slim frame: when a pane is too narrow or short for the minimum usable TUI,
- * cover it with a non-capturing overlay. Content is three-tier: full TUI (overlay
- * hidden), an activity-anchored todo window when ≥3 rows fit, else the pane title.
+ * D97 slim frame: a pane too narrow/short for the minimum usable TUI gets a non-capturing overlay
+ * instead of a continuously repainting one — full TUI when it fits, an activity-anchored todo
+ * window when ≥3 rows fit, else the pane title. Content updates only on todo/status reports, so
+ * streaming thinking tokens can never reach it and the alt-screen diff produces no PTY output.
  *
- * Why (observed by the user): after the heat view compresses an unfocused pane, streaming worker thinking
- * continuously repaints the entire screen in the narrow pane, causing flicker. The static frame updates only on
- * todo_write/status reports (sharing arguments and source with formatPaneTitle), so thinking tokens cannot reach it;
- * alt-screen row-level diffing then produces zero PTY output and physically eliminates the flicker.
+ * Requires fullscreen TUI mode (buildLaunchParts injects it): the composite layer sits above the
+ * document, so only the alt-screen path can be covered. Registered only inside a herdr pane
+ * (PIER_SLIM_FRAME=0 opts out), as one process-local singleton whose overlay stays resident —
+ * `done()` is never called, so the pending promise is swallowed and never awaited.
  *
- * Prerequisite: worker/master run with --tui-mode fullscreen (injected by default by buildLaunchParts).
- * The regular main-screen full dump path (tui-main-screen firstChanged < viewportTop → full redraw) cannot be
- * covered by the overlay: composite is above the document, while the dump is inside the document.
- *
- * Registration gate: only inside a herdr pane (index.ts checks the environment), because covering an interactive
- * normal terminal window would be hazardous. Clicking a narrow herdr pane focuses it and the heat view expands it;
- * the visible predicate re-evaluates on every frame as SIGWINCH arrives, so the frame disappears automatically and
- * the real TUI remains underneath (agent/session/widget execution never stops).
- *
- * Lifecycle: one process-local singleton, registered once on session_start (not resume); the overlay stays resident
- * (done() is never called, leaving the Promise pending, swallowing rejection, and never awaiting it). If switching
- * pi sessions removes the overlay (resetExtensionUI), the static frame naturally exits without affecting the main
- * flow. PI_HERDR_SLIM_FRAME=0 is the escape hatch.
- * Resize watchdog (D98): the component owns a SIGWINCH listener plus a 1s size poll that call tui.requestRender() on
- * any PTY size change. Why: long-running sessions stop re-rendering on resize (observed in herdr — an idle master
- * shrunk by heat reflow froze on a stale clipped frame: no todo, no title), so pi's own resize wiring cannot be relied
- * on; columns/rows are read live per render, so one render is the whole fix. Stopped in dispose().
+ * Resize watchdog (D98): the component owns a SIGWINCH listener plus a 1 s poll, because
+ * long-running sessions stop re-rendering on resize (an idle master shrunk by heat froze on a
+ * stale clipped frame). Sizes are read live per render; both stop in dispose().
  */
 
 import { isArchived } from './stale-core.ts';
@@ -54,11 +41,9 @@ export function isSlimFrame(cols: number, rows: number): boolean {
 
 /* ── Width-aware wrapping lives in ansi-text (styledWidth / wrapStyled); the frame content is plain text ── */
 
-/**
- * Frame lines: wrap the title, center it vertically, and clamp to rows. Pad every line to full visible width:
- * row-wise overlay compositing would let the TUI underneath show through blank lines (leaking flicker),
- * while full-width spaces make the freeze genuinely opaque. Without a title, center one `·` (alive, no plan).
- */
+/** Frame lines: wrap the title, center it vertically, clamp to rows. Every line is padded to the
+ *  full visible width — row-wise compositing would otherwise let the TUI underneath show through
+ *  blank lines and leak the flicker this frame exists to hide. No title → one centered `·`. */
 export function frameLines(
   text: string,
   opts: { width: number; rows: number; colorize?: (s: string) => string },
@@ -109,10 +94,8 @@ export interface SlimFrameInput {
   now?: number;
 }
 
-/**
- * Choose overlay content: todo window when the pane can show ≥3 wrapped rows at ≥16 cols;
- * otherwise the pane title (or SLIM_EMPTY_COPY when the list is empty).
- */
+/** Choose overlay content: the todo window when the pane can show ≥3 wrapped rows at ≥16 cols,
+ *  otherwise the pane title (or SLIM_EMPTY_COPY when the list is empty). */
 export function slimContentLines(
   input: SlimFrameInput & { width: number; rows: number; colorize?: (s: string) => string },
 ): string[] {
@@ -274,10 +257,7 @@ export function resetForTest(): void {
 
 let active: SlimFrameComponent | null = null;
 
-/**
- * Register the static-frame overlay (idempotent: once per process). eventCtx is the pi lifecycle event context
- * (the session_start ctx, sourced from the same place as the todo widget's widgetUi).
- */
+/** Register the static-frame overlay (idempotent, once per process) from the session_start ctx. */
 export function registerSlimFrame(eventCtx: unknown): void {
   if (active) return;
   if (pierOption('PIER_SLIM_FRAME') === '0') return;

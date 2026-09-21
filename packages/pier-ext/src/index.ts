@@ -12,9 +12,8 @@
  *  - index-worker.ts   worker/bare-pi mount (todo only)                        [dynamic]
  *  - plugins/*.ts      cordis plugin entries; pure logic lives in top-level *-core.ts
  *
- * pi 0.84.2 contract: onUpdate must have AgentToolResult shape (a string crashes
- * the TUI); tool-result details persist in session JSONL and getBranch() replay
- * implements branch rollback.
+ * pi contract: onUpdate must have AgentToolResult shape (a string crashes the TUI); tool-result
+ * details persist in session JSONL and getBranch() replay implements branch rollback.
  */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import {
@@ -593,7 +592,7 @@ export default async function (pi: ExtensionAPI) {
       try {
         await pruneSessionObjects(sessionRoot);
       } catch {
-        /* ignore shutdown pruning errors */
+        /* Pruning is opportunistic. */
       }
     }
     client.close();

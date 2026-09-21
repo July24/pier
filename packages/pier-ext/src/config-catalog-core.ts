@@ -1,10 +1,10 @@
 /**
  * D104 config catalog core (pure).
  *
- * Single source of truth for the five pier configuration planes: knob descriptors,
- * effective-value provenance (env > workspace > user > default) and text rendering for
- * `/pier-config show|check|doc`. The `env` plane is derived from the `PIER_OPTIONS`
- * registry (pier-options.ts), so the catalog cannot disagree with the runtime readers.
+ * Single source of truth for the five pier configuration planes: knob descriptors, effective-value
+ * provenance (env > workspace > user > default) and text rendering for `/pier-config show|check|doc`.
+ * The `env` plane is derived from the `PIER_OPTIONS` registry (pier-options.ts), so the catalog
+ * cannot disagree with the runtime readers.
  *
  * No I/O here; reading the real files/env and registering the command live in config-command.ts.
  * test/config-catalog.test.ts diffs the efficiency knobs against schemas/efficiency-config.schema.json.
@@ -121,11 +121,8 @@ const PI_KNOBS: readonly ConfigKnob[] = [
   { plane: 'pi', key: 'compaction.keepRecentTokens', kind: 'number', impact: 'Inherited as the OCC retention window when not set in the efficiency config', docRef: 'docs/efficiency-trial.md', readOnly: true },
 ];
 
-/**
- * Runtime policy / behaviour env knobs, derived from the `PIER_OPTIONS` registry:
- * `min` decides whether a knob is numeric, and its `fallback`/`description` are the
- * catalog's default value and impact line. Bounds mirror runtime-policy.ts.
- */
+/** Runtime policy / behaviour env knobs, derived from the `PIER_OPTIONS` registry: `min` decides
+ *  whether a knob is numeric, and `fallback`/`description` become its default and impact line. */
 const ENV_KNOBS: readonly ConfigKnob[] = PIER_OPTIONS.map((option) => ({
   plane: 'env' as const,
   key: option.name,
@@ -151,10 +148,8 @@ export function readDotted(obj: unknown, dotted: string): unknown {
   return cursor;
 }
 
-/**
- * Secret-shaped KEY names (not values). Deliberately narrower than a bare `token` match so
- * that legitimate keys like `compaction.keepRecentTokens` are still shown verbatim.
- */
+/** Secret-shaped KEY names (not values). Deliberately narrower than a bare `token` match so that
+ *  legitimate keys like `compaction.keepRecentTokens` are still shown verbatim. */
 const SECRET_LIKE = /(api[_-]?key|apikey|authorization|bearer|access[_-]?token|client[_-]?secret|password|credential)/i;
 
 export function formatValue(value: unknown): string {

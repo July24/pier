@@ -33,12 +33,17 @@ const placeholderMemo = new Map<string, MemoizedPlaceholder>();
 /** Subset of pi context messages this plugin reads; anything else is left untouched. */
 interface ContextMessage { role?: unknown; isError?: unknown; toolName?: unknown; toolCallId?: unknown; content?: unknown }
 
-function contentCharLength(content: readonly unknown[]): number {
-  let length = content.length - 1;
-  for (const b of content as Array<{ text?: unknown }>) {
-    if (b && typeof b.text === 'string') length += b.text.length;
-  }
-  return length;
+/** Text blocks of a non-error, text-only tool result plus the joined-content length (blocks are
+ * joined with newlines). Null leaves the message untouched. Shared by the projection fast path and
+ * the compaction batch path so eligibility cannot drift. */
+function toolResultContent(msg: unknown): { texts: string[]; charLength: number } | null {
+  const m = msg as ContextMessage | undefined;
+  if (!m || m.role !== 'toolResult' || m.isError) return null;
+  const content = m.content;
+  if (!Array.isArray(content) || content.length === 0) return null;
+  if (!content.every((b) => b && b.type === 'text' && typeof b.text === 'string')) return null;
+  const texts = (content as Array<{ text: string }>).map((b) => b.text);
+  return { texts, charLength: texts.length - 1 + texts.reduce((n, text) => n + text.length, 0) };
 }
 
 /** Id + placeholder for a candidate message, derived from name/call/text (no I/O). */
@@ -100,11 +105,9 @@ interface ExcerptMiddlePick {
 /** P0-3 seam: async middle-window picker (jev-backed); null keeps the legacy head+tail halves. */
 export type PickMiddleExcerpt = (text: string, excerptBudgetBytes: number) => Promise<ExcerptMiddlePick | null>;
 
-/**
- * Build the OCC `onBeforeCompact` hook: role-gated, config-gated batch packing of the branch's
- * large tool results before `ctx.compact()` rewrites the prefix. Exported (rather than inlined in
- * index.ts) so the gate behaviour is unit-testable.
- */
+/** Build the OCC `onBeforeCompact` hook: role-gated, config-gated batch packing of the branch's
+ * large tool results before `ctx.compact()` rewrites the prefix. Exported so the gate behaviour is
+ * unit-testable without index.ts. */
 export function createCompactionBatchPackHook(deps: {
   getObsConfig: () => ObservationPackConfig;
   getManifest?: () => RuntimeRoleManifest | null;
@@ -137,12 +140,9 @@ export function createCompactionBatchPackHook(deps: {
   };
 }
 
-/**
- * Shared packing primitive: derive id/placeholder, archive the object, memoize it, and append the
- * `observation.jsonl` record exactly once. Keeping memo + telemetry in one place prevents the
- * "memo written but log forgotten" (or vice versa) divergence between projection and batch paths.
- * Returns the placeholder, or null when the object could not be stored.
- */
+/** Shared packing primitive: derive id/placeholder, archive the object, memoize it, and append the
+ * `observation.jsonl` record exactly once — memo + telemetry in one place keeps the projection and
+ * batch paths from diverging. Returns the placeholder, or null when the object could not be stored. */
 async function packOneMessage(opts: {
   sessionRoot: string;
   toolName: string;
@@ -207,22 +207,15 @@ interface PackCandidate { toolName: string; toolCallId: string; text: string; te
 /** Eligibility shared by the projection path and the compaction batch path; null = leave untouched. */
 function packCandidateAt(messages: readonly unknown[], index: number, sessionRoot: string): PackCandidate | null {
   const msg = messages[index] as ContextMessage | undefined;
-  if (!msg || msg.role !== 'toolResult' || msg.isError) return null;
-  const content = msg.content;
-  if (!Array.isArray(content) || content.length === 0) return null;
-  if (!content.every((b) => b && b.type === 'text' && typeof b.text === 'string')) return null;
-  const text = (content as Array<{ text: string }>).map((b) => b.text).join('\n');
-  const toolName = typeof msg.toolName === 'string' ? msg.toolName : 'tool';
-  const toolCallId = typeof msg.toolCallId === 'string' ? msg.toolCallId : `call_${index}`;
-  if (placeholderMemo.has(memoKeyFor(sessionRoot, toolCallId, contentCharLength(content)))) return null;
+  const content = toolResultContent(msg);
+  if (!content) return null;
+  const { texts, charLength } = content;
+  const text = texts.join('\n');
+  const toolName = typeof msg?.toolName === 'string' ? msg.toolName : 'tool';
+  const toolCallId = typeof msg?.toolCallId === 'string' ? msg.toolCallId : `call_${index}`;
+  if (placeholderMemo.has(memoKeyFor(sessionRoot, toolCallId, charLength))) return null;
   if (containsReducerReceipt(text)) return null;
-  return {
-    toolName,
-    toolCallId,
-    text,
-    textBytes: Buffer.byteLength(text, 'utf8'),
-    charLength: contentCharLength(content),
-  };
+  return { toolName, toolCallId, text, textBytes: Buffer.byteLength(text, 'utf8'), charLength };
 }
 
 export async function batchPackObservations(opts: {
@@ -392,15 +385,13 @@ async function projectPlaceholders(
 
   for (let i = 0; i < len; i++) {
     const msg = projected[i];
-    if (!msg || msg.role !== 'toolResult' || msg.isError) continue;
-    const content = msg.content;
-    if (!Array.isArray(content) || content.length === 0) continue;
-    if (!content.every((b) => b && b.type === 'text' && typeof b.text === 'string')) continue;
+    const content = toolResultContent(msg);
+    if (!content || !msg) continue;
 
     const toolCallId = typeof msg.toolCallId === 'string' ? msg.toolCallId : `call_${i}`;
     // N1' fast path: the memo is keyed by session+call+content length, so it answers before the text
     // join, the receipt scan, and the byte count — once packed, a message stays packed until eviction.
-    const memoKey = memoKeyFor(sessionRoot, toolCallId, contentCharLength(content));
+    const memoKey = memoKeyFor(sessionRoot, toolCallId, content.charLength);
     const memoized = placeholderMemo.get(memoKey);
     if (memoized) {
       placeholderMemo.delete(memoKey); // refresh LRU position

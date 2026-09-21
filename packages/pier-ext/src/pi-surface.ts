@@ -1,14 +1,13 @@
 /**
  * Proxy the pi ExtensionAPI registration surface (D79).
  *
- * pi 0.86+: `pi.on()` returns an unsubscribe function, so event handlers are truly removed
- * when their generation retires (P1, RFC docs/rfc-pi-0.86-dynamic-tools.md §5). Tools and
- * commands still have no unregister API: tools overwrite by name, so retired generations
- * keep tombstoned wrappers there (inert execute / inert handler).
+ * pi 0.86+ `pi.on()` returns an unsubscribe, so event handlers are truly removed when their
+ * generation retires (RFC docs/rfc-pi-0.86-dynamic-tools.md §5). Tools and commands have no
+ * unregister API: tools overwrite by name, so retired generations keep tombstoned wrappers there.
  *
- * Because HMR emits reload after mounting the replacement (d87), mounting a key retires
- * older generations immediately. The ledger then collects only generations registered
- * through the reload boundary; explicit disposal retires every generation.
+ * HMR emits reload after mounting the replacement (d87), so mounting a key retires older
+ * generations immediately; the ledger then collects only generations registered through the reload
+ * boundary, while explicit disposal retires every generation.
  */
 import type { DisposeLedger } from './ledger.ts';
 
@@ -67,11 +66,9 @@ export class PiSurface<P extends object> {
     return this.pi;
   }
 
-  /**
-   * Get a module-scoped registration surface. Each call creates a new generation, retiring older
-   * generations for the same key so HMR replacement and manual remounting share one lifecycle.
-   * The ledger registers each key once and registers it again only after its entry is consumed.
-   */
+  /** Get a module-scoped registration surface. Each call creates a new generation, retiring older
+   *  ones for the same key; the ledger registers each key once and again only after its entry is
+   *  consumed. */
   forModule(key: string): ScopedSurface {
     this.epochCounter += 1;
     const epoch = this.epochCounter;
@@ -121,10 +118,9 @@ export class PiSurface<P extends object> {
           .registerCommand?.(name, wrapped ? { ...options, handler: wrapped } : options);
       },
       on: (event, handler) => {
-        // The wrapper is a pass-through while alive and a tombstone after retirement; when pi
-        // (0.86+) returns an unsubscribe, retirement additionally removes the registration so
-        // HMR churn cannot grow the dispatch list. The `on` view of generic P is the same
-        // unchecked DI seam as registerTool/registerCommand above; its return is typeof-narrowed.
+        // Pass-through while alive, tombstone after retirement; when pi (0.86+) returns an
+        // unsubscribe, retirement also removes the registration so HMR churn cannot grow the
+        // dispatch list. The `on` view of generic P is the same unchecked DI seam as above.
         const wrapped = (...a: unknown[]) => (group!.alive ? handler(...a) : undefined);
         const unsubscribe: unknown = (
           this.pi as { on?: (e: string, h: (...a: unknown[]) => unknown) => unknown }

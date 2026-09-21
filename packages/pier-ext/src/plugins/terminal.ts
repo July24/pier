@@ -3,8 +3,7 @@
  *
  * A Cordis loader plugin so the terminal surface stays hot-swappable: services provide the
  * tombstone-aware pi surface, the herdr client/environment and the state slot used by index GC.
- * Importing index.ts is avoided to keep the dependency graph acyclic; terminal-core holds the
- * pure, independently testable logic.
+ * terminal-core holds the pure, independently testable logic.
  */
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
@@ -68,7 +67,7 @@ export default function terminalPlugin(ctx: Context): void {
   // Keying the surface by this file lets HMR tombstone and replace exactly this registration.
   const scoped = surface.forModule(import.meta.url);
 
-  /* ── M14 resident terminal tools (D71 / T1–T6) ────────────────────
+  /* ── M14 resident terminal tools ──────────────────────────────────
    * Dedicated herdr panes preserve shell state without reusing the pi TUI pane, and active
    * terminal panes remain exempt from index GC. Workers omit this master-side entry. */
 
@@ -261,10 +260,8 @@ export default function terminalPlugin(ctx: Context): void {
     }
   }
 
-  /**
-   * Best-effort `set +H` right after a shell becomes usable: history expansion would otherwise wedge it.
-   * Returns whether the command was injected, so a shell that was not at its prompt yet retries later.
-   */
+  /** Best-effort `set +H` right after a shell becomes usable (history expansion would wedge it);
+   *  returns whether the command was injected, so a shell not yet at its prompt retries later. */
   async function injectShellInit(entry: TerminalEntry, readiness?: ReadinessTier): Promise<boolean> {
     const init = planShellInit({ strategy: promptStrategyFor(), readiness });
     if (!init.shouldInit || !init.command) return false;
@@ -388,11 +385,9 @@ export default function terminalPlugin(ctx: Context): void {
     };
   }
 
-  /**
-   * T5: a direct `pane_id` read is limited to panes in this session's own tab or to self-created
-   * terminal panes, so one task can never read another's pane. Returns the error text instead of
-   * throwing, keeping the tool's own hard-failure policy at the call site.
-   */
+  /** T5: a direct `pane_id` read is limited to panes in this session's own tab or to self-created
+   *  terminal panes, so one task can never read another's pane. Returns the error text instead of
+   *  throwing, keeping the tool's hard-failure policy at the call site. */
   async function resolveDirectPaneId(paneId: string): Promise<{ ok: true; paneId: string } | { ok: false; error: string }> {
     let panes;
     try {

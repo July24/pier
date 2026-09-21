@@ -9,26 +9,20 @@ import type { HerdrClientLike } from './herdr-client.ts';
 import { isPathInside, planIsolateSweep, shouldClosePane, shouldCloseTaskTab } from './gc-core.ts';
 import { runtimePolicy } from './runtime-policy.ts';
 import { swallow } from './swallow.ts';
-import { evaluateRelease, foldSubsRegistry, makeRegistry, parseWorktreePorcelain, SUBS_CUSTOM_TYPE, type SubEntry } from './subagent-core.ts';
+import { evaluateRelease, foldSubsRegistry, makeRegistry, parseWorktreePorcelain, sleep, SUBS_CUSTOM_TYPE, type SubEntry } from './subagent-core.ts';
 import type { GitIo } from './subagent-spawn.ts';
 import type { TerminalStateSlot } from './plugins/terminal.ts';
 
-function sleep(ms: number): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  setTimeout(resolve, ms);
-  return promise;
-}
-
 /* ── registry projection + recovery ─────────────────────────────── */
 
-export interface SubagentRegistryHost {
+interface SubagentRegistryHost {
   pi: { appendEntry?: (customType: string, data: unknown) => void };
   client: HerdrClientLike;
   subs: Map<string, SubEntry>;
   writeHistory: (entry: SubEntry, patch?: { status?: SubEntry['status']; closedAt?: number }, via?: string) => void;
 }
 
-export interface SubagentRegistry {
+interface SubagentRegistry {
   /** Append the registry snapshot to the session branch; duplicate snapshots are skipped. */
   persist(): void;
   /** Replay `pi-herdr.subs` entries from the session branch into the live map. */
@@ -90,7 +84,7 @@ export function createSubagentRegistry(host: SubagentRegistryHost): SubagentRegi
 
 /* ── GC ─────────────────────────────────────────────────────────── */
 
-export interface GcHost {
+interface GcHost {
   client: HerdrClientLike;
   env: { tabId: string; paneId?: string } | null;
   subs: Map<string, SubEntry>;
@@ -103,7 +97,7 @@ export interface GcHost {
   injectNotice(content: string): Promise<void>;
 }
 
-export interface GcController {
+interface GcController {
   runGcSafely(): Promise<void>;
   onTurnStart(): Promise<void>;
   startTicker(ctx: Context): void;

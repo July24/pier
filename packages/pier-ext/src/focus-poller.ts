@@ -1,8 +1,7 @@
 /**
- * D-4: herdr 0.9.0 resolved mouse focus client-side, so `pane.focused` never reached plugins and each pier
- * pane had to sample `layout.export` itself. 0.9.1 delivers the hook, so default polling is off (0 ms) on
- * ≥0.9.1 to avoid a second reflow ~8 s after a click; older servers keep the 1500 ms sampler.
- * `PIER_FOCUS_POLL_MS` overrides either default; 0 disables.
+ * D-4: herdr 0.9.1+ delivers `pane.focused`, so default polling is off (0 ms) there — a sampler
+ * would reflow a second time ~8 s after a click; older servers keep the 1500 ms sampler.
+ * `PIER_FOCUS_POLL_MS` overrides either default, 0 disables.
  */
 import { spawn } from 'node:child_process';
 import { dirname, join } from 'node:path';
@@ -31,10 +30,8 @@ export function isHerdr091OrLater(version?: string | null): boolean {
 export function resolveDefaultFocusPollMs(herdrVersion?: string | null): number {
   return isHerdr091OrLater(herdrVersion) ? FOCUS_POLL_HERDR_091_MS : FOCUS_POLL_DEFAULT_MS;
 }
-/**
- * Minimum gap between two reflow triggers. Re-clicking the same pane quickly must not spawn a
- * process per click; the workbench debounces per tab (150 ms) on top of this.
- */
+/** Minimum gap between two reflow triggers: re-clicking the same pane must not spawn a process per
+ *  click; the workbench debounces per tab (150 ms) on top of this. */
 export const FOCUS_FIRE_MIN_INTERVAL_MS = 700;
 
 export interface FocusSample {
@@ -84,12 +81,10 @@ export interface FocusTick {
 }
 
 /**
- * Decide whether one sample should trigger a reflow.
- *
- * Fires only on a *transition* into "I am focused" (a steady focus never re-triggers) and at most once per
- * `minIntervalMs`. `cause` is 'user' when the pane set did not change in the same sample: a click moves focus
- * and nothing else, whereas a spawn auto-focus always comes with a new pane. The workbench uses that to keep
- * its 3 s pane-age whitelist (F1: a freshly created pane must not grab the layout through an automatic focus).
+ * Decide whether one sample should trigger a reflow: only on a *transition* into "I am focused",
+ * and at most once per `minIntervalMs`. `cause` is 'user' when the pane set did not change in the
+ * same sample (a click moves focus and nothing else, a spawn auto-focus comes with a new pane), so
+ * the workbench can keep its pane-age whitelist. Baseline sample never fires.
  */
 export function planFocusTick(opts: {
   myPaneId: string;
@@ -210,11 +205,8 @@ export interface SpawnReflowOpts {
   spawnFn?: typeof spawn;
 }
 
-/**
- * Fire-and-forget replay of the `pane.focused` hook.
- * Why a child process: it is exactly how herdr runs the hook, so the workbench script keeps its own
- * event parsing, debounce and state file — pier never duplicates layout logic.
- */
+/** Fire-and-forget replay of the `pane.focused` hook as a child process — exactly how herdr runs it,
+ *  so the workbench script keeps its own event parsing, debounce and state file. */
 export function spawnReflow(opts: SpawnReflowOpts): void {
   const env = opts.env ?? process.env;
   const spawnFn = opts.spawnFn ?? spawn;

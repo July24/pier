@@ -2,8 +2,7 @@
  * Subagent spawn domain: git/worktree I/O, task-tab pane placement, launch line, readiness wait,
  * and the `spawn` action (isolate creation, prompt injection, foreground wait).
  *
- * Placement is serialized by a mutex (concurrent spawns raced on tab lookup) and readiness
- * failures explain themselves instead of collapsing into a bare timeout.
+ * Placement is serialized by a mutex (concurrent spawns raced on tab lookup).
  */
 import { execFile as nodeExecFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -36,6 +35,7 @@ import {
   planIsolateWorktree,
   planLaunchValidation,
   planTabPlacement,
+  sleep,
   type SubEntry,
   type TabPlacementPlan,
   type WorktreeZone,
@@ -46,12 +46,6 @@ import type { Poller } from './subagent-poller.ts';
 import type { SessionIo } from './subagent-session.ts';
 
 const statAsync = promisify(statCb);
-
-function sleep(ms: number): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  setTimeout(resolve, ms);
-  return promise;
-}
 
 /* ── git adapter ────────────────────────────────────────────────── */
 
@@ -73,11 +67,8 @@ export type GitExecFile = (
   options: { timeout: number; encoding: 'utf8'; maxBuffer: number },
 ) => Promise<{ stdout: string; stderr: string }>;
 
-/**
- * Output ceiling for one git call. execFile defaults to 1MB, which a large checkout exceeds
- * (`status --porcelain` with tens of thousands of untracked files): the call then fails with
- * ENOBUFS, callers normalize it to null, and the user sees a silently missing stat line.
- */
+/** Output ceiling for one git call (execFile's 1MB default is exceeded by a large checkout, and
+ * `status --porcelain` then fails ENOBUFS into a silently missing stat line). */
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 
 export interface GitAdapter {
@@ -211,7 +202,7 @@ const READY_LIVENESS_SAMPLE_MS = 2500;
 /** Enough of the pane tail to carry a stack trace head into the failure text. */
 const READY_TAIL_CHARS = 1200;
 
-export interface ReadyFailure {
+interface ReadyFailure {
   readonly paneId: string;
   readonly reason: 'pane-gone' | 'timeout';
   readonly elapsedMs: number;
@@ -227,10 +218,8 @@ type ReadyAttemptPlan =
   | { readonly kind: 'retry'; readonly delayMs: number }
   | { readonly kind: 'give-up'; readonly reason: 'pane-gone' | 'timeout' };
 
-/**
- * Decide one readiness attempt. `alive` is tri-state on purpose: an unavailable liveness probe
- * (`null`) must not be read as death, or a slow herdr socket fails spawns that are merely slow.
- */
+/** Decide one readiness attempt. `alive` is tri-state on purpose: an unavailable liveness probe
+ * (`null`) must not be read as death, or a slow herdr socket fails spawns that are merely slow. */
 export function planReadyAttempt(opts: {
   elapsedMs: number;
   attempt: number;
@@ -250,11 +239,9 @@ export function readyBackoffMs(attempt: number, baseMs = READY_BASE_INTERVAL_MS,
   return Math.min(capMs, baseMs * 2 ** n);
 }
 
-/**
- * Failure text for the model. Three cases must stay distinguishable: the pane died (usually a
- * crash — the tail carries the reason), the pane is alive but never opened its pipe (extension
- * failed to load / wrong pane env), and the pane is alive and working, just slower than timeout.
- */
+/** Failure text for the model. The three cases stay distinguishable: the pane died (usually a
+ * crash — the tail carries the reason), the pane is alive but never opened its pipe, and the pane
+ * is alive and working, just slower than the timeout. */
 export function readyFailureText(failure: ReadyFailure): string {
   const seconds = Math.round(failure.elapsedMs / 1000);
   const head = failure.reason === 'pane-gone'
@@ -272,7 +259,7 @@ export function readyFailureText(failure: ReadyFailure): string {
 
 /* ── spawner ────────────────────────────────────────────────────── */
 
-export interface SpawnEnv {
+interface SpawnEnv {
   paneId: string;
   tabId: string;
   workspaceId: string;
@@ -287,7 +274,7 @@ interface SpawnerHost {
   readinessTimeoutMs?: number;
 }
 
-export type ReadyOutcome = { ok: true } | { ok: false; message: string };
+type ReadyOutcome = { ok: true } | { ok: false; message: string };
 
 export interface Spawner {
   spawnPaneInTaskTab(
@@ -528,7 +515,7 @@ export function createSpawner(h: SpawnerHost): Spawner {
 
 /* ── spawn action ───────────────────────────────────────────────── */
 
-export interface SpawnActionHost {
+interface SpawnActionHost {
   client: HerdrClientLike;
   env: SpawnEnv | null;
   subSemaphore: Semaphore;
@@ -717,8 +704,7 @@ export function createSpawnAction(h: SpawnActionHost) {
       }
 
       // Foreground waiting uses a content gate plus a patience threshold before backgrounding:
-      // treating idle as settled with a hard window misclassified real multi-minute working
-      // periods as "no output" and consumed healthy subagents that produced results right after.
+      // an idle-as-settled hard window consumed healthy subagents that produced results right after.
       const patienceDeadline = Date.now() + runtimePolicy.foregroundPatienceMs;
       let text: string | null = null;
       let settledKind: 'settled' | 'timeout' = 'timeout';

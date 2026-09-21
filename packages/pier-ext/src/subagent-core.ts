@@ -5,6 +5,13 @@
  */
 import { normalizeEntryKind } from './history-store.ts';
 
+/** Shared backoff sleep for the subagent adapters (poll loops, readiness probes, GC pacing). */
+export function sleep(ms: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  return promise;
+}
+
 export interface SubagentSpec {
   description: string;
   prompt: string;
@@ -179,10 +186,8 @@ export function makeRegistry(subs: SubEntry[] = []): SubsRegistry {
 
 const SUB_STATUSES: Record<string, true> = { running: true, settled: true, consumed: true, closed: true };
 
-/**
- * Replay `pi-herdr.subs` custom branch entries into a registry; last snapshot wins.
- * Tolerant of v1 rows (missing taskId/kind/tabName) and unknown future fields.
- */
+/** Replay `pi-herdr.subs` custom branch entries into a registry; last snapshot wins. Tolerant of
+ *  v1 rows (missing taskId/kind/tabName) and unknown future fields. */
 export function foldSubsRegistry(entries: ReadonlyArray<{ type?: string; customType?: string; data?: unknown }>): SubsRegistry {
   let found = makeRegistry();
   for (const entry of entries) {
@@ -449,10 +454,8 @@ type LaunchValidation =
     tab: string | null;
   };
 
-/**
- * Validate spawn parameters. `role` doubles as the pane label and (when it names a profile) the
- * manifest to compose; unknown names stay labels. `isolate` and `cwd` are mutually exclusive.
- */
+/** Validate spawn parameters. `role` doubles as the pane label and (when it names a profile) the
+ *  manifest to compose; unknown names stay labels. `isolate` and `cwd` are mutually exclusive. */
 export function planLaunchValidation(
   params: {
     description?: unknown;
@@ -525,10 +528,8 @@ type TaskIdResolutionResult =
   | { kind: 'too_short'; query: string }
   | { kind: 'not_found'; query: string };
 
-/**
- * Resolve a full or short task ID against known candidates. Exact matches are accepted at any
- * length; prefix matching requires four characters and reports ambiguity with sorted candidates.
- */
+/** Resolve a full or short task ID against known candidates: exact matches at any length, prefix
+ *  matches need four characters, ambiguity is reported with sorted candidates. */
 export function resolveTaskIdPrefix(
   query: string,
   candidates: Iterable<string>,
@@ -554,7 +555,7 @@ export function resolveTaskIdPrefix(
 
 /* ── outbound port (composition root → plugin) ──────────────────── */
 
-/** Bound atomically: a missing bag used to crash at mount when index mutated it field by field. */
+/** Bound atomically at session_start: consumers read `current` and must tolerate null. */
 export interface SubagentPort {
   applyReplySession(paneId: string, sessionFile: string | null): void;
   reconcileOnReply(paneId: string): string[];

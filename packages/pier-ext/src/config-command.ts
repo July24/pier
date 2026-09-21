@@ -2,11 +2,10 @@
  * D104 `/pier-config`: probes the five configuration planes (real files + process env), renders
  * `show|check|doc|doctor`, and registers the command.
  *
- * Read-only by design: the command reports effective values with their provenance and hands the
- * actual edit to the agent under the existing write-lock + diff-confirmation flow; only the opt-in
- * `doc` report writes a file. Fail-open: every read is wrapped, so a broken plane degrades to a
- * reported issue instead of throwing into pi's command pipeline. All paths are injectable, so tests
- * never touch the developer's real home directory.
+ * Read-only by design: effective values are reported with their provenance and the actual edit goes
+ * to the agent under the write-lock + diff-confirmation flow; only the opt-in `doc` report writes a
+ * file. Fail-open: every read is wrapped, so a broken plane degrades to a reported issue instead of
+ * throwing into pi's command pipeline. All paths are injectable, so tests never touch a real home dir.
  */
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
@@ -162,7 +161,6 @@ export function collectConfigSnapshot(deps: ConfigGuideDeps = {}): ConfigGuideSn
     : [`${piSettingsPath}: not found (pi defaults apply; use pi's /settings to create it)`];
   files.pi.push({ path: piSettingsPath, label: 'agent', exists: piSettingsExists });
 
-  /* env */
   const envIssues = checkEnvKnobs(env);
   files.env.push({ path: '(process environment)', label: 'env', exists: true });
 
@@ -416,9 +414,9 @@ export function installConfigCommand(deps: ConfigCommandDeps): void {
       }
 
       if (sub === 'doctor') {
-        // B9/B10: one place to see every pier option (canonical name, effective value, source) and the
-        // errors that were deliberately swallowed this session. Without it, a silently failing
-        // best-effort path stays invisible until something else breaks.
+        // B9/B10: one place for every pier option (canonical name, effective value, source) and the
+        // errors deliberately swallowed this session — otherwise a failing best-effort path stays
+        // invisible until something else breaks.
         emit([
           'pier doctor',
           '',

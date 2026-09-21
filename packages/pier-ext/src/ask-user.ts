@@ -184,9 +184,8 @@ function parseOptions(raw: unknown): { ok: true; options: AskOption[] } | { ok: 
   for (const item of raw) {
     const rec = asRecord(item);
     const rawLabel = typeof rec?.label === 'string' ? rec.label.trim() : '';
-    // B3: models often repeat the UI's own marker (`label: 'Redis (Recommended)'`), which rendered
-    // as "Redis (Recommended) (Recommended)". Only a trailing bracketed marker is stripped, so a
-    // label that merely mentions the word ("Recommended approach") survives untouched.
+    // B3: models often repeat the marker the UI appends (label: 'Redis (Recommended)' rendered as
+    // "Redis (Recommended) (Recommended)"). Only a trailing bracketed marker is stripped.
     const label = rawLabel.replace(/\s*[([]\s*recommended\s*[)\]]\s*$/i, '').trim();
     if (!label) {
       return fail(
@@ -334,8 +333,8 @@ async function askOtherText(ui: AskUi, question: AskQuestion, signal?: AbortSign
  * Single-select: a listed line or its number takes that option, the Other number opens the free-text
  * prompt, anything else is a custom answer — but only on the typed fallback, since a real select
  * dialog can only return a listed row. Multi-select: comma/space separated numbers, the Other number
- * alone opens free text, an empty submission is an empty selection, anything else is custom when the
- * question offers free text. Returns 'other' to ask for free text, undefined to decline.
+ * alone opens free text, an empty submission is an empty selection. Returns 'other' to ask for free
+ * text, undefined to decline.
  */
 function parseTypedPicks(
   question: AskQuestion,
@@ -383,11 +382,8 @@ function parseTypedPicks(
     : undefined;
 }
 
-/**
- * Ask one question, both modes: the pier dialog, then the host's select dialog (single only),
- * then the typed prompt. `ui.custom` is absent (or resolves undefined) in RPC mode, which is why
- * every rung has a fallback.
- */
+/** Ask one question, both modes: the pier dialog, then the host's select dialog (single only), then
+ *  the typed prompt. `ui.custom` is absent (or resolves undefined) in RPC mode, hence every rung. */
 async function askQuestion(ui: AskUi, question: AskQuestion, signal?: AbortSignal): Promise<AskAnswer | undefined> {
   const { multi } = question;
   if (typeof ui.custom === 'function') {
