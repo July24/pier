@@ -44,7 +44,7 @@ The installer also verifies node / pi / herdr versions, probes local paths, and 
 |---|---|
 | `todo_write` | Full-replacement todo list. Session JSONL is the single source of truth; correct rollback on branch switches. Projected live onto the pane title (`▶i ○p ■b ✓c (N/M) · current task`). `/todos` command to view/edit/unblock |
 | `subagent` | Delegate self-contained subtasks to an isolated pi session in its own herdr pane. Actions: `spawn` (default; foreground / parallel / background), `list`, `send`, `interrupt`, `resume`, `output` (incremental preview of a running subagent's pane output), `role` (switch that worker's role profile mid-session — pi 0.86 records the toolset change as a transcript delta, so it applies on the worker's next request and survives resume) |
-| `ask_user_question` | Human gate: 2-5 authored options plus a trailing free-text row (`allowOther: false` for pure choice); multiple related questions per call. A `multi: true` question opens an interactive toggle list (space toggles, `a` all, enter confirms, esc declines); pane shows blocked in herdr while waiting |
+| `ask_user_question` | Human gate: 2-5 authored options plus a trailing free-text row (`allowOther: false` for pure choice); multiple related questions per call. TUI renders single- and multi-select through one picker dialog (multi adds checkboxes: space toggles, `a` all, live count; `recommended` seeds the cursor and pre-checks in multi); pane shows blocked in herdr while waiting |
 | `terminal` | Persistent interactive shells in dedicated herdr panes. Actions: `open`, `send`, `read`, `signal`, `close`, `list` |
 
 ### Commands
@@ -73,7 +73,7 @@ This extension mutates the pi session even outside herdr. After `pi install npm:
 | Surface | Bare `pi` (no `HERDR_ENV`) | Inside herdr |
 |---|---|---|
 | `todo_write`, `/todos`, widget, anti-freeze, stop reminder | live | live |
-| `ask_user_question` | live (TUI select/input; multi questions use the toggle list) | live + blocked marker |
+| `ask_user_question` | live (TUI picker for single and multi; host select dialog / typed prompts as RPC fallback) | live + blocked marker |
 | Blocked reporting for blocking `ctx.ui` dialogs (`ui_prompt_start/end`, `select`/`confirm`/`input`/`editor`) | live | live + blocked marker |
 | Hidden inject (`before_agent_start` todo-read; settle reminder) | live | live |
 | `subagent`, `terminal` | **not registered** | live |

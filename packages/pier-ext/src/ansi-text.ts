@@ -81,3 +81,61 @@ export function truncateStyled(line: string, width: number): string {
   }
   return `${out}\x1b[0m…`;
 }
+
+/**
+ * Wrap a styled line to `width` cells, preferring space breaks and never
+ * splitting a wide glyph or an escape sequence. Open SGR codes are re-emitted
+ * at continuation starts so a style spanning the break (a dim description)
+ * survives the wrap; emitted lines end with a reset when a style is open.
+ */
+export function wrapStyled(line: string, width: number): string[] {
+  if (width <= 0) return [''];
+  const out: string[] = [];
+  let current = '';
+  let used = 0;
+  let spaceAt = -1; // index in `current` of the last breakable space
+  let open = '';    // SGR codes active at the scan position
+  let i = 0;
+  while (i < line.length) {
+    SGR.lastIndex = i;
+    const m = SGR.exec(line);
+    if (m && m.index === i) {
+      current += m[0];
+      open = m[0] === '\x1b[0m' ? '' : open + m[0];
+      i += m[0].length;
+      continue;
+    }
+    const cp = line.codePointAt(i)!;
+    const w = charWidth(cp);
+    const chunk = cp > 0xffff ? line.slice(i, i + 2) : line[i]!;
+    if (used + w > width && used > 0) {
+      // A space that overflows breaks right there; otherwise rewind to the
+      // last space so words stay whole.
+      const atSpace = chunk === ' ';
+      const head = !atSpace && spaceAt > 0 ? current.slice(0, spaceAt) : current;
+      const tail = !atSpace && spaceAt > 0 ? current.slice(spaceAt + 1) : '';
+      out.push(head.replace(/ +$/, '') + (open ? '\x1b[0m' : ''));
+      current = open + tail;
+      used = styledWidth(tail);
+      const tailSpace = tail.lastIndexOf(' ');
+      spaceAt = tailSpace > 0 ? open.length + tailSpace : -1;
+      if (atSpace) i += 1; // the breaking space is consumed, not re-processed
+      continue; // re-evaluate the pending char on the fresh line
+    }
+    if (used + w > width) {
+      // A glyph wider than the whole line (width 1): emit it alone.
+      out.push(current + chunk + (open ? '\x1b[0m' : ''));
+      current = open;
+      used = 0;
+      spaceAt = -1;
+      i += cp > 0xffff ? 2 : 1;
+      continue;
+    }
+    current += chunk;
+    used += w;
+    if (chunk === ' ') spaceAt = current.length - 1;
+    i += cp > 0xffff ? 2 : 1;
+  }
+  if (current || out.length === 0) out.push(current);
+  return out;
+}

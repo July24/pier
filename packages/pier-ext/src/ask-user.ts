@@ -6,10 +6,10 @@
  * so the model cannot forget a free-text escape and Esc is a real decline.
  */
 import { Type } from 'typebox';
-import { runMultiSelect } from './ask-multi.ts';
+import { OTHER_ROW_LABEL, runSelectDialog, type DialogConfig } from './ask-dialog.ts';
 
 export const ASK_TOOL_NAME = 'ask_user_question';
-export const OTHER_OPTION = 'Other (type your own)';
+export const OTHER_OPTION = OTHER_ROW_LABEL;
 export const OTHER_ANSWER = 'Other';
 export const RECOMMENDED_SUFFIX = ' (Recommended)';
 export const MIN_OPTIONS = 2;
@@ -121,6 +121,9 @@ export type AskUi = {
   input: (title: string, placeholder?: string, opts?: { signal?: AbortSignal }) => Promise<string | undefined>;
   /** TUI-only: full custom components (absent in RPC mode, where it returns undefined). */
   custom?: (factory: unknown) => Promise<unknown>;
+  /** TUI-only helpers from pi's extension UI context; wired for ctrl+o parity with pi's selector. */
+  getToolsExpanded?: () => boolean;
+  setToolsExpanded?: (expanded: boolean) => void;
 };
 
 export type PrepareAskResult =
@@ -316,7 +319,57 @@ function withId(question: AskQuestion, answer: AskAnswer): AskAnswer {
   return question.id ? { ...answer, id: question.id } : answer;
 }
 
+/** Shared dialog config: same chrome either way; only `multi` switches the grammar. */
+function dialogConfig(question: AskQuestion, multi: boolean): DialogConfig {
+  return {
+    options: question.options,
+    allowOther: question.allowOther,
+    multi,
+    ...(question.recommended !== undefined ? { recommended: question.recommended } : {}),
+  };
+}
+
+/** Options threaded into the dialog: abort support plus ctrl+o parity when the host exposes it. */
+function dialogOptions(ui: AskUi, signal?: AbortSignal): { signal?: AbortSignal; toggleToolsExpanded?: () => void } {
+  const toggleToolsExpanded = ui.getToolsExpanded && ui.setToolsExpanded
+    ? () => ui.setToolsExpanded!(!ui.getToolsExpanded!())
+    : undefined;
+  return { ...(signal ? { signal } : {}), ...(toggleToolsExpanded ? { toggleToolsExpanded } : {}) };
+}
+
+/** Free-text answer behind the Other row; shared by the dialog and both fallback ladders. */
+async function askOtherText(ui: AskUi, question: AskQuestion, signal?: AbortSignal): Promise<AskAnswer | undefined> {
+  const typed = await ui.input(`${question.question}\n\n${CUSTOM_ANSWER_TITLE}`, '', signal ? { signal } : undefined);
+  if (typed == null || !typed.trim()) return undefined;
+  return withId(question, {
+    question: question.question,
+    kind: 'custom',
+    answer: OTHER_ANSWER,
+    customInput: typed.trim(),
+  });
+}
+
 async function askSingle(ui: AskUi, question: AskQuestion, signal?: AbortSignal): Promise<AskAnswer | undefined> {
+  // TUI path: the same pier dialog the multi path uses, so both modes share one
+  // chrome. ctx.ui.custom is absent or returns undefined in RPC mode, in which
+  // case we fall through to the host select dialog, then the typed prompt.
+  if (typeof ui.custom === 'function') {
+    const outcome = await runSelectDialog(
+      ui.custom,
+      question.question,
+      dialogConfig(question, false),
+      dialogOptions(ui, signal),
+    );
+    if (outcome?.kind === 'cancel') return undefined;
+    if (outcome?.kind === 'other') return askOtherText(ui, question, signal);
+    if (outcome?.kind === 'selected') {
+      return withId(question, {
+        question: question.question,
+        kind: 'option',
+        answer: outcome.labels[0]!,
+      });
+    }
+  }
   const lines = optionLines(question);
   const opts = signal ? { signal } : undefined;
   const chosen = ui.select
@@ -333,16 +386,7 @@ async function askSingle(ui: AskUi, question: AskQuestion, signal?: AbortSignal)
       answer: question.options[idx]!.label,
     });
   }
-  if (idx === question.options.length) {
-    const typed = await ui.input(`${question.question}\n\n${CUSTOM_ANSWER_TITLE}`, '', opts);
-    if (typed == null || !typed.trim()) return undefined;
-    return withId(question, {
-      question: question.question,
-      kind: 'custom',
-      answer: OTHER_ANSWER,
-      customInput: typed.trim(),
-    });
-  }
+  if (idx === question.options.length) return askOtherText(ui, question, signal);
   if (!ui.select) {
     return withId(question, {
       question: question.question,
@@ -358,34 +402,24 @@ async function askMulti(ui: AskUi, question: AskQuestion, signal?: AbortSignal):
   // TUI path: a real toggle list. ctx.ui.custom is absent in RPC mode (or returns undefined),
   // in which case we fall through to the typed-index prompt below.
   if (typeof ui.custom === 'function') {
-    const outcome = await runMultiSelect(ui.custom, question.question, {
-      options: question.options,
-      allowOther: question.allowOther,
-      ...(question.recommended !== undefined ? { recommended: question.recommended } : {}),
-    });
+    const outcome = await runSelectDialog(
+      ui.custom,
+      question.question,
+      dialogConfig(question, true),
+      dialogOptions(ui, signal),
+    );
     if (outcome?.kind === 'cancel') return undefined;
-    if (outcome?.kind === 'other') {
-      const typed = await ui.input(`${question.question}\n\n${CUSTOM_ANSWER_TITLE}`, '', signal ? { signal } : undefined);
-      if (typed == null || !typed.trim()) return undefined;
-      return withId(question, {
-        question: question.question,
-        kind: 'custom',
-        answer: OTHER_ANSWER,
-        customInput: typed.trim(),
-      });
-    }
+    if (outcome?.kind === 'other') return askOtherText(ui, question, signal);
     if (outcome?.kind === 'selected') {
       return withId(question, { question: question.question, kind: 'multi', answer: null, selected: outcome.labels });
     }
   }
-  const list = question.options
-    .map((option, i) => formatAuthoredLine(option, i, question.recommended))
-    .join('\n');
+  const lines = optionLines(question);
   const hint = question.allowOther === false
     ? `Enter the numbers of all that apply, comma-separated (e.g. "1,3"). There is no free-text answer for this question.`
     : MULTI_INSTRUCTIONS;
   const value = await ui.input(
-    `${question.question}\n\n${list}\n\n${hint}`,
+    `${question.question}\n\n${lines.join('\n')}\n\n${hint}`,
     '1,3',
     signal ? { signal } : undefined,
   );
@@ -393,6 +427,12 @@ async function askMulti(ui: AskUi, question: AskQuestion, signal?: AbortSignal):
   const trimmed = value.trim();
   if (!trimmed) {
     return withId(question, { question: question.question, kind: 'multi', answer: null, selected: [] });
+  }
+  // The Other row is listed with a number like every authored option; typing it
+  // alone opens the free-text prompt. Mixed with choice numbers it stays on the
+  // free-text/decline handling below.
+  if (trimmed.split(/[,\s]+/).length === 1 && parseChoice(trimmed, lines) === question.options.length) {
+    return askOtherText(ui, question, signal);
   }
   const tokens = trimmed.split(/[,\s]+/).filter((tok) => tok.length > 0);
   const indices = tokens.map((tok) => {
