@@ -269,15 +269,23 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     return out;
   }
 
+  /** Candidate files that are readable right now, with their change stamp. */
+  async function* readableCandidates(paneId: string, cwd: string, preferred?: string | null): AsyncGenerator<{ file: string; stamp: FileStamp }> {
+    for (const file of await resolveSessionFileCandidates(paneId, cwd, preferred)) {
+      // herdr often reports a .jsonl path before the worker creates the file; callers assume a
+      // readable candidate, so vanished paths are skipped rather than surfaced.
+      const stamp = stampOf(file);
+      if (stamp) yield { file, stamp };
+    }
+  }
+
   async function resolveSessionFile(
     paneId: string,
     cwd: string,
     preferred?: string | null,
     opts?: ResolveSessionFileOpts,
   ): Promise<string | null> {
-    for (const file of await resolveSessionFileCandidates(paneId, cwd, preferred)) {
-      const stamp = stampOf(file);
-      if (!stamp) continue;
+    for await (const { file, stamp } of readableCandidates(paneId, cwd, preferred)) {
       // No write since the request → this candidate cannot hold the run's transcript.
       if (opts?.minMtimeMs != null && stamp.mtimeMs < opts.minMtimeMs) continue;
       return file;
@@ -319,9 +327,7 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     preferred?: string | null,
   ): Promise<string | null> {
     for (let i = 0; i < attempts; i++) {
-      for (const file of await resolveSessionFileCandidates(paneId, cwd, preferred)) {
-        const stamp = stampOf(file);
-        if (!stamp) continue;
+      for await (const { file, stamp } of readableCandidates(paneId, cwd, preferred)) {
         const cached = finalTextCache.get(file, stamp, sinceTs);
         if (cached !== undefined) {
           if (cached) return cached;
@@ -370,9 +376,7 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     } catch {
       /* agent.list is status-only; absence is not death */
     }
-    for (const file of await resolveSessionFileCandidates(paneId, cwd)) {
-      const stamp = stampOf(file);
-      if (!stamp) continue; // a vanished candidate has no activity
+    for await (const { stamp } of readableCandidates(paneId, cwd)) {
       if (probe.lastActivityMs == null || stamp.mtimeMs > probe.lastActivityMs) probe.lastActivityMs = stamp.mtimeMs;
     }
     return probe;
@@ -384,11 +388,7 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     sinceTs: number,
     preferred?: string | null,
   ): Promise<SubSessionState> {
-    for (const file of await resolveSessionFileCandidates(paneId, cwd, preferred)) {
-      // herdr often reports a .jsonl path before the worker creates the file; callers assume a
-      // non-null state, so a vanished candidate is skipped.
-      const stamp = stampOf(file);
-      if (!stamp) continue;
+    for await (const { file, stamp } of readableCandidates(paneId, cwd, preferred)) {
       const cached = stateCache.get(file, stamp, sinceTs);
       if (cached) return cached;
       const entries = readSessionFile(file);
@@ -409,8 +409,7 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     preferred?: string | null,
     maxChars = 1200,
   ): Promise<string | null> {
-    for (const file of await resolveSessionFileCandidates(paneId, cwd, preferred)) {
-      if (!stampOf(file)) continue;
+    for await (const { file } of readableCandidates(paneId, cwd, preferred)) {
       const entries = readSessionFile(file);
       if (!entries?.length) continue;
       for (let i = entries.length - 1; i >= 0; i--) {

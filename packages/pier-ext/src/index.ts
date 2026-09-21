@@ -151,7 +151,7 @@ function composeMasterRuntime(): RuntimeRoleManifest | null {
     return null;
   }
 }
-// C3: cordis belongs only in the master process; subagent-scope includes @deepseek-ai/cordis.
+// C3: cordis belongs only in the master process; subagent-poller includes @deepseek-ai/cordis.
 // Dynamically import it on the master branch so worker processes never load the module.
 // Subagent constants/helpers moved with the family to plugins/subagent.ts.
 
