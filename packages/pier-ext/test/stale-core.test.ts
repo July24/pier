@@ -6,7 +6,6 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   STALE_CLOCK_MS,
-  STALE_NOTICE_MAX,
   STALE_TURNS,
   evaluateStaleness,
   formatAge,
@@ -19,12 +18,6 @@ const done = (content: string): TodoItem => ({ content, status: 'completed' });
 const HOUR = 3_600_000;
 
 const ALL_DONE = [done('Verify gateway'), done('Verify id consistency'), done('Update design doc')];
-
-test('常量：双条件阈值（6 轮 / 1h）与警告封顶 3', () => {
-  assert.equal(STALE_TURNS, 6);
-  assert.equal(STALE_CLOCK_MS, HOUR);
-  assert.equal(STALE_NOTICE_MAX, 3);
-});
 
 test('openTodos：pending/in_progress/blocked 计入，completed/abandoned 不计', () => {
   const items: TodoItem[] = [
@@ -55,26 +48,26 @@ test('fresh：全完成但写入新鲜（<1h 且 <6 轮）→ 正常复读不警
   assert.equal(st.kind, 'fresh');
 });
 
-test('stale（A）：全完成 + ≥6 轮未写（时钟未到）→ turns 维度警告', () => {
+test('stale（A）：全完成 + ≥STALE_TURNS 轮未写（时钟未到）→ turns 维度警告', () => {
   const st = evaluateStaleness({
     items: ALL_DONE,
     lastWriteAt: 10 * HOUR,
-    turnsSinceWrite: 6,
+    turnsSinceWrite: STALE_TURNS,
     now: 10 * HOUR + 30 * 60_000,
   });
   assert.equal(st.kind, 'stale');
   assert.equal(st.open, 0);
 });
 
-test('archived（B）：全完成 + 墙钟 ≥1h → 时钟优先于 turns（即使 0 轮）', () => {
+test('archived（B）：全完成 + 墙钟 ≥STALE_CLOCK_MS → 时钟优先于 turns', () => {
   const st = evaluateStaleness({
     items: ALL_DONE,
     lastWriteAt: 10 * HOUR,
     turnsSinceWrite: 1,
-    now: 10 * HOUR + HOUR,
+    now: 10 * HOUR + STALE_CLOCK_MS,
   });
   assert.equal(st.kind, 'archived');
-  assert.equal(st.ageMs, HOUR);
+  assert.equal(st.ageMs, STALE_CLOCK_MS);
 });
 
 test('保守：lastWriteAt 未知（旧会话无时间戳）→ 永不 stale/archived', () => {

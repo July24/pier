@@ -6,12 +6,21 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  TODO_REMINDERS_MAX,
   TODO_REMINDER_CUSTOM_TYPE,
   planStopTodoReminder,
   todoReminderGraceMs,
-  type TodoReminderInput,
 } from '../src/todo-reminder-core.ts';
+
+/** Fixture shape mirroring the planner input; a drifted field surfaces at the call site. */
+interface TodoReminderInput {
+  lastStopReason: string | null;
+  intentionalAbort?: boolean;
+  compactionInFlight?: boolean;
+  reminders: number;
+  runningSubs: number;
+  blockedDepth: number;
+  items: ReadonlyArray<{ content: string; status: string }>;
+}
 
 const OPEN = [
   { content: 'restart CRM user-service', status: 'in_progress' },
@@ -33,7 +42,6 @@ function base(over: Partial<TodoReminderInput> = {}): TodoReminderInput {
 }
 
 test('常量：封顶 3 + custom 通道类型 + 宽限缺省 30s', () => {
-  assert.equal(TODO_REMINDERS_MAX, 3);
   assert.equal(TODO_REMINDER_CUSTOM_TYPE, 'pi-herdr.todo-reminder');
   const had = 'PI_HERDR_TODO_GRACE_MS' in process.env;
   const prev = process.env.PI_HERDR_TODO_GRACE_MS;
@@ -80,10 +88,10 @@ test('abort 抑制：ESC 中止后的 settled 不催（反唤醒风暴守卫保�
   assert.equal(plan.nextReminders, 0);
 });
 
-test('封顶：已达 TODO_REMINDERS_MAX 不再注入', () => {
-  const plan = planStopTodoReminder(base({ reminders: TODO_REMINDERS_MAX }));
+test('封顶：已达 3 不再注入', () => {
+  const plan = planStopTodoReminder(base({ reminders: 3 }));
   assert.equal(plan.due, false);
-  assert.equal(plan.nextReminders, TODO_REMINDERS_MAX);
+  assert.equal(plan.nextReminders, 3);
 });
 
 test('在途 subagent / blocked 深度：主控本就在等，不催', () => {

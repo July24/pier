@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { EMPTY_GUARD_EVERY_N, planTodoReadHook } from '../src/todo-read-hook.ts';
+import { planTodoReadHook } from '../src/todo-read-hook.ts';
 import { STALE_CLOCK_MS, STALE_NOTICE_MAX, STALE_TURNS } from '../src/stale-core.ts';
 import type { TodoItem } from '../src/vocab.ts';
 
@@ -51,7 +51,6 @@ test('全完成但新鲜 → 仍正常复读（不误伤刚完成的列表）', 
 });
 
 test('空列表：会话开始注入一次，之后每 N 轮再守卫', () => {
-  assert.equal(EMPTY_GUARD_EVERY_N, 4);
   const first = planTodoReadHook({ items: [], turn: 0, lastEmptyGuardTurn: null, ...fresh });
   assert.equal(first.inject, true);
   assert.equal(first.effect, 'empty-guard');
@@ -129,7 +128,7 @@ test('archived（B+R1/R3）：窗口被无视 → 终态通知 + clearArchived +
     turnsSinceWrite: 1,
     now: 100 * HOUR + 16 * HOUR,
   };
-  const second = planTodoReadHook({ ...base, turn: EMPTY_GUARD_EVERY_N, lastEmptyGuardTurn: 0, staleNotices: 1, lastStaleGuardTurn: 0 });
+  const second = planTodoReadHook({ ...base, turn: 4, lastEmptyGuardTurn: 0, staleNotices: 1, lastStaleGuardTurn: 0 });
   assert.equal(second.inject, true);
   assert.equal(second.effect, 'archive-notice');
   assert.equal(second.archived, true);
@@ -141,13 +140,12 @@ test('archived（B+R1/R3）：窗口被无视 → 终态通知 + clearArchived +
   assert.ok(!second.message.content.includes('if tracking is not needed'), 'R3：去掉豁免出口');
   assert.ok(!second.message.content.includes('Verify gateway forwarding'), '终态明细不再复读');
   // 非到期拍：inject false 且不置 clearArchived
-  const quiet = planTodoReadHook({ ...base, turn: EMPTY_GUARD_EVERY_N + 1, lastEmptyGuardTurn: EMPTY_GUARD_EVERY_N, staleNotices: 1, lastStaleGuardTurn: 0 });
+  const quiet = planTodoReadHook({ ...base, turn: 4 + 1, lastEmptyGuardTurn: 4, staleNotices: 1, lastStaleGuardTurn: 0 });
   assert.equal(quiet.inject, false);
   assert.equal(quiet.clearArchived, false);
-});
 
-test('时钟阈值边界：恰好 STALE_CLOCK_MS → archived（时钟优先于 turns；R2 窗口态）', () => {
-  const plan = planTodoReadHook({
+  // 时钟阈值边界：恰好 STALE_CLOCK_MS 即 archived（时钟优先于 turns，且仍是 R2 窗口态）
+  const boundary = planTodoReadHook({
     items: ALL_DONE,
     turn: 3,
     lastEmptyGuardTurn: null,
@@ -157,6 +155,6 @@ test('时钟阈值边界：恰好 STALE_CLOCK_MS → archived（时钟优先于 
     staleNotices: 0,
     lastStaleGuardTurn: null,
   });
-  assert.equal(plan.effect, 'stale-notice');
-  assert.equal(plan.archived, true, '时钟维度已归档（窗口态）');
+  assert.equal(boundary.effect, 'stale-notice');
+  assert.equal(boundary.archived, true, '时钟维度已归档（窗口态）');
 });

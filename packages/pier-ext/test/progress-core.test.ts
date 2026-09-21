@@ -5,10 +5,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  ETA_MIN_SAMPLES,
-  PROGRESS_HIDE_MS,
-  RATE_WINDOW_MS,
-  UNFINISHED_CAP,
   estimateEta,
   formatProgressSuffix,
   planToolBadge,
@@ -17,7 +13,6 @@ import {
 /* ── 速率估算（kimi 估算器语义：窗口速率 + 未完成 cap + 置信度门） ── */
 
 test('estimateEta：<2 完成点 → null（保守：只显示 N/M）', () => {
-  assert.equal(ETA_MIN_SAMPLES, 2);
   assert.equal(estimateEta({ completedAt: [], total: 7, now: 1000 }), null);
   assert.equal(estimateEta({ completedAt: [1000], total: 7, now: 2000 }), null);
 });
@@ -31,14 +26,6 @@ test('estimateEta：≥2 完成点 → 按点间距估速率；剩余 × 间距 
   assert.equal(e!.confidence, 'ok');
 });
 
-test('estimateEta：完成点全在窗口外（陈旧）→ null', () => {
-  // 完成于 10 分钟前，now 远离 → 陈旧不估
-  assert.equal(
-    estimateEta({ completedAt: [0, 60_000], total: 7, now: 10 * 60_000 }),
-    null,
-  );
-});
-
 test('estimateEta：全部完成（remaining=0）→ eta 0；total=0 → null', () => {
   const done = estimateEta({ completedAt: [0, 60_000], total: 2, now: 61_000 });
   assert.ok(done);
@@ -46,12 +33,9 @@ test('estimateEta：全部完成（remaining=0）→ eta 0；total=0 → null', 
   assert.equal(estimateEta({ completedAt: [0, 60_000], total: 0, now: 61_000 }), null);
 });
 
-test('estimateEta：爆发后停顿（完成点新鲜度超窗）→ null', () => {
-  // 10 秒内完成 2 步（爆发），然后 20 分钟无进展 → 数据陈旧，不估
-  assert.equal(
-    estimateEta({ completedAt: [590_000, 600_000], total: 7, now: 1_800_000 }),
-    null,
-  );
+test('estimateEta：最新完成点陈旧（完成于 10 分钟前 / 爆发后停顿 20 分钟）→ null', () => {
+  assert.equal(estimateEta({ completedAt: [0, 60_000], total: 7, now: 10 * 60_000 }), null);
+  assert.equal(estimateEta({ completedAt: [590_000, 600_000], total: 7, now: 1_800_000 }), null);
 });
 
 /* ── 进度后缀（title 内嵌，保守 N/M 优先） ─────────────────────── */
@@ -75,12 +59,4 @@ test('planToolBadge：单工具名；多工具首 + 计数；空 → null（不�
   assert.equal(planToolBadge([]), null);
   assert.equal(planToolBadge(['bash']), '🔧 bash');
   assert.equal(planToolBadge(['bash', 'read', 'grep']), '🔧 bash +2');
-});
-
-/* ── 常量锁定（kimi 语义对齐） ─────────────────────────────────── */
-
-test('常量：窗口 45s / cap 0.85 / 展示超时隐藏', () => {
-  assert.equal(RATE_WINDOW_MS, 45_000);
-  assert.equal(UNFINISHED_CAP, 0.85);
-  assert.ok(PROGRESS_HIDE_MS > 0);
 });

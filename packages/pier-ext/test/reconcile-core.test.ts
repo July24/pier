@@ -8,7 +8,7 @@ import { reconcileTodos } from '../src/reconcile-core.ts';
 import {
   TODO_EDIT_CUSTOM_TYPE,
   applyTodoEdits,
-  foldLatestTodos,
+  foldLatestTodosMeta,
 } from '../src/todo-core.ts';
 
 const D = '调研 cordis';
@@ -118,30 +118,22 @@ test('blocker substring（「等 X 完成」短语包含）→ 也解锁；faile
 
 /* ── 边界 ─────────────────────────────────────────────────────── */
 
-test('completed/abandoned 条目永不参与匹配；无候选 → 零编辑零提示', () => {
-  const prev = items([[D, 'completed'], [`${D} 旧`, 'abandoned']]);
-  const p = reconcileTodos(prev, { description: D, outcome: 'settled' });
-  assert.equal(p.edits.length, 0);
-  assert.equal(p.noteLines.length, 0);
-});
+test('边界：completed/abandoned 不参与匹配；大小写与空白归一后仍算 exact', () => {
+  const terminal = reconcileTodos(items([[D, 'completed'], [`${D} 旧`, 'abandoned']]), { description: D, outcome: 'settled' });
+  assert.equal(terminal.edits.length, 0);
+  assert.equal(terminal.noteLines.length, 0, '无候选 → 零编辑零提示');
 
-test('大小写/空白归一：仍算 exact', () => {
-  const p = reconcileTodos(items([['  调研  CORDIS ', 'pending']]), {
-    description: '调研 cordis',
-    outcome: 'settled',
-  });
-  assert.equal(p.tier, 'exact');
+  const normalized = reconcileTodos(items([['  调研  CORDIS ', 'pending']]), { description: '调研 cordis', outcome: 'settled' });
+  assert.equal(normalized.tier, 'exact');
 });
 
 /* ── unblock 编辑 op：applyTodoEdits + 分支回放（权威闭环） ────── */
 
-test('unblock op：applyTodoEdits blocked→pending 清 blocker；非 blocked 为 no-op', () => {
+test('unblock op：blocked→pending 清 blocker（非 blocked no-op），并经 custom 条目回放', () => {
   const next = applyTodoEdits(items([['a', 'blocked', 'x'], ['b', 'pending']]), [{ op: 'unblock', content: 'a' }]);
-  assert.deepEqual(next[0], { content: 'a', status: 'pending' });
-  assert.deepEqual(next[1], { content: 'b', status: 'pending' });
-});
+  assert.deepEqual(next, [{ content: 'a', status: 'pending' }, { content: 'b', status: 'pending' }]);
 
-test('unblock op 经 custom 条目回放（foldLatestTodos，重启/分支正确性）', () => {
+  // 重启/分支正确性：权威路径（pi-herdr.todo-edit）折叠后仍是 pending
   const branch = [
     {
       type: 'message',
@@ -153,6 +145,5 @@ test('unblock op 经 custom 条目回放（foldLatestTodos，重启/分支正确
     },
     { type: 'custom', customType: TODO_EDIT_CUSTOM_TYPE, data: { version: 1, edits: [{ op: 'unblock', content: '汇总' }], ts: 1 } },
   ];
-  const folded = foldLatestTodos(branch as never);
-  assert.deepEqual(folded, [{ content: '汇总', status: 'pending' }]);
+  assert.deepEqual(foldLatestTodosMeta(branch as never)?.items, [{ content: '汇总', status: 'pending' }]);
 });

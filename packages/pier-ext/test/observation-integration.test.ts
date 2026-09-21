@@ -1,5 +1,7 @@
 /**
- * D101 ObservationPack Integration Tests.
+ * D101 ObservationPack 集成测试：obs_recall 注册与分页、context 投影（角色闸门 / 活跃窗口 / 豁免 /
+ * memo 快路径）、批打包（上限、遥测、并发预取）、onBeforeCompact 钩子。
+ * 纯算法（excerpt/切片/经济性）见 observation-core.test.ts。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -19,142 +21,101 @@ import { REDUCER_RECEIPT_PREFIX } from '../src/observation-core.ts';
 import type { RuntimeRoleManifest } from '../src/tool-gate.ts';
 
 interface MockPi {
-  tools: Map<string, any>;
-  listeners: Map<string, Array<Function>>;
-  registerTool(def: any): void;
-  on(event: string, handler: Function): void;
+  tools: Map<string, { execute: (...a: unknown[]) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }> }>;
+  listeners: Map<string, Array<(...a: unknown[]) => unknown>>;
 }
 
 function createMockPi(): MockPi & ExtensionAPI {
-  const tools = new Map<string, any>();
-  const listeners = new Map<string, Array<Function>>();
-
-  const mock: any = {
+  const tools = new Map<string, never>();
+  const listeners = new Map<string, Array<(...a: unknown[]) => unknown>>();
+  return {
     tools,
     listeners,
-    registerTool(def: any) {
-      tools.set(def.name, def);
-    },
-    on(event: string, handler: Function) {
+    registerTool: (def: { name: string }) => { tools.set(def.name, def as never); },
+    on: (event: string, handler: (...a: unknown[]) => unknown) => {
       listeners.set(event, [...(listeners.get(event) ?? []), handler]);
     },
-  };
-  return mock;
+  } as unknown as MockPi & ExtensionAPI;
 }
 
-function createMockContext(sessionDir: string, sessionId: string): ExtensionContext {
-  return {
-    sessionManager: {
-      getSessionDir: () => sessionDir,
-      getSessionId: () => sessionId,
-    } as any,
-  } as ExtensionContext;
-}
+const createMockContext = (sessionDir: string, sessionId: string): ExtensionContext => ({
+  sessionManager: { getSessionDir: () => sessionDir, getSessionId: () => sessionId },
+} as unknown as ExtensionContext);
 
-test('ObservationPack: registers obs_recall tool and executes paged recall', async () => {
-  const tempDir = await mkdtemp(join(tmpdir(), 'pier-obs-pack-test-'));
-  const sessionId = 'session_test_01';
+const obsConfig = (over: Record<string, unknown> = {}) => ({
+  ...DEFAULT_EFFICIENCY_CONFIG.observationPack,
+  enabled: true,
+  thresholdBytes: 500,
+  fullSends: 1,
+  ...over,
+});
 
+const effConfig = (over: Record<string, unknown> = {}): EfficiencyConfig => ({
+  ...DEFAULT_EFFICIENCY_CONFIG,
+  observationPack: obsConfig(over),
+});
+
+const toolResult = (text: string, id = 'tc_1', toolName = 'bash') => ({
+  role: 'toolResult',
+  toolName,
+  toolCallId: id,
+  content: [{ type: 'text', text }],
+});
+
+/** 一条日志，默认 ~2KB，超过测试阈值。 */
+const longLog = (marker = 'INFO: step processing') => `${marker}\n`.repeat(100);
+
+/** 每个测试独立的临时 session 根；回调结束后清理 memo 与目录。 */
+async function withSession(fn: (sessionDir: string) => Promise<void>): Promise<void> {
+  const tempDir = await mkdtemp(join(tmpdir(), 'pier-obs-test-'));
+  clearObservationMemoForTest();
   try {
+    await fn(tempDir);
+  } finally {
+    clearObservationMemoForTest();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+test('ObservationPack: 注册 obs_recall；活跃窗口内原样，超窗后投影占位符并可分页召回', async () => {
+  await withSession(async (tempDir) => {
     const pi = createMockPi();
-    const config: EfficiencyConfig = {
-      ...DEFAULT_EFFICIENCY_CONFIG,
-      observationPack: {
-        ...DEFAULT_EFFICIENCY_CONFIG.observationPack,
-        enabled: true,
-        thresholdBytes: 1024, // 1KB threshold for test
-        fullSends: 1,
-      },
-    };
-
-    registerObservationPack({
-      pi,
-      getConfig: () => config,
-    });
-
+    registerObservationPack({ pi, getConfig: () => effConfig() });
     assert.equal(pi.tools.has(RECALL_TOOL_NAME), true);
-    const recallTool = pi.tools.get(RECALL_TOOL_NAME);
-    const ctx = createMockContext(tempDir, sessionId);
+    const recallTool = pi.tools.get(RECALL_TOOL_NAME)!;
+    const ctx = createMockContext(tempDir, 'session_test_01');
 
-    // 1. Invalid ID rejection (A1: hard failures reject instead of returning error text)
+    // A1：非法 id 是硬失败（抛错让 pi 标 isError），不是普通结果
     await assert.rejects(
       async () => { await recallTool.execute('call_1', { id: 'bad_id' }, undefined, undefined, ctx); },
       /invalid observation id format/,
     );
 
-    // 2. Prepare context with a large output (2KB)
-    const largeLog = 'INFO: step processing\n'.repeat(100); // ~2200 bytes
-    const contextHandlers = pi.listeners.get('context') ?? [];
-    assert.equal(contextHandlers.length, 1);
-    const contextHandler = contextHandlers[0]!;
+    const contextHandler = pi.listeners.get('context')![0]!;
+    const log = longLog();
 
-    // First send: prior assistant count = 0 (< fullSends=1) -> remains full text
-    const eventFirst = {
-      messages: [
-        {
-          role: 'toolResult',
-          toolName: 'bash',
-          toolCallId: 'tc_1',
-          content: [{ type: 'text', text: largeLog }],
-        },
-      ],
-    };
-    const resFirst = await contextHandler(eventFirst, ctx);
-    assert.equal(resFirst.messages[0].content[0].text, largeLog);
+    // 第 1 次 sendCount=0 < fullSends=1 → 全文保留；第 2 次已有 1 条 assistant → 替换
+    const first = await contextHandler({ messages: [toolResult(log)] }, ctx) as { messages: Array<{ content: Array<{ text: string }> }> };
+    assert.equal(first.messages[0].content[0].text, log);
+    const second = await contextHandler({
+      messages: [toolResult(log), { role: 'assistant', content: [{ type: 'text', text: 'analyzing...' }] }],
+    }, ctx) as { messages: Array<{ content: Array<{ text: string }> }> };
+    const replaced = second.messages[0].content[0].text;
+    assert.notEqual(replaced, log);
+    assert.match(replaced, /\[large tool result replaced after its first 1 provider requests\]/);
+    const obsId = replaced.match(/id:\s+(obs_[a-f0-9]{24})/)![1]!;
 
-    // Second send: message is followed by 1 assistant message -> sendCount = 1 (>= fullSends)
-    const eventSecond = {
-      messages: [
-        {
-          role: 'toolResult',
-          toolName: 'bash',
-          toolCallId: 'tc_1',
-          content: [{ type: 'text', text: largeLog }],
-        },
-        {
-          role: 'assistant',
-          content: [{ type: 'text', text: 'analyzing...' }],
-        },
-      ],
-    };
-    const resSecond = await contextHandler(eventSecond, ctx);
-    const replacedText = resSecond.messages[0].content[0].text;
-    assert.notEqual(replacedText, largeLog);
-    assert.match(replacedText, /\[large tool result replaced after its first 1 provider requests\]/);
-    assert.match(replacedText, /id: (obs_[a-f0-9]{24})/);
-
-    // 3. Extract obsId and recall original content using obs_recall
-    const match = replacedText.match(/id:\s+(obs_[a-f0-9]{24})/);
-    assert.ok(match && match[1]);
-    const obsId = match[1];
-
-    const recallRes = await recallTool.execute('call_2', { id: obsId, offset: 0 }, undefined, undefined, ctx);
-    assert.ok(recallRes.content[0].text.includes('[obs_recall id='));
-    assert.ok(recallRes.content[0].text.includes('INFO: step processing'));
-    assert.equal(recallRes.details.id, obsId);
-    assert.equal(recallRes.details.offset, 0);
-  } finally {
-    await rm(tempDir, { recursive: true, force: true });
-  }
+    const recalled = await recallTool.execute('call_2', { id: obsId, offset: 0 }, undefined, undefined, ctx);
+    assert.ok(recalled.content[0].text.includes('[obs_recall id='));
+    assert.ok(recalled.content[0].text.includes('INFO: step processing'), '召回原文');
+    assert.equal(recalled.details.id, obsId);
+    assert.equal(recalled.details.offset, 0);
+  });
 });
 
-test('ObservationPack: skips packing when obs_recall is denied by role manifest', async () => {
-  const tempDir = await mkdtemp(join(tmpdir(), 'pier-obs-role-test-'));
-  const sessionId = 'session_test_02';
-
-  try {
+test('ObservationPack: 角色被拒 obs_recall 时完全不投影（模型不该拿到不可用的句柄）', async () => {
+  await withSession(async (tempDir) => {
     const pi = createMockPi();
-    const config: EfficiencyConfig = {
-      ...DEFAULT_EFFICIENCY_CONFIG,
-      observationPack: {
-        ...DEFAULT_EFFICIENCY_CONFIG.observationPack,
-        enabled: true,
-        thresholdBytes: 1024,
-        fullSends: 1,
-      },
-    };
-
-    // Role denies unknown tools and does not list obs_recall
     const restrictedRole: RuntimeRoleManifest = {
       role: 'restricted-agent',
       version: '1.0.0',
@@ -162,234 +123,89 @@ test('ObservationPack: skips packing when obs_recall is denied by role manifest'
       permissions: { '*': 'allow' },
       unknownTools: 'deny',
     };
-
-    registerObservationPack({
-      pi,
-      getConfig: () => config,
-      getRuntimeManifest: () => restrictedRole,
-    });
-
-    const ctx = createMockContext(tempDir, sessionId);
-    const largeLog = 'DEBUG: trace output\n'.repeat(100);
+    registerObservationPack({ pi, getConfig: () => effConfig(), getRuntimeManifest: () => restrictedRole });
     const contextHandler = pi.listeners.get('context')![0]!;
-
-    const event = {
-      messages: [
-        {
-          role: 'toolResult',
-          toolName: 'bash',
-          toolCallId: 'tc_2',
-          content: [{ type: 'text', text: largeLog }],
-        },
-        {
-          role: 'assistant',
-          content: [{ type: 'text', text: 'response 1' }],
-        },
-      ],
-    };
-
-    // Packing must be skipped so model doesn't get an inaccessible tool handle
-    const res = await contextHandler(event, ctx);
+    const res = await contextHandler({
+      messages: [toolResult(longLog('DEBUG: trace output')), { role: 'assistant', content: [] }],
+    }, createMockContext(tempDir, 'session_test_02'));
     assert.equal(res, undefined);
-  } finally {
-    await rm(tempDir, { recursive: true, force: true });
-  }
+  });
 });
 
-test('ObservationPack: never packs errors or EPR receipts', async () => {
-  const tempDir = await mkdtemp(join(tmpdir(), 'pier-obs-exempt-test-'));
-  const sessionId = 'session_test_03';
-
-  try {
+test('ObservationPack: 错误结果与 EPR receipt 都不打包', async () => {
+  await withSession(async (tempDir) => {
     const pi = createMockPi();
-    const config: EfficiencyConfig = {
-      ...DEFAULT_EFFICIENCY_CONFIG,
-      observationPack: {
-        ...DEFAULT_EFFICIENCY_CONFIG.observationPack,
-        enabled: true,
-        thresholdBytes: 500,
-        fullSends: 1,
-      },
-    };
-
-    registerObservationPack({
-      pi,
-      getConfig: () => config,
-    });
-
-    const ctx = createMockContext(tempDir, sessionId);
+    registerObservationPack({ pi, getConfig: () => effConfig() });
     const contextHandler = pi.listeners.get('context')![0]!;
+    const ctx = createMockContext(tempDir, 'session_test_03');
 
-    // 1. Tool result with isError: true
-    const errorEvent = {
+    const errorRes = await contextHandler({
+      messages: [{ ...toolResult('FATAL: process crashed\n'.repeat(50)), isError: true }, { role: 'assistant', content: [] }],
+    }, ctx) as { messages: Array<{ content: Array<{ text: string }> }> };
+    assert.ok(errorRes.messages[0].content[0].text.includes('FATAL: process crashed'));
+
+    const receiptRes = await contextHandler({
       messages: [
-        {
-          role: 'toolResult',
-          isError: true,
-          content: [{ type: 'text', text: 'FATAL: process crashed\n'.repeat(50) }],
-        },
+        toolResult(`${REDUCER_RECEIPT_PREFIX}\nstatus=failure\n`.repeat(50)),
         { role: 'assistant', content: [] },
       ],
-    };
-    const errorRes = await contextHandler(errorEvent, ctx);
-    assert.equal(errorRes.messages[0].content[0].text.includes('FATAL: process crashed'), true);
-
-    // 2. Receipt containing REDUCER_RECEIPT_PREFIX
-    const receiptEvent = {
-      messages: [
-        {
-          role: 'toolResult',
-          isError: false,
-          content: [{ type: 'text', text: `${REDUCER_RECEIPT_PREFIX}\nstatus=failure\n`.repeat(50) }],
-        },
-        { role: 'assistant', content: [] },
-      ],
-    };
-    const receiptRes = await contextHandler(receiptEvent, ctx);
-    assert.equal(receiptRes.messages[0].content[0].text.includes(REDUCER_RECEIPT_PREFIX), true);
-  } finally {
-    await rm(tempDir, { recursive: true, force: true });
-  }
+    }, ctx) as { messages: Array<{ content: Array<{ text: string }> }> };
+    assert.ok(receiptRes.messages[0].content[0].text.includes(REDUCER_RECEIPT_PREFIX));
+  });
 });
 
-test('ObservationPack: memoization fast-path and self-healing on missing disk object', async () => {
-  const tempDir = await mkdtemp(join(tmpdir(), 'pier-obs-memo-test-'));
-  const sessionId = 'session_test_04';
-
-  try {
-    clearObservationMemoForTest();
+test('ObservationPack: memo 快路径命中同一占位符；存储丢失时召回自愈', async () => {
+  await withSession(async (tempDir) => {
     const pi = createMockPi();
-    const config: EfficiencyConfig = {
-      ...DEFAULT_EFFICIENCY_CONFIG,
-      observationPack: {
-        ...DEFAULT_EFFICIENCY_CONFIG.observationPack,
-        enabled: true,
-        thresholdBytes: 1024,
-        fullSends: 1,
-      },
-    };
-
-    registerObservationPack({
-      pi,
-      getConfig: () => config,
-    });
-
-    const ctx = createMockContext(tempDir, sessionId);
-    const recallTool = pi.tools.get(RECALL_TOOL_NAME);
+    registerObservationPack({ pi, getConfig: () => effConfig() });
+    const ctx = createMockContext(tempDir, 'session_test_04');
     const contextHandler = pi.listeners.get('context')![0]!;
-    const largeLog = 'VERBOSE: detailed diagnostic line\n'.repeat(60);
+    const event = { messages: [toolResult(longLog('VERBOSE: detailed diagnostic line'), 'tc_memo_1'), { role: 'assistant', content: [] }] };
 
-    const event = {
-      messages: [
-        {
-          role: 'toolResult',
-          toolName: 'bash',
-          toolCallId: 'tc_memo_1',
-          content: [{ type: 'text', text: largeLog }],
-        },
-        { role: 'assistant', content: [] },
-      ],
-    };
+    const first = await contextHandler(event, ctx) as { messages: Array<{ content: Array<{ text: string }> }> };
+    assert.ok(first.messages[0].content[0].text.includes('[large tool result replaced'));
+    const second = await contextHandler(event, ctx) as { messages: Array<{ content: Array<{ text: string }> }> };
+    assert.equal(second.messages[0].content[0].text, first.messages[0].content[0].text, 'memo 命中：占位符稳定');
 
-    // 1. First packing: creates memo and saves file
-    const res1 = await contextHandler(event, ctx);
-    assert.ok(res1.messages[0].content[0].text.includes('[large tool result replaced'));
-
-    // 2. Second invocation: hits memoization fast-path (O(1) memory lookup)
-    const res2 = await contextHandler(event, ctx);
-    assert.equal(res2.messages[0].content[0].text, res1.messages[0].content[0].text);
-
-    // 3. Self-healing: simulate file removal from disk
-    // Deliberately query non-existent/corrupted file to trigger self-healing invalidation
-    const recallFail = await recallTool.execute('call_fail', { id: 'obs_000000000000000000000000' }, undefined, undefined, ctx);
-    assert.ok(recallFail.content[0].text.includes('Error: failed to recall observation'));
-  } finally {
-    clearObservationMemoForTest();
-    await rm(tempDir, { recursive: true, force: true });
-  }
+    const missing = await pi.tools.get(RECALL_TOOL_NAME)!.execute(
+      'call_fail', { id: 'obs_000000000000000000000000' }, undefined, undefined, ctx,
+    );
+    assert.ok(missing.content[0].text.includes('Error: failed to recall observation'), '缺文件自愈路径');
+  });
 });
 
-test('ObservationPack: batchPackObservations pre-packs large observations at OCC compaction point with limits and telemetry', async () => {
-  const tempDir = await mkdtemp(join(tmpdir(), 'pier-obs-batch-test-'));
-  const sessionId = 'session_test_05';
-
-  try {
-    clearObservationMemoForTest();
-    const config = {
-      ...DEFAULT_EFFICIENCY_CONFIG.observationPack,
-      enabled: true,
-      logEnabled: true,
-      thresholdBytes: 500,
-    };
-
-    const messages = [
-      {
-        role: 'toolResult',
-        toolName: 'bash',
-        toolCallId: 'tc_batch_1',
-        content: [{ type: 'text', text: 'OUTPUT 1: long line...\n'.repeat(50) }],
-      },
-      {
-        role: 'toolResult',
-        toolName: 'bash',
-        toolCallId: 'tc_batch_2',
-        content: [{ type: 'text', text: 'OUTPUT 2: long line...\n'.repeat(50) }],
-      },
-      {
-        role: 'toolResult',
-        toolName: 'read',
-        toolCallId: 'tc_batch_3',
-        content: [{ type: 'text', text: 'small text' }],
-      },
-    ];
-
-    // Limit to max 1 item in batch
-    const packedCount = await batchPackObservations({
+test('ObservationPack: 批打包遵守条数上限并写 packed-batch 遥测', async () => {
+  await withSession(async (tempDir) => {
+    const packed = await batchPackObservations({
       sessionRoot: tempDir,
-      sessionId,
-      messages,
-      obsConfig: config,
+      sessionId: 'session_test_05',
+      messages: [
+        toolResult('OUTPUT 1: long line...\n'.repeat(50), 'tc_batch_1'),
+        toolResult('OUTPUT 2: long line...\n'.repeat(50), 'tc_batch_2'),
+        toolResult('small text', 'tc_batch_3', 'read'),
+      ],
+      obsConfig: obsConfig({ logEnabled: true }),
       limits: { maxItems: 1 },
     });
+    assert.equal(packed, 1);
 
-    assert.equal(packedCount, 1);
-
-    // Verify packed-batch telemetry written
-    const logPath = join(tempDir, 'efficiency-logs', 'observation.jsonl');
-    const logData = await readFile(logPath, 'utf8');
+    const logData = await readFile(join(tempDir, 'efficiency-logs', 'observation.jsonl'), 'utf8');
     assert.ok(logData.includes('"event":"packed-batch"'));
     assert.ok(logData.includes('"source":"compaction"'));
-    assert.ok(logData.includes(`"sessionId":"${sessionId}"`));
+    assert.ok(logData.includes('"sessionId":"session_test_05"'));
     assert.ok(logData.includes('"obsId":"obs_'));
-  } finally {
-    clearObservationMemoForTest();
-    await rm(tempDir, { recursive: true, force: true });
-  }
+  });
 });
 
-test('ObservationPack: batch prefetches middle excerpts concurrently, one pick per candidate (2026-09-19 flip)', async () => {
-  const tempDir = await mkdtemp(join(tmpdir(), 'pier-obs-parallel-test-'));
-  try {
-    clearObservationMemoForTest();
-    const config = {
-      ...DEFAULT_EFFICIENCY_CONFIG.observationPack,
-      enabled: true,
-      thresholdBytes: 500,
-    };
-    const messages = [1, 2, 3].map((n) => ({
-      role: 'toolResult',
-      toolName: 'bash',
-      toolCallId: `tc_parallel_${n}`,
-      content: [{ type: 'text', text: `PARALLEL ${n}: long line...\n`.repeat(50) }],
-    }));
-
-    // Deterministic concurrency probe: every pick blocks on `release`; only a
-    // concurrent prefetch lets all three be in flight at once. No real timers.
+test('ObservationPack: 批打包并发预取 middle 窗口，每条候选只 pick 一次', async () => {
+  await withSession(async (tempDir) => {
+    const messages = [1, 2, 3].map((n) => toolResult(`PARALLEL ${n}: long line...\n`.repeat(50), `tc_parallel_${n}`));
+    // 确定性并发探针：每个 pick 都卡在 release 上，只有并发预取才能三条同时在场（无真实计时器）。
     let inFlight = 0;
     let maxInFlight = 0;
     let calls = 0;
     const release = Promise.withResolvers<void>();
-    const turn = async (): Promise<void> => {
+    const tick = async (): Promise<void> => {
       const { promise, resolve } = Promise.withResolvers<void>();
       setImmediate(resolve);
       await promise;
@@ -407,59 +223,32 @@ test('ObservationPack: batch prefetches middle excerpts concurrently, one pick p
       sessionRoot: tempDir,
       sessionId: 'session_parallel',
       messages,
-      obsConfig: config,
+      obsConfig: obsConfig(),
       pickMiddleExcerpt,
     });
-    // Drain the event loop: a serial implementation would sit on its first
-    // pending pick; a concurrent one has all three parked on `release`.
-    for (let i = 0; i < 10; i++) await turn();
+    for (let i = 0; i < 10; i++) await tick();
     release.resolve();
-    const packedCount = await batch;
-
-    assert.equal(packedCount, 3);
-    // A serial loop would block onBeforeCompact for candidates × jev latency.
-    assert.equal(maxInFlight, 3, 'prefetch must run concurrently, not serially');
-    assert.equal(calls, 3, 'the prefetched middle is consumed; packing must not re-pick');
-  } finally {
-    clearObservationMemoForTest();
-    await rm(tempDir, { recursive: true, force: true });
-  }
+    assert.equal(await batch, 3);
+    assert.equal(maxInFlight, 3, '预取必须并发，否则 onBeforeCompact 会被 jev 延迟线性拖住');
+    assert.equal(calls, 3, '预取结果被消费，打包阶段不得重挑');
+  });
 });
 
-test('ObservationPack: multi-block content matches memoKey and avoids recalculation (P1 fix §13.1)', async () => {
-  const tempDir = await mkdtemp(join(tmpdir(), 'pier-obs-multiblock-test-'));
-  const sessionId = 'session_test_06';
-
-  try {
-    clearObservationMemoForTest();
+test('ObservationPack: 多 block 内容按长度做 memoKey；命中后不再评估 horizon', async () => {
+  await withSession(async (tempDir) => {
     const pi = createMockPi();
-    const config = {
-      ...DEFAULT_EFFICIENCY_CONFIG.observationPack,
-      enabled: true,
-      thresholdBytes: 500,
-      fullSends: 1,
-    };
-
     let horizonCalls = 0;
     registerObservationPack({
       pi,
-      getConfig: () => ({ ...DEFAULT_EFFICIENCY_CONFIG, observationPack: config }),
-      getRemainingHorizon: () => {
-        horizonCalls++;
-        return 5;
-      },
+      getConfig: () => effConfig(),
+      getRemainingHorizon: () => { horizonCalls++; return 5; },
     });
-
-    const ctx = createMockContext(tempDir, sessionId);
+    const ctx = createMockContext(tempDir, 'session_test_06');
     const contextHandler = pi.listeners.get('context')![0]!;
-
-    // Two-block content where text.length > approxChars (due to newline join)
     const event = {
       messages: [
         {
-          role: 'toolResult',
-          toolName: 'bash',
-          toolCallId: 'tc_multi_1',
+          ...toolResult('ignored', 'tc_multi_1'),
           content: [
             { type: 'text', text: 'Block A content line...\n'.repeat(60) },
             { type: 'text', text: 'Block B content line...\n'.repeat(60) },
@@ -469,57 +258,34 @@ test('ObservationPack: multi-block content matches memoKey and avoids recalculat
       ],
     };
 
-    // 1. First context call packs it and evaluates horizon
-    const res1 = await contextHandler(event, ctx);
-    assert.ok(res1.messages[0].content[0].text.includes('[large tool result replaced'));
+    const first = await contextHandler(event, ctx) as { messages: Array<{ content: Array<{ text: string }> }> };
+    assert.ok(first.messages[0].content[0].text.includes('[large tool result replaced'));
     assert.equal(horizonCalls, 1);
-
-    // 2. Second context call must hit memoKey directly and NOT re-call getRemainingHorizon!
-    const res2 = await contextHandler(event, ctx);
-    assert.equal(res2.messages[0].content[0].text, res1.messages[0].content[0].text);
-    // Horizon must NOT have been called again because memo hit early!
-    assert.equal(horizonCalls, 1);
-  } finally {
-    clearObservationMemoForTest();
-    await rm(tempDir, { recursive: true, force: true });
-  }
+    const second = await contextHandler(event, ctx) as { messages: Array<{ content: Array<{ text: string }> }> };
+    assert.equal(second.messages[0].content[0].text, first.messages[0].content[0].text);
+    assert.equal(horizonCalls, 1, 'memo 命中即短路，不该再问 horizon');
+  });
 });
 
-test('ObservationPack: createCompactionBatchPackHook honours config, role gate and branch shape (§13.3)', async () => {
-  const tempDir = await mkdtemp(join(tmpdir(), 'pier-obs-hook-test-'));
-  const objectsDir = join(tempDir, 'observation-pack', 'objects');
-  const readObjects = async (): Promise<string[]> =>
-    await readdir(objectsDir).catch(() => [] as string[]);
-
-  try {
-    clearObservationMemoForTest();
-    const obsConfig = {
-      ...DEFAULT_EFFICIENCY_CONFIG.observationPack,
-      enabled: true,
-      logEnabled: true,
-      thresholdBytes: 500,
-    };
+test('ObservationPack: createCompactionBatchPackHook 尊重配置、角色闸门与分支形状', async () => {
+  await withSession(async (tempDir) => {
+    const objectsDir = join(tempDir, 'observation-pack', 'objects');
+    const readObjects = async (): Promise<string[]> => await readdir(objectsDir).catch(() => []);
+    const config = obsConfig({ logEnabled: true });
     const branch = [
       {
         type: 'message',
         id: 'm1',
-        message: {
-          role: 'toolResult',
-          toolName: 'bash',
-          toolCallId: 'tc_hook_1',
-          content: [{ type: 'text', text: 'OUTPUT: long line...\n'.repeat(50) }],
-        },
+        message: toolResult('OUTPUT: long line...\n'.repeat(50), 'tc_hook_1'),
       },
-      { type: 'custom', customType: 'pi-herdr.todo', data: {} }, // non-message entry: ignored
-      { type: 'message', id: 'm2' }, // message entry without payload: ignored
+      { type: 'custom', customType: 'pi-herdr.todo', data: {} }, // 非 message 条目：跳过
+      { type: 'message', id: 'm2' }, // 无 payload 的 message 条目：跳过
     ];
     const ctx = { sessionManager: { getBranch: () => branch } };
 
-    // 1. Disabled pack config -> no-op (no objects, no telemetry dir).
-    await createCompactionBatchPackHook({ getObsConfig: () => ({ ...obsConfig, enabled: false }) })(tempDir, ctx);
-    assert.deepEqual(await readObjects(), []);
+    await createCompactionBatchPackHook({ getObsConfig: () => ({ ...config, enabled: false }) })(tempDir, ctx);
+    assert.deepEqual(await readObjects(), [], '未启用即 no-op');
 
-    // 2. Role denies obs_recall -> no-op even when packing is enabled.
     const denyingRole = {
       role: 'restricted-agent',
       version: '1.0.0',
@@ -528,33 +294,24 @@ test('ObservationPack: createCompactionBatchPackHook honours config, role gate a
       unknownTools: 'deny',
     } as RuntimeRoleManifest;
     await createCompactionBatchPackHook({
-      getObsConfig: () => obsConfig,
+      getObsConfig: () => config,
       getManifest: () => denyingRole,
       getSessionId: () => 'session_hook',
     })(tempDir, ctx);
-    assert.deepEqual(await readObjects(), [], 'a role without obs_recall must not receive pre-packed placeholders');
+    assert.deepEqual(await readObjects(), [], '无 obs_recall 权限的角色不该收到预打包占位符');
 
-    // 3. Allowed role -> packs the message entries only, and logs one packed-batch record.
     const hook = createCompactionBatchPackHook({
-      getObsConfig: () => obsConfig,
+      getObsConfig: () => config,
       getManifest: () => null,
       getSessionId: () => 'session_hook',
     });
     await hook(tempDir, ctx);
-    assert.equal((await readObjects()).length, 1);
-
+    assert.equal((await readObjects()).length, 1, '只打包 message 条目');
     const logPath = join(tempDir, 'efficiency-logs', 'observation.jsonl');
-    const logData = await readFile(logPath, 'utf8');
-    assert.ok(logData.includes('"event":"packed-batch"'));
-    assert.ok(logData.includes('"source":"compaction"'));
-    assert.ok(logData.includes('"sessionId":"session_hook"'));
+    assert.ok((await readFile(logPath, 'utf8')).includes('"source":"compaction"'));
 
-    // 4. Second invocation hits the memo -> nothing repacked, no duplicate telemetry.
     await hook(tempDir, ctx);
-    assert.equal((await readObjects()).length, 1);
-    assert.equal((await readFile(logPath, 'utf8')).trim().split('\n').length, 1);
-  } finally {
-    clearObservationMemoForTest();
-    await rm(tempDir, { recursive: true, force: true });
-  }
+    assert.equal((await readObjects()).length, 1, '第二次命中 memo');
+    assert.equal((await readFile(logPath, 'utf8')).trim().split('\n').length, 1, '不重复遥测');
+  });
 });

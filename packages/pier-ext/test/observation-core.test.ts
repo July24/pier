@@ -11,7 +11,6 @@ import {
   isObservationId,
   shouldPackForCache,
   sliceBufferChunk,
-  trimUtf8End,
 } from '../src/observation-core.ts';
 
 test('deriveObservationId: deterministic 24-hex ID and handles collisions', () => {
@@ -63,36 +62,23 @@ test('formatObservationPlaceholder: includes metadata and whole line previews', 
   assert.ok(placeholder.includes('line 1\n'));
 });
 
-test('sliceBufferChunk: paged retrieval with line limit and eof detection', () => {
-  const content = 'Row 1\nRow 2\nRow 3\nRow 4\nRow 5\n';
-  const buf = Buffer.from(content, 'utf8');
-
-  // Slice at most 2 lines
+test('sliceBufferChunk: pages by line limit and reports eof', () => {
+  const buf = Buffer.from('Row 1\nRow 2\nRow 3\nRow 4\nRow 5\n', 'utf8');
   const chunk1 = sliceBufferChunk(buf, 0, { maxBytes: 1024, maxLines: 2 });
-  assert.equal(chunk1.text, 'Row 1\nRow 2\n');
-  assert.equal(chunk1.lines, 2);
-  assert.equal(chunk1.eof, false);
-
-  // Slice next chunk
+  assert.deepEqual([chunk1.text, chunk1.lines, chunk1.eof], ['Row 1\nRow 2\n', 2, false]);
   const chunk2 = sliceBufferChunk(buf, chunk1.nextOffset, { maxBytes: 1024, maxLines: 2 });
-  assert.equal(chunk2.text, 'Row 3\nRow 4\n');
-  assert.equal(chunk2.lines, 2);
-  assert.equal(chunk2.eof, false);
-
-  // Final chunk
+  assert.deepEqual([chunk2.text, chunk2.lines, chunk2.eof], ['Row 3\nRow 4\n', 2, false]);
   const chunk3 = sliceBufferChunk(buf, chunk2.nextOffset, { maxBytes: 1024, maxLines: 2 });
-  assert.equal(chunk3.text, 'Row 5\n');
-  assert.equal(chunk3.lines, 1);
-  assert.equal(chunk3.eof, true);
+  assert.deepEqual([chunk3.text, chunk3.lines, chunk3.eof], ['Row 5\n', 1, true]);
+  assert.deepEqual(sliceBufferChunk(buf, buf.length, { maxBytes: 1024, maxLines: 2 }), { text: '', bytes: 0, lines: 0, nextOffset: buf.length, eof: true });
 });
 
-test('trimUtf8End: does not split multi-byte characters', () => {
-  // Chinese characters: '中' (3 bytes: E4 B8 AD)
-  const buf = Buffer.from('中', 'utf8');
-  assert.equal(buf.length, 3);
-  // If cut at 2 bytes:
-  const trimmed = trimUtf8End(buf, 2);
-  assert.equal(trimmed, 0); // Discards partial character
+test('sliceBufferChunk: never splits a multi-byte character at the byte limit', () => {
+  // '中' is 3 bytes (E4 B8 AD); a 4-byte budget would cut the second one in half.
+  const chunk = sliceBufferChunk(Buffer.from('中中', 'utf8'), 0, { maxBytes: 4, maxLines: 10 });
+  assert.equal(chunk.text, '中');
+  assert.equal(chunk.bytes, 3);
+  assert.equal(chunk.eof, false);
 });
 
 test('shouldPackForCache: balances read savings against prefix rewrite cost', () => {
