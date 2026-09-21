@@ -1,14 +1,9 @@
-/** Why: Preserve the established compatibility and safety behavior (D71, M14, T1–T6, T3, T6). */
 import { pierOption } from './pier-options.ts';
 import { basename } from 'node:path';
-
-/** Why: Preserve the established compatibility and safety behavior. */
 
 export const TERMINALS_CUSTOM_TYPE = 'pi-herdr.terminals';
 export const MAX_TERMINALS = 8;
 export const READ_MAX_CHARS = 8000;
-/** Why: Preserve the established compatibility and safety behavior. */
-export const READ_HARD_CAP_CHARS = 200;
 export const READINESS_TIMEOUT_MS = 30_000;
 export const SILENCE_IDLE_MS = 2000;
 /** POSIX / PowerShell / Nushell / Zsh prompt tail.
@@ -30,52 +25,44 @@ export const POSIX_PROMPT: PromptStrategy = {
   tailRe: PROMPT_TAIL_RE,
 };
 
-export const BASH_PROMPT: PromptStrategy = POSIX_PROMPT;
-export const ZSH_PROMPT: PromptStrategy = POSIX_PROMPT;
-
 /** cmd.exe / PowerShell: `>` still matches POSIX; this also accepts `PS C:\\>` without a trailing `$`. */
 export const POWERSHELL_PROMPT: PromptStrategy = {
   waitPattern: '(PS [^\\n>]+|>)\\s*$',
   tailRe: /(PS [^\n>]+|>)\s*$/,
 };
 
-export const PWSH_PROMPT: PromptStrategy = POWERSHELL_PROMPT; // same object: identity checks stay valid
+/** Shell name (lowercased basename from $SHELL, or a PIER_TERMINAL_PROMPT value) → strategy. */
+const PROMPT_STRATEGIES: Record<string, PromptStrategy> = {
+  bash: POSIX_PROMPT,
+  zsh: POSIX_PROMPT,
+  pwsh: POWERSHELL_PROMPT,
+  'pwsh.exe': POWERSHELL_PROMPT,
+  powershell: POWERSHELL_PROMPT,
+  'powershell.exe': POWERSHELL_PROMPT,
+};
 
 /**
- * Strategy selection covering bash, zsh, powershell/pwsh.
- * Explicit `PIER_TERMINAL_PROMPT` env var takes precedence; otherwise `SHELL` is inspected.
- * Default remains POSIX so existing Windows/Linux panes without explicit configuration do not flip.
+ * Explicit `PIER_TERMINAL_PROMPT` wins over `$SHELL`; the default stays POSIX so panes without
+ * explicit configuration never flip strategy.
  */
 export function promptStrategyFor(env: NodeJS.ProcessEnv = process.env): PromptStrategy {
   // B10: canonical PIER_TERMINAL_PROMPT, legacy PI_HERDR_TERMINAL_PROMPT alias.
   const prompt = pierOption('PIER_TERMINAL_PROMPT', env)?.trim().toLowerCase();
-  if (prompt === 'powershell' || prompt === 'pwsh') return POWERSHELL_PROMPT;
-  if (prompt === 'bash') return BASH_PROMPT;
-  if (prompt === 'zsh') return ZSH_PROMPT;
-  if (!prompt && env.SHELL) {
-    const sh = basename(env.SHELL.replace(/\\/g, '/')).toLowerCase();
-    if (sh === 'pwsh' || sh === 'powershell' || sh === 'powershell.exe' || sh === 'pwsh.exe') {
-      return POWERSHELL_PROMPT;
-    }
-    if (sh === 'bash') return BASH_PROMPT;
-    if (sh === 'zsh') return ZSH_PROMPT;
-  }
-  return POSIX_PROMPT;
+  const shell = prompt || basename((env.SHELL ?? '').replace(/\\/g, '/')).toLowerCase();
+  return PROMPT_STRATEGIES[shell] ?? POSIX_PROMPT;
 }
-/** Why: Preserve the established compatibility and safety behavior (T6). */
+
 export const SIGNAL_KEYS = ['ctrl+c', 'ctrl+d', 'ctrl+z', 'esc', 'enter'] as const;
 export type SignalKey = (typeof SIGNAL_KEYS)[number];
 
 const FULLSCREEN_SEQUENCES = [
-  '\x1b[?1049h', // Why: Preserve the established compatibility and safety behavior.
-  '\x1b[?47h', // Why: Preserve the established compatibility and safety behavior.
-  '\x1b[2J\x1b[H', // Why: Preserve the established compatibility and safety behavior.
+  '\x1b[?1049h',
+  '\x1b[?47h',
+  '\x1b[2J\x1b[H',
 ] as const;
 
 export const RESET_MARKER = '…[buffer reset — earlier output scrolled away or cleared]…';
 export const TRUNCATE_MARKER = '…[truncated]…';
-
-/** Why: Preserve the established compatibility and safety behavior. */
 
 export interface TerminalEntry {
   terminalId: string;
@@ -100,8 +87,6 @@ export interface TerminalsRegistry {
   version: 1;
   terminals: TerminalEntry[];
 }
-
-/** Why: Preserve the established compatibility and safety behavior. */
 
 export function nextTerminalId(existingIds: readonly string[]): string {
   let max = 0;
@@ -148,7 +133,6 @@ export function registerTerminal(
   return { ok: true, entries: [...entries, entry], entry };
 }
 
-/** Why: Preserve the established compatibility and safety behavior. */
 export function closeTerminal(
   entries: readonly TerminalEntry[],
   terminalId: string,
@@ -163,12 +147,9 @@ export function closeTerminal(
   };
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D71). */
 export function activeTerminalPaneIds(entries: readonly TerminalEntry[]): Set<string> {
   return new Set(entries.filter((e) => e.status === 'open').map((e) => e.paneId));
 }
-
-/** Why: Preserve the established compatibility and safety behavior (T6). */
 
 export function validateSendText(text: string): { ok: true; text: string } | { ok: false; error: string } {
   if (text.includes('\x1b')) {
@@ -177,7 +158,7 @@ export function validateSendText(text: string): { ok: true; text: string } | { o
       error: 'unsupported input: ANSI escape sequences cannot be sent as text; use terminal(action: "signal") for control keys, or plain commands only',
     };
   }
-  // Why: Preserve the established compatibility and safety behavior (C0).
+
   const stripped = text.replace(/[\r\n]+$/, '');
   const bad = stripped.match(/[\x00-\x08\x0b-\x1f\x7f]/);
   if (bad) {
@@ -200,8 +181,6 @@ export function validateSignal(key: string): { ok: true; key: SignalKey } | { ok
   return { ok: true, key: k };
 }
 
-/** Why: Preserve the established compatibility and safety behavior (T6). */
-
 export function detectFullscreenTUI(raw: string): { detected: boolean; sequence: string | null } {
   for (const seq of FULLSCREEN_SEQUENCES) {
     if (raw.includes(seq)) return { detected: true, sequence: seq };
@@ -211,21 +190,16 @@ export function detectFullscreenTUI(raw: string): { detected: boolean; sequence:
 
 export function stripAnsi(raw: string): string {
   return raw
-    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '') // Why: Preserve the established compatibility and safety behavior.
-    .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '') // Why: Preserve the established compatibility and safety behavior.
-    .replace(/\x1b[@-Z\\-_]/g, '') // Why: Preserve the established compatibility and safety behavior.
-    .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, ''); // Why: Preserve the established compatibility and safety behavior.
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '')
+    .replace(/\x1b[@-Z\\-_]/g, '')
+    .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
 }
-
-/** Why: Preserve the established compatibility and safety behavior. */
 
 export interface ReadCursor {
   revision: number;
-  /** Why: Preserve the established compatibility and safety behavior. */
   len: number;
-  /** Why: Preserve the established compatibility and safety behavior. */
   tail: string;
-  /** Why: Preserve the established compatibility and safety behavior. */
   eoTail: string;
 }
 
@@ -233,14 +207,11 @@ export interface ReadIncrement {
   mode: 'none' | 'append' | 'reset';
   text: string;
   cursor: ReadCursor;
-  /** Why: Preserve the established compatibility and safety behavior. */
   hardCapped: boolean;
 }
 
-/** Why: Preserve the established compatibility and safety behavior. */
 const CURSOR_TAIL_CHARS = 64;
 
-/** Why: Preserve the established compatibility and safety behavior (M14). */
 export function computeIncrement(
   prev: ReadCursor | null,
   next: { text: string; revision: number },
@@ -265,7 +236,7 @@ export function computeIncrement(
     const bounded = boundText(suffix, maxChars);
     return { mode: 'append', text: bounded.text, cursor, hardCapped: bounded.capped };
   }
-  // Why: Preserve the established compatibility and safety behavior.
+
   const bounded = boundText(next.text, maxChars);
   const text = prev ? `${RESET_MARKER}\n${bounded.text}` : bounded.text;
   return { mode: 'reset', text, cursor, hardCapped: bounded.capped };
@@ -275,8 +246,6 @@ function boundText(text: string, maxChars: number): { text: string; capped: bool
   if (text.length <= maxChars) return { text, capped: false };
   return { text: `${text.slice(text.length - maxChars)}\n${TRUNCATE_MARKER}`, capped: true };
 }
-
-/** Why: Preserve the established compatibility and safety behavior (T3). */
 
 export type ReadinessTier = 'prompt' | 'silent' | 'busy';
 
@@ -290,8 +259,6 @@ export function classifyReadiness(
   if (opts.silentMs >= (opts.silenceThresholdMs ?? SILENCE_IDLE_MS)) return 'silent';
   return 'busy';
 }
-
-/** Why: Preserve the established compatibility and safety behavior (T6). */
 
 export interface TerminalSummary {
   terminalId: string;
@@ -321,33 +288,8 @@ export function summarizeSessions(
   return { terminals, stalePaneIds };
 }
 
-/** Why: Preserve the established compatibility and safety behavior. */
-
-export interface BranchEntryLike3 {
-  type?: string;
-  customType?: string;
-  data?: unknown;
-}
-
 export function makeTerminalsRegistry(terminals: TerminalEntry[] = []): TerminalsRegistry {
   return { version: 1, terminals };
-}
-
-/**
- * Why: In interactive bash and zsh, history expansion (`!`) is active by default. Commands
- * containing `!` (such as `!|` or `if [ ! -f ... ]` or `!$`) trigger history expansion
- * (e.g. `zsh: event not found: \|`), wedging the managed shell and leaving the controller
- * waiting indefinitely (observed in session 01a08f37).
- * We disable history expansion for managed shells right after creation via `set +H` (supported
- * by both bash and zsh; equivalent to `unsetopt BANG_HIST` in zsh).
- * On Windows / PowerShell, `set +H` is unrecognized syntax and PowerShell does not use `!`
- * for history expansion, so init is skipped.
- *
- * Limits: `set +H` only affects the top-level persistent shell process. If a command spawns
- * a nested interactive subshell (e.g. `bash -i`), that subshell would re-enable its default options.
- */
-export function shellInitCommandFor(strategy: PromptStrategy = POSIX_PROMPT): string | null {
-  return strategy === POWERSHELL_PROMPT ? null : 'set +H';
 }
 
 export interface ShellInitPlan {
@@ -355,22 +297,29 @@ export interface ShellInitPlan {
   readonly command: string | null;
 }
 
+/**
+ * Plan the shell init command: `set +H` disables history expansion in managed bash/zsh shells, where `!`
+ * in ordinary commands (`!|`, `if [ ! -f ... ]`, `!$`) otherwise triggers `zsh: event not found: \|` and
+ * wedges the shell. PowerShell rejects the syntax and does not use `!` for history expansion, so it is
+ * skipped. Limit: applies to the top-level shell only; a nested `bash -i` re-enables its own defaults.
+ * Init is only worth sending once the shell is at its prompt and has not been initialized yet.
+ */
 export function planShellInit(opts: {
   strategy?: PromptStrategy;
   readiness?: ReadinessTier;
   initialized?: boolean;
 }): ShellInitPlan {
   if (opts.initialized) return { shouldInit: false, command: null };
-  const strategy = opts.strategy ?? POSIX_PROMPT;
-  const cmd = shellInitCommandFor(strategy);
-  if (!cmd) return { shouldInit: false, command: null };
+  if ((opts.strategy ?? POSIX_PROMPT) === POWERSHELL_PROMPT) return { shouldInit: false, command: null };
   if (opts.readiness !== undefined && opts.readiness !== 'prompt') {
     return { shouldInit: false, command: null };
   }
-  return { shouldInit: true, command: cmd };
+  return { shouldInit: true, command: 'set +H' };
 }
 
-export function foldTerminalsRegistry(entries: readonly BranchEntryLike3[]): TerminalEntry[] {
+export function foldTerminalsRegistry(
+  entries: readonly { type?: string; customType?: string; data?: unknown }[],
+): TerminalEntry[] {
   let found: TerminalEntry[] = [];
   for (const entry of entries) {
     if (entry.type !== 'custom' || entry.customType !== TERMINALS_CUSTOM_TYPE) continue;
@@ -400,15 +349,13 @@ export function foldTerminalsRegistry(entries: readonly BranchEntryLike3[]): Ter
 }
 
 /* ── Idle-terminal nudge: turn-end self-cleanup for shells the model forgot to close ──
- * Observed (wF:p7 orphan): a master opened a resident terminal for a one-shot background
- * compile, the job finished, and nothing ever closed the pane — terminals are persistent by
- * design, so the shell lingered as a dead split in the main tab. Decision core mirrors the
- * todo stop-reminder: pure plan here, delivery wiring in plugins/terminal. */
+ * Terminals are persistent by design, so a shell whose work finished lingers as a dead split.
+ * Decision core here, delivery wiring in plugins/terminal (mirrors the todo stop-reminder). */
 
 /** Cap idle-terminal nudges for the lifetime of the process (same shape as TODO_REMINDERS_MAX). */
 export const TERM_REMINDERS_MAX = 2;
 
-/** Idle threshold before a nudge is due; PI_HERDR_TERM_IDLE_MS is read per call so tests can use small values. */
+/** Idle threshold before a nudge is due; the env var is read per call so tests can use small values. */
 export function terminalIdleMs(): number {
   // B10: canonical PIER_TERM_IDLE_MS, legacy PI_HERDR_TERM_IDLE_MS.
   return Number(pierOption('PIER_TERM_IDLE_MS') ?? 30 * 60_000) || 30 * 60_000;
@@ -427,7 +374,7 @@ export interface IdleTerminalInput {
   cwd: string;
   label: string | null;
   lastActivityAt: number;
-  /** Set once this terminal has been nudged; a nudged terminal is never nudged again (01a06ae3 goodbye-loop guard). */
+  /** Set once this terminal has been nudged; a nudged terminal is never nudged again (goodbye-loop guard). */
   nudgedAt?: number | null;
 }
 
@@ -447,11 +394,10 @@ function noIdleInject(reminders: number): IdleTerminalReminderPlan {
 }
 
 /**
- * Due only when an OPEN terminal is idle past the threshold AND has never been nudged
- * (01a06ae3: a per-process counter alone let nudges resume after restarts and looped a
- * farewell exchange 52 times — a nudged terminal must stay nudged, persisted in the ledger).
- * Shells still hosting long-running work were touched recently, so the idle filter is what
- * keeps legitimate dev-server terminals out of the nudge.
+ * Due only when an OPEN terminal is idle past the threshold AND has never been nudged: a nudged
+ * terminal must stay nudged (persisted in the ledger), or a farewell exchange can loop. Shells
+ * still hosting long-running work were touched recently, so the idle filter keeps legitimate
+ * dev-server terminals out of the nudge.
  */
 export function planIdleTerminalReminder(
   input: { open: readonly IdleTerminalInput[]; now: number; reminders: number },

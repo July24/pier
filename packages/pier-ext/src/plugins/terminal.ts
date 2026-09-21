@@ -1,10 +1,10 @@
 /**
  * M14 terminal loader entry for the D78 mount tree and D81 responsibility split.
  *
- * Keeping this as a Cordis loader plugin makes the terminal surface hot-swappable. Services
- * provide the D79 tombstone-aware pi surface, herdr client/environment, and the state slot
- * used by index GC. Avoiding an index.ts import preserves an acyclic dependency graph, while
- * terminal-core remains independently testable pure logic.
+ * A Cordis loader plugin so the terminal surface stays hot-swappable: services provide the
+ * tombstone-aware pi surface, the herdr client/environment and the state slot used by index GC.
+ * Importing index.ts is avoided to keep the dependency graph acyclic; terminal-core holds the
+ * pure, independently testable logic.
  */
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
@@ -12,9 +12,6 @@ import type { PiSurface } from '../pi-surface.ts';
 import type { HerdrClientLike } from '../herdr-client.ts';
 import { herdrUnavailableHint } from '../herdr-client.ts';
 import { toolError } from '../tool-error.ts'
-
-/** Raw tool arguments: every field is validated inside the action handlers. */
-type ToolParams = Record<string, unknown> | undefined;;
 import {
   READINESS_TIMEOUT_MS,
   READ_MAX_CHARS,
@@ -37,10 +34,19 @@ import {
   validateSendText,
   validateSignal,
   type ReadCursor,
+  type ReadinessTier,
   type TerminalEntry,
 } from '../terminal-core.ts';
 import { swallow } from '../swallow.ts';
 import { pierOption } from '../pier-options.ts';
+
+/** Raw tool arguments: every field is validated inside the action handlers. */
+type ToolParams = Record<string, unknown> | undefined;
+
+/** Terminal tool actions; the tool schema union and the handler map are both keyed by this list. */
+const TERMINAL_ACTIONS = ['open', 'send', 'wait', 'read', 'signal', 'close', 'list'] as const;
+type TerminalAction = (typeof TERMINAL_ACTIONS)[number];
+type ActionHandler = (params: ToolParams, ctx: unknown) => Promise<unknown>;
 
 export interface TerminalStateSlot {
   /** Lets index GC preserve panes that host active terminals. */
@@ -108,9 +114,8 @@ export default function terminalPlugin(ctx: Context): void {
   });
 
   // Session teardown (quit / Ctrl+D / SIGTERM) is the last chance to reclaim resident shells:
-  // terminals are persistent by design, so a master that exits without closing them leaks live
-  // zsh panes. Session SWITCH never fires this event (only session_start/session_tree), so
-  // switching branches cannot kill shells that the registry replays on the next session_start.
+  // a master that exits without closing them leaks live zsh panes. Session SWITCH never fires this
+  // event, so switching branches cannot kill shells that session_start replays from the registry.
   scoped.on('session_shutdown', async () => {
     idleReminderTimer && clearTimeout(idleReminderTimer);
     idleReminderTimer = null;
@@ -124,8 +129,7 @@ export default function terminalPlugin(ctx: Context): void {
     persistTerminals();
   });
 
-  // Turn-end nudge: remind the model to close terminals idle past the threshold (wF:p7 orphan —
-  // a one-shot background compile left a dead split in the main tab forever). Same delivery
+  // Turn-end nudge: remind the model to close terminals idle past the threshold. Same delivery
   // shape as the todo stop reminder: grace window, cancel on agent_start, capped followUp.
   const piSend = surface.raw as {
     sendMessage?: (
@@ -152,9 +156,9 @@ export default function terminalPlugin(ctx: Context): void {
       reminders: idleReminders,
     });
     if (!plan.due || plan.content == null) return;
-    // 01a06ae3 goodbye-loop: mark the covered terminals nudged NOW (persisted), and deliver the
-    // notice as a queued followUp WITHOUT triggerTurn — a reminder alone must never wake the
-    // agent, or a farewell exchange loops: wake → polite goodbye → settle → nudge → wake …
+    // Goodbye-loop guard: mark the covered terminals nudged NOW (persisted), and deliver the notice
+    // as a queued followUp WITHOUT triggerTurn — a reminder must never wake the agent, or the loop
+    // wake → polite goodbye → settle → nudge → wake … never ends.
     const now = Date.now();
     const ids = new Set(plan.ids);
     terminals = terminals.map((t) => (ids.has(t.terminalId) ? { ...t, nudgedAt: now } : t));
@@ -189,6 +193,17 @@ export default function terminalPlugin(ctx: Context): void {
   /** A1: a hard failure must throw (pi sets isError only for throws); non-failures stay results. */
   const fail = (msg: string): never => toolError(msg);
 
+  // Action routing: each handler validates its own params, and `open` additionally needs the tool ctx.
+  const handlers: Record<TerminalAction, ActionHandler> = {
+    open: executeTerminalOpen,
+    send: executeTerminalSend,
+    wait: executeTerminalWait,
+    read: executeTerminalRead,
+    signal: executeTerminalSignal,
+    close: executeTerminalClose,
+    list: executeTerminalList,
+  };
+
   scoped.registerTool({
     name: 'terminal',
     label: 'Terminal',
@@ -196,10 +211,7 @@ export default function terminalPlugin(ctx: Context): void {
       'Manage persistent interactive terminals (resident shells in dedicated herdr panes).',
       'Operations: open (create session), send (type commands), wait (block until output matches a pattern), read (capture output), signal (ctrl+c/ctrl+d/ctrl+z/esc/enter), close (kill shell), list (show all).',
       'The shell keeps cwd, environment variables, and background processes across calls.',
-      'Use for dev servers, REPLs, or multi-step shell work — not one-shot bash calls.',
-      'Close a terminal with action: "close" as soon as the work in it is done — finished terminals are never auto-reclaimed and keep occupying a pane.',
       'Long job pattern: send "cmd; echo TERM_DONE_$?" then wait with pattern "TERM_DONE_" — the sentinel also carries the exit code; redirect verbose output to a log file and read the file, because output between two reads is lost.',
-      'After send, use read to confirm the command actually started; multi-line text executes line-by-line. send(wait_prompt: true) refuses to queue text while a previous command is still running.',
     ].join(' '),
     promptSnippet: 'terminal: a persistent shell in its own pane — use for dev servers, REPLs, and multi-step shell work that must keep state between calls.',
     promptGuidelines: [
@@ -210,15 +222,7 @@ export default function terminalPlugin(ctx: Context): void {
       'Close the terminal as soon as the work is done — a finished terminal keeps occupying a pane and is never auto-reclaimed.',
     ],
     parameters: Type.Object({
-      action: Type.Union([
-        Type.Literal('open'),
-        Type.Literal('send'),
-        Type.Literal('wait'),
-        Type.Literal('read'),
-        Type.Literal('signal'),
-        Type.Literal('close'),
-        Type.Literal('list'),
-      ], { description: 'Terminal operation to perform' }),
+      action: Type.Union(TERMINAL_ACTIONS.map((name) => Type.Literal(name)), { description: 'Terminal operation to perform' }),
       cwd: Type.Optional(Type.String({ description: '[open] Working directory for the shell (defaults to session cwd)' })),
       terminal_id: Type.Optional(Type.String({ description: '[send|wait|read|signal|close] Terminal id returned by open action' })),
       text: Type.Optional(Type.String({ description: '[send] Command text to type and run (Enter appended automatically)' })),
@@ -232,36 +236,44 @@ export default function terminalPlugin(ctx: Context): void {
     }),
     async execute(_tc: string, params: ToolParams, _sig: AbortSignal | undefined, _upd: unknown, ctx: unknown) {
       const action = typeof params?.action === 'string' ? params.action : '';
-      switch (action) {
-        case 'open': return executeTerminalOpen(params, ctx);
-        case 'send': return executeTerminalSend(params);
-        case 'wait': return executeTerminalWait(params);
-        case 'read': return executeTerminalRead(params);
-        case 'signal': return executeTerminalSignal(params);
-        case 'close': return executeTerminalClose(params);
-        case 'list': return executeTerminalList();
-        default:
-          return fail(action
-            ? `unknown action "${action}" (valid: open, send, wait, read, signal, close, list)`
-            : 'action is required (open, send, wait, read, signal, close, list)');
+      const handler: ActionHandler | undefined = handlers[action as TerminalAction];
+      if (!handler) {
+        const valid = TERMINAL_ACTIONS.join(', ');
+        return fail(action
+          ? `unknown action "${action}" (valid: ${valid})`
+          : `action is required (${valid})`);
       }
+      return handler(params, ctx);
     },
   });
 
   /** Probe whether the shell sits at its interactive prompt (advisory: probe failures degrade to 'busy'). */
-  async function probeReadiness(paneId: string): Promise<'prompt' | 'silent' | 'busy'> {
+  async function probeReadiness(paneId: string): Promise<ReadinessTier> {
     const prompt = promptStrategyFor();
     try {
       const waitRes = await client.waitForOutput(paneId, { type: 'regex', value: prompt.waitPattern }, READINESS_TIMEOUT_MS);
-      const isMatched = waitRes && typeof waitRes === 'object' && 'matched' in waitRes
-        ? (waitRes as { matched: boolean }).matched
-        : Boolean(waitRes);
-      if (isMatched) return 'prompt';
+      if (waitRes.matched) return 'prompt';
       const read = await client.readPane(paneId, { stripAnsi: false });
       return classifyReadiness(stripAnsi(read.text), { silentMs: 0, prompt });
     } catch {
       /* Readiness is advisory, so probe failures still leave a usable terminal. */
       return 'busy';
+    }
+  }
+
+  /**
+   * Best-effort `set +H` right after a shell becomes usable: history expansion would otherwise wedge it.
+   * Returns whether the command was injected, so a shell that was not at its prompt yet retries later.
+   */
+  async function injectShellInit(entry: TerminalEntry, readiness?: ReadinessTier): Promise<boolean> {
+    const init = planShellInit({ strategy: promptStrategyFor(), readiness });
+    if (!init.shouldInit || !init.command) return false;
+    try {
+      await client.sendPaneText(entry.paneId, init.command);
+      return true;
+    } catch {
+      /* Shell init is best-effort: the terminal works without it. */
+      return false;
     }
   }
 
@@ -287,16 +299,9 @@ export default function terminalPlugin(ctx: Context): void {
     terminals = r.entries;
     persistTerminals();
     const readiness = await probeReadiness(paneId);
-    const prompt = promptStrategyFor();
-    const init = planShellInit({ strategy: prompt, readiness });
-    if (init.shouldInit && init.command) {
-      try {
-        await client.sendPaneText(paneId, init.command);
-        r.entry.initialized = true;
-        persistTerminals();
-      } catch {
-        /* Shell init is best-effort: failure to set +H does not block terminal usage */
-      }
+    if (await injectShellInit(r.entry, readiness)) {
+      r.entry.initialized = true;
+      persistTerminals();
     }
     const text = [
       `terminal ${r.entry.terminalId} open (pane ${paneId})`,
@@ -312,15 +317,7 @@ export default function terminalPlugin(ctx: Context): void {
     const v = validateSendText(typeof params?.text === 'string' ? params.text : '');
     if (!v.ok) return fail(v.error);
     if (!entry.initialized) {
-      const prompt = promptStrategyFor();
-      const init = planShellInit({ strategy: prompt });
-      if (init.shouldInit && init.command) {
-        try {
-          await client.sendPaneText(entry.paneId, init.command);
-        } catch {
-          /* Shell init is best-effort */
-        }
-      }
+      await injectShellInit(entry);
       entry.initialized = true;
       persistTerminals();
     }
@@ -365,16 +362,7 @@ export default function terminalPlugin(ctx: Context): void {
     const matcher = useRegex ? { type: 'regex' as const, value: raw } : { type: 'substring' as const, value: raw };
     let waitResult: { matched: boolean; reason?: 'timeout' | 'unavailable' };
     try {
-      const res = await client.waitForOutput(entry.paneId, matcher, timeoutMs);
-      if (typeof res === 'object' && res !== null && 'matched' in res) {
-        waitResult = res as { matched: boolean; reason?: 'timeout' | 'unavailable' };
-      } else if (res === true) {
-        waitResult = { matched: true };
-      } else if (res === false) {
-        waitResult = { matched: false, reason: 'timeout' };
-      } else {
-        waitResult = { matched: false, reason: 'unavailable' };
-      }
+      waitResult = await client.waitForOutput(entry.paneId, matcher, timeoutMs);
     } catch (e) {
       return fail(herdrUnavailableHint(e) ?? `wait failed (pane may be closed): ${(e as Error).message}`);
     }
@@ -400,41 +388,42 @@ export default function terminalPlugin(ctx: Context): void {
     };
   }
 
+  /**
+   * T5: a direct `pane_id` read is limited to panes in this session's own tab or to self-created
+   * terminal panes, so one task can never read another's pane. Returns the error text instead of
+   * throwing, keeping the tool's own hard-failure policy at the call site.
+   */
+  async function resolveDirectPaneId(paneId: string): Promise<{ ok: true; paneId: string } | { ok: false; error: string }> {
+    let panes;
+    try {
+      panes = await client.listPanes();
+    } catch (e) {
+      return { ok: false, error: herdrUnavailableHint(e) ?? `pane lookup failed: ${(e as Error).message}` };
+    }
+    const target = panes.find((p) => p.paneId === paneId);
+    const ownTab = Boolean(target?.tabId) && target?.tabId === env?.tabId;
+    if (!target || !(ownTab || activeTerminalPaneIds(terminals).has(paneId))) {
+      return { ok: false, error: 'pane_id read is limited to panes in this session\'s own tab or self-created terminal panes' };
+    }
+    return { ok: true, paneId };
+  }
+
   async function executeTerminalRead(params: ToolParams) {
-    let paneId: string | null = null;
+    let paneId: string;
     let entry: TerminalEntry | null = null;
     if (typeof params?.terminal_id === 'string') {
       entry = findOpenTerminal(params.terminal_id);
       if (!entry) return fail(`unknown or closed terminal "${params.terminal_id}" (see action list)`);
       paneId = entry.paneId;
     } else if (typeof params?.pane_id === 'string') {
-      // T5 limits direct reads to this task tab or owned terminals to prevent cross-task access.
-      // A1: the guard result is carried out of the try block — a thrown tool error must not be eaten
-      // by the lookup catch below (it would be reported as a bogus "pane lookup failed").
-      let allowed = false;
-      let lookupError: unknown = null;
-      try {
-        const panes = await client.listPanes();
-        const target = panes.find((p) => p.paneId === params.pane_id);
-        const ownTab = target?.tabId && target.tabId === env?.tabId;
-        const ownTerminal = activeTerminalPaneIds(terminals).has(params.pane_id);
-        allowed = Boolean(target) && Boolean(ownTab || ownTerminal);
-        if (allowed) paneId = params.pane_id;
-      } catch (e) {
-        lookupError = e;
-      }
-      if (lookupError !== null) {
-        return fail(herdrUnavailableHint(lookupError) ?? `pane lookup failed: ${(lookupError as Error).message}`);
-      }
-      if (!allowed) {
-        return fail('pane_id read is limited to panes in this session\'s own tab or self-created terminal panes');
-      }
+      const resolved = await resolveDirectPaneId(params.pane_id);
+      if (!resolved.ok) return fail(resolved.error);
+      paneId = resolved.paneId;
     } else {
       return fail('provide terminal_id (or pane_id for a direct own-tab read)');
     }
     const maxChars = typeof params?.max_chars === 'number' && params.max_chars > 0
       ? Math.min(params.max_chars, TERM_READ_MAX) : TERM_READ_MAX;
-    if (paneId === null) return fail('no readable pane resolved (pass terminal_id, or pane_id for an own-tab pane)');
     let read: { text: string; revision: number; truncated: boolean };
     try {
       read = await client.readPane(paneId, { stripAnsi: false });
