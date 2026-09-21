@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   appendHistory,
+  inheritOutcome,
   applyReportedSessionFile,
   generationsByTask,
   historyFilePath,
@@ -132,4 +133,19 @@ test('parseHistoryEntries: 旧 kind=resident 读盘不炸，折叠为 task', () 
   const entries = parseHistoryEntries(JSON.stringify(mk({ kind: 'resident' })));
   assert.equal(entries.length, 1);
   assert.equal(entries[0].kind, 'task');
+});
+
+test('inheritOutcome: an omitted patch value inherits the latest non-empty outcome', () => {
+  assert.equal(inheritOutcome('最终报告…', undefined), '最终报告…', 'undefined → inherit');
+  assert.equal(inheritOutcome(null, 'observation timeout'), 'observation timeout');
+  assert.equal(inheritOutcome('最终报告…', null), null, 'an explicit null also wins');
+  assert.equal(inheritOutcome(undefined, undefined), null);
+});
+
+test('via: the writer marker survives a round-trip (one row per event, auditable)', () => {
+  const rows = parseHistoryEntries([
+    JSON.stringify({ taskId: 't1', kind: 'task', paneId: 'p1', status: 'consumed', outcome: 'x', createdAt: 1, via: 'poll-settle' }),
+    JSON.stringify({ taskId: 't1', kind: 'task', paneId: 'p1', status: 'closed', createdAt: 2, via: 'gc' }),
+  ].join('\n'));
+  assert.deepEqual(rows.map((r) => r.via), ['poll-settle', 'gc']);
 });

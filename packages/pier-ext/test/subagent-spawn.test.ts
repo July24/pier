@@ -253,12 +253,15 @@ function fakeClient(sessionFile: string, h: Harness): HerdrClientLike {
 }
 
 /** One connection per request; prompt requests can be rejected on demand. */
-async function startPipeSim(cwd: string, h: Harness, opts: { rejectPrompt?: boolean }): Promise<net.Server> {
+async function startPipeSim(cwd: string, h: Harness, opts: { rejectPrompt?: boolean }): Promise<{ stop: () => Promise<void> }> {
   const sockPath = pipePathFor(pipeNameFor(cwd, 'p2'));
   try {
     if (existsSync(sockPath)) unlinkSync(sockPath);
   } catch { /* stale socket cleanup is best effort */ }
+  const sockets = new Set<net.Socket>();
   const server = net.createServer((sock) => {
+    sockets.add(sock);
+    sock.on('close', () => sockets.delete(sock));
     let buf = '';
     sock.setEncoding('utf8');
     sock.on('data', (chunk) => {
@@ -281,7 +284,15 @@ async function startPipeSim(cwd: string, h: Harness, opts: { rejectPrompt?: bool
   const { promise, resolve } = Promise.withResolvers<void>();
   server.listen(sockPath, () => resolve());
   await promise;
-  return server;
+  // Destroying the live sockets first: a lingering client would keep close() pending forever.
+  return {
+    stop: async () => {
+      for (const sock of sockets) sock.destroy();
+      const closed = Promise.withResolvers<void>();
+      server.close(() => closed.resolve());
+      await closed.promise;
+    },
+  };
 }
 
 interface SpawnCtx {
@@ -305,7 +316,7 @@ async function withSpawnEnv(fn: (ctx: SpawnCtx) => Promise<void>, opts: { reject
       message: { role: 'assistant', content: [{ type: 'text', text: SUB_TEXT }], timestamp: Date.now(), stopReason: 'stop' },
     }) + '\n'),
   };
-  const server = await startPipeSim(opts.childCwd ?? cwd, h, opts);
+  const pipeSim = await startPipeSim(opts.childCwd ?? cwd, h, opts);
   const pi = fakePi();
   const port = emptySubagentPortBox();
   const root = new Context();
@@ -327,9 +338,7 @@ async function withSpawnEnv(fn: (ctx: SpawnCtx) => Promise<void>, opts: { reject
     await fn({ pi, port, h, cwd });
   } finally {
     await root.fiber.dispose();
-    const closed = Promise.withResolvers<void>();
-    server.close(() => closed.resolve());
-    await closed.promise;
+    await pipeSim.stop();
     if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
   }
@@ -350,7 +359,7 @@ const runRejects = async (pi: FakePi, params: Record<string, unknown>, cwd: stri
   throw new Error('expected the subagent tool to fail');
 };
 
-test('spawn: foreground run injects the prompt once and settles with the closing text', async () => {
+test('spawn: foreground run injects the prompt once and settles with the closing text', { timeout: 30_000 }, async () => {
   await withSpawnEnv(async ({ pi, port, h, cwd }) => {
     const result = await run(pi, { description: '探查', prompt: PROMPT }, cwd);
     const text = result.content[0]!.text;
@@ -362,7 +371,7 @@ test('spawn: foreground run injects the prompt once and settles with the closing
   });
 });
 
-test('spawn/send: the reply pipe is scoped by the master session cwd, not the worker cwd', async () => {
+test('spawn/send: the reply pipe is scoped by the master session cwd, not the worker cwd', { timeout: 30_000 }, async () => {
   const other = mkdtempSync(join(tmpdir(), 'pier-spawn-other-'));
   await withSpawnEnv(async ({ pi, h, cwd }) => {
     const spawned = await run(pi, { description: '跨仓库任务', prompt: PROMPT, run_in_background: true, cwd: other }, cwd);
@@ -377,7 +386,7 @@ test('spawn/send: the reply pipe is scoped by the master session cwd, not the wo
   }, { childCwd: other });
 });
 
-test('spawn: a rejected prompt injection rolls back the ledger and closes the pane', async () => {
+test('spawn: a rejected prompt injection rolls back the ledger and closes the pane', { timeout: 30_000 }, async () => {
   await withSpawnEnv(async ({ pi, port, h, cwd }) => {
     const text = (await run(pi, { description: '探查', prompt: PROMPT }, cwd)).content[0]!.text;
     assert.match(text, /failed to spawn/);
@@ -390,7 +399,7 @@ test('spawn: a rejected prompt injection rolls back the ledger and closes the pa
   }, { rejectPrompt: true });
 });
 
-test('spawn: run_in_background returns immediately and keeps the row running', async () => {
+test('spawn: run_in_background returns immediately and keeps the row running', { timeout: 30_000 }, async () => {
   await withSpawnEnv(async ({ pi, port, cwd }) => {
     const result = await run(pi, { description: '后台探查', prompt: PROMPT, run_in_background: true }, cwd);
     assert.match(result.content[0]!.text, /^started subagent p2 \(task [0-9a-f-]+\)$/);
@@ -402,7 +411,7 @@ test('spawn: run_in_background returns immediately and keeps the row running', a
   });
 });
 
-test('send/resume: short prefixes resolve at four characters and report ambiguity or misses', async () => {
+test('send/resume: short prefixes resolve at four characters and report ambiguity or misses', { timeout: 30_000 }, async () => {
   await withSpawnEnv(async ({ pi, h, cwd }) => {
     const spawned = await run(pi, { description: '后台任务', prompt: PROMPT, run_in_background: true }, cwd);
     const fullTaskId = spawned.details?.taskId as string;
@@ -521,7 +530,7 @@ const fire = async (pi: FakePi, event: string, ...args: unknown[]): Promise<void
 const branchOf = (entry: SubEntry) => [{ type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { subs: [entry] } }];
 const ledgerSnapshot = (pi: FakePi) => pi.entries.filter(([t]) => t === SUBS_CUSTOM_TYPE).at(-1)?.[1] as { subs: SubEntry[] } | undefined;
 
-test('resume: a ledger row pointing at the master session is refused; another pane is reused', async () => {
+test('resume: a ledger row pointing at the master session is refused; another pane is reused', { timeout: 30_000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), 'pier-resume-self-'));
   const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = home;
@@ -566,7 +575,7 @@ test('resume: a ledger row pointing at the master session is refused; another pa
   }
 });
 
-test('applyReplySession: a bare session id self-report repairs a poisoned sessionFile', async () => {
+test('applyReplySession: a bare session id self-report repairs a poisoned sessionFile', { timeout: 30_000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), 'pier-reply-session-'));
   const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = home;
@@ -600,7 +609,7 @@ test('applyReplySession: a bare session id self-report repairs a poisoned sessio
   }
 });
 
-test('session recovery: a still-running subagent gets its settlement watch re-armed', async () => {
+test('session recovery: a still-running subagent gets its settlement watch re-armed', { timeout: 30_000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), 'pier-recover-home-'));
   const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = home;
