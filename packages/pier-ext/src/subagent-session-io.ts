@@ -26,14 +26,26 @@ export interface SessionIoHost {
   sessionsDir: () => string;
 }
 
+export interface ResolveSessionFileOpts {
+  /** Reject candidates whose last write predates this timestamp (epoch ms). Used to avoid
+   * attributing a request to a session file that was never written after the request was
+   * injected — the spawn-race mis-attribution observed in session 01a0c282. */
+  minMtimeMs?: number;
+}
+
 export interface SessionIo {
   resolveSessionFileCandidates(paneId: string, cwd: string, preferred?: string | null): Promise<string[]>;
-  resolveSessionFile(paneId: string, cwd: string, preferred?: string | null): Promise<string | null>;
+  resolveSessionFile(paneId: string, cwd: string, preferred?: string | null, opts?: ResolveSessionFileOpts): Promise<string | null>;
   collectFinalText(paneId: string, cwd: string, sinceTs: number, attempts?: number, preferred?: string | null): Promise<string | null>;
   readAskFlag(paneId: string): Promise<string | null>;
   probeAlive(paneId: string, cwd: string): Promise<AliveProbe>;
   subSessionState(paneId: string, cwd: string, sinceTs: number, preferred?: string | null): Promise<SubSessionState>;
   readSettleTail(paneId: string, cwd: string, preferred?: string | null, maxChars?: number): Promise<string | null>;
+  /** Re-attribute a registry sessionFile that has no writes since `sinceTs`: keep `preferred`
+   * when it is fresh; otherwise accept herdr's per-pane report when that file is fresh.
+   * Never falls back to mtime heuristics, so an existing value is only ever replaced by
+   * the authoritative report. Returns null when nothing fresh is known (keep the old value). */
+  reattributeStaleSessionFile(paneId: string, cwd: string, sinceTs: number, preferred: string | null): Promise<string | null>;
 }
 
 /** Cheap change fingerprint of a session file; null when it does not exist. */
@@ -150,12 +162,62 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     for (const f of listSessionFiles(cwd, h.sessionsDir(), 4)) push(f);
     return out;
   }
-
-  async function resolveSessionFile(paneId: string, cwd: string, preferred?: string | null): Promise<string | null> {
+  async function resolveSessionFile(
+    paneId: string,
+    cwd: string,
+    preferred?: string | null,
+    opts?: ResolveSessionFileOpts,
+  ): Promise<string | null> {
     for (const file of await resolveSessionFileCandidates(paneId, cwd, preferred)) {
+      if (opts?.minMtimeMs != null) {
+        const stamp = stampOf(file);
+        // No fresh write since the request → this candidate cannot hold the run's transcript.
+        if (!stamp || stamp.mtimeMs < opts.minMtimeMs) continue;
+      }
       if (isReadableFile(file)) return file;
     }
     return null;
+  }
+
+  async function reattributeStaleSessionFile(
+    paneId: string,
+    cwd: string,
+    sinceTs: number,
+    preferred: string | null,
+  ): Promise<string | null> {
+    // Tolerate fs timestamp granularity against the pre-injection injectTs capture.
+    const minMtimeMs = sinceTs - 2_000;
+    // Own/taken exclusions apply to `preferred` too (01a0bd3a): a registry value pointing at
+    // the master's own transcript is always "fresh" — the master rewrites it continuously
+    // during its own turn — so the freshness gate can never veto it. A poisoned preferred
+    // FALLS THROUGH to herdr's per-pane report instead of returning null: the caller repairs
+    // only on a different value, and null means "keep the old one" — i.e. preserve the poison.
+    const own = bareSessionId(h.getSessionId());
+    const taken = new Set<string>();
+    let reported: string | null = null;
+    try {
+      for (const a of await h.client.listAgents()) {
+        if (!a.session) continue;
+        if (a.paneId === paneId) reported = a.session;
+        else taken.add(bareSessionId(a.session));
+      }
+      if (!reported) reported = await h.client.getAgentSessionPath(paneId);
+    } catch {
+      return null;
+    }
+    const preferredId = preferred ? bareSessionId(preferred) : null;
+    const preferredHeld = preferredId != null
+      && ((own != null && preferredId === own) || taken.has(preferredId));
+    const preferredStamp = preferred ? stampOf(preferred) : null;
+    if (preferred && !preferredHeld && preferredStamp && preferredStamp.mtimeMs >= minMtimeMs) return preferred;
+    if (!reported) return null;
+    const file = /\.jsonl$/.test(reported) ? reported : sessionFileById(cwd, h.sessionsDir(), reported);
+    if (!file) return null;
+    const id = bareSessionId(file);
+    if (own && id === own) return null;
+    if (taken.has(id)) return null;
+    const stamp = stampOf(file);
+    return stamp && stamp.mtimeMs >= minMtimeMs ? file : null;
   }
 
   async function collectFinalText(
@@ -290,6 +352,7 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     probeAlive,
     subSessionState,
     readSettleTail,
+    reattributeStaleSessionFile,
   };
 }
 

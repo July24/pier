@@ -153,7 +153,7 @@ interface SpawnCtx {
   cwd: string;
 }
 
-async function withSpawnEnv(fn: (ctx: SpawnCtx) => Promise<void>, opts: { rejectPrompt?: boolean } = {}): Promise<void> {
+async function withSpawnEnv(fn: (ctx: SpawnCtx) => Promise<void>, opts: { rejectPrompt?: boolean; childCwd?: string } = {}): Promise<void> {
   const home = mkdtempSync(join(tmpdir(), 'pier-spawn-home-'));
   const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = home; // 台账/会话扫描根重定向（不污染 ~/.pi）
@@ -174,7 +174,7 @@ async function withSpawnEnv(fn: (ctx: SpawnCtx) => Promise<void>, opts: { reject
       },
     }) + '\n'),
   };
-  const server = await startPipeSim(cwd, h, opts);
+  const server = await startPipeSim(opts.childCwd ?? cwd, h, opts);
   const pi = fakePi();
   const mounted = await mountSpawn(pi, sessionFile, h);
   try {
@@ -189,6 +189,38 @@ async function withSpawnEnv(fn: (ctx: SpawnCtx) => Promise<void>, opts: { reject
   }
 }
 
+test('spawn/send 回归（01a0c282）：跨目录委托时 reply 管道名必须按 master 会话 cwd 作用域', async () => {
+  // 实证链：跨仓库 spawn（master=apnv3-backend，worker=CRM）时 from 曾按子 cwd 命名，
+  // worker 结算回推进死管道 → 报告丢失 + registry sessionFile 永不纠正。
+  const other = mkdtempSync(join(tmpdir(), 'pier-spawn-other-'));
+  await withSpawnEnv(async ({ pi, h, cwd }) => {
+    const tool = pi.tools.get('subagent');
+    assert.ok(tool?.execute);
+    const spawned = await tool.execute!(
+      'tc_xdir',
+      { description: '跨仓库任务', prompt: PROMPT, run_in_background: true, cwd: other },
+      undefined,
+      undefined,
+      { cwd },
+    ) as { content: Array<{ text: string }>; details?: { taskId?: string } };
+    assert.match(spawned.content[0].text, /^started subagent p2 /);
+
+    const expected = pipeNameFor(cwd, 'p0');
+    assert.equal((h.prompts[0] as { from?: string }).from, expected, 'spawn from = master 会话 cwd 作用域');
+    assert.notEqual((h.prompts[0] as { from?: string }).from, pipeNameFor(other, 'p0'), '不得按子 cwd 命名');
+
+    // follow_up 同一语义：send 的 from 也必须指向 master 的管道。
+    const sendRes = await tool.execute!(
+      'tc_xdir_send',
+      { action: 'send', agentId: 'p2', message: 'wrap up and report' },
+      undefined,
+      undefined,
+      { cwd },
+    ) as { content: Array<{ text: string }> };
+    assert.match(sendRes.content[0].text, /Message sent to subagent p2/);
+    assert.equal((h.prompts[1] as { from?: string }).from, expected, 'send from = master 会话 cwd 作用域');
+  }, { childCwd: other });
+});
 test('spawn 回归（01a03bf0 缺陷 1）：prompt 必须注入 + 无 ReferenceError + 正常结算', async () => {
   await withSpawnEnv(async ({ pi, port, h, cwd }) => {
     const tool = pi.tools.get('subagent');

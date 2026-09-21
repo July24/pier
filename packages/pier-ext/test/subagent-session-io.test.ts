@@ -45,6 +45,7 @@ test('subSessionState: readable session after injectTs still settles', async () 
   assert.deepEqual(state, { text: 'ok', pendingTool: false, activity: true, turnEnded: true });
 });
 
+
 test('subSessionState (A16): toolResult 已写、下一条 assistant 未到时，回合未结束', async () => {
   const sessionsDir = mkdtempSync(join(tmpdir(), 'pier-session-io-'));
   const file = join(sessionsDir, 'child-midflight.jsonl');
@@ -267,4 +268,64 @@ test('readSettleTail (P0-1): 返回最佳候选的最后 assistant 文本尾巴�
   });
   const tail = await io.readSettleTail('wA:p24', cwd);
   assert.ok(tail && tail.length <= 1200 && tail.includes('阶段性输出'), String(tail?.length));
+});
+
+test('reattributeStaleSessionFile (01a0c282): accepts a fresh foreign report, rejects own/taken sessions', async () => {
+  const agentDir = mkdtempSync(join(tmpdir(), 'pier-session-io-reattr-'));
+  const mk = (name: string): string => {
+    const file = join(agentDir, name);
+    writeFileSync(file, '{}\n');
+    return file;
+  };
+  const ownFile = mk('2026-09-21T06-00-00-000Z_11111111-1111-4111-8111-111111111111.jsonl');
+  const takenFile = mk('2026-09-21T06-00-00-000Z_22222222-2222-4222-8222-222222222222.jsonl');
+  const foreignFile = mk('2026-09-21T06-05-00-000Z_33333333-3333-4333-8333-333333333333.jsonl');
+  const stalePreferred = mk('2026-09-16T07-15-46-751Z_44444444-4444-4444-8444-444444444444.jsonl');
+  utimesSync(stalePreferred, new Date(Date.now() - 3_600_000), new Date(Date.now() - 3_600_000));
+
+  const io = createSessionIo({
+    client: {
+      listAgents: async () => [
+        // The target pane's lagging report points at the MASTER's own transcript (01a0bd3a).
+        { paneId: 'wA:pStale', session: ownFile },
+        // Another live pane has claimed takenFile.
+        { paneId: 'wA:pOther', session: takenFile },
+      ],
+      getAgentSessionPath: async () => ownFile,
+    } as unknown as HerdrClientLike,
+    getSessionId: () => ownFile,
+    sessionsDir: () => agentDir,
+  });
+
+  // Poisoned report (own transcript) must be rejected even though the file is fresh.
+  assert.equal(await io.reattributeStaleSessionFile('wA:pStale', "/tmp/proj", Date.now(), stalePreferred), null);
+
+  // A fresh foreign report that no other live pane claims is accepted; a stale preferred is kept when fresh.
+  const io2 = createSessionIo({
+    client: {
+      listAgents: async () => [
+        { paneId: 'wA:pStale', session: foreignFile },
+        { paneId: 'wA:pOther', session: takenFile },
+      ],
+      getAgentSessionPath: async () => foreignFile,
+    } as unknown as HerdrClientLike,
+    getSessionId: () => ownFile,
+    sessionsDir: () => agentDir,
+  });
+  assert.equal(await io2.reattributeStaleSessionFile('wA:pStale', "/tmp/proj", Date.now(), stalePreferred), foreignFile);
+  assert.equal(await io2.reattributeStaleSessionFile('wA:pStale', "/tmp/proj", Date.now(), foreignFile), foreignFile, 'fresh preferred kept as-is');
+
+  // 01a0bd3a class (advisor follow-up): a preferred pointing at the MASTER'S OWN transcript is
+  // always fresh — the master writes it continuously — so freshness alone must not keep it.
+  // Fall through to herdr's report and repair; null would mean "keep the poison".
+  assert.equal(
+    await io2.reattributeStaleSessionFile('wA:pStale', "/tmp/proj", Date.now(), ownFile),
+    foreignFile,
+    'poisoned-but-fresh preferred (own transcript) is repaired via the report',
+  );
+  assert.equal(
+    await io2.reattributeStaleSessionFile('wA:pStale', "/tmp/proj", Date.now(), takenFile),
+    foreignFile,
+    'preferred held by another live pane is repaired via the report',
+  );
 });

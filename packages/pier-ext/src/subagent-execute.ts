@@ -209,7 +209,12 @@ export function createSpawnAction(h: SpawnActionHost): SpawnAction {
       };
       const ready = await waitSubReady(cwd, paneId);
       if (!ready.ok) throw new Error(ready.message);
-      entry.sessionFile = await resolveSessionFile(paneId, cwd);
+      // p25 (01a0c282): herdr's per-pane report lags right after spawn, and the mtime fallback
+      // then attributes the registry to the newest PRE-EXISTING session in cwd (a cross-repo
+      // worker inherited last week's transcript and settlement detection never fired). Only a
+      // file written after the pane existed can be this worker's; otherwise leave null and let
+      // the poller resolve it once herdr reports.
+      entry.sessionFile = await resolveSessionFile(paneId, cwd, undefined, { minMtimeMs: spawnedAt - 2_000 });
       subs.set(paneId, entry);
       h.persistSubs();
       onUpdate?.(makeProgressUpdate(`subagent ready in pane ${paneId}; injecting prompt via pipe…`));
@@ -223,7 +228,11 @@ export function createSpawnAction(h: SpawnActionHost): SpawnAction {
         type: 'prompt',
         id: `prompt-${taskId}`,
         text: spec.prompt,
-        from: pipeNameFor(cwd, env?.paneId ?? ''),
+        // The child pushes its settle reply to this name: it MUST be scoped by the MASTER's
+        // cwd (the pipe server binds pipeNameFor(master session cwd, own paneId) — index.ts).
+        // The worker's cwd (e.g. a cross-repo delegation) names a pipe nobody listens on and
+        // the reply becomes a silent dead letter (01a0c282).
+        from: pipeNameFor(masterCwd, env?.paneId ?? ''),
         push: background,
       });
       if (injected.type !== 'ok') {

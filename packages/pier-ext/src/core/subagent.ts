@@ -563,7 +563,9 @@ export default function subagentPlugin(ctx: Context): void {
           type: 'follow_up',
           id: fuId,
           text: String(params?.message ?? ''),
-          from: pipeNameFor(entry.cwd, env?.paneId ?? ''),
+          // Reply pipe is the MASTER's (bound at session_start with this session's cwd);
+          // entry.cwd would name a dead pipe for cross-repo workers (01a0c282).
+          from: pipeNameFor(cwd, env?.paneId ?? ''),
           push: true,
           steer: true,
         });
@@ -661,6 +663,11 @@ export default function subagentPlugin(ctx: Context): void {
     readAskFlag,
     outputCursors,
     getCwd: (toolCtx: unknown): string => (toolCtx as { cwd?: string })?.cwd ?? process.cwd(),
+    // Transcript fallback: small worker panes show only the opaque status overlay, so the
+    // pane delta can never carry the final report (01a0c282). No preferred file — let the
+    // resolver start from herdr's per-pane report instead of a possibly stale registry value.
+    readFinalReport: async (paneId: string, entryCwd: string) =>
+      (await session.subSessionState(paneId, entryCwd, 0)).text,
   };
   const executeSubagentSpawn = createSpawnAction({
     client,

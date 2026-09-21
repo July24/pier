@@ -67,6 +67,10 @@ export interface Poller {
 export function createPoller(h: PollerHost): Poller {
   const pollers = new Set<string>();
   const subScopes = new Map<string, { dispose: () => Promise<void> }>();
+  /** Current tracked request per pane. startPoller refreshes it even when a poller is already
+   * running (01a0c282: a follow_up's startPoller used to be a no-op, so the loop kept judging
+   * settlement against the ORIGINAL request's injectTs and claimed notices under a stale id). */
+  const requestByPane = new Map<string, { injectTs: number; description: string; requestId: string }>();
   const doSleep = h.sleep ?? sleep;
   const now = h.now ?? Date.now;
   const observeWindowMs = h.policy?.observationWindowMs ?? runtimePolicy.observationWindowMs;
@@ -91,6 +95,9 @@ export function createPoller(h: PollerHost): Poller {
       : null;
     try {
       while (true) {
+        // A follow_up refreshes the tracked request mid-flight (see requestByPane): judge
+        // settlement against the newest injectTs, not the one this loop was started with.
+        const current = requestByPane.get(paneId) ?? { injectTs, description, requestId };
         const entry = h.subs.get(paneId);
         if (!entry || entry.status === 'settled') return;
 
@@ -140,7 +147,7 @@ export function createPoller(h: PollerHost): Poller {
             h.blockedGateNotified.add(paneId);
             const question = await h.session.readAskFlag(paneId);
             try {
-              await h.injectNotice(buildBlockedGateNotice({ paneId, description, question }));
+              await h.injectNotice(buildBlockedGateNotice({ paneId, description: current.description, question }));
             } catch {
               /* list_agents can recover a missed notice */
             }
@@ -149,7 +156,23 @@ export function createPoller(h: PollerHost): Poller {
         }
         if (gate.kind === 'clear-gate') h.blockedGateNotified.delete(paneId);
         if (state === 'idle' || state === 'done') {
-          const s = await h.session.subSessionState(paneId, cwd, injectTs, entry.sessionFile);
+          // p25 (01a0c282): spawn can mis-attribute entry.sessionFile (herdr's report lags and
+          // the mtime fallback records the newest PRE-EXISTING session). A file with no writes
+          // since the request then freezes settlement detection until the 600s vacuum. Re-attribute
+          // from herdr's per-pane report before judging; only a null value falls back to mtime.
+          if (entry.sessionFile) {
+            const fixed = await h.session.reattributeStaleSessionFile(paneId, cwd, current.injectTs, entry.sessionFile);
+            if (fixed && fixed !== entry.sessionFile) {
+              entry.sessionFile = fixed;
+              h.persistSubs();
+            }
+          } else {
+            entry.sessionFile = applyReportedSessionFile(
+              entry.sessionFile,
+              await h.session.resolveSessionFile(paneId, cwd, undefined, { minMtimeMs: current.injectTs - 2_000 }),
+            );
+          }
+          const s = await h.session.subSessionState(paneId, cwd, current.injectTs, entry.sessionFile);
           pollTrace?.(`state=${state} text=${s.text ? s.text.length : 'null'} pend=${s.pendingTool} act=${s.activity} obs=${String(entry.observationStartedAt ?? null)} takeover=${String(Boolean(entry.userTakeover))}`);
           if (isSettlementCandidate(s)) {
             const closing = s.text;
@@ -219,7 +242,7 @@ export function createPoller(h: PollerHost): Poller {
                   const tail = await h.session.readSettleTail(paneId, cwd, entry.sessionFile);
                   if (tail && settleAskIsSafe(tail)) {
                     const res = await h.jev.ask(
-                      settleVerdictRequest({ description, tail }),
+                      settleVerdictRequest({ description: current.description, tail }),
                       { questionId: 'settle-attribution', timeoutMs: 2500 },
                     );
                     if (res.ok) {
@@ -235,7 +258,7 @@ export function createPoller(h: PollerHost): Poller {
             if (!entry.sessionFile) {
               entry.sessionFile = applyReportedSessionFile(
                 entry.sessionFile,
-                await h.session.resolveSessionFile(paneId, cwd),
+                await h.session.resolveSessionFile(paneId, cwd, undefined, { minMtimeMs: current.injectTs - 2_000 }),
               );
             }
             entry.status = 'consumed';
@@ -244,13 +267,13 @@ export function createPoller(h: PollerHost): Poller {
             // "running" and a restart replays a ghost subagent into list/settle-wake/zombie sweep.
             h.persistSubs();
             h.writeHistory(entry, { outcome: closing }, 'poll-settle');
-            const notes = h.reconcileOnSettlement(description, 'settled');
+            const notes = h.reconcileOnSettlement(current.description, 'settled');
             const statLine = await h.git.worktreeStatLine(entry);
             const notice = h.withReconcileNotes(
-              buildSettlementNoticeText(`${paneId} (${description})`, closing, statLine, nullReason),
+              buildSettlementNoticeText(`${paneId} (${current.description})`, closing, statLine, nullReason),
               notes,
             );
-            if (h.claimSettleNotice(`${paneId}:${requestId}`)) {
+            if (h.claimSettleNotice(`${paneId}:${current.requestId}`)) {
               try {
                 await h.injectNotice(notice);
               } catch {
@@ -279,9 +302,9 @@ export function createPoller(h: PollerHost): Poller {
           entry.consumedAt = now();
           h.persistSubs();
           h.writeHistory(entry, { outcome: 'pane closed before settling' }, 'poll-pane-closed');
-          const notes = h.reconcileOnSettlement(description, 'failed');
+          const notes = h.reconcileOnSettlement(current.description, 'failed');
           const notice = h.withReconcileNotes(
-            formatPaneClosedNotice(paneId, description),
+            formatPaneClosedNotice(paneId, current.description),
             notes,
           );
           try {
@@ -294,11 +317,11 @@ export function createPoller(h: PollerHost): Poller {
           entry.consumedAt = now();
           h.persistSubs();
           h.writeHistory(entry, { outcome: 'observation timeout' }, 'poll-timeout');
-          const notes = h.reconcileOnSettlement(description, 'failed');
+          const notes = h.reconcileOnSettlement(current.description, 'failed');
           const notice = h.withReconcileNotes(
             formatObservationTimeoutNotice({
               paneId,
-              description,
+              description: current.description,
               idleSeconds: Math.round((now() - lastActivityAt) / 1000),
               startedAtIso: new Date(startedAt).toISOString(),
             }),
@@ -316,6 +339,9 @@ export function createPoller(h: PollerHost): Poller {
   }
 
   function startPoller(paneId: string, cwd: string, spawnedAt: number, injectTs: number, description: string, requestId: string): Promise<void> {
+    // Always refresh first: a follow_up arriving while the spawn poller still runs must move
+    // settlement judgment to the new request instead of being dropped by the has() guard.
+    requestByPane.set(paneId, { injectTs, description, requestId });
     if (pollers.has(paneId)) return Promise.resolve();
     pollers.add(paneId);
     return (async () => {

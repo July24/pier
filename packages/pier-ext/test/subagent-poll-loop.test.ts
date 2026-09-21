@@ -64,11 +64,17 @@ interface FakeHostFixture {
     subSessionResponses: Array<{ text: string | null; pendingTool: boolean; activity: boolean; turnEnded?: boolean }>;
     askFlagResponses: Array<string | null>;
     resolvedSessionFile: string | null;
+    /** sinceTs values observed by subSessionState, in call order. */
+    subSessionSinceTsCalls: number[];
+    /** Queued re-attribute results; empty → keep the preferred value. */
+    reattributeResponses: Array<string | null>;
   };
   gitIo: {
     statLine: string | null;
   };
   claimSettleResults: boolean[];
+  /** Claim keys observed by claimSettleNotice, in call order. */
+  claimKeys: string[];
 }
 
 function createFakeHost(options?: {
@@ -102,6 +108,8 @@ function createFakeHost(options?: {
     subSessionResponses: [],
     askFlagResponses: [],
     resolvedSessionFile: '/resolved/session.jsonl',
+    subSessionSinceTsCalls: [],
+    reattributeResponses: [],
   };
 
   const gitMock: FakeHostFixture['gitIo'] = {
@@ -109,6 +117,7 @@ function createFakeHost(options?: {
   };
 
   const claimSettleResults: boolean[] = [];
+  const claimKeys: string[] = [];
 
   const fakeClient: HerdrClientLike = {
     available: true,
@@ -148,7 +157,8 @@ function createFakeHost(options?: {
   } as unknown as HerdrClientLike;
 
   const fakeSession: SessionIo = {
-    subSessionState: async () => {
+    subSessionState: async (_paneId: string, _cwd: string, sinceTs: number) => {
+      sessionMock.subSessionSinceTsCalls.push(sinceTs);
       if (sessionMock.subSessionResponses.length > 0) {
         const response = sessionMock.subSessionResponses.shift()!;
         return { ...response, turnEnded: response.turnEnded ?? false };
@@ -163,6 +173,10 @@ function createFakeHost(options?: {
     },
     resolveSessionFileCandidates: async () => [],
     resolveSessionFile: async () => sessionMock.resolvedSessionFile,
+    reattributeStaleSessionFile: async (_paneId: string, _cwd: string, _sinceTs: number, preferred: string | null) => {
+      if (sessionMock.reattributeResponses.length > 0) return sessionMock.reattributeResponses.shift()!;
+      return preferred;
+    },
     collectFinalText: async () => null,
     probeAlive: async () => ({ alive: true, paneExists: true, agentStatus: 'working', lastActivityMs: Date.now() }),
     readSettleTail: async () => null,
@@ -198,7 +212,10 @@ function createFakeHost(options?: {
       return [`- Reconciled: ${description}`];
     },
     withReconcileNotes: (base, notes) => (notes.length > 0 ? `${base}\n${notes.join('\n')}` : base),
-    claimSettleNotice: () => (claimSettleResults.length > 0 ? claimSettleResults.shift()! : true),
+    claimSettleNotice: (key: string) => {
+      claimKeys.push(key);
+      return claimSettleResults.length > 0 ? claimSettleResults.shift()! : true;
+    },
     sleep: async (ms) => {
       sleepCalls.push(ms);
       virtualTime.now += ms;
@@ -224,6 +241,7 @@ function createFakeHost(options?: {
     sessionIo: sessionMock,
     gitIo: gitMock,
     claimSettleResults,
+    claimKeys,
   };
 }
 
@@ -649,6 +667,74 @@ test('pollLoop: settles with no closing message when the turn ENDED without text
   assert.match(f.injectedNotices[0]!, /It left no closing message\./);
 });
 
+test('p25 (01a0c282): a registry sessionFile with no writes since the request is re-attributed before settlement judgment', async () => {
+  // Spawn race recorded last week's transcript; the real session's report never reached
+  // settlement detection and the vacuum fired 600s later. herdr's per-pane report fixes it.
+  const entry = makeEntry('p-stale', {
+    observationStartedAt: 10_000,
+    sessionFile: '/stale/last-week.jsonl',
+  });
+  const f = createFakeHost({ initialTime: 13_000, entry });
+  f.client.waitAgentQueue = ['idle'];
+  f.sessionIo.reattributeResponses = ['/fresh/real-session.jsonl'];
+  f.sessionIo.subSessionResponses = [{ text: 'FINAL REPORT delivered from the real session', pendingTool: false, activity: true, turnEnded: true }];
+
+  const poller = createPoller(f.host);
+  await poller.startPoller('p-stale', '/tmp', 0, 5_000, 'cross-repo task', 'prompt-a');
+
+  assert.equal(entry.sessionFile, '/fresh/real-session.jsonl', 'registry re-attributed from herdr report');
+  assert.equal(entry.status, 'consumed');
+  assert.equal(f.historyWrites[0]?.patch?.outcome, 'FINAL REPORT delivered from the real session');
+  assert.match(f.injectedNotices[0]!, /FINAL REPORT delivered from the real session/);
+});
+
+test('p25 (01a0c282): a fresh registry sessionFile is kept as-is (no re-attribution churn)', async () => {
+  const entry = makeEntry('p-fresh', {
+    observationStartedAt: 10_000,
+    sessionFile: '/fresh/current.jsonl',
+  });
+  const f = createFakeHost({ initialTime: 13_000, entry });
+  f.client.waitAgentQueue = ['idle'];
+  // reattributeResponses empty → fake keeps the preferred value, mirroring a fresh file.
+  f.sessionIo.subSessionResponses = [{ text: 'done', pendingTool: false, activity: true, turnEnded: true }];
+
+  const poller = createPoller(f.host);
+  await poller.startPoller('p-fresh', '/tmp', 0, 5_000, 'task', 'prompt-a');
+
+  assert.equal(entry.sessionFile, '/fresh/current.jsonl');
+  assert.equal(entry.status, 'consumed');
+});
+
+test('p25 (01a0c282): follow_up refreshes the tracked request of an ALREADY-RUNNING poller', async () => {
+  // send used to call startPoller as a no-op while the spawn poller lived on with the
+  // original injectTs/requestId; settlement was judged against the stale request.
+  const entry = makeEntry('p-refresh');
+  const f = createFakeHost({ initialTime: 10_000, entry });
+  f.client.waitAgentQueue = ['working', 'idle'];
+  f.client.agents = [{ paneId: 'p-refresh', status: 'idle' }];
+  f.sessionIo.subSessionResponses = [
+    { text: 'report for the follow-up', pendingTool: false, activity: true, turnEnded: true },
+    { text: 'report for the follow-up', pendingTool: false, activity: true, turnEnded: true },
+  ];
+  const origSleep = f.host.sleep!;
+  f.host.sleep = async (ms) => {
+    await origSleep(ms);
+    f.virtualTime.now += 2_500; // advance past observationWindowMs (2000) like the OCC test
+  };
+
+  const poller = createPoller(f.host);
+  const running = poller.startPoller('p-refresh', '/tmp', 0, 1_111, 'task', 'prompt-a');
+  poller.startPoller('p-refresh', '/tmp', 0, 2_222, 'task', 'fu-42'); // must move judgment to the follow-up
+  await running;
+
+  assert.ok(
+    f.sessionIo.subSessionSinceTsCalls.includes(2_222),
+    `subSessionState must see the follow-up injectTs (saw ${f.sessionIo.subSessionSinceTsCalls.join(',')})`,
+  );
+  assert.ok(!f.sessionIo.subSessionSinceTsCalls.includes(1_111), 'the superseded spawn injectTs must not be used');
+  assert.ok(f.claimKeys.includes('p-refresh:fu-42'), `settle claim must use the follow-up id (saw ${f.claimKeys.join(',')})`);
+  assert.match(f.injectedNotices[0] ?? '', /report for the follow-up/);
+});
 /* ──────────────── Vacuum Branches ──────────────── */
 
 test('pollLoop: vacuum triggers pane-closed when pane is missing from pane.list', async () => {

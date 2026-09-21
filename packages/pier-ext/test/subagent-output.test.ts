@@ -14,7 +14,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:net';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -576,4 +576,70 @@ test('P2-4: restart 旗标文案不再暗示进程重启（fullscreen TUI 恒态
   });
   assert.match(out, /buffer scrolled or reset — full text returned \(not a process restart\)/);
   assert.doesNotMatch(out, /restart: true/);
+});
+
+test('p25 (01a0c282): idle/settled output falls back to the session transcript when the pane shows only the status overlay', async () => {
+  // Evidence shape: every pane read returned the 306-char todo footer while the worker's
+  // real report existed only in its session file. The action must surface that report,
+  // exactly once per distinct report.
+  const home = mkdtempSync(join(tmpdir(), 'pier-out-home-'));
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = home;
+  const reportFile = join(home, 'sessions', 'sub-report.jsonl');
+  mkdirSync(join(home, 'sessions'), { recursive: true });
+  writeFileSync(reportFile, JSON.stringify({
+    type: 'message',
+    message: {
+      role: 'assistant',
+      content: [{ type: 'text', text: 'FINAL REPORT: region enum + converter delivered byte-identical to dev_eu' }],
+      timestamp: Date.now(),
+      stopReason: 'stop',
+    },
+  }) + '\n');
+
+  const client = {
+    available: true,
+    listAgents: async () => [{
+      paneId: 'pWorker',
+      agent: 'pi',
+      status: 'idle',
+      session: reportFile,
+      stateLabels: {},
+      tokens: {},
+    } as AgentInfo],
+    readAgent: async () => ({ text: 'todo: 0▶ 0○ 0■ 7✓\n   +3 hidden (7✓) · /todos\n', revision: 0, truncated: false }),
+  } as unknown as HerdrClientLike;
+
+  const sub = makeSubEntry('pWorker', 'running');
+  const pi = createFakePi();
+  const root = await mountSubagent({ pi, client, subs: [sub] });
+  try {
+    const tool = pi.tools.get('subagent');
+    assert.ok(tool?.execute);
+
+    const res1 = await tool.execute!(null, { action: 'output', agentId: 'pWorker', max_chars: 3000 }) as {
+      content: Array<{ text: string }>;
+      details: { status: string; deltaLength: number; reportDelivered?: boolean };
+    };
+    assert.equal(res1.details.status, 'idle');
+    assert.ok(res1.details.deltaLength > 0, 'first read returns the overlay footer as the full text');
+    assert.match(res1.content[0].text, /todo: 0▶ 0○ 0■ 7✓/, 'pane read is footer-only');
+    assert.equal(res1.details.reportDelivered, true, 'report must be surfaced from the transcript');
+    assert.match(res1.content[0].text, /Subagent Report \| latest finalized message from session transcript/);
+    assert.match(res1.content[0].text, /FINAL REPORT: region enum/);
+
+    // Second poll with unchanged transcript: no duplicate report section.
+    const res2 = await tool.execute!(null, { action: 'output', agentId: 'pWorker', max_chars: 3000 }) as {
+      content: Array<{ text: string }>;
+      details: { reportDelivered?: boolean; deltaLength?: number };
+    };
+    assert.equal(res2.details.deltaLength, 0, 'pane delta stays empty (overlay footer unchanged)');
+    assert.equal(res2.details.reportDelivered, false, 'unchanged report is not re-delivered');
+    assert.doesNotMatch(res2.content[0].text, /Subagent Report/);
+  } finally {
+    await root.fiber.dispose();
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    rmSync(home, { recursive: true, force: true });
+  }
 });

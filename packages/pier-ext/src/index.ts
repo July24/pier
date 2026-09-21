@@ -1134,8 +1134,10 @@ export default async function (pi: ExtensionAPI) {
         // directly); fall back to the bare id for a master-side mapping.
         sessionFile: ownFile ?? (sessionId || null),
       }, 5000);
-    } catch {
-      /* Push failed silently; the requester's pollLoop is the fallback. */
+    } catch (err) {
+      /* The requester's pollLoop is the fallback, but a dead letter here was invisible in
+       * 01a0c282 (cross-workspace pipe name) — surface it for triage. */
+      console.error(`pier: settle reply push to ${req.from} failed: ${(err as Error)?.message ?? err}`);
     }
   });
 

@@ -22,6 +22,9 @@ export interface SubagentOutputCursor {
   tail: string;
   /** Length of previous full text */
   fullLength: number;
+  /** Fingerprint of the last session-transcript report already delivered for this pane;
+   * deduplicates the transcript fallback across polls (present only after such a delivery). */
+  reportTail?: string;
 }
 
 export interface SubagentOutputDeltaOptions {
