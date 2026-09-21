@@ -1,5 +1,5 @@
 import type { HerdrClientLike, HerdrEnv } from './herdr-client.ts';
-import type { TodoItem } from './vocab.ts';
+import type { TodoItem, TodoStatus } from './vocab.ts';
 
 export interface DashboardCommandDeps {
   pi: {
@@ -10,6 +10,25 @@ export interface DashboardCommandDeps {
   getTodoItems?: () => readonly TodoItem[];
   getHeldLocks?: () => readonly string[];
 }
+
+/**
+ * Presentation of the todo states that appear in the standalone view: `count` labels the summary
+ * line, `live` adds the detail line that follows it. `abandoned` is tracked but not shown.
+ */
+const STATUS_ROWS: ReadonlyArray<{
+  status: Exclude<TodoStatus, 'abandoned'>;
+  count: string;
+  live?: { label: string; glyph: string; line: (todo: TodoItem) => string };
+}> = [
+  { status: 'completed', count: 'done' },
+  { status: 'in_progress', count: 'working', live: { label: 'Active', glyph: '▶', line: (todo) => todo.content } },
+  {
+    status: 'blocked',
+    count: 'blocked',
+    live: { label: 'Blocked', glyph: '■', line: (todo) => `${todo.content}${todo.blocker ? ` (${todo.blocker})` : ''}` },
+  },
+  { status: 'pending', count: 'pending' },
+];
 
 export function formatStandaloneDashboard(opts: {
   todos: readonly TodoItem[];
@@ -22,26 +41,27 @@ export function formatStandaloneDashboard(opts: {
   lines.push('Mode: Standalone (Non-Herdr / Local Session)');
   lines.push('--------------------------------------------------------------------------------');
 
-  const todos = opts.todos;
-  if (todos.length > 0) {
-    const inProg = todos.filter((t) => t.status === 'in_progress');
-    const blocked = todos.filter((t) => t.status === 'blocked');
-    const done = todos.filter((t) => t.status === 'completed');
-    const pending = todos.filter((t) => t.status === 'pending');
-    lines.push(
-      `Todos: ${todos.length} total (${done.length} done, ${inProg.length} working, ${blocked.length} blocked, ${pending.length} pending)`,
-    );
-    if (inProg.length > 0) {
-      lines.push(`Active: ▶ ${inProg.map((t) => t.content).join(', ')}`);
-    }
-    if (blocked.length > 0) {
-      lines.push(`Blocked: ■ ${blocked.map((t) => `${t.content}${t.blocker ? ` (${t.blocker})` : ''}`).join(', ')}`);
-    }
-    if (inProg.length === 0 && blocked.length === 0 && done.length > 0) {
-      lines.push(`Completed: ✓ ${done.slice(-3).map((t) => t.content).join(', ')}`);
-    }
-  } else {
+  if (opts.todos.length === 0) {
     lines.push('Todos: (none)');
+  } else {
+    const groups: Record<TodoStatus, TodoItem[]> = {
+      pending: [], in_progress: [], completed: [], blocked: [], abandoned: [],
+    };
+    for (const todo of opts.todos) groups[todo.status].push(todo);
+
+    lines.push(
+      `Todos: ${opts.todos.length} total (${STATUS_ROWS.map((row) => `${groups[row.status].length} ${row.count}`).join(', ')})`,
+    );
+    for (const row of STATUS_ROWS) {
+      const items = groups[row.status];
+      if (row.live && items.length > 0) {
+        lines.push(`${row.live.label}: ${row.live.glyph} ${items.map(row.live.line).join(', ')}`);
+      }
+    }
+    // Recent completions only carry signal when nothing is in flight.
+    if (groups.in_progress.length === 0 && groups.blocked.length === 0 && groups.completed.length > 0) {
+      lines.push(`Completed: ✓ ${groups.completed.slice(-3).map((todo) => todo.content).join(', ')}`);
+    }
   }
 
   const locks = opts.locks;

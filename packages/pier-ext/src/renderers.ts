@@ -1,22 +1,19 @@
 /**
  * TUI renderers for pier's own session custom entries and reminder messages.
  *
- * Why: pier persists authority in the session JSONL (todo edits, subagent registry,
- * terminal registry, role manifests, soft-approvals) and injects reminder messages.
- * Without a renderer those transcript rows are raw JSON, which buries the one line
- * that matters. The line builders here are pure (unit-tested); the component is a
- * thin string array plus an ANSI-aware truncator, so this module needs no pi-tui
- * import and degrades to "no renderer" on older pi builds.
+ * pier persists authority in the session JSONL (todo edits, subagent registry, terminal registry,
+ * role manifests, soft-approvals) and injects reminder messages; without a renderer those transcript
+ * rows are raw JSON, which buries the one line that matters. Pure string builders plus an ANSI-aware
+ * truncator, so this module needs no pi-tui import and degrades to "no renderer" on older pi builds.
  */
 import { TODO_EDIT_CUSTOM_TYPE, type TodoEditPayload } from './todo-core.ts';
 import { SUBS_CUSTOM_TYPE, type SubsRegistry } from './subagent-core.ts';
 import { TERMINALS_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE, type TerminalsRegistry } from './terminal-core.ts';
 import { TODO_REMINDER_CUSTOM_TYPE } from './todo-reminder-core.ts';
 
-// Width handling lives in its own module so the ask_user_question UI can reuse it
-// without pulling the todo/subagent/terminal cores into its import graph.
-import { charWidth, styledWidth, truncateStyled } from './ansi-text.ts';
-export { charWidth, styledWidth, truncateStyled };
+// Width handling lives in ansi-text.ts so the ask_user_question UI can reuse it without pulling the
+// todo/subagent/terminal cores into its import graph.
+import { truncateStyled } from './ansi-text.ts';
 
 /** Role manifest entry is written by index.ts; keep the literal here to avoid an import cycle. */
 export const ROLE_MANIFEST_CUSTOM_TYPE = 'pi-herdr.role-manifest';
@@ -48,17 +45,18 @@ export interface RendererApi {
 
 /* ── Pure line builders ────────────────────────────────────────────── */
 
+/** Single-line summary text: whitespace collapsed, ellipsis-clipped to `max` characters. */
+function clip(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
+}
+
 /** Component wrapper: render is a no-op transform except for width clipping. */
-export function card(lines: readonly string[]): RenderComponent {
+function card(lines: readonly string[]): RenderComponent {
   return {
     render: (width: number) => lines.map((line) => truncateStyled(line, width)),
     invalidate() { /* No cached state. */ },
   };
-}
-
-export function clip(text: string, max: number): string {
-  const flat = text.replace(/\s+/g, ' ').trim();
-  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
 
 const EDIT_VERB: Record<string, string> = {
@@ -68,7 +66,7 @@ const EDIT_VERB: Record<string, string> = {
   rm: '✗ removed',
 };
 
-export function formatEditCounts(edits: ReadonlyArray<{ op: string }>): string {
+function formatEditCounts(edits: ReadonlyArray<{ op: string }>): string {
   const counts = new Map<string, number>();
   for (const edit of edits) counts.set(edit.op, (counts.get(edit.op) ?? 0) + 1);
   return [...counts.entries()]
@@ -76,7 +74,7 @@ export function formatEditCounts(edits: ReadonlyArray<{ op: string }>): string {
     .join(' · ');
 }
 
-export function todoEditLines(data: unknown, theme: RenderTheme, expanded: boolean): string[] {
+function todoEditLines(data: unknown, theme: RenderTheme, expanded: boolean): string[] {
   const payload = data as TodoEditPayload | undefined;
   const edits = Array.isArray(payload?.edits) ? payload.edits : [];
   if (edits.length === 0) return [theme.fg('dim', 'todo · no edits')];
@@ -88,7 +86,7 @@ export function todoEditLines(data: unknown, theme: RenderTheme, expanded: boole
   ];
 }
 
-export function subsLines(data: unknown, theme: RenderTheme, expanded: boolean): string[] {
+function subsLines(data: unknown, theme: RenderTheme, expanded: boolean): string[] {
   const subs = (data as SubsRegistry | undefined)?.subs;
   if (!Array.isArray(subs) || subs.length === 0) return [theme.fg('dim', 'subagents · none')];
   const running = subs.filter((s) => s.status === 'running').length;
@@ -103,7 +101,7 @@ export function subsLines(data: unknown, theme: RenderTheme, expanded: boolean):
   ];
 }
 
-export function terminalsLines(data: unknown, theme: RenderTheme, expanded: boolean): string[] {
+function terminalsLines(data: unknown, theme: RenderTheme, expanded: boolean): string[] {
   const terminals = (data as TerminalsRegistry | undefined)?.terminals;
   if (!Array.isArray(terminals) || terminals.length === 0) return [theme.fg('dim', 'terminals · none')];
   const head = `${theme.fg('accent', theme.bold('terminals'))} ${theme.fg('dim', `· ${terminals.length} open`)}`;
@@ -114,7 +112,7 @@ export function terminalsLines(data: unknown, theme: RenderTheme, expanded: bool
   ];
 }
 
-export function roleManifestLines(data: unknown, theme: RenderTheme): string[] {
+function roleManifestLines(data: unknown, theme: RenderTheme): string[] {
   const rec = (data ?? {}) as {
     role?: unknown;
     manifestVersion?: unknown;
@@ -137,7 +135,7 @@ export function roleManifestLines(data: unknown, theme: RenderTheme): string[] {
   return [`${theme.fg('accent', theme.bold('role'))} ${role} ${theme.fg('dim', `v${version} · ${tools} tools`)}${tail}${switched}`];
 }
 
-export function approvalLines(data: unknown, theme: RenderTheme): string[] {
+function approvalLines(data: unknown, theme: RenderTheme): string[] {
   const rec = (data ?? {}) as { role?: unknown; tool?: unknown };
   const role = typeof rec.role === 'string' ? rec.role : '?';
   const tool = typeof rec.tool === 'string' ? rec.tool : '?';
@@ -145,7 +143,7 @@ export function approvalLines(data: unknown, theme: RenderTheme): string[] {
 }
 
 /** Reminder custom messages carry the full injected text; restyle without altering it. */
-export function reminderLines(message: unknown, theme: RenderTheme, label: string, expanded: boolean): string[] {
+function reminderLines(message: unknown, theme: RenderTheme, label: string, expanded: boolean): string[] {
   const content = typeof (message as { content?: unknown } | undefined)?.content === 'string'
     ? String((message as { content: string }).content)
     : '';
@@ -157,51 +155,41 @@ export function reminderLines(message: unknown, theme: RenderTheme, label: strin
 
 /* ── Installation ──────────────────────────────────────────────────── */
 
-function entryCard(
-  build: (data: unknown, theme: RenderTheme, expanded: boolean) => string[],
-): (entry: unknown, options: { expanded: boolean }, theme: RenderTheme) => RenderComponent {
-  return (entry, options, theme) => card(build((entry as { data?: unknown } | undefined)?.data, theme, options.expanded));
-}
-
-function messageCard(
-  build: (message: unknown, theme: RenderTheme, expanded: boolean) => string[],
-): (message: unknown, options: { expanded: boolean }, theme: RenderTheme) => RenderComponent {
-  return (message, options, theme) => card(build(message, theme, options.expanded));
-}
+type LineBuilder = (data: unknown, theme: RenderTheme, expanded: boolean) => string[];
 
 /**
- * Register pier's transcript renderers. Returns the custom types actually registered,
- * so the caller can log coverage and tests can assert the degrade path.
+ * Register pier's transcript renderers. Returns the custom types actually registered, so the caller
+ * can log coverage and tests can assert the degrade path.
  *
- * Why best-effort: entry/message renderers are display-only. A pi build without the
- * API (pre-0.80.4) or a throwing renderer must never break tool registration, so each
- * registration is individually guarded.
+ * Each registration is individually guarded: a pi build without the API (pre-0.80.4) or a throwing
+ * renderer must never break tool registration.
  */
 export function installRenderers(pi: unknown): string[] {
   const api = pi as RendererApi;
   const registered: string[] = [];
-  const entry = (type: string, build: (data: unknown, theme: RenderTheme, expanded: boolean) => string[]): void => {
+  const entry = (type: string, build: LineBuilder): void => {
     if (typeof api.registerEntryRenderer !== 'function') return;
     try {
-      api.registerEntryRenderer(type, entryCard(build));
+      api.registerEntryRenderer(type, (entryData, options, theme) =>
+        card(build((entryData as { data?: unknown } | undefined)?.data, theme, options.expanded)));
       registered.push(type);
     } catch {
       /* Older pi or a conflicting renderer: keep the default rendering. */
     }
   };
-  const message = (type: string, build: (msg: unknown, theme: RenderTheme, expanded: boolean) => string[]): void => {
+  const message = (type: string, build: LineBuilder): void => {
     if (typeof api.registerMessageRenderer !== 'function') return;
     try {
-      api.registerMessageRenderer(type, messageCard(build));
+      api.registerMessageRenderer(type, (msg, options, theme) => card(build(msg, theme, options.expanded)));
       registered.push(type);
     } catch {
       /* Best effort; the message still reaches the model. */
     }
   };
 
-  entry(TODO_EDIT_CUSTOM_TYPE, (data, theme, expanded) => todoEditLines(data, theme, expanded));
-  entry(SUBS_CUSTOM_TYPE, (data, theme, expanded) => subsLines(data, theme, expanded));
-  entry(TERMINALS_CUSTOM_TYPE, (data, theme, expanded) => terminalsLines(data, theme, expanded));
+  entry(TODO_EDIT_CUSTOM_TYPE, todoEditLines);
+  entry(SUBS_CUSTOM_TYPE, subsLines);
+  entry(TERMINALS_CUSTOM_TYPE, terminalsLines);
   entry(ROLE_MANIFEST_CUSTOM_TYPE, (data, theme) => roleManifestLines(data, theme));
   entry(APPROVAL_NEEDED_CUSTOM_TYPE, (data, theme) => approvalLines(data, theme));
   message(TODO_REMINDER_CUSTOM_TYPE, (msg, theme, expanded) => reminderLines(msg, theme, 'todo reminder', expanded));

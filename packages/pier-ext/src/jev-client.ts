@@ -1,23 +1,20 @@
 /**
  * Jev decision layer — direct HTTP client (RFC docs/rfc-jev-integration.md §5).
  *
- * Why not the official SDK (@typesafe-ai/sdk v0.6.0): its retry machinery has
- * no total-latency budget (DEFAULT_TIMEOUT_MS is per attempt, apiTimeoutError
- * retries timeouts by default, Retry-After honored up to 60s — worst case
- * >80s), which is incompatible with pier's fail-open budgets. The call surface
- * here is one endpoint and three question types, and pi-pier ships as an npm
- * package where a zero-dependency transport wins. Payload is pinned to the
- * versioned model id; see the RFC for re-evaluation triggers.
+ * Not the official SDK (@typesafe-ai/sdk): its retry machinery has no total-latency budget (timeouts
+ * are retried by default, Retry-After honored up to 60s), which is incompatible with pier's
+ * fail-open budgets, and the call surface here is one endpoint and three question types. Payload is
+ * pinned to the versioned model id; see the RFC for re-evaluation triggers.
  *
- * Every ask() resolves (never throws): errors, timeouts, 429s and low
- * confidence at the call site all mean " unanswered" -> caller fails open.
+ * Every ask() resolves (never throws): errors, timeouts, 429s and low confidence at the call site
+ * all mean unanswered, and the caller fails open.
  */
 import { sha256Hex } from './observation-core.ts';
 import { appendEfficiencyLog, efficiencyLogPath } from './efficiency-store.ts';
 import { parseJevAnswers, type JevAnswer, type JevQuestion, type JevUsage } from './jev-core.ts';
 import type { JevConfig } from './efficiency-config-core.ts';
 
-export const JEV_DEFAULT_BASE_URL = 'https://api.typesafe.ai';
+const JEV_DEFAULT_BASE_URL = 'https://api.typesafe.ai';
 
 export interface JevAskMeta {
   /** Stable question-set id for telemetry rows (e.g. 'epr-diagnostic-gate'). */

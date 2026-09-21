@@ -2,16 +2,12 @@
  * Jev decision layer — pure core (RFC docs/rfc-jev-integration.md).
  *
  * Question/answer shapes mirror the closed set of POST /v1/systemone
- * (https://docs.typesafe.ai/api): noul / choice / score. No I/O here; the HTTP
- * client + jev.jsonl telemetry live in jev-client.ts.
+ * (https://docs.typesafe.ai/api): noul / choice / score. No I/O here; the HTTP client and the
+ * jev.jsonl telemetry live in jev-client.ts.
  *
- * Design rules from the RFC:
- *  - arithmetic, counting and thresholds stay in code (jaggedness #2/#3);
- *  - state is minimal — only the fields each question needs (jaggedness #5);
- *  - instructions are English (models page: English is the primary training
- *    language; CJK is handled but weaker, so P0-2 runs a stricter gate);
- *  - any answer below its confidence gate counts as unanswered -> caller
- *    fails open to the existing heuristic.
+ * RFC design rules: arithmetic, counting and thresholds stay in code; state carries only what each
+ * question needs; instructions are English (CJK is handled but weaker, hence the stricter P0-2
+ * gate); and any answer below its confidence gate counts as unanswered so callers fail open.
  */
 import { containsLikelySecret, FAILURE_SIGNAL } from './reducer-core.ts';
 
@@ -54,6 +50,26 @@ function finiteNumber(v: unknown): number | undefined {
 function unitNumber(v: unknown): number | undefined {
   const n = finiteNumber(v);
   return n !== undefined && n >= 0 && n <= 1 ? n : undefined;
+}
+
+type NoulAnswer = Extract<JevAnswer, { type: 'noul' }>;
+type ChoiceAnswer = Extract<JevAnswer, { type: 'choice' }>;
+type ScoreAnswer = Extract<JevAnswer, { type: 'score' }>;
+
+/** A missing or wrongly-shaped answer counts as unanswered, never as a verdict (RFC fail-open). */
+function noulAnswer(answers: Record<string, JevAnswer>, id: string): NoulAnswer | undefined {
+  const answer = answers[id];
+  return answer?.type === 'noul' ? answer : undefined;
+}
+
+function choiceAnswer(answers: Record<string, JevAnswer>, id: string): ChoiceAnswer | undefined {
+  const answer = answers[id];
+  return answer?.type === 'choice' ? answer : undefined;
+}
+
+function scoreAnswer(answers: Record<string, JevAnswer>, id: string): ScoreAnswer | undefined {
+  const answer = answers[id];
+  return answer?.type === 'score' ? answer : undefined;
 }
 
 function parseProbabilities(v: unknown): Record<string, number> | undefined {
@@ -161,9 +177,9 @@ export function evaluateDiagnosticGate(
   answers: Record<string, JevAnswer>,
   minConfidence: number,
 ): DiagnosticGateVerdict {
-  const kind = answers.cmd_kind;
-  const output = answers.diagnostic_output;
-  if (kind === undefined || output === undefined || kind.type !== 'choice' || output.type !== 'noul') {
+  const kind = choiceAnswer(answers, 'cmd_kind');
+  const output = noulAnswer(answers, 'diagnostic_output');
+  if (kind === undefined || output === undefined) {
     return { hit: false, reason: 'missing-answer', confidence: null, choice: null, noul: null };
   }
   if (kind.choice !== 'build_test_run') {
@@ -179,11 +195,10 @@ export function evaluateDiagnosticGate(
 }
 
 /**
- * Flip semantics (2026-09-19, user directive): jev is the primary judge and
- * the regex list is the fallback. The regex list only decides when jev never
- * produced a usable answer — call failure, malformed answers, or a below-gate
- * confidence. A confident not-build-test / non-diagnostic-output verdict is an
- * authoritative rejection even for commands the regex list would match.
+ * Flip semantics (2026-09-19, user directive): jev is the primary judge and the regex list the
+ * fallback. The regex list decides only when jev never produced a usable answer — call failure,
+ * malformed answers, below-gate confidence. A confident rejection is authoritative even for
+ * commands the regex list would match.
  */
 export function isDiagnosticGateUnanswered(verdict: DiagnosticGateVerdict): boolean {
   return verdict.reason === 'missing-answer' || verdict.reason === 'low-confidence';
@@ -199,7 +214,7 @@ export function isDiagnosticGateUnanswered(verdict: DiagnosticGateVerdict): bool
  * the initial gate starts at 0.7 and calibrates from jev.jsonl.
  */
 export const NOTICE_RANK_MIN_CONFIDENCE = 0.7;
-export const RANK_SCORE_WEIGHT = 0.6;
+const RANK_SCORE_WEIGHT = 0.6;
 
 const RANK_LEVELS = [
   'Routine completion; the master agent can check it later',
@@ -236,13 +251,11 @@ export function noticeRankRequest(input: {
 }
 
 /**
- * Failure-pin threshold: a settlement whose fail-noul clears this is forced to
- * the front regardless of its relevance score. Live calibration (2026-09-18):
- * two runs over the same Chinese batch reordered a failure notice from #2 to
- * #4 — beyond the 3-shown cap. Score noise on CJK must not be able to bury a
- * failure; the invariant lives in code, not in the model.
+ * A settlement whose fail-noul clears this is forced to the front regardless of its relevance score:
+ * score noise on CJK rejected the same failure notice from #2 to #4 in live calibration — beyond the
+ * cap of shown notices. The invariant lives in code, not in the model.
  */
-export const NOTICE_FAIL_PIN_THRESHOLD = 0.7;
+const NOTICE_FAIL_PIN_THRESHOLD = 0.7;
 
 /**
  * Compose the display order: pinned failures first, then descending composed
@@ -261,11 +274,9 @@ export function composeNoticeRanking(
   const entries: Array<{ pin: number; value: number; index: number }> = [];
   let answered = 0;
   for (let i = 0; i < noticeCount; i++) {
-    const rank = answers[`notice_${i}_rank`];
-    const fail = answers[`notice_${i}_fail`];
-    if (rank === undefined || fail === undefined || rank.type !== 'score' || fail.type !== 'noul') {
-      return null;
-    }
+    const rank = scoreAnswer(answers, `notice_${i}_rank`);
+    const fail = noulAnswer(answers, `notice_${i}_fail`);
+    if (rank === undefined || fail === undefined) return null;
     const gated = rank.confidence < minConfidence;
     if (!gated) answered++;
     const normalizedScore = rank.score / Math.max(1, RANK_LEVELS.length - 1);
@@ -395,8 +406,8 @@ export function evaluateExcerptPick(
   answers: Record<string, JevAnswer>,
   minConfidence: number,
 ): ExcerptWindowId | null {
-  const picked = answers.window;
-  if (picked === undefined || picked.type !== 'choice') return null;
+  const picked = choiceAnswer(answers, 'window');
+  if (picked === undefined) return null;
   if (picked.confidence < minConfidence) return null;
   return picked.choice === 'first_signal' || picked.choice === 'densest' || picked.choice === 'mid'
     ? picked.choice
@@ -404,11 +415,9 @@ export function evaluateExcerptPick(
 }
 
 /**
- * Local privacy gate for the excerpt-pick request (2026-09-19 flip): the
- * request state is the head/tail excerpts plus candidate windows, and since
- * the flip it is sent for EVERY packed output — a path the EPR secret gate
- * never covers. Credential-shaped text in any state part keeps the whole
- * request local (legacy halves, no API call).
+ * Local privacy gate for the excerpt-pick request: its state is the head/tail excerpts plus the
+ * candidate windows, and it is sent for EVERY packed output — a path the EPR secret gate never
+ * covers. Credential-shaped text in any part keeps the whole request local (legacy halves, no call).
  */
 export function excerptAskIsSafe(
   middleWindows: readonly ExcerptWindow[],
@@ -424,12 +433,11 @@ export function excerptAskIsSafe(
 //---------------------------------------------------------------------------
 
 /**
- * Noul answers carry no confidence field (unlike choice/score), so this use case
- * gates on the noul probabilities themselves via dedicated constants — the same
- * convention as DIAGNOSTIC_OUTPUT_MIN_NOUL / NOTICE_FAIL_PIN_THRESHOLD.
+ * Noul answers carry no confidence field (unlike choice/score), so this use case gates on the noul
+ * probabilities themselves via dedicated constants, like DIAGNOSTIC_OUTPUT_MIN_NOUL.
  */
-export const SETTLE_MATCH_MIN_NOUL = 0.6;
-export const SETTLE_FINAL_MIN_NOUL = 0.6;
+const SETTLE_MATCH_MIN_NOUL = 0.6;
+const SETTLE_FINAL_MIN_NOUL = 0.6;
 
 
 export type SettleNullVerdict = 'silent' | 'attribution-suspect' | 'extraction-failed';
@@ -459,14 +467,13 @@ export function settleVerdictRequest(input: { description: string; tail: string 
   };
 }
 /**
- * Compose the null-closing verdict. null = unanswered (jev off / failed / wrong
- * shapes) — callers fall back to deterministic signals and the legacy wording so
- * jev-off stays byte-identical (RFC fail-open invariant).
+ * Compose the null-closing verdict. null = unanswered (jev off / failed / wrong shapes) — callers
+ * fall back to deterministic signals and the legacy wording, so jev-off stays byte-identical.
  */
 export function evaluateSettleVerdict(answers: Record<string, JevAnswer>): SettleNullVerdict | null {
-  const match = answers.tail_matches_task;
-  const fin = answers.tail_has_final_answer;
-  if (match?.type !== 'noul' || fin?.type !== 'noul') return null;
+  const match = noulAnswer(answers, 'tail_matches_task');
+  const fin = noulAnswer(answers, 'tail_has_final_answer');
+  if (match === undefined || fin === undefined) return null;
   if (match.noul < SETTLE_MATCH_MIN_NOUL) return 'attribution-suspect';
   if (fin.noul >= SETTLE_FINAL_MIN_NOUL) return 'extraction-failed';
   return 'silent';

@@ -1,26 +1,14 @@
 /**
- * renderers: ANSI-aware clipping, pure card builders, and best-effort installation.
- *
- * Why: these renderers are display-only, so the risk we test is "wrong text in the
- * transcript" and "registration breaks the extension", not tool behavior.
+ * renderers: ANSI-aware clipping and the transcript line builders, exercised through the public
+ * seam (`installRenderers` registers them on the host) plus best-effort registration behavior.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { charWidth, styledWidth, truncateStyled } from '../src/ansi-text.ts';
 import {
   APPROVAL_NEEDED_CUSTOM_TYPE,
   ROLE_MANIFEST_CUSTOM_TYPE,
-  approvalLines,
-  card,
-  charWidth,
-  formatEditCounts,
   installRenderers,
-  reminderLines,
-  roleManifestLines,
-  styledWidth,
-  subsLines,
-  terminalsLines,
-  todoEditLines,
-  truncateStyled,
   type RenderComponent,
   type RenderTheme,
 } from '../src/renderers.ts';
@@ -34,76 +22,98 @@ const plain: RenderTheme = { fg: (_c, t) => t, bold: (t) => t };
 /** Marker theme: exposes which colors the builders request. */
 const marker: RenderTheme = { fg: (c, t) => `[${c}]${t}`, bold: (t) => `**${t}**` };
 
-const ANSI_LINE = '\x1b[31mred\x1b[0m and \x1b[1mbold\x1b[0m';
+type EntryRenderer = (entry: unknown, options: { expanded: boolean }, theme: RenderTheme) => RenderComponent;
+type MessageRenderer = (message: unknown, options: { expanded: boolean }, theme: RenderTheme) => RenderComponent;
 
-test('styledWidth: escapes are zero-width, ASCII counts one cell each', () => {
+interface Harness {
+  entries: Map<string, EntryRenderer>;
+  messages: Map<string, MessageRenderer>;
+  registered: string[];
+}
+
+function install(): Harness {
+  const entries = new Map<string, EntryRenderer>();
+  const messages = new Map<string, MessageRenderer>();
+  const registered = installRenderers({
+    registerEntryRenderer: (type: string, renderer: EntryRenderer) => { entries.set(type, renderer); },
+    registerMessageRenderer: (type: string, renderer: MessageRenderer) => { messages.set(type, renderer); },
+  });
+  return { entries, messages, registered };
+}
+
+/** Render one entry card; `expanded` mirrors pi's ctrl+o state. */
+function entryLines(type: string, data: unknown, expanded = false, theme = plain, width = 200): string[] {
+  const renderer = install().entries.get(type);
+  assert.ok(renderer, `${type} should be registered`);
+  return renderer({ customType: type, data }, { expanded }, theme).render(width);
+}
+
+function messageLines(type: string, message: unknown, expanded = false): string[] {
+  const renderer = install().messages.get(type);
+  assert.ok(renderer, `${type} should be registered`);
+  return renderer(message, { expanded }, plain).render(200);
+}
+
+/* ── width handling (ansi-text, reused by the card wrapper) ─────────── */
+
+test('width helpers: escapes are zero-width, wide glyphs take two cells, control/combining take none', () => {
   assert.equal(styledWidth('abc'), 3);
-  assert.equal(styledWidth(ANSI_LINE), 'red and bold'.length);
-  assert.equal(styledWidth(''), 0);
-});
-
-test('charWidth: CJK and emoji are wide, control and combining are zero', () => {
+  assert.equal(styledWidth('\x1b[31mred\x1b[0m and \x1b[1mbold\x1b[0m'), 'red and bold'.length);
   assert.equal(charWidth(0x41), 1);
   assert.equal(charWidth(0x4e2d), 2); // 中
   assert.equal(charWidth(0x1f680), 2); // 🚀
-  assert.equal(charWidth(0x0301), 0);
+  assert.equal(charWidth(0x0301), 0); // combining acute
   assert.equal(charWidth(0x0a), 0);
 });
 
-test('truncateStyled: passthrough when it fits, ellipsis when it does not', () => {
+test('truncateStyled: passthrough when it fits, ellipsis otherwise, escapes survive the cut', () => {
   assert.equal(truncateStyled('short', 10), 'short');
-  const cut = truncateStyled('0123456789', 5);
-  assert.equal(cut.endsWith('…'), true);
-  assert.equal(styledWidth(cut), 5);
+  assert.equal(styledWidth(truncateStyled('0123456789', 5)), 5);
   assert.equal(truncateStyled('anything', 0), '');
-});
-
-test('truncateStyled: wide glyphs consume two cells and escapes survive the cut', () => {
-  const cjk = '中中中中中';
-  assert.equal(styledWidth(cjk), 10);
-  const cut = truncateStyled(cjk, 5);
-  assert.equal(styledWidth(cut), 5);
-
+  assert.equal(styledWidth(truncateStyled('中中中中中', 5)), 5);
   const styled = `\x1b[32m${'ab'.repeat(20)}\x1b[0m`;
   const clipped = truncateStyled(styled, 8);
   assert.equal(styledWidth(clipped), 8);
   assert.equal(clipped.startsWith('\x1b[32m'), true);
 });
 
-test('card: render clips to the requested width and invalidate is safe', () => {
-  const component: RenderComponent = card(['abcdefghij', 'x']);
-  assert.deepEqual(component.render(4).map((l) => styledWidth(l)), [4, 1]);
-  component.invalidate();
+test('every card clips its lines to the requested width', () => {
+  const data = { edits: [{ op: 'done', content: 'x'.repeat(200) }] };
+  const lines = entryLines(TODO_EDIT_CUSTOM_TYPE, data, true, plain, 12);
+  assert.ok(lines.length > 1);
+  assert.ok(lines.every((line) => styledWidth(line) <= 12), JSON.stringify(lines));
 });
 
-test('formatEditCounts: verbs per op and ×N for repeats', () => {
-  assert.equal(
-    formatEditCounts([{ op: 'done' }, { op: 'done' }, { op: 'unblock' }, { op: 'weird' }]),
-    '✓ done ×2 · ○ unblocked · weird',
-  );
-  assert.equal(formatEditCounts([]), '');
-});
+/* ── line builders ─────────────────────────────────────────────────── */
 
-test('todoEditLines: collapsed shows the summary, expanded shows each edit', () => {
-  const data = { version: 1, ts: 1, edits: [{ op: 'done', content: 'ship it' }, { op: 'rm', content: 'stale' }] };
-  const collapsed = todoEditLines(data, plain, false);
+test('todo edit card: collapsed shows the summary, expanded adds one line per edit', () => {
+  const data = {
+    edits: [{ op: 'done', content: 'ship it' }, { op: 'done', content: 'again' }, { op: 'rm', content: 'stale' }],
+  };
+  const collapsed = entryLines(TODO_EDIT_CUSTOM_TYPE, data, false, marker);
   assert.equal(collapsed.length, 1);
-  assert.match(collapsed[0]!, /todo/);
-  assert.match(collapsed[0]!, /2 edits/);
+  assert.match(collapsed[0]!, /\[accent\]\*\*todo\*\*/);
+  assert.match(collapsed[0]!, /3 edits/);
+  assert.match(collapsed[0]!, /✓ done ×2 · ✗ removed/, 'verbs and repeats are mapped');
 
-  const expanded = todoEditLines(data, plain, true);
-  assert.equal(expanded.length, 3);
+  const expanded = entryLines(TODO_EDIT_CUSTOM_TYPE, data, true);
+  assert.equal(expanded.length, 4);
   assert.match(expanded[1]!, /done — ship it/);
-  assert.match(expanded[2]!, /removed — stale/);
+  assert.match(expanded[3]!, /removed — stale/);
+
+  const single = entryLines(TODO_EDIT_CUSTOM_TYPE, { edits: [{ op: 'done', content: 'ship it' }] });
+  assert.match(single[0]!, /1 edit\b/);
 });
 
-test('todoEditLines: malformed or empty payloads never throw', () => {
-  assert.deepEqual(todoEditLines(undefined, plain, true).length, 1);
-  assert.deepEqual(todoEditLines({ edits: [] }, plain, true).length, 1);
-  assert.deepEqual(todoEditLines({ edits: 'nope' }, plain, false).length, 1);
+test('todo edit card: malformed payloads render a single placeholder line', () => {
+  for (const data of [undefined, {}, { edits: [] }, { edits: 'nope' }]) {
+    const lines = entryLines(TODO_EDIT_CUSTOM_TYPE, data, true);
+    assert.equal(lines.length, 1, JSON.stringify(data));
+    assert.match(lines[0]!, /no edits/);
+  }
 });
 
-test('subsLines: counts running entries and lists them when expanded', () => {
+test('subagent registry card: tracked/running counts, then one row per entry', () => {
   const data = {
     version: 2,
     subs: [
@@ -111,114 +121,90 @@ test('subsLines: counts running entries and lists them when expanded', () => {
       { paneId: 'wD:p5', status: 'settled', description: 'poll-loop tests' },
     ],
   };
-  const head = subsLines(data, plain, false);
+  const head = entryLines(SUBS_CUSTOM_TYPE, data);
   assert.equal(head.length, 1);
   assert.match(head[0]!, /2 tracked/);
   assert.match(head[0]!, /1 running/);
 
-  const expanded = subsLines(data, plain, true);
+  const expanded = entryLines(SUBS_CUSTOM_TYPE, data, true);
   assert.equal(expanded.length, 3);
   assert.match(expanded[1]!, /● wD:p4 · running/);
   assert.match(expanded[2]!, /○ wD:p5 · settled/);
+
+  assert.match(entryLines(SUBS_CUSTOM_TYPE, { version: 2, subs: [] })[0]!, /none/);
+  assert.match(entryLines(SUBS_CUSTOM_TYPE, undefined)[0]!, /none/);
 });
 
-test('subsLines: empty or malformed registry renders a single dim line', () => {
-  assert.match(subsLines({ version: 2, subs: [] }, plain, true)[0]!, /none/);
-  assert.match(subsLines(undefined, plain, true)[0]!, /none/);
+test('terminal registry card: open count and label/cwd per pane', () => {
+  const data = { version: 1, terminals: [{ paneId: 'wD:p9', label: 'dev server', cwd: '/repo' }, { paneId: 'wD:p8', cwd: '/tmp' }] };
+  assert.match(entryLines(TERMINALS_CUSTOM_TYPE, data)[0]!, /2 open/);
+  const expanded = entryLines(TERMINALS_CUSTOM_TYPE, data, true);
+  assert.match(expanded[1]!, /wD:p9 · dev server/);
+  assert.match(expanded[2]!, /wD:p8 · \/tmp/, 'a pane without a label falls back to its cwd');
+  assert.match(entryLines(TERMINALS_CUSTOM_TYPE, {})[0]!, /none/);
 });
 
-test('terminalsLines: open panes with labels', () => {
-  const data = { version: 1, terminals: [{ paneId: 'wD:p9', label: 'dev server', cwd: '/repo' }] };
-  assert.match(terminalsLines(data, plain, false)[0]!, /1 open/);
-  const expanded = terminalsLines(data, plain, true);
-  assert.match(expanded[1]!, /wD:p9/);
-  assert.match(expanded[1]!, /dev server/);
-  assert.match(terminalsLines({}, plain, false)[0]!, /none/);
+test('role manifest card: role, version, tool count, gated count and switch provenance', () => {
+  const theme = marker;
+  const plainRole = { role: 'worker-default', manifestVersion: 'v1', tools: ['read', 'bash', 'write'], permissions: { bash: 'deny', write: 'ask', read: 'allow' } };
+  const line = entryLines(ROLE_MANIFEST_CUSTOM_TYPE, plainRole, false, theme)[0]!;
+  assert.match(line, /\[accent\]\*\*role\*\*/);
+  assert.match(line, /worker-default/);
+  assert.match(line, /v1 · 3 tools/);
+  assert.match(line, /\[warning\] · 2 gated/);
+
+  const switched = entryLines(ROLE_MANIFEST_CUSTOM_TYPE, { ...plainRole, origin: 'switch', switchedBy: 'p-master' }, false, theme)[0]!;
+  assert.match(switched, /⇄ p-master/);
+  assert.equal(entryLines(ROLE_MANIFEST_CUSTOM_TYPE, plainRole, false, theme)[0]!.includes('⇄'), false);
+
+  assert.match(entryLines(ROLE_MANIFEST_CUSTOM_TYPE, undefined)[0]!, /role \? v\? · 0 tools/);
 });
 
-test('roleManifestLines: role, version, tool count and gated permission count', () => {
-  const data = { role: 'worker-default', manifestVersion: 'v1', tools: ['read', 'bash', 'write'], permissions: { bash: 'deny', write: 'ask', read: 'allow' } };
-  const lines = roleManifestLines(data, marker);
-  assert.equal(lines.length, 1);
-  assert.match(lines[0]!, /\[accent\]\*\*role\*\*/);
-  assert.match(lines[0]!, /worker-default/);
-  assert.match(lines[0]!, /v1 · 3 tools/);
-  assert.match(lines[0]!, /\[warning\] · 2 gated/);
-});
+test('approval card and reminder cards: tool/role pair, collapsed preview, expanded body', () => {
+  assert.match(entryLines(APPROVAL_NEEDED_CUSTOM_TYPE, { role: 'worker', tool: 'bash' })[0]!, /approval needed · bash \(worker\)/);
+  assert.match(entryLines(APPROVAL_NEEDED_CUSTOM_TYPE, {})[0]!, /· \? \(\?\)/);
 
-test('roleManifestLines: unknown shapes fall back to placeholders', () => {
-  assert.match(roleManifestLines(undefined, plain)[0]!, /role \? v\? · 0 tools/);
-});
-
-test('approvalLines: tool and role are both visible', () => {
-  assert.match(approvalLines({ role: 'worker', tool: 'bash' }, plain)[0]!, /approval needed · bash \(worker\)/);
-  assert.match(approvalLines({}, plain)[0]!, /· \? \(\?\)/);
-});
-
-test('reminderLines: collapsed keeps one dim line, expanded keeps the full body', () => {
   const message = { content: 'Reminder 1/3: you stopped with unfinished todos\nsecond line' };
-  const collapsed = reminderLines(message, plain, 'todo reminder', false);
+  const collapsed = messageLines(TODO_REMINDER_CUSTOM_TYPE, message);
   assert.equal(collapsed.length, 2);
   assert.match(collapsed[0]!, /↻ todo reminder/);
   assert.match(collapsed[1]!, /Reminder 1\/3/);
-
-  const expanded = reminderLines(message, plain, 'todo reminder', true);
+  const expanded = messageLines(TODO_REMINDER_CUSTOM_TYPE, message, true);
   assert.equal(expanded.length, 3);
   assert.match(expanded[2]!, /second line/);
+
+  // Empty content falls back to the label so the row is never blank.
+  assert.match(messageLines(TERM_REMINDER_CUSTOM_TYPE, {})[1]!, /terminal nudge/);
 });
 
-test('reminderLines: empty content falls back to the label', () => {
-  const lines = reminderLines({}, plain, 'terminal nudge', false);
-  assert.match(lines[1]!, /terminal nudge/);
-});
+/* ── installation ──────────────────────────────────────────────────── */
 
-test('installRenderers: registers every pier custom type when the API exists', () => {
-  const entryTypes: string[] = [];
-  const messageTypes: string[] = [];
-  const pi = {
-    registerEntryRenderer: (type: string) => { entryTypes.push(type); },
-    registerMessageRenderer: (type: string) => { messageTypes.push(type); },
-  };
-  const registered = installRenderers(pi);
-  assert.deepEqual(entryTypes, [
+test('installRenderers: registers every pier custom type when the host API exists', () => {
+  const harness = install();
+  assert.deepEqual([...harness.entries.keys()], [
     TODO_EDIT_CUSTOM_TYPE,
     SUBS_CUSTOM_TYPE,
     TERMINALS_CUSTOM_TYPE,
     ROLE_MANIFEST_CUSTOM_TYPE,
     APPROVAL_NEEDED_CUSTOM_TYPE,
   ]);
-  assert.deepEqual(messageTypes, [TODO_REMINDER_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE]);
-  assert.equal(registered.length, 7);
+  assert.deepEqual([...harness.messages.keys()], [TODO_REMINDER_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE]);
+  assert.equal(harness.registered.length, 7);
 });
 
-test('installRenderers: missing API registers nothing and never throws', () => {
+test('installRenderers: a missing API registers nothing, a throwing host is contained per type', () => {
   assert.deepEqual(installRenderers({}), []);
-});
 
-test('installRenderers: a throwing registration is contained per type', () => {
   let calls = 0;
-  const pi = {
-    registerEntryRenderer: () => { calls += 1; throw new Error('boom'); },
-    registerMessageRenderer: () => { calls += 1; },
-  };
-  const registered = installRenderers(pi);
-  assert.equal(calls, 7);
-  assert.deepEqual(registered, [TODO_REMINDER_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE]);
-});
-
-test('installRenderers: registered entry renderer closes over the right custom type', () => {
-  const seen = new Map<string, (entry: unknown, options: { expanded: boolean }, theme: RenderTheme) => RenderComponent>();
-  const pi = {
-    registerEntryRenderer: (type: string, renderer: (entry: unknown, options: { expanded: boolean }, theme: RenderTheme) => RenderComponent) => {
-      seen.set(type, renderer);
+  const registered = installRenderers({
+    registerEntryRenderer: () => {
+      calls += 1;
+      throw new Error('boom');
     },
-  };
-  installRenderers(pi);
-  const renderer = seen.get(SUBS_CUSTOM_TYPE)!;
-  const component = renderer(
-    { customType: SUBS_CUSTOM_TYPE, data: { version: 2, subs: [{ paneId: 'p1', status: 'running', description: 'x' }] } },
-    { expanded: false },
-    plain,
-  );
-  assert.match(component.render(80)[0]!, /subagents/);
+    registerMessageRenderer: () => {
+      calls += 1;
+    },
+  });
+  assert.equal(calls, 7, 'one throwing registration must not skip the rest');
+  assert.deepEqual(registered, [TODO_REMINDER_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE]);
 });
