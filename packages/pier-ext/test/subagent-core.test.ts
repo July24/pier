@@ -1,35 +1,14 @@
-/**
- * Subagent domain units: pure planners and notices (launch line, validation, tab placement,
- * readiness, liveness, isolate/worktree planning, task-id resolution) plus plugin wiring
- * (tool surface, port binding, action dispatch, list rendering).
- */
+/** Subagent domain units: pure planners and notices (launch line, validation, tab placement,
+ * readiness, liveness, isolate/worktree planning, task-id resolution) plus plugin wiring. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DisposeLedger } from '../src/ledger.ts';
-import { mountSubagent, runSubagent } from './test-utils.ts';
+import { mountSubagent, runSubagent, subEntry } from './test-utils.ts';
 import {
-  FOREGROUND_POLL_MS,
-  SUBS_CUSTOM_TYPE,
-  TAB_NAME_MAX,
-  Semaphore,
-  agoText,
-  buildAliveNotice,
-  buildBlockedGateNotice,
-  buildLaunchLine,
-  buildLaunchParts,
-  classifyWorktreeZone,
-  foldSubsRegistry,
-  formatSubagentResult,
-  isAlive,
-  makeProgressUpdate,
-  nextTaskTabName,
-  planForegroundTick,
-  planLaunchValidation,
-  planTabPlacement,
-  resolveTaskIdPrefix,
-  tabNameForTask,
-  type AliveProbe,
-  type SubEntry,
+  FOREGROUND_POLL_MS, SUBS_CUSTOM_TYPE, TAB_NAME_MAX, Semaphore, agoText, buildAliveNotice, buildBlockedGateNotice,
+  buildLaunchLine, buildLaunchParts, classifyWorktreeZone, foldSubsRegistry, formatSubagentResult, isAlive,
+  makeProgressUpdate, nextTaskTabName, planForegroundTick, planLaunchValidation, planTabPlacement, resolveTaskIdPrefix,
+  tabNameForTask, type AliveProbe, type SubEntry,
 } from '../src/subagent-core.ts';
 import { planReadyAttempt, readyBackoffMs, readyFailureText } from '../src/subagent-spawn.ts';
 
@@ -37,14 +16,9 @@ const RT = { nodePath: '/usr/local/bin/node', cliPath: '/opt/pi/dist/cli.js', ex
 
 test('buildLaunchLine: win32 uses PowerShell & syntax, POSIX starts via sh', () => {
   const parts = ['/usr/local/bin/node', '/opt/pi/dist/cli.js', '-e', '/ext/index.ts'];
-  assert.equal(
-    buildLaunchLine(parts, 'win32'),
-    `& '/usr/local/bin/node' '/opt/pi/dist/cli.js' '-e' '/ext/index.ts'`,
-  );
-  assert.equal(
-    buildLaunchLine(parts, 'darwin'),
-    `'/usr/local/bin/node' '/opt/pi/dist/cli.js' '-e' '/ext/index.ts'`,
-  );
+  const posix = `'/usr/local/bin/node' '/opt/pi/dist/cli.js' '-e' '/ext/index.ts'`;
+  assert.equal(buildLaunchLine(parts, 'win32'), `& ${posix}`);
+  assert.equal(buildLaunchLine(parts, 'darwin'), posix);
   assert.equal(buildLaunchLine(parts, 'linux'), buildLaunchLine(parts, 'darwin'));
   // A quoted path stays a single literal under both syntaxes.
   assert.equal(buildLaunchLine(["it's a path"], 'darwin'), `'it'\\''s a path'`);
@@ -52,31 +26,21 @@ test('buildLaunchLine: win32 uses PowerShell & syntax, POSIX starts via sh', () 
 });
 
 test('buildLaunchParts: fullscreen TUI by default (static frames); PI_HERDR_TUI=regular opts out', () => {
-  assert.deepEqual(
-    buildLaunchParts(RT, {}, {}),
-    ['/usr/local/bin/node', '/opt/pi/dist/cli.js', '-e', '/ext/index.ts', '--tui-mode', 'fullscreen'],
-  );
-  assert.deepEqual(
-    buildLaunchParts(RT, {}, { PI_HERDR_TUI: 'regular' }),
-    ['/usr/local/bin/node', '/opt/pi/dist/cli.js', '-e', '/ext/index.ts'],
-  );
-  assert.deepEqual(
-    buildLaunchParts(RT, { approve: true, roleModel: 'zai/glm-4.7', resumeFile: '/s.jsonl' }, {}),
-    [
-      '/usr/local/bin/node', '/opt/pi/dist/cli.js', '-a', '-e', '/ext/index.ts',
-      '--tui-mode', 'fullscreen', '--provider', 'zai', '--model', 'glm-4.7', '--session', '/s.jsonl',
-    ],
-  );
+  const base = ['/usr/local/bin/node', '/opt/pi/dist/cli.js', '-e', '/ext/index.ts'];
+  assert.deepEqual(buildLaunchParts(RT, {}, {}), [...base, '--tui-mode', 'fullscreen']);
+  assert.deepEqual(buildLaunchParts(RT, {}, { PI_HERDR_TUI: 'regular' }), base);
+  assert.deepEqual(buildLaunchParts(RT, { approve: true, roleModel: 'zai/glm-4.7', resumeFile: '/s.jsonl' }, {}), [
+    '/usr/local/bin/node', '/opt/pi/dist/cli.js', '-a', '-e', '/ext/index.ts',
+    '--tui-mode', 'fullscreen', '--provider', 'zai', '--model', 'glm-4.7', '--session', '/s.jsonl',
+  ]);
 });
 
 const mkSub = (over: Record<string, unknown>) => ({
-  taskId: 't1', kind: 'short', paneId: 'w1:p1', tabId: 'w1:t9', cwd: 'F:\\herdr-pi',
-  description: 'task', background: true, status: 'running', sessionFile: null,
-  launchCommand: ['x'], createdAt: 1, ...over,
+  taskId: 't1', kind: 'short', paneId: 'w1:p1', tabId: 'w1:t9', cwd: 'F:\\herdr-pi', description: 'task', background: true,
+  status: 'running', sessionFile: null, launchCommand: ['x'], createdAt: 1, ...over,
 });
 
-const registry = (...rows: unknown[]) =>
-  [{ type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { version: 2, subs: rows } }];
+const registry = (...rows: unknown[]) => [{ type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { version: 2, subs: rows } }];
 
 const entryFrom = (row: Record<string, unknown>): SubEntry => foldSubsRegistry(registry(row)).subs[0]!;
 
@@ -403,11 +367,7 @@ test('subagent plugin: ledger tombstone makes the tool inert', async () => {
 
 test('subagent plugin: tool_result hook only rewrites our errors, and stays silent for a dead pane', async () => {
   const { root, pi } = await mountSubagent({
-    subs: [{
-      taskId: 'task-1', kind: 'task', paneId: 'w1:p2', tabId: 't0', tabName: 'main', cwd: '/tmp',
-      description: 'dead worker', background: true, status: 'running', consumedAt: null, sessionFile: null,
-      launchCommand: [], createdAt: 1, revivedFrom: null,
-    }],
+    subs: [subEntry({ paneId: 'w1:p2', cwd: '/tmp', description: 'dead worker', createdAt: 1 })],
   });
   const hook = (pi.listeners.get('tool_result') ?? [])[0]!;
   const call = (event: Record<string, unknown>) => hook(event) as Promise<unknown>;
@@ -434,10 +394,8 @@ test('subagent plugin: prompt surface is present and a missing action normalizes
 });
 
 test('subagent plugin: list shows live state, activity and a foreign cwd only when it differs', async () => {
-  const worker = (paneId: string, taskId: string, description: string): SubEntry => ({
-    taskId, kind: 'task', paneId, tabId: 't-1', tabName: '', cwd: '/workspace/repo',
-    description, background: true, status: 'running', consumedAt: null, sessionFile: null,
-    launchCommand: [], createdAt: 1, revivedFrom: null,
+  const worker = (paneId: string, taskId: string, description: string): SubEntry => subEntry({
+    paneId, taskId, tabId: 't-1', tabName: '', cwd: '/workspace/repo', description, createdAt: 1,
   });
   const { root, pi } = await mountSubagent({
     client: {

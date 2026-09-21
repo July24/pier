@@ -8,6 +8,7 @@ import * as fs from 'node:fs';
 import {
   pipeNameCandidates, pipeNameFor, pipePathFor, pipeRequest, pipeRequestTo, startPipeServer,
 } from '../src/pipe-channel.ts';
+import { jsonl } from './test-utils.ts';
 
 type Handler = Parameters<typeof startPipeServer>[1];
 type FrameCase = { name: string; line: string; handler: Handler; message: RegExp };
@@ -18,22 +19,14 @@ const uniqueName = (prefix: string): string =>
 
 const okHandler: Handler = async (req) => ({ type: 'ok', id: req.id });
 
-/** Bind `create(name)` on a fresh pipe name, run `body`, then destroy tracked sockets before close() —
- * a half-open socket stalls `close()` forever and would cancel the file; `beforeBind` seeds the path. */
-async function withServer<T>(
-  prefix: string,
-  create: (name: string) => net.Server,
-  body: (name: string) => Promise<T>,
-  beforeBind?: (name: string) => void,
-): Promise<T> {
+/** Binds `create(name)` on a fresh pipe name and runs `body`; a half-open socket would stall close()
+ *  forever, so tracked sockets are destroyed first. `beforeBind` seeds the path. */
+async function withServer<T>(prefix: string, create: (name: string) => net.Server, body: (name: string) => Promise<T>, beforeBind?: (name: string) => void): Promise<T> {
   const name = uniqueName(prefix);
   beforeBind?.(name);
   const server = create(name);
   const sockets = new Set<net.Socket>();
-  server.on('connection', (sock) => {
-    sockets.add(sock);
-    sock.on('close', () => sockets.delete(sock));
-  });
+  server.on('connection', (sock) => { sockets.add(sock); sock.on('close', () => sockets.delete(sock)); });
   try {
     // `once` rejects on 'error', so a failed bind surfaces instead of hanging.
     if (!server.listening) await once(server, 'listening');
@@ -100,12 +93,8 @@ test('pipeRequest: 往返分发 ping/prompt，error 帧原样交回调用方', a
 test('startPipeServer: bad frame / handler throw answer with error frames', async (t) => {
   const CASES: FrameCase[] = [
     { name: 'malformed line → bad frame', line: 'not-json\n', handler: okHandler, message: /^bad frame$/ },
-    {
-      name: 'handler throw → error frame with the message',
-      line: `${JSON.stringify({ type: 'ping', id: 't1' })}\n`,
-      handler: async () => { throw new Error('handler exploded'); },
-      message: /handler exploded/,
-    },
+    { name: 'handler throw → error frame with the message', line: `${jsonl({ type: 'ping', id: 't1' })}`,
+      handler: async () => { throw new Error('handler exploded'); }, message: /handler exploded/ },
   ];
   for (const c of CASES) {
     await t.test(c.name, () => withServer(c.name, (name) => startPipeServer(name, c.handler), async (name) => {
@@ -119,11 +108,9 @@ test('startPipeServer: bad frame / handler throw answer with error frames', asyn
 test('pipeRequest: rejects on bad frame, silence, peer hangup and a missing peer', async (t) => {
   const CASES: PeerCase[] = [
     // Scripted raw peers: junk reply / silence / immediate hangup.
-    { name: 'malformed response frame', timeout: 2000, match: /bad response frame/,
-      accept: (sock) => sock.on('data', () => { sock.end('not valid JSON\n'); }) },
+    { name: 'malformed response frame', timeout: 2000, match: /bad response frame/, accept: (s) => s.on('data', () => { s.end('not valid JSON\n'); }) },
     { name: 'no answer within the deadline', timeout: 150, match: /timeout/, accept: () => {} },
-    { name: 'peer hangs up before answering', timeout: 5000, maxMs: 3000,
-      match: /connection closed|EPIPE|ECONNRESET/, accept: (sock) => { sock.end(); } },
+    { name: 'peer hangs up before answering', timeout: 5000, maxMs: 3000, match: /connection closed|EPIPE|ECONNRESET/, accept: (s) => { s.end(); } },
     { name: 'no server listening', timeout: 400, match: /ENOENT/ },
   ];
   for (const c of CASES) {
@@ -168,9 +155,9 @@ test('startPipeServer (F04): POSIX unlinks a stale socket file before listen', a
 });
 
 test('startPipeServer (F04): a failed listen reaches onError and never kills the process', async () => {
-  // An 'error' event with no listener throws and would take the extension host down, so a failed bind
-  // must reach onError while a listener-less server stays alive. The address is squatted: POSIX uses a
-  // directory (unlink-proof → EADDRINUSE); Windows a live server holds the name (FIRST_PIPE_INSTANCE).
+  // An 'error' event with no listener would take the extension host down, so a failed bind must reach
+  // onError while a listener-less server stays alive. The address is squatted: POSIX a directory
+  // (unlink-proof → EADDRINUSE), Windows a live server holding the name (FIRST_PIPE_INSTANCE).
   const name = uniqueName('badpath');
   const socketPath = pipePathFor(name);
   const squatter = net.createServer(() => {});

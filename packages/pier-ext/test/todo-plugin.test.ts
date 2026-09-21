@@ -1,12 +1,10 @@
-/**
- * core/todo plugin wiring: tool/command/read-hook registration, widget slot, dispose tombstone,
- * master stop reminder, and the widgetLines window (activity anchor / archive demotion / gate
- * collapse). Real TodosService against the shared fakePi.
- */
+/** core/todo plugin wiring (tool/command/read-hook, widget slot, tombstone, stop reminder, widgetLines
+ *  window) over a real TodosService + fakePi, plus the pane-title pure functions (M22/D68/D96). */
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { Context } from '@deepseek-ai/cordis';
 import todoPlugin, { widgetLines } from '../src/plugins/todo.ts';
+import { BLOCKED_LABEL_KEY, formatBlockedLabel, formatPaneTitle, sidebarTodoTokens, staleTokenClearance } from '../src/pane-title.ts';
 import { PiSurface } from '../src/pi-surface.ts';
 import { DisposeLedger } from '../src/ledger.ts';
 import { TodosService } from '../src/todos-service.ts';
@@ -48,8 +46,7 @@ async function todoWrite(pi: FakePi, todos: unknown, eventCtx: unknown = { ui: {
 test('core/todo：工具/命令/读钩注册 + todo_write 全链（完成通知 + 读钩信封）', async () => {
   const pi = fakePi();
   const { ctx } = await mount(pi);
-  assert.ok(pi.tools.has('todo_write'));
-  assert.ok(pi.commands.has('todos'));
+  assert.ok(pi.tools.has('todo_write')); assert.ok(pi.commands.has('todos'));
   assert.ok((pi.listeners.get('before_agent_start') ?? []).length >= 1);
   const r = await todoWrite(pi, [
     { content: 'a', status: 'in_progress' },
@@ -75,8 +72,7 @@ test('core/todo：墓碑（ledger.disposeKey 本文件）→ 工具 inert + 读�
   const { ctx } = await mount(pi, { ledger });
   assert.equal(ledger.disposeKey(new URL('../src/plugins/todo.ts', import.meta.url).href), 1);
   const r = await todoWrite(pi, [], {});
-  assert.match(r.content[0].text, /disposed/);
-  assert.equal(await pi.listeners.get('before_agent_start')?.[0]?.(), undefined);
+  assert.match(r.content[0].text, /disposed/); assert.equal(await pi.listeners.get('before_agent_start')?.[0]?.(), undefined);
   await ctx.fiber.dispose();
 });
 test('core/todo：/todos unblock 端到端（blocked → pending + 权威 appendEntry + 幂等 no-op）', async () => {
@@ -94,14 +90,11 @@ test('core/todo：/todos unblock 端到端（blocked → pending + 权威 append
   assert.equal(todos.items.find((t) => t.content === '汇总结果')?.blocker, undefined, 'blocker 已清');
   // The human edit is persisted as one authoritative branch entry, so replay rebuilds it.
   const [customType, data] = pi.entries[0] as [string, { version: number; edits: unknown[]; ts: number }];
-  assert.equal(customType, 'pi-herdr.todo-edit');
-  assert.equal(data.version, 1);
-  assert.deepEqual(data.edits, [{ op: 'unblock', content: '汇总结果' }]);
-  assert.equal(typeof data.ts, 'number');
+  assert.equal(customType, 'pi-herdr.todo-edit'); assert.equal(data.version, 1);
+  assert.deepEqual(data.edits, [{ op: 'unblock', content: '汇总结果' }]); assert.equal(typeof data.ts, 'number');
   assert.ok(notes.some((n) => n.includes('unblocked')), '用户反馈');
   await handler('unblock 汇总', { ui });
-  assert.equal(pi.entries.length, 1, 'no-op 不追加权威条目');
-  assert.ok(notes.some((n) => n.includes('no change')));
+  assert.equal(pi.entries.length, 1, 'no-op 不追加权威条目'); assert.ok(notes.some((n) => n.includes('no change')));
   await ctx.fiber.dispose();
 });
 test('core/todo：R1 归档清空执行链——窗口拍不清，终态拍 rm 全量落盘 + 内存清空 → 空守卫接管', async () => {
@@ -111,8 +104,7 @@ test('core/todo：R1 归档清空执行链——窗口拍不清，终态拍 rm �
   todos.replace([{ content: '探查代码', status: 'completed' }, { content: '写文档', status: 'completed' }]);
   todos.lastWriteAt = Date.now() - 2 * 3_600_000; // all done + 2h idle → archived
   const win = (await hook?.()) as { message?: { content: string } } | undefined;
-  assert.match(win?.message?.content ?? '', /rewrite window/i);
-  assert.equal(todos.items.length, 2, '窗口不清空');
+  assert.match(win?.message?.content ?? '', /rewrite window/i); assert.equal(todos.items.length, 2, '窗口不清空');
   assert.ok(!pi.entries.some(([t]) => t === 'pi-herdr.todo-edit'), '窗口不落盘');
   // Same cadence as the empty guard (4 turns), so the terminal notice lands on the 5th pass.
   for (let i = 0; i < 4; i++) await hook?.();
@@ -146,12 +138,9 @@ test('D41 stop 提醒：custom 通道 + 宽限窗 + 唤醒取消（决策矩阵�
     mock.timers.tick(30_001);
     await flush();
     const { msg, opts } = pi.sent[0]!;
-    assert.equal(msg.customType, 'pi-herdr.todo-reminder');
-    assert.equal(msg.display, true);
-    assert.equal(opts?.deliverAs, 'followUp');
-    assert.equal(opts?.triggerTurn, true);
-    assert.equal(pi.userSent.length, 0, '不再走 sendUserMessage 用户通道');
-    assert.match(String(msg.content ?? ''), /Reconcile the list instead of blindly continuing/);
+    assert.equal(msg.customType, 'pi-herdr.todo-reminder'); assert.equal(msg.display, true);
+    assert.equal(opts?.deliverAs, 'followUp'); assert.equal(opts?.triggerTurn, true);
+    assert.equal(pi.userSent.length, 0, '不再走 sendUserMessage 用户通道'); assert.match(String(msg.content ?? ''), /Reconcile the list instead of blindly continuing/);
   } finally {
     mock.timers.reset();
     await ctx.fiber.dispose();
@@ -228,4 +217,82 @@ test('widgetLines: 窗口矩阵（预算内全量 / 活动锚定 / 归档降权 
       for (const s of c.excludes ?? []) assert.ok(!joined.includes(s), `${c.name}: 不该含 ${s}`);
     });
   }
+});
+
+/* ── pane-title pure functions (M22: the title is the kanban, D68 formula) ── */
+test('formatPaneTitle: 计数 + 标题选取（D91 四件套 ▶○■✓）；空列表 → null（clear_title）', () => {
+  assert.equal(formatPaneTitle([]), null); assert.equal(formatPaneTitle([], '调研 kimi'), null);
+  assert.equal(
+    formatPaneTitle([
+      { content: 'pending 的', status: 'pending' },
+      { content: 'Clone kimi-code', status: 'in_progress' },
+      { content: '另一条并行', status: 'in_progress' },
+      { content: '已完成', status: 'completed' },
+    ]),
+    '▶2 ○1 ■0 ✓1 · Clone kimi-code',
+  );
+  assert.equal(
+    formatPaneTitle([{ content: '卡住', status: 'blocked', blocker: '等确认' }, { content: '写测试', status: 'pending' }], '调研'),
+    '▶0 ○1 ■1 ✓0 · 调研',
+  );
+  // no in_progress → the fallback label; without one, counts only
+  const pendingOnly = [{ content: '写测试', status: 'pending' as const }];
+  assert.equal(formatPaneTitle(pendingOnly, '调研'), '▶0 ○1 ■0 ✓0 · 调研'); assert.equal(formatPaneTitle(pendingOnly), '▶0 ○1 ■0 ✓0');
+});
+
+test('formatPaneTitle: M16 progressSuffix 拼进计数后（保守/ETA/空）；超 TITLE_MAX 本地先裁', () => {
+  const items = [
+    { content: 'a', status: 'in_progress' as const },
+    { content: 'b', status: 'pending' as const },
+    { content: 'c', status: 'completed' as const },
+  ];
+  assert.equal(formatPaneTitle(items, null, { progressSuffix: '1/3' }), '▶1 ○1 ■0 ✓1 (1/3) · a');
+  assert.equal(formatPaneTitle(items, null, { progressSuffix: '1/3 ~4m' }), '▶1 ○1 ■0 ✓1 (1/3 ~4m) · a');
+  assert.equal(formatPaneTitle(items, null, {}), '▶1 ○1 ■0 ✓1 · a'); assert.equal(formatPaneTitle(items, null, { progressSuffix: '' }), '▶1 ○1 ■0 ✓1 · a');
+
+  // herdr truncates title/state_label at 80 characters, so the clip has to happen locally first
+  const title = formatPaneTitle([{ content: 'x'.repeat(200), status: 'in_progress' }]);
+  assert.ok(title); assert.equal(title.length, 80);
+  assert.equal(title.slice(0, 8), '▶1 ○0 ■0');
+});
+
+test('formatPaneTitle: 反冻结（stale-core D）——归档列表降权为 ✓N done <age>', () => {
+  const done3 = [
+    { content: 'Verify gateway', status: 'completed' as const },
+    { content: 'Verify ids', status: 'completed' as const },
+    { content: 'Update doc', status: 'completed' as const },
+  ];
+  const t0 = 100 * 3_600_000;
+  // no lastWriteAt (older callers) → unchanged behaviour (the full four-glyph summary)
+  assert.equal(formatPaneTitle(done3, null, {}), '▶0 ○0 ■0 ✓3');
+  // fresh (<1h) → full weight
+  assert.equal(formatPaneTitle(done3, null, { lastWriteAt: t0, now: t0 + 30 * 60_000 }), '▶0 ○0 ■0 ✓3');
+  // archived (≥1h) → `✓3 done <age>`; a dead list no longer poses as the current state
+  assert.equal(formatPaneTitle(done3, null, { lastWriteAt: t0, now: t0 + 16 * 3_600_000 }), '✓3 done 16h');
+  // any open item → never archived, however old the list is
+  const withOpen = [...done3, { content: 'next', status: 'in_progress' as const }];
+  assert.equal(formatPaneTitle(withOpen, null, { lastWriteAt: t0, now: t0 + 48 * 3_600_000 }), '▶1 ○0 ■0 ✓3 · next');
+});
+
+test('formatBlockedLabel: 取第一条 blocked 的 blocker；无 blocked → null', () => {
+  assert.equal(formatBlockedLabel([{ content: 'a', status: 'pending' }]), null);
+  assert.equal(formatBlockedLabel([{ content: '等文档', status: 'blocked', blocker: '人类确认范围' }]), '人类确认范围');
+  assert.equal(formatBlockedLabel([{ content: '卡住了', status: 'blocked' }]), '卡住了');
+});
+
+test('herdr token maps: stale 清理为 16 个 null 键；侧栏日报只带 pi-todo', () => {
+  const tokens = staleTokenClearance();
+  assert.equal(Object.keys(tokens).length, 16); assert.equal(tokens['pi-herdr'], null);
+  for (let i = 0; i < 15; i += 1) assert.equal(tokens[`pi-herdr-${i}`], null);
+  // the blocked state_label key herdr accepts (anything else is rejected as invalid_state_label)
+  assert.equal(BLOCKED_LABEL_KEY, 'blocked');
+
+  const withTodo = sidebarTodoTokens('▶1 ○0 ■0 ✓0 · a');
+  assert.equal(withTodo['pi-todo'], '▶1 ○0 ■0 ✓0 · a'); assert.equal(Object.keys(withTodo).length, 1);
+  // no todo: an empty string (herdr patch semantics delete the key instead of keeping a stale summary)
+  assert.equal(sidebarTodoTokens(null)['pi-todo'], '');
+  // D96: the stale cleanup is never merged into the daily report (stale 16 + pi-todo 1 = 17 > herdr's
+  // tokens maxProperties=16, which rejects the whole request and drops title and tokens alike).
+  const daily = sidebarTodoTokens('t');
+  assert.ok(!('pi-herdr' in daily), 'the daily report carries pi-todo only, never the stale chunks'); assert.deepEqual(Object.keys(daily), ['pi-todo']);
 });

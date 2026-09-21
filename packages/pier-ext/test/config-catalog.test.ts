@@ -1,8 +1,5 @@
-/**
- * D104 config catalog + `/pier-config` probe tests: the pure catalog (provenance, rendering, drift
- * guards against the JSON schema and the runtime env readers) and the command-side probe, which runs
- * against temp dirs and an injected env so the developer's real ~/.pi/agent and .pi-herdr are never read.
- */
+/** D104 config catalog + `/pier-config` probe: the pure catalog (provenance, rendering, drift guards
+ * against the JSON schema and the runtime env readers) and the command-side probe over injected deps. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -31,18 +28,16 @@ const knobValue = (snapshot: ConfigGuideSnapshot, plane: string, key: string): s
 };
 
 function schemaPropertyPaths(file: string): string[] {
-  const schema = JSON.parse(readFileSync(join(repoRoot, 'packages', 'pier-ext', 'schemas', file), 'utf8'));
+  const schema = JSON.parse(readFileSync(join(repoRoot, 'packages', 'pier-ext', 'schemas', file), 'utf8')) as Record<string, unknown>;
   const out: string[] = [];
   const walk = (node: Record<string, unknown>, prefix: string): void => {
-    const props = node.properties as Record<string, unknown> | undefined;
-    if (!props) return;
-    for (const [key, value] of Object.entries(props)) {
+    for (const [key, value] of Object.entries((node.properties ?? {}) as Record<string, unknown>)) {
       const path = prefix ? `${prefix}.${key}` : key;
       out.push(path);
       walk((value ?? {}) as Record<string, unknown>, path);
     }
   };
-  walk(schema as Record<string, unknown>, '');
+  walk(schema, '');
   return out;
 }
 
@@ -67,8 +62,7 @@ test('drift guards: the catalog matches the JSON schema and the runtime env read
   const registered = new Set(PIER_OPTIONS.flatMap((o) => [o.name, ...(o.legacy ? [o.legacy] : [])]));
   const efficiencyEnv = new Set(CONFIG_KNOBS.filter((k) => k.plane === 'efficiency' && k.envVar).map((k) => k.envVar!));
   for (const name of found) {
-    if (allowlist.has(name)) continue;
-    assert.equal(registered.has(name) || efficiencyEnv.has(name), true, `env var ${name} is read by the runtime but missing from the registry`);
+    if (!allowlist.has(name)) assert.equal(registered.has(name) || efficiencyEnv.has(name), true, `env var ${name} is read by the runtime but missing from the registry`);
   }
 });
 
@@ -77,8 +71,7 @@ test('drift guards: the catalog matches the JSON schema and the runtime env read
 test('readDotted walks parsed JSON layers and tolerates bad shapes', () => {
   const layer = { observationPack: { thresholdBytes: 20480 }, mode: 'x' };
   assert.equal(readDotted(layer, 'observationPack.thresholdBytes'), 20480); assert.equal(readDotted(layer, 'observationPack.missing'), undefined);
-  assert.equal(readDotted(layer, 'mode.deeper'), undefined); assert.equal(readDotted(undefined, 'a.b'), undefined);
-  assert.equal(readDotted([1, 2], '0'), undefined);
+  assert.equal(readDotted(layer, 'mode.deeper'), undefined); assert.equal(readDotted(undefined, 'a.b'), undefined); assert.equal(readDotted([1, 2], '0'), undefined);
 });
 
 const LAYERS: RawConfigLayers = {
@@ -90,32 +83,21 @@ const LAYERS: RawConfigLayers = {
 
 /** [case, layers, [[knob, "value [source]"], …], note?] */
 const KNOB_CASES: Array<{ name: string; layers: RawConfigLayers; expect: Array<[string, string]>; note?: RegExp }> = [
-  {
-    name: 'env > workspace > user > default, per knob', layers: LAYERS,
+  { name: 'env > workspace > user > default, per knob', layers: LAYERS,
     expect: [
       ['observationPack.enabled', '1 [env]'], ['observationPack.thresholdBytes', '4096 [workspace]'],
       ['observationPack.fullSends', '5 [user]'], ['evidencePreservingReducer.localOnly', 'false [default]'],
-    ],
-  },
-  {
-    name: 'an untrusted workspace layer is ignored, not merged',
-    layers: { ...LAYERS, workspaceTrusted: false },
-    expect: [['observationPack.thresholdBytes', '8192 [user]']], note: /untrusted/,
-  },
-  {
-    name: 'pi compaction.enabled=false disables an enabled OCC',
+    ] },
+  { name: 'an untrusted workspace layer is ignored, not merged', layers: { ...LAYERS, workspaceTrusted: false },
+    expect: [['observationPack.thresholdBytes', '8192 [user]']], note: /untrusted/ },
+  { name: 'pi compaction.enabled=false disables an enabled OCC',
     layers: { env: {}, user: { onlineContextCompact: { enabled: true } }, piSettings: { enabled: false } },
-    expect: [['onlineContextCompact.enabled', 'false [user]']], note: /compaction\.enabled=false/,
-  },
-  {
-    name: 'an env force beats pi compaction.enabled=false',
+    expect: [['onlineContextCompact.enabled', 'false [user]']], note: /compaction\.enabled=false/ },
+  { name: 'an env force beats pi compaction.enabled=false',
     layers: { env: { PI_HERDR_COMPACT_ENABLE: '1' }, user: { onlineContextCompact: { enabled: true } }, piSettings: { enabled: false } },
-    expect: [['onlineContextCompact.enabled', '1 [env]']],
-  },
-  {
-    name: 'pi-owned knobs report source=pi', layers: { piSettings: { keepRecentTokens: 35000 } },
-    expect: [['compaction.keepRecentTokens', '35000 [pi]']],
-  },
+    expect: [['onlineContextCompact.enabled', '1 [env]']] },
+  { name: 'pi-owned knobs report source=pi', layers: { piSettings: { keepRecentTokens: 35000 } },
+    expect: [['compaction.keepRecentTokens', '35000 [pi]']] },
 ];
 
 test('resolveConfigKnobs: provenance and precedence matrix', async (t) => {
@@ -158,8 +140,7 @@ test('secret-shaped keys are redacted and never rendered verbatim', () => {
   const entries = resolveConfigKnobs({ env: {}, user: { jev: { apiKey: 'sk-live' } } });
   assert.equal(entries.find((e) => e.knob.key === 'jev.apiKey')!.value, '***');
   const report = renderReport(entries, { generatedAt: 'now', cwd: '/w', workspaceTrusted: true });
-  assert.match(report, /# pier config report/); assert.match(report, /Precedence: env > workspace \(trusted\) > user > default\./);
-  assert.ok(!report.includes('sk-live'), 'the key never reaches the report');
+  assert.match(report, /# pier config report/); assert.match(report, /Precedence: env > workspace \(trusted\) > user > default\./); assert.ok(!report.includes('sk-live'), 'the key never reaches the report');
 });
 
 test('renderers cover the five planes and stay compact', () => {
@@ -173,19 +154,16 @@ test('renderers cover the five planes and stay compact', () => {
   assert.ok(index.some((l) => l.includes('OCC off / OBS on / EPR off')));
 
   assert.ok(renderPlane(planeEntries('efficiency')).some((l) => l.includes('observationPack.enabled = true'))); assert.deepEqual(renderPlane([]), []);
-  assert.equal(summarizePlane([]), 'all defaults');
-  assert.equal(summarizePlane([{ knob: CONFIG_KNOBS[0]!, value: 'true', source: 'env' }]), '1 set (env 1)');
+  assert.equal(summarizePlane([]), 'all defaults'); assert.equal(summarizePlane([{ knob: CONFIG_KNOBS[0]!, value: 'true', source: 'env' }]), '1 set (env 1)');
 
   const check = renderCheck([{ plane: 'env', ok: false, issues: ['bad value'] }, { plane: 'pi', ok: true, issues: [] }]);
-  assert.ok(check.some((l) => l.includes('FAIL env'))); assert.ok(check.some((l) => l.includes('- bad value')));
-  assert.ok(check.some((l) => l.includes('ok   pi')));
+  assert.ok(check.some((l) => l.includes('FAIL env'))); assert.ok(check.some((l) => l.includes('- bad value'))); assert.ok(check.some((l) => l.includes('ok   pi')));
 });
 
 /* ── command-side probe ─────────────────────────────────────────────────── */
 
 interface Fixture {
-  base: string;
-  deps: ConfigGuideDeps;
+  base: string; deps: ConfigGuideDeps;
   paths: { cwd: string; agentDir: string; userConfigPath: string; workspaceConfigPath: string; herdrDir: string };
 }
 
@@ -202,17 +180,20 @@ function makeFixture(cleanup: CleanupContext, opts: { brokenRole?: boolean; rese
 
   // pi owns settings.json; OCC reads compaction.* only. The user config enables OCC (pi's
   // compaction.enabled=false wins unless env forces it); the workspace config enables OBS at 4096.
-  writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ compaction: { enabled: false, keepRecentTokens: 35000 } }));
-  writeFileSync(userConfigPath, JSON.stringify({ version: 1, onlineContextCompact: { enabled: true } }));
-  writeFileSync(workspaceConfigPath, JSON.stringify({ version: 1, observationPack: { enabled: true, thresholdBytes: 4096 } }));
-  // Real paths on disk: the boot plane verifies piNode/piCli/extPath exist.
-  const bootPaths = { piNode: join(base, 'node'), piCli: join(base, 'cli.js'), extPath: join(base, 'ext.ts') };
-  for (const target of Object.values(bootPaths)) writeFileSync(target, '');
-  writeFileSync(join(herdrDir, 'boot-config.json'), JSON.stringify({ mainTabLabel: 'main', ...bootPaths }));
   const role = (role: string, version: string) => JSON.stringify({ role, version, manifest: { tools: ['read', 'todo_write', 'ask_user_question'], rules: {}, unknownTools: 'allow' } });
-  writeFileSync(join(rolesDir, 'auditor.json'), role('auditor', '1.0.0'));
-  if (opts.brokenRole) writeFileSync(join(rolesDir, 'broken.json'), JSON.stringify({ role: 'broken' }));
-  if (opts.reservedRole) writeFileSync(join(rolesDir, 'master.json'), role('master', '9.9.9'));
+  // The boot plane verifies piNode/piCli/extPath exist, so those are real files on disk.
+  const bootPaths = { piNode: join(base, 'node'), piCli: join(base, 'cli.js'), extPath: join(base, 'ext.ts') };
+  const files: Array<[string, string]> = [
+    ...Object.values(bootPaths).map((path): [string, string] => [path, '']),
+    [join(agentDir, 'settings.json'), JSON.stringify({ compaction: { enabled: false, keepRecentTokens: 35000 } })],
+    [userConfigPath, JSON.stringify({ version: 1, onlineContextCompact: { enabled: true } })],
+    [workspaceConfigPath, JSON.stringify({ version: 1, observationPack: { enabled: true, thresholdBytes: 4096 } })],
+    [join(herdrDir, 'boot-config.json'), JSON.stringify({ mainTabLabel: 'main', ...bootPaths })],
+    [join(rolesDir, 'auditor.json'), role('auditor', '1.0.0')],
+    ...(opts.brokenRole ? [[join(rolesDir, 'broken.json'), JSON.stringify({ role: 'broken' })]] as Array<[string, string]> : []),
+    ...(opts.reservedRole ? [[join(rolesDir, 'master.json'), role('master', '9.9.9')]] as Array<[string, string]> : []),
+  ];
+  for (const [path, content] of files) writeFileSync(path, content);
 
   return {
     base,
@@ -229,22 +210,18 @@ test('collectConfigSnapshot: reports effective values, sources and per-plane che
   const snapshot = collectConfigSnapshot(fx.deps);
 
   // Workspace beats default; pi-disabled compaction overrides an explicitly enabled OCC.
-  assert.equal(knobValue(snapshot, 'efficiency', 'observationPack.enabled'), 'true [workspace]');
-  assert.equal(knobValue(snapshot, 'efficiency', 'observationPack.thresholdBytes'), '4096 [workspace]');
+  assert.equal(knobValue(snapshot, 'efficiency', 'observationPack.enabled'), 'true [workspace]'); assert.equal(knobValue(snapshot, 'efficiency', 'observationPack.thresholdBytes'), '4096 [workspace]');
   assert.equal(knobValue(snapshot, 'efficiency', 'onlineContextCompact.enabled'), 'false [user]');
   assert.match(snapshot.entries.find((e) => e.knob.key === 'onlineContextCompact.enabled')!.note ?? '', /pi compaction\.enabled=false/);
   assert.equal(knobValue(snapshot, 'pi', 'compaction.keepRecentTokens'), '35000 [pi]');
 
-  for (const plane of ['efficiency', 'boot', 'roles', 'env'] as const) {
-    assert.equal(planeReport(snapshot, plane).ok, true, planeReport(snapshot, plane).issues.join(' | '));
-  }
+  for (const plane of ['efficiency', 'boot', 'roles', 'env'] as const) assert.equal(planeReport(snapshot, plane).ok, true, planeReport(snapshot, plane).issues.join(' | '));
   assert.equal(snapshot.files.boot.find((f) => f.label === 'herdr plugin config-dir')!.exists, true); assert.equal(snapshot.bootSummary.includes('present'), true);
   assert.equal(snapshot.roleSummary, '3 role(s): workspace 1 / user 0 / builtin 2');
 
   assert.ok(renderGuide(snapshot, 'index').some((l) => l.includes('/pier-config show')));
   const efficiencyLines = renderGuide(snapshot, 'efficiency');
-  assert.ok(efficiencyLines.some((l) => l.includes('observationPack.enabled = true')));
-  assert.ok(efficiencyLines.some((l) => l.includes(fx.paths.workspaceConfigPath) && l.includes('present')), 'the plane names its source file');
+  assert.ok(efficiencyLines.some((l) => l.includes('observationPack.enabled = true'))); assert.ok(efficiencyLines.some((l) => l.includes(fx.paths.workspaceConfigPath) && l.includes('present')), 'the plane names its source file');
   assert.ok(renderGuide(snapshot, 'check').some((l) => l.includes('all planes look consistent')));
 
   const report = guideReportMarkdown(snapshot, { generatedAt: '2026-09-13T00:00:00Z', cwd: fx.paths.cwd, piVersion: 'test' });
@@ -253,25 +230,18 @@ test('collectConfigSnapshot: reports effective values, sources and per-plane che
 }));
 
 interface ProbeCase {
-  name: string;
-  fixture?: { brokenRole?: boolean; reservedRole?: boolean; trustWorkspace?: boolean };
-  setup?: (fx: Fixture) => void;
-  deps?: (fx: Fixture) => ConfigGuideDeps;
+  name: string; fixture?: { brokenRole?: boolean; reservedRole?: boolean; trustWorkspace?: boolean };
+  setup?: (fx: Fixture) => void; deps?: (fx: Fixture) => ConfigGuideDeps;
   /** [plane, issue substring, plane stays ok?] — a missing pi-owned file is reported, not an error. */
-  expect: Array<[string, string, boolean?]>;
-  extra?: (snapshot: ConfigGuideSnapshot, fx: Fixture) => void;
+  expect: Array<[string, string, boolean?]>; extra?: (snapshot: ConfigGuideSnapshot, fx: Fixture) => void;
 }
 
 const PROBE_CASES: ProbeCase[] = [
-  {
-    name: 'untrusted workspace is ignored and marked',
-    fixture: { trustWorkspace: false },
-    expect: [['efficiency', 'not trusted']],
+  { name: 'untrusted workspace is ignored and marked', fixture: { trustWorkspace: false }, expect: [['efficiency', 'not trusted']],
     extra: (s, fx) => {
       assert.equal(s.workspaceTrusted, false); assert.equal(knobValue(s, 'efficiency', 'observationPack.enabled'), 'false [default]', 'the workspace value must not apply');
       assert.ok(renderGuide(s, 'efficiency').some((l) => l.includes('IGNORED: untrusted project')));
-    },
-  },
+    } },
   { name: 'broken workspace JSON is reported as invalid JSON', setup: (fx) => writeFileSync(fx.paths.workspaceConfigPath, '{ not json'), expect: [['efficiency', 'invalid JSON']] },
   { name: 'invalid and reserved roles are flagged', fixture: { brokenRole: true, reservedRole: true }, expect: [['roles', 'broken'], ['roles', 'master']] },
   {

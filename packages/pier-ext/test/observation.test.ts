@@ -1,8 +1,5 @@
-/**
- * ObservationPack: the pure helpers (id / excerpt / paging / economics) plus the plugin surface —
- * `obs_recall`, the `context` projection (role gate / active window / exemptions / memo), batch
- * packing and the `onBeforeCompact` hook.
- */
+/** ObservationPack: the pure helpers (id / excerpt / paging / economics) plus the plugin surface —
+ * `obs_recall`, the `context` projection, batch packing and the `onBeforeCompact` hook. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readdir, readFile } from 'node:fs/promises';
@@ -27,19 +24,15 @@ test('deriveObservationId: deterministic 24-hex ID and handles collisions', () =
   const id2 = deriveObservationId('bash', 'call_1', hash);
   const id3 = deriveObservationId('bash', 'call_2', hash);
 
-  assert.equal(id1, id2);
-  assert.notEqual(id1, id3); // Different tool call IDs must not collide
-  assert.equal(isObservationId(id1), true);
-  assert.equal(isObservationId(id3), true);
-  assert.equal(isObservationId('invalid_id'), false);
+  assert.equal(id1, id2); assert.notEqual(id1, id3); // different tool call IDs must not collide
+  assert.equal(isObservationId(id1), true); assert.equal(isObservationId(id3), true); assert.equal(isObservationId('invalid_id'), false);
 });
 
 test('completeLineExcerpt: maintains whole line boundaries', () => {
   const text = 'line 1\nline 2\nline 3\nline 4\n';
-  const head = completeLineExcerpt(text, 15, false);
-  assert.equal(head, 'line 1\nline 2\n'); // 'line 1\n' + 'line 2\n' = 14 bytes, the third line would overflow
-  const tail = completeLineExcerpt(text, 15, true);
-  assert.equal(tail, 'line 3\nline 4\n');
+  // 'line 1\n' + 'line 2\n' = 14 bytes; the third line would overflow a 15-byte head budget.
+  assert.equal(completeLineExcerpt(text, 15, false), 'line 1\nline 2\n');
+  assert.equal(completeLineExcerpt(text, 15, true), 'line 3\nline 4\n');
 });
 
 test('sliceBufferChunk: pages by line limit and reports eof', () => {
@@ -56,9 +49,7 @@ test('sliceBufferChunk: pages by line limit and reports eof', () => {
 test('sliceBufferChunk: never splits a multi-byte character at the byte limit', () => {
   // '中' is 3 bytes (E4 B8 AD); a 4-byte budget would cut the second one in half.
   const chunk = sliceBufferChunk(Buffer.from('中中', 'utf8'), 0, { maxBytes: 4, maxLines: 10 });
-  assert.equal(chunk.text, '中');
-  assert.equal(chunk.bytes, 3);
-  assert.equal(chunk.eof, false);
+  assert.deepEqual([chunk.text, chunk.bytes, chunk.eof], ['中', 3, false]);
 });
 
 test('shouldPackForCache: balances read savings against prefix rewrite cost', () => {
@@ -135,14 +126,11 @@ test('ObservationPack: 注册 obs_recall；活跃窗口内原样，超窗后投�
 
     // Memo fast path: the same message projects the same placeholder without re-asking the horizon
     const third = await project(event, ctx);
-    assert.equal(third.messages[0].content[0].text, replaced, 'memo 命中：占位符稳定');
-    assert.equal(horizonCalls, 1, 'memo 命中即短路，不该再问 horizon');
+    assert.equal(third.messages[0].content[0].text, replaced, 'memo 命中：占位符稳定'); assert.equal(horizonCalls, 1, 'memo 命中即短路，不该再问 horizon');
 
     const recalled = await recall({ id: obsId, offset: 0 }, ctx);
-    assert.ok(recalled.content[0].text.includes('[obs_recall id='));
-    assert.ok(recalled.content[0].text.includes('INFO: step processing'), '召回原文');
-    assert.equal(recalled.details.id, obsId);
-    assert.equal(recalled.details.offset, 0);
+    assert.ok(recalled.content[0].text.includes('[obs_recall id=')); assert.ok(recalled.content[0].text.includes('INFO: step processing'), '召回原文');
+    assert.equal(recalled.details.id, obsId); assert.equal(recalled.details.offset, 0);
 
     // Storage gone → an error result instead of a throw, so the model can see the handle went stale
     const missing = await recall({ id: 'obs_000000000000000000000000' }, ctx);
@@ -208,10 +196,8 @@ test('ObservationPack: 批打包遵守条数上限并写 packed-batch 遥测', a
     assert.equal(packed, 1);
 
     const logData = await readFile(join(sessionDir, 'efficiency-logs', 'observation.jsonl'), 'utf8');
-    assert.ok(logData.includes('"event":"packed-batch"'));
-    assert.ok(logData.includes('"source":"compaction"'));
-    assert.ok(logData.includes('"sessionId":"session_test_05"'));
-    assert.ok(logData.includes('"obsId":"obs_'));
+    assert.ok(logData.includes('"event":"packed-batch"')); assert.ok(logData.includes('"source":"compaction"'));
+    assert.ok(logData.includes('"sessionId":"session_test_05"')); assert.ok(logData.includes('"obsId":"obs_'));
   });
 });
 
@@ -225,14 +211,10 @@ test('ObservationPack: 批打包并发预取 middle 窗口，每条候选只 pic
     let calls = 0;
     const release = Promise.withResolvers<void>();
     const tick = async (): Promise<void> => {
-      const { promise, resolve } = Promise.withResolvers<void>();
-      setImmediate(resolve);
-      await promise;
+      const { promise, resolve } = Promise.withResolvers<void>(); setImmediate(resolve); await promise;
     };
     const pickMiddleExcerpt = async () => {
-      calls++;
-      inFlight++;
-      maxInFlight = Math.max(maxInFlight, inFlight);
+      calls++; inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
       await release.promise;
       inFlight--;
       return { text: 'mid window', label: 'test window' };
@@ -286,7 +268,6 @@ test('ObservationPack: createCompactionBatchPackHook 尊重配置、角色闸门
     assert.ok((await readFile(logPath, 'utf8')).includes('"source":"compaction"'));
 
     await hook(sessionDir, ctx);
-    assert.equal((await readObjects()).length, 1, '第二次命中 memo');
-    assert.equal((await readFile(logPath, 'utf8')).trim().split('\n').length, 1, '不重复遥测');
+    assert.equal((await readObjects()).length, 1, '第二次命中 memo'); assert.equal((await readFile(logPath, 'utf8')).trim().split('\n').length, 1, '不重复遥测');
   });
 });

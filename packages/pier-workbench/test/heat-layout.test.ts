@@ -1,7 +1,4 @@
-/**
- * Planner guards and helpers (planGridHeat guards / shouldAcceptFocus / shouldFireDebounced /
- * unwrapLayout / drag hold). Geometry and area assertions live in heat-grid.test.ts.
- */
+/** Planner guards/helpers (planGridHeat guards, shouldAcceptFocus, shouldFireDebounced, unwrapLayout, drag hold). Geometry and area assertions live in heat-grid.test.ts. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -28,8 +25,7 @@ test('两 pane：零 swap 原地放大（ratio = 焦点所在侧）', async (t) 
   for (const c of TWO_PANE_CASES) {
     await t.test(c.name, () => {
       const plan = planGridHeat({ root: split(c.direction, pane('a'), pane('b')), focusPaneId: c.focus, paneCount: 2 });
-      assert.equal(plan.type, 'apply');
-      if (plan.type !== 'apply') return;
+      assert.ok(plan.type === 'apply');
       assert.deepEqual(plan.ops, [{ kind: 'ratio', path: [], ratio: c.ratio }]);
     });
   }
@@ -59,17 +55,8 @@ test('unwrapLayout: 兼容 result 直接树 与 {type,layout} 信封', () => {
 });
 
 test('unwrapLayout: herdr 嵌套 pane.pane_id + direction=down', () => {
-  const exported = {
-    layout: {
-      tab_id: 'w1:t1',
-      zoomed: false,
-      root: {
-        type: 'split', direction: 'down', ratio: 0.5,
-        first: { type: 'pane', pane: { pane_id: 'w1:p1' } },
-        second: { type: 'pane', pane: { pane_id: 'w1:p2' } },
-      },
-    },
-  };
+  const exported = { layout: { tab_id: 'w1:t1', zoomed: false, root: { type: 'split', direction: 'down', ratio: 0.5,
+    first: { type: 'pane', pane: { pane_id: 'w1:p1' } }, second: { type: 'pane', pane: { pane_id: 'w1:p2' } } } } };
   const { root, tabId } = unwrapLayout(exported);
   assert.equal(tabId, 'w1:t1');
   assert.ok(root && root.type === 'split' && root.direction === 'down');
@@ -91,10 +78,9 @@ test('heat-reflow.mjs 不依赖 cordis（user-mode GitHub checkout 无 node_modu
 });
 
 test('指纹：同 pane 集合 ratio 偏差 → hold；集合增减 → 不 hold', () => {
-  const a = split('right', pane('p1'), pane('p2'), 0.72);
   const dragged = split('right', pane('p1'), pane('p2'), 0.2);
   const grown = split('right', pane('p1'), split('down', pane('p2'), pane('p3')), 0.72);
-  const prior = layoutFingerprint(a);
+  const prior = layoutFingerprint(split('right', pane('p1'), pane('p2'), 0.72));
   assert.equal(shouldHoldHeat({ prior, current: layoutFingerprint(dragged), acceptedFocus: false }).hold, true);
   assert.equal(shouldHoldHeat({ prior, current: layoutFingerprint(grown), acceptedFocus: false }).reason, 'pane-set-changed');
   assert.equal(shouldHoldHeat({ prior, current: layoutFingerprint(dragged), acceptedFocus: true }).hold, false);

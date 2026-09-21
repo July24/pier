@@ -1,7 +1,4 @@
-/**
- * renderers: ANSI-aware clipping and the transcript line builders, exercised through the public
- * seam (`installRenderers` registers them on the host).
- */
+/** renderers: ANSI-aware clipping and the transcript line builders, driven through `installRenderers`. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { charWidth, styledWidth, truncateStyled } from '../src/ansi-text.ts';
@@ -18,36 +15,29 @@ const plain: RenderTheme = { fg: (_c, t) => t, bold: (t) => t };
 /** Marker theme: exposes which colors the builders request. */
 const marker: RenderTheme = { fg: (c, t) => `[${c}]${t}`, bold: (t) => `**${t}**` };
 
-type EntryRenderer = (entry: unknown, options: { expanded: boolean }, theme: RenderTheme) => RenderComponent;
-type MessageRenderer = (message: unknown, options: { expanded: boolean }, theme: RenderTheme) => RenderComponent;
-
-interface Harness { entries: Map<string, EntryRenderer>; messages: Map<string, MessageRenderer> }
+/** Renderer shape stored for both maps; the host hands the raw pi payload straight in. */
+type CardRenderer = (payload: unknown, options: { expanded: boolean }, theme: RenderTheme) => RenderComponent;
+interface Harness { entries: Map<string, CardRenderer>; messages: Map<string, CardRenderer> }
 
 function install(): Harness {
-  const entries = new Map<string, EntryRenderer>();
-  const messages = new Map<string, MessageRenderer>();
+  const entries = new Map<string, CardRenderer>();
+  const messages = new Map<string, CardRenderer>();
   installRenderers({
-    registerEntryRenderer: (type: string, renderer: EntryRenderer) => { entries.set(type, renderer); },
-    registerMessageRenderer: (type: string, renderer: MessageRenderer) => { messages.set(type, renderer); },
+    registerEntryRenderer: (type: string, renderer: CardRenderer) => { entries.set(type, renderer); },
+    registerMessageRenderer: (type: string, renderer: CardRenderer) => { messages.set(type, renderer); },
   });
   return { entries, messages };
 }
 
-/** Render one card through the installed seam; `expanded` mirrors pi's ctrl+o state. */
-function entryLines(type: string, data: unknown, expanded = false, theme = plain, width = 200): string[] {
-  const renderer = install().entries.get(type);
+/** Renders one card through the installed seam; entries get `{customType, data}`, messages the payload. */
+function cardLines(kind: 'entry' | 'message', type: string, data: unknown, expanded = false, theme = plain, width = 200): string[] {
+  const harness = install();
+  const renderer = (kind === 'entry' ? harness.entries : harness.messages).get(type);
   assert.ok(renderer, `${type} should be registered`);
-  return renderer({ customType: type, data }, { expanded }, theme).render(width);
+  return renderer(kind === 'entry' ? { customType: type, data } : data, { expanded }, theme).render(width);
 }
 
-function messageLines(type: string, message: unknown, expanded = false): string[] {
-  const renderer = install().messages.get(type);
-  assert.ok(renderer, `${type} should be registered`);
-  return renderer(message, { expanded }, plain).render(200);
-}
-
-/* ── width handling (ansi-text, reused by the card wrapper) ─────────── */
-
+/* ── width handling ── */
 test('width helpers: escapes are zero-width, wide glyphs take two cells, control/combining take none', () => {
   assert.equal(styledWidth('abc'), 3);
   assert.equal(styledWidth('\x1b[31mred\x1b[0m and \x1b[1mbold\x1b[0m'), 'red and bold'.length);
@@ -76,23 +66,17 @@ test('every card clips its lines to the requested width', () => {
     [APPROVAL_NEEDED_CUSTOM_TYPE, { role: 'worker', tool: 'bash' }],
   ];
   for (const [type, data] of cases) {
-    const lines = entryLines(type, data, true, plain, 12);
+    const lines = cardLines('entry', type, data, true, plain, 12);
     assert.ok(lines.every((line) => styledWidth(line) <= 12), `${type}: ${JSON.stringify(lines)}`);
   }
-  const wrapped = entryLines(TODO_EDIT_CUSTOM_TYPE, cases[0]![1], true, plain, 12);
+  const wrapped = cardLines('entry', TODO_EDIT_CUSTOM_TYPE, cases[0]![1], true, plain, 12);
   assert.ok(wrapped.length > 1, 'an over-long payload wraps before each row is clipped');
 });
 
-/* ── line builders ─────────────────────────────────────────────────── */
-
+/* ── line builders ── */
 interface RenderCase {
-  name: string;
-  kind: 'entry' | 'message';
-  type: string;
-  data?: unknown;
-  expanded?: boolean;
-  theme?: RenderTheme;
-  expect: string[];
+  name: string; kind: 'entry' | 'message'; type: string; data?: unknown;
+  expanded?: boolean; theme?: RenderTheme; expect: string[];
 }
 
 const CASES: RenderCase[] = [
@@ -123,15 +107,12 @@ const CASES: RenderCase[] = [
 test('card renderers: each custom type renders its lines', async (t) => {
   for (const c of CASES) {
     await t.test(c.name, () => {
-      const lines = c.kind === 'entry'
-        ? entryLines(c.type, c.data, c.expanded ?? false, c.theme ?? plain)
-        : messageLines(c.type, c.data, c.expanded ?? false);
-      assert.deepEqual(lines, c.expect);
+      assert.deepEqual(cardLines(c.kind, c.type, c.data, c.expanded ?? false, c.theme ?? plain), c.expect);
     });
   }
 });
 
-/* ── installation ──────────────────────────────────────────────────── */
+/* ── installation ── */
 
 test('installRenderers: registers every pier custom type when the host API exists', () => {
   const harness = install();
@@ -144,13 +125,8 @@ test('installRenderers: a missing API registers nothing, a throwing host is cont
 
   let calls = 0;
   const registered = installRenderers({
-    registerEntryRenderer: () => {
-      calls += 1;
-      throw new Error('boom');
-    },
-    registerMessageRenderer: () => {
-      calls += 1;
-    },
+    registerEntryRenderer: () => { calls += 1; throw new Error('boom'); },
+    registerMessageRenderer: () => { calls += 1; },
   });
   assert.equal(calls, 7, 'one throwing registration must not skip the rest');
   assert.deepEqual(registered, [TODO_REMINDER_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE]);

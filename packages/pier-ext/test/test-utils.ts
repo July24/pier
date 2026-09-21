@@ -1,7 +1,4 @@
-/**
- * Shared test fixtures: temp/env lifecycle, the pi surface fake, the herdr client fake, and the
- * cordis mount for the subagent plugin family.
- */
+/** Shared fixtures: temp/env lifecycle, the pi surface and herdr fakes, the subagent plugin mount. */
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -12,73 +9,52 @@ import type { DisposeLedger } from '../src/ledger.ts';
 import subagentPlugin from '../src/plugins/subagent.ts';
 import { SUBS_CUSTOM_TYPE, emptySubagentPortBox, type SubEntry, type SubagentPortBox } from '../src/subagent-core.ts';
 
-/* ── temp dirs and env ──────────────────────────────────────────── */
-
-export class TempDir {
-  readonly path: string;
-
-  constructor(prefix: string) {
-    this.path = mkdtempSync(join(tmpdir(), `pier-test-${prefix}-`));
-  }
-
-  dispose(): void {
-    rmSync(this.path, { recursive: true, force: true });
-  }
-}
-
-export class EnvSnapshot {
-  private readonly snapshot = new Map<string, string | undefined>();
-
-  set(key: string, value: string): void {
-    this.remember(key);
-    process.env[key] = value;
-  }
-
-  delete(key: string): void {
-    this.remember(key);
-    delete process.env[key];
-  }
-
-  private remember(key: string): void {
-    if (!this.snapshot.has(key)) this.snapshot.set(key, process.env[key]);
-  }
-
-  dispose(): void {
-    for (const [key, original] of this.snapshot) {
-      if (original === undefined) delete process.env[key];
-      else process.env[key] = original;
-    }
-    this.snapshot.clear();
-  }
-}
-
 export interface CleanupContext {
-  tempDir(prefix: string): TempDir;
-  env(): EnvSnapshot;
+  /** Temp dir removed when the test body settles. */
+  tempDir(prefix: string): { readonly path: string; dispose(): void };
+  env(): { set(key: string, value: string): void; delete(key: string): void };
 }
 
 /** Wraps a test body so temp dirs and env mutations are undone even when it throws. */
 export function withCleanup<T>(fn: (cleanup: CleanupContext) => T | Promise<T>): () => T | Promise<T> {
   return async () => {
-    const tempDirs: TempDir[] = [];
-    const envSnapshots: EnvSnapshot[] = [];
+    const dirs: Array<{ path: string; dispose(): void }> = [];
+    const envs: Array<Map<string, string | undefined>> = [];
     const cleanup: CleanupContext = {
       tempDir: (prefix) => {
-        const dir = new TempDir(prefix);
-        tempDirs.push(dir);
+        const path = mkdtempSync(join(tmpdir(), `pier-test-${prefix}-`));
+        const dir = { path, dispose: () => rmSync(path, { recursive: true, force: true }) };
+        dirs.push(dir);
         return dir;
       },
       env: () => {
-        const env = new EnvSnapshot();
-        envSnapshots.push(env);
-        return env;
+        const orig = new Map<string, string | undefined>();
+        const remember = (key: string): void => {
+          if (!orig.has(key)) orig.set(key, process.env[key]);
+        };
+        envs.push(orig);
+        return {
+          set: (key, value) => {
+            remember(key);
+            process.env[key] = value;
+          },
+          delete: (key) => {
+            remember(key);
+            delete process.env[key];
+          },
+        };
       },
     };
     try {
       return await fn(cleanup);
     } finally {
-      for (const env of envSnapshots.reverse()) env.dispose();
-      for (const dir of tempDirs.reverse()) dir.dispose();
+      for (const orig of envs.reverse()) {
+        for (const [key, value] of orig) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+      for (const dir of dirs.reverse()) dir.dispose();
     }
   };
 }
@@ -88,7 +64,7 @@ export class TempHome {
   private readonly previous: string | undefined;
 
   constructor(prefix: string) {
-    this.path = new TempDir(prefix).path;
+    this.path = mkdtempSync(join(tmpdir(), `pier-test-${prefix}-`));
     this.previous = process.env.PI_CODING_AGENT_DIR;
     process.env.PI_CODING_AGENT_DIR = this.path;
   }
@@ -107,33 +83,19 @@ export class TempHome {
   }
 }
 
-/* ── pi surface fake ────────────────────────────────────────────── */
-
-export interface ToolDef {
+export type PiHandler = (...a: unknown[]) => unknown;
+type ToolDef = {
   name: string;
-  execute?: (...a: unknown[]) => unknown;
+  execute?: PiHandler;
   promptSnippet?: string;
   promptGuidelines?: string[];
   prepareArguments?: (args: unknown) => Record<string, unknown>;
   [key: string]: unknown;
-}
+};
+type CommandDef = { handler?: PiHandler; [key: string]: unknown };
+type SentMessage = { msg: { customType?: string; content?: unknown; display?: boolean }; opts?: Record<string, unknown> };
 
-export interface CommandDef {
-  handler?: (...a: unknown[]) => unknown;
-  [key: string]: unknown;
-}
-
-export type PiHandler = (...a: unknown[]) => unknown;
-export interface SentMessage {
-  msg: { customType?: string; content?: unknown; display?: boolean };
-  opts?: { deliverAs?: string; triggerTurn?: boolean };
-}
-export interface FakeEventBus {
-  emitted: Array<{ channel: string; data: unknown }>;
-  on(channel: string, handler: PiHandler): () => void;
-  emit(channel: string, data: unknown): void;
-}
-
+/** Superset fake of the pi ExtensionAPI surface. */
 export interface FakePi {
   tools: Map<string, ToolDef>;
   commands: Map<string, CommandDef>;
@@ -141,38 +103,43 @@ export interface FakePi {
   entries: Array<[string, unknown]>;
   sent: SentMessage[];
   userSent: Array<{ content: string; opts?: unknown }>;
-  events: FakeEventBus;
+  events: {
+    emitted: Array<{ channel: string; data: unknown }>;
+    on(channel: string, handler: PiHandler): () => void;
+    emit(channel: string, data: unknown): void;
+  };
   registerTool(def: ToolDef): void;
   registerCommand(name: string, def: CommandDef): void;
   on(event: string, handler: PiHandler): void;
   appendEntry(customType: string, data: unknown): void;
-  sendMessage(msg: SentMessage['msg'], opts?: SentMessage['opts']): Promise<void>;
+  sendMessage(msg: SentMessage['msg'], opts?: Record<string, unknown>): Promise<void>;
   sendUserMessage(content: unknown, opts?: unknown): Promise<void>;
   getActiveTools(): string[];
   setActiveTools(names: string[]): void;
 }
 
 /**
- * Superset fake of the pi ExtensionAPI surface. Every plugin reaches the host through a few
- * methods only, so one permissive object serves all of them; `sendMessage` records into the
- * closure because plugins call it unbound (`const send = pi.sendMessage`).
+ * `sendMessage` closes over its record array because plugins call it unbound
+ * (`const send = pi.sendMessage`).
  */
 export function fakePi(): FakePi {
   const tools = new Map<string, ToolDef>();
   const listeners = new Map<string, PiHandler[]>();
+  const commands = new Map<string, CommandDef>();
   const bus = new Map<string, PiHandler[]>();
   const sent: SentMessage[] = [];
   const userSent: Array<{ content: string; opts?: unknown }> = [];
   const entries: Array<[string, unknown]> = [];
+  const emitted: Array<{ channel: string; data: unknown }> = [];
   return {
     tools,
-    commands: new Map<string, CommandDef>(),
+    commands,
     listeners,
     entries,
     sent,
     userSent,
     events: {
-      emitted: [],
+      emitted,
       on(channel, handler) {
         bus.set(channel, [...(bus.get(channel) ?? []), handler]);
         return () => {
@@ -180,15 +147,15 @@ export function fakePi(): FakePi {
         };
       },
       emit(channel, data) {
-        this.emitted.push({ channel, data });
-        for (const h of bus.get(channel) ?? []) h(data);
+        emitted.push({ channel, data });
+        for (const handler of bus.get(channel) ?? []) handler(data);
       },
     },
     registerTool(def) {
       tools.set(def.name, def);
     },
     registerCommand(name, def) {
-      this.commands.set(name, def);
+      commands.set(name, def);
     },
     on(event, handler) {
       listeners.set(event, [...(listeners.get(event) ?? []), handler]);
@@ -204,10 +171,8 @@ export function fakePi(): FakePi {
       userSent.push({ content: String(content ?? ''), opts });
       return Promise.resolve();
     },
-    getActiveTools() {
-      return [...tools.keys()];
-    },
-    setActiveTools() {},
+    getActiveTools: () => [...tools.keys()],
+    setActiveTools: () => undefined,
   };
 }
 
@@ -216,36 +181,32 @@ export async function fire(pi: FakePi, event: string, ...args: unknown[]): Promi
   for (const handler of pi.listeners.get(event) ?? []) await handler(...args);
 }
 
-/* ── herdr client fake ──────────────────────────────────────────── */
-
-/**
- * HerdrClientLike with inert defaults; pass only the methods a test cares about. `available`
- * defaults to true.
- */
+/** HerdrClientLike with inert defaults; pass only the methods a test cares about. */
 export function fakeHerdr(over: Partial<HerdrClientLike> = {}): HerdrClientLike {
+  const noop = async () => undefined;
   return {
     available: true,
-    reportAgent: async () => undefined,
-    reportMetadata: async () => undefined,
-    reportLockTokens: async () => undefined,
-    reportDisplayAgent: async () => undefined,
-    reportAskFlag: async () => undefined,
+    reportAgent: noop,
+    reportMetadata: noop,
+    reportLockTokens: noop,
+    reportDisplayAgent: noop,
+    reportAskFlag: noop,
+    sendPaneText: noop,
+    closePane: noop,
+    tabClose: noop,
+    sendPaneKeys: noop,
     listAgents: async () => [],
-    sendPaneText: async () => undefined,
     waitAgent: async () => null,
     getAgentSessionPath: async () => null,
     splitPane: async () => 'p2',
-    closePane: async () => undefined,
     createTab: async () => ({ tabId: 't9', paneId: 'p9' }),
     listPanes: async () => [],
     exportLayout: async () => null,
     paneLayout: async () => null,
     tabList: async () => [],
-    tabClose: async () => undefined,
     openPluginPane: async () => ({ mode: 'popup', ok: true }),
     agentExplain: async () => null,
     getServerVersion: async () => null,
-    sendPaneKeys: async () => undefined,
     readPane: async () => ({ text: '', revision: 0, truncated: false }),
     readAgent: async () => ({ text: '', revision: 0, truncated: false }),
     waitForOutput: async () => ({ matched: false, reason: 'timeout' }),
@@ -253,8 +214,6 @@ export function fakeHerdr(over: Partial<HerdrClientLike> = {}): HerdrClientLike 
     ...over,
   };
 }
-
-/* ── subagent registry + mount ──────────────────────────────────── */
 
 export function subEntry(over: Partial<SubEntry> = {}): SubEntry {
   return {
@@ -277,20 +236,13 @@ export function subEntry(over: Partial<SubEntry> = {}): SubEntry {
 }
 
 /** Custom-branch snapshot the plugin folds the registry from. */
-export function subsBranch(subs: SubEntry[]): never {
+function subsBranch(subs: SubEntry[]): never {
   return [{ type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { version: 2, subs } }] as never;
 }
 
 /** The registry snapshot the plugin most recently appended. */
 export function subsSnapshot(pi: FakePi): { subs: SubEntry[] } | undefined {
   return pi.entries.filter(([type]) => type === SUBS_CUSTOM_TYPE).at(-1)?.[1] as { subs: SubEntry[] } | undefined;
-}
-
-export interface SubagentMount {
-  root: Context;
-  pi: FakePi;
-  port: SubagentPortBox;
-  client: HerdrClientLike;
 }
 
 export interface SubagentMountOptions {
@@ -303,6 +255,8 @@ export interface SubagentMountOptions {
   extPath?: string;
   deps?: Record<string, unknown>;
 }
+
+export type SubagentMount = { root: Context; pi: FakePi; port: SubagentPortBox; client: HerdrClientLike };
 
 /** Mounts the subagent plugin against fakes, wiring the same deps index.ts provides. */
 export async function mountSubagent(opts: SubagentMountOptions = {}): Promise<SubagentMount> {
@@ -352,8 +306,6 @@ export async function runSubagentRejects(pi: FakePi, params: Record<string, unkn
   }
   throw new Error('expected the subagent tool to fail');
 }
-
-/* ── session transcripts ────────────────────────────────────────── */
 
 /** JSONL body for pi session transcripts. */
 export function jsonl(...lines: unknown[]): string {

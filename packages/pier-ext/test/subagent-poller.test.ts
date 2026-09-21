@@ -4,19 +4,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Context } from '@deepseek-ai/cordis';
 import {
-  buildSettlementNoticeText,
-  createPoller,
-  createSessionRoot,
-  disposeSessionRoot,
-  formatObservationTimeoutNotice,
-  formatPaneClosedNotice,
-  isSettlementCandidate,
-  mountSubagentScope,
-  planBlockedGate,
-  planObservationTick,
-  planTakeoverTick,
-  planVacuumTick,
-  type PollerHost,
+  buildSettlementNoticeText, createPoller, createSessionRoot, disposeSessionRoot, formatObservationTimeoutNotice,
+  formatPaneClosedNotice, isSettlementCandidate, mountSubagentScope, planBlockedGate, planObservationTick,
+  planTakeoverTick, planVacuumTick, type PollerHost,
 } from '../src/subagent-poller.ts';
 import type { SubEntry } from '../src/subagent-core.ts';
 import { subEntry } from './test-utils.ts';
@@ -28,17 +18,13 @@ import type { GitIo } from '../src/subagent-spawn.ts';
 /* ── planners ───────────────────────────────────────────────────── */
 
 test('planTakeoverTick: missing agent ignores; the idle edge starts the timer; sustained idle returns control', () => {
-  assert.equal(planTakeoverTick({ currentStatus: null, previousStatus: 'working', idleStartedAt: 1, now: 2, idleMs: 60_000 }).kind, 'ignore');
-  assert.equal(planTakeoverTick({ currentStatus: 'idle', previousStatus: 'working', idleStartedAt: null, now: 10, idleMs: 60_000 }).kind, 'start-idle');
-  assert.equal(planTakeoverTick({ currentStatus: 'idle', previousStatus: 'idle', idleStartedAt: 1, now: 60_002, idleMs: 60_000 }).kind, 'return-control');
-  assert.deepEqual(
-    planTakeoverTick({ currentStatus: 'idle', previousStatus: 'idle', idleStartedAt: 1, now: 50_000, idleMs: 60_000 }),
-    { kind: 'hold', lastAgentStatus: 'idle', clearIdleTimer: false },
-  );
-  assert.deepEqual(
-    planTakeoverTick({ currentStatus: 'working', previousStatus: 'idle', idleStartedAt: 1, now: 2, idleMs: 60_000 }),
-    { kind: 'hold', lastAgentStatus: 'working', clearIdleTimer: true },
-  );
+  const tick = (over: Partial<Parameters<typeof planTakeoverTick>[0]>) =>
+    planTakeoverTick({ currentStatus: 'idle', previousStatus: 'idle', idleStartedAt: 1, now: 2, idleMs: 60_000, ...over });
+  assert.equal(tick({ currentStatus: null, previousStatus: 'working' }).kind, 'ignore');
+  assert.equal(tick({ previousStatus: 'working', idleStartedAt: null, now: 10 }).kind, 'start-idle');
+  assert.equal(tick({ now: 60_002 }).kind, 'return-control');
+  assert.deepEqual(tick({ now: 50_000 }), { kind: 'hold', lastAgentStatus: 'idle', clearIdleTimer: false });
+  assert.deepEqual(tick({ currentStatus: 'working' }), { kind: 'hold', lastAgentStatus: 'working', clearIdleTimer: true });
 });
 
 test('planBlockedGate: the first block notifies, repeats stay silent, any other state clears', () => {
@@ -58,18 +44,9 @@ test('planObservationTick: window opens, machine injects reset it, a human takeo
 });
 
 test('planVacuumTick: a null wait state is a heartbeat; a dead pane outranks the timeout', () => {
-  assert.deepEqual(
-    planVacuumTick({ waitState: null, paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 100 }),
-    { refreshActivity: true, action: 'continue' },
-  );
-  assert.deepEqual(
-    planVacuumTick({ waitState: 'idle', paneAlive: false, now: 50, lastActivityAt: 1, timeoutMs: 10 }),
-    { refreshActivity: false, action: 'pane-closed' },
-  );
-  assert.deepEqual(
-    planVacuumTick({ waitState: 'idle', paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 10 }),
-    { refreshActivity: false, action: 'timeout' },
-  );
+  assert.deepEqual(planVacuumTick({ waitState: null, paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 100 }), { refreshActivity: true, action: 'continue' });
+  assert.deepEqual(planVacuumTick({ waitState: 'idle', paneAlive: false, now: 50, lastActivityAt: 1, timeoutMs: 10 }), { refreshActivity: false, action: 'pane-closed' });
+  assert.deepEqual(planVacuumTick({ waitState: 'idle', paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 10 }), { refreshActivity: false, action: 'timeout' });
 });
 
 test('isSettlementCandidate: final text or an ENDED turn without a pending tool', () => {
@@ -129,29 +106,16 @@ const makeEntry = (paneId: string, overrides: Partial<SubEntry> = {}): SubEntry 
 });
 
 type HistoryWrite = { entry: SubEntry; patch?: { outcome?: string | null; status?: SubEntry['status']; closedAt?: number }; via?: string };
+type Reconcile = { description: string; outcome: 'settled' | 'failed' };
 
-interface Fixture {
-  host: PollerHost;
-  entry: SubEntry | null;
-  writes: HistoryWrite[];
-  notices: string[];
-  reconciled: Array<{ description: string; outcome: 'settled' | 'failed' }>;
-  claimKeys: string[];
-  virtual: { now: number };
-  state: (s: Partial<SubSessionState>) => void;
-  waitState: (s: HerdrAgentState | null) => void;
-  panes: string[];
-  reattribute: (f: string | null) => void;
-  setClaim: (v: boolean) => void;
-}
-
-function fixture(entry: SubEntry | null, initialTime = 13_000): Fixture {
+/** Poller host over a virtual clock, with every recorded effect exposed for assertions. */
+function fixture(entry: SubEntry | null, initialTime = 13_000) {
   const virtual = { now: initialTime };
   const subs = new Map<string, SubEntry>();
   if (entry) subs.set(entry.paneId, entry);
   const writes: HistoryWrite[] = [];
   const notices: string[] = [];
-  const reconciled: Fixture['reconciled'] = [];
+  const reconciled: Reconcile[] = [];
   const claimKeys: string[] = [];
   const panes: string[] = entry ? [entry.paneId] : [];
   let waitState: HerdrAgentState | null = 'idle';
@@ -209,14 +173,14 @@ function fixture(entry: SubEntry | null, initialTime = 13_000): Fixture {
 
   return {
     host, entry, writes, notices, reconciled, claimKeys, virtual, panes,
-    state: (s) => { state = { ...state, ...s }; },
-    waitState: (s) => { waitState = s; },
-    reattribute: (f) => { reattributed = f; },
-    setClaim: (v) => { claimResult = v; },
+    state: (s: Partial<SubSessionState>) => { state = { ...state, ...s }; },
+    waitState: (s: HerdrAgentState | null) => { waitState = s; },
+    reattribute: (f: string | null) => { reattributed = f; },
+    setClaim: (v: boolean) => { claimResult = v; },
   };
 }
 
-const start = (f: Fixture, requestId = 'req-1', injectTs = 10_000) =>
+const start = (f: { host: PollerHost; entry: SubEntry | null }, requestId = 'req-1', injectTs = 10_000) =>
   createPoller(f.host).startPoller(f.entry!.paneId, '/tmp', injectTs, 'desc', requestId);
 
 test('pollLoop: an already-settled row stops the loop without side effects', async () => {

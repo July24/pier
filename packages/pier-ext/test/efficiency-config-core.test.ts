@@ -1,8 +1,5 @@
-/**
- * D100-D103 efficiency configuration: fail-open validation, layer precedence, env overrides and the
- * pi-native settings handshake. Per-field rejection is one case table derived from
- * DEFAULT_EFFICIENCY_CONFIG, so a new core field is covered by construction.
- */
+/** D100-D103 efficiency configuration: fail-open validation, layer precedence, env overrides and the
+ * pi-native settings handshake; per-field rejection is a table built from DEFAULT_EFFICIENCY_CONFIG. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -11,7 +8,7 @@ import {
   DEFAULT_EFFICIENCY_CONFIG, loadEfficiencyConfigFromDisk, loadPiNativeCompactionSettings,
   resolveEfficiencyConfig, validateEfficiencyConfig, type EfficiencyConfig,
 } from '../src/efficiency-config-core.ts';
-import { withCleanup } from './test-utils.ts';
+import { withCleanup, type CleanupContext } from './test-utils.ts';
 
 const SECTIONS = ['onlineContextCompact', 'observationPack', 'evidencePreservingReducer', 'jev'] as const;
 type Section = (typeof SECTIONS)[number];
@@ -44,8 +41,7 @@ const UNKNOWN_KEY_CASES: UnknownKeyCase[] = [
   {
     name: 'unknown top-level key disables every mechanism',
     raw: { version: 1, foo: 'bar', onlineContextCompact: { enabled: true }, observationPack: { enabled: true }, evidencePreservingReducer: { enabled: true }, jev: { enabled: true } },
-    issue: '未知顶层配置项: "foo"',
-    disabled: SECTIONS,
+    issue: '未知顶层配置项: "foo"', disabled: SECTIONS,
   },
   ...SECTIONS.map((section) => ({
     name: `unknown key inside ${section}`,
@@ -54,6 +50,21 @@ const UNKNOWN_KEY_CASES: UnknownKeyCase[] = [
     disabled: [section],
   })),
 ];
+
+/** Temp checkout + agent dir with pi's own settings.json written; `.pi/settings.json` only when given. */
+async function piSettingsFixture(
+  cleanup: CleanupContext, agent: unknown, project?: unknown,
+): Promise<{ base: string; agentDir: string; projectDir: string }> {
+  const base = cleanup.tempDir('pi-settings').path;
+  const agentDir = join(base, 'agent');
+  const projectDir = join(base, 'project');
+  await mkdir(agentDir, { recursive: true }); await mkdir(join(projectDir, '.pi'), { recursive: true });
+  await writeFile(join(agentDir, 'settings.json'), JSON.stringify(agent));
+  if (project !== undefined) await writeFile(join(projectDir, '.pi', 'settings.json'), JSON.stringify(project));
+  return { base, agentDir, projectDir };
+}
+
+const PI_SETTINGS = { compaction: { enabled: false, keepRecentTokens: 35000 } };
 
 test('validateEfficiencyConfig: field rejection matrix (wrong type / below bound) fails open', async (t) => {
   for (const c of REJECTION_CASES) {
@@ -76,14 +87,11 @@ test('validateEfficiencyConfig: version, upper bound and the ratio escape hatch'
 
 test('validateEfficiencyConfig: empty object yields the on-disk defaults, a non-object disables everything', () => {
   const res = validateEfficiencyConfig({});
-  assert.equal(res.ok, true);
-  assert.deepEqual(res.issues, []);
-  assert.deepEqual(res.config, DEFAULT_EFFICIENCY_CONFIG);
+  assert.equal(res.ok, true); assert.deepEqual(res.issues, []); assert.deepEqual(res.config, DEFAULT_EFFICIENCY_CONFIG);
   assert.equal(res.config.jev.model, 'jev-1.13.0', 'pinned versioned id — an alias would drift silently');
 
   const notObject = validateEfficiencyConfig('not an object');
-  assert.equal(notObject.ok, false);
-  assert.match(notObject.issues[0]!, /必须是 JSON 对象/);
+  assert.equal(notObject.ok, false); assert.match(notObject.issues[0]!, /必须是 JSON 对象/);
   for (const section of SECTIONS) assert.equal(enabledOf(notObject.config, section), false, section);
 });
 
@@ -107,28 +115,23 @@ test('validateEfficiencyConfig: a fully customized config passes and keeps every
     jev: { enabled: true, logEnabled: true, baseUrl: 'https://relay.example/v1', model: 'jev-1.13.1', timeoutMs: 3000, minConfidence: 0.75, apiKey: 'k' },
   };
   const res = validateEfficiencyConfig(custom);
-  assert.deepEqual(res.issues, []);
-  assert.equal(res.ok, true);
+  assert.deepEqual(res.issues, []); assert.equal(res.ok, true);
   assert.deepEqual(res.config, custom, 'every supplied value survives validation');
 });
 
 test('validateEfficiencyConfig: optional strings clear on ""/null and reject whitespace', () => {
   const cleared = validateEfficiencyConfig({ version: 1, evidencePreservingReducer: { model: null }, jev: { baseUrl: '', apiKey: null } });
-  assert.equal(cleared.ok, true);
-  assert.equal(cleared.config.evidencePreservingReducer.model, undefined);
-  assert.equal(cleared.config.jev.baseUrl, undefined);
-  assert.equal(cleared.config.jev.apiKey, undefined);
+  assert.equal(cleared.ok, true); assert.equal(cleared.config.evidencePreservingReducer.model, undefined);
+  assert.equal(cleared.config.jev.baseUrl, undefined); assert.equal(cleared.config.jev.apiKey, undefined);
 
   // Whitespace is neither "unset" nor a legal value.
   const blank = validateEfficiencyConfig({ version: 1, evidencePreservingReducer: { model: '   ' } });
-  assert.equal(blank.ok, false);
-  assert.ok(blank.issues.some((i) => i.includes('evidencePreservingReducer.model 必须是非空字符串')));
+  assert.equal(blank.ok, false); assert.ok(blank.issues.some((i) => i.includes('evidencePreservingReducer.model 必须是非空字符串')));
   // jev.model has no null escape hatch: a missing model id would silently fall back to an alias.
   assert.equal(validateEfficiencyConfig({ version: 1, jev: { model: null } }).ok, false);
 
   const trimmed = validateEfficiencyConfig({ version: 1, jev: { model: '  m/x  ', apiKey: ' k ' } });
-  assert.equal(trimmed.config.jev.model, 'm/x');
-  assert.equal(trimmed.config.jev.apiKey, 'k');
+  assert.equal(trimmed.config.jev.model, 'm/x'); assert.equal(trimmed.config.jev.apiKey, 'k');
 });
 
 test('validateEfficiencyConfig: section issues force enabled=false, clean sections stay untouched', () => {
@@ -138,11 +141,9 @@ test('validateEfficiencyConfig: section issues force enabled=false, clean sectio
     observationPack: { enabled: true, thresholBytes: 1024 }, // typo!
     evidencePreservingReducer: { enabled: true, timeoutMs: 100 }, // below the 500 bound
   });
-  assert.equal(res.ok, false);
-  assert.equal(res.config.observationPack.enabled, false);
+  assert.equal(res.ok, false); assert.equal(res.config.observationPack.enabled, false);
   assert.equal(res.config.evidencePreservingReducer.enabled, false);
-  assert.equal(res.config.onlineContextCompact.enabled, true);
-  assert.equal(res.config.onlineContextCompact.logEnabled, true);
+  assert.equal(res.config.onlineContextCompact.enabled, true); assert.equal(res.config.onlineContextCompact.logEnabled, true);
 });
 
 test('resolveEfficiencyConfig: the workspace layer replaces the user layer only when trusted', () => {
@@ -172,11 +173,9 @@ test('resolveEfficiencyConfig: environment variables override file configs', () 
       PI_HERDR_REDUCER_ENABLE: '1', PI_HERDR_REDUCER_LOG: '1', PI_HERDR_REDUCER_MODEL: 'custom/fast-model',
     },
   });
-  const { enabled, logEnabled, cacheWriteReadRatio } = resolved.onlineContextCompact;
-  assert.deepEqual({ enabled, logEnabled, cacheWriteReadRatio }, { enabled: true, logEnabled: true, cacheWriteReadRatio: 15.5 });
-  const obs = resolved.observationPack;
+  const { onlineContextCompact: occ, observationPack: obs, evidencePreservingReducer: epr } = resolved;
+  assert.deepEqual({ enabled: occ.enabled, logEnabled: occ.logEnabled, cacheWriteReadRatio: occ.cacheWriteReadRatio }, { enabled: true, logEnabled: true, cacheWriteReadRatio: 15.5 });
   assert.deepEqual({ enabled: obs.enabled, logEnabled: obs.logEnabled }, { enabled: true, logEnabled: true });
-  const epr = resolved.evidencePreservingReducer;
   assert.deepEqual({ enabled: epr.enabled, logEnabled: epr.logEnabled, model: epr.model }, { enabled: true, logEnabled: true, model: 'custom/fast-model' });
 
   assert.equal(resolveEfficiencyConfig({ env: { PI_HERDR_CACHE_RATIO: 'auto' } }).onlineContextCompact.cacheWriteReadRatio, 'auto');
@@ -187,16 +186,13 @@ test('resolveEfficiencyConfig: environment variables override file configs', () 
 test('resolveEfficiencyConfig: jev env keys outrank the config value, TYPESAFE_API_KEY only fills a hole', () => {
   const env = { PIER_JEV_ENABLE: '1', PIER_JEV_MODEL: 'jev-1.13.1', PIER_JEV_TIMEOUT_MS: '1500', PIER_JEV_MIN_CONFIDENCE: '0.8', PIER_JEV_API_KEY: 'pk' };
   const byEnv = resolveEfficiencyConfig({ env });
-  assert.deepEqual(
-    { enabled: byEnv.jev.enabled, model: byEnv.jev.model, timeoutMs: byEnv.jev.timeoutMs, minConfidence: byEnv.jev.minConfidence, apiKey: byEnv.jev.apiKey },
-    { enabled: true, model: 'jev-1.13.1', timeoutMs: 1500, minConfidence: 0.8, apiKey: 'pk' },
-  );
+  const { enabled, model, timeoutMs, minConfidence, apiKey } = byEnv.jev;
+  assert.deepEqual({ enabled, model, timeoutMs, minConfidence, apiKey }, { enabled: true, model: 'jev-1.13.1', timeoutMs: 1500, minConfidence: 0.8, apiKey: 'pk' });
   assert.equal(resolveEfficiencyConfig({ env: { PIER_JEV_ENABLE: '1', TYPESAFE_API_KEY: 'fk' } }).jev.apiKey, 'fk', 'SDK-convention env fills a missing key');
   assert.equal(resolveEfficiencyConfig({ env: { PIER_JEV_API_KEY: 'pk', TYPESAFE_API_KEY: 'fk' } }).jev.apiKey, 'pk', 'pier env wins over the foreign convention');
 
   const byConfig = resolveEfficiencyConfig({ userConfig: { jev: { apiKey: 'ck' } }, env: {} });
-  assert.equal(byConfig.jev.apiKey, 'ck');
-  assert.equal(byConfig.jev.enabled, false, 'key alone does not enable the layer');
+  assert.equal(byConfig.jev.apiKey, 'ck'); assert.equal(byConfig.jev.enabled, false, 'key alone does not enable the layer');
   assert.equal(resolveEfficiencyConfig({ env: {} }).jev.apiKey, undefined);
 });
 
@@ -207,8 +203,7 @@ test('resolveEfficiencyConfig: invalid env values warn and keep the previous val
     env: { PIER_JEV_TIMEOUT_MS: '100', PIER_JEV_MIN_CONFIDENCE: 'nope', PI_HERDR_CACHE_RATIO: 'fast' },
     onWarning: (w) => warnings.push(w),
   });
-  assert.equal(resolved.jev.timeoutMs, 900);
-  assert.equal(resolved.jev.minConfidence, 0.4);
+  assert.equal(resolved.jev.timeoutMs, 900); assert.equal(resolved.jev.minConfidence, 0.4);
   assert.equal(resolved.onlineContextCompact.cacheWriteReadRatio, 3);
   assert.equal(warnings.length, 3, warnings.join(' | '));
 });
@@ -217,30 +212,17 @@ test('loadPiNativeCompactionSettings: missing paths are tolerated, project file 
   const missing = loadPiNativeCompactionSettings({ cwd: '/tmp/nonexistent-pier-test-dir', isProjectTrusted: false, agentDir: '/tmp/nonexistent-pier-agent-dir' });
   assert.deepEqual(missing, {});
 
-  const base = cleanup.tempDir('pi-settings-unit').path;
-  const agentDir = join(base, 'agent');
-  const projectDir = join(base, 'project');
-  await mkdir(agentDir, { recursive: true });
-  await mkdir(join(projectDir, '.pi'), { recursive: true });
-  await writeFile(join(agentDir, 'settings.json'), JSON.stringify({ compaction: { enabled: false, keepRecentTokens: 35000 } }));
-  await writeFile(join(projectDir, '.pi', 'settings.json'), JSON.stringify({ compaction: { keepRecentTokens: 99999 } }));
-
+  const { agentDir, projectDir } = await piSettingsFixture(cleanup, PI_SETTINGS, { compaction: { keepRecentTokens: 99999 } });
   const trusted = loadPiNativeCompactionSettings({ cwd: projectDir, isProjectTrusted: true, agentDir });
-  assert.equal(trusted.enabled, false);
-  assert.equal(trusted.keepRecentTokens, 99999, 'project settings win when the project is trusted');
+  assert.equal(trusted.enabled, false); assert.equal(trusted.keepRecentTokens, 99999, 'project settings win when the project is trusted');
   assert.equal(loadPiNativeCompactionSettings({ cwd: projectDir, isProjectTrusted: false, agentDir }).keepRecentTokens, 35000, 'untrusted project settings are ignored');
 }));
 
 test('loadEfficiencyConfigFromDisk: respects Pi native compaction settings and inheritance (A4)', withCleanup(async (cleanup) => {
-  const base = cleanup.tempDir('pi-settings').path;
-  const agentDir = join(base, 'agent');
-  const projectDir = join(base, 'project');
+  const { base, agentDir, projectDir } = await piSettingsFixture(cleanup, PI_SETTINGS);
   const configFile = join(projectDir, '.pi-herdr', 'config.json');
-  await mkdir(agentDir, { recursive: true });
   await mkdir(join(projectDir, '.pi-herdr'), { recursive: true });
-  await mkdir(join(projectDir, '.pi'), { recursive: true });
-  await writeFile(join(agentDir, 'settings.json'), JSON.stringify({ compaction: { enabled: false, keepRecentTokens: 35000 } }));
-  // The efficiency config explicitly ENABLES OCC, so the assertion below is non-vacuous.
+  // The efficiency config explicitly ENABLES OCC, so the assertions below are non-vacuous.
   await writeFile(configFile, JSON.stringify({ version: 1, onlineContextCompact: { enabled: true } }));
 
   const opts = { cwd: projectDir, isProjectTrusted: true, agentDir, userConfigPath: join(base, 'user-efficiency-config.json') };

@@ -1,7 +1,4 @@
-/**
- * Pure cores behind the hook scripts: notification.show params, agent.view.set params, and the
- * boot.jsonl restore plan.
- */
+/** Pure cores behind the hook scripts: notification.show params, agent.view.set params, boot.jsonl restore plan. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildNotificationParams } from '../src/notify.ts';
@@ -14,11 +11,7 @@ const blockedEvent = (data: Record<string, unknown>) => ({ type: 'pane.agent_sta
 
 test('buildNotificationParams: valid pi blocked event produces correct notification.show params', () => {
   const params = buildNotificationParams(blockedEvent({ agent: 'pi', agent_status: 'blocked', pane_id: 'pane-42', title: 'Waiting for approval' }));
-  assert.deepEqual(params, {
-    title: 'Subagent blocked: pi',
-    body: 'Pane pane-42 needs a human decision — Waiting for approval',
-    sound: 'request',
-  });
+  assert.deepEqual(params, { title: 'Subagent blocked: pi', body: 'Pane pane-42 needs a human decision — Waiting for approval', sound: 'request' });
   assert.ok(params !== null && !('message' in params), 'must use body, not message');
 });
 
@@ -53,8 +46,7 @@ test('buildAgentViewSetParams: defaults conform to the Herdr 0.9.0 agent.view.se
   const params = buildAgentViewSetParams();
   assert.equal(params.source, 'pier.workbench');
   assert.equal(params.label, 'Pier');
-  // No harness filter: agent.view.set replaces Herdr's built-in Agents projection globally, so any
-  // filter silently hides the harnesses it omits.
+  // No harness filter: agent.view.set replaces Herdr's built-in Agents projection globally, so any filter hides harnesses.
   assert.equal(params.filter, null);
   assert.deepEqual(params.sort, [{ field: 'attention', order: 'desc' }, { field: 'pane_order', order: 'asc' }]);
 });
@@ -83,8 +75,7 @@ test('parseBootRecords: 跳过空行、坏行与缺少 workspace_id 的记录', 
 test('latestBootRecordPerWorkspace: 同 workspace 只保留最新一条（追加顺序 = 时间顺序）', () => {
   const latest = latestBootRecordPerWorkspace(parseBootRecords([
     '{"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1"}', '{"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p9"}',
-    '{"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p2"}', '{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1"}',
-    '{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p3"}',
+    '{"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p2"}', '{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1"}', '{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p3"}',
   ].join('\n')));
   assert.equal(latest.length, 2, '一个 workspace 恰好恢复一次');
   const w1 = latest.find((r) => r.workspace_id === 'w1');

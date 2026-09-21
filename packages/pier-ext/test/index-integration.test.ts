@@ -1,6 +1,6 @@
 /**
  * index.ts composition root: process-mode mounting, the herdr human gate, and the session
- * lifecycle (notice buffering, session-object pruning, todo folding).
+ * lifecycle (notice buffering, session-object pruning, todo folding on resume).
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -41,36 +41,44 @@ async function mountIndex(
   return pi;
 }
 
+/** The `ui` the ask tool sees for an authored pick: the test's own `select`, and an input path that must not run. */
+const authoredUi = (select: (title: string, options: string[]) => Promise<string | undefined>) =>
+  ({ ui: { select, input: async () => { throw new Error('input must not run for an authored pick'); } } });
+
 /** The herdr:blocked edge stream the herdr host (and pi core) consumes. */
 function blockedEdges(pi: FakePi): unknown[] {
   return pi.events.emitted.filter((e) => e.channel === 'herdr:blocked').map((e) => e.data);
 }
 
+/** Mounts a worker index and returns the registered ask tool's execute. */
+async function workerAsk(cleanup: CleanupContext) {
+  const pi = await mountIndex(cleanup, 'worker');
+  const exec = pi.tools.get('ask_user_question')?.execute;
+  assert.ok(exec, 'ask_user_question must be registered');
+  return { pi, exec };
+}
+
 /* ── mount surface per process mode ─────────────────────────────── */
 
 test('index mount surface: worker and bare pi stay todo-only', async (t) => {
-  for (const mode of ['worker', 'bare'] as const) {
-    await t.test(mode, withCleanup(async (cleanup) => {
-      const pi = await mountIndex(cleanup, mode);
-      assert.ok(pi.tools.has('todo_write'), `${mode} mounts todo_write`);
-      assert.ok(pi.tools.has('ask_user_question'), 'common tool still registered');
-      for (const tool of ['subagent', 'terminal', 'list_agents', 'terminal_open']) {
-        assert.ok(!pi.tools.has(tool), `${mode} must not register ${tool}`);
-      }
-      assert.ok(pi.commands.has('todos'));
-      assert.ok(!pi.commands.has('locks'), 'write locks stay herdr-only');
+  for (const mode of ['worker', 'bare'] as const) await t.test(mode, withCleanup(async (cleanup) => {
+    const pi = await mountIndex(cleanup, mode);
+    assert.ok(pi.tools.has('todo_write'), `${mode} mounts todo_write`);
+    assert.ok(pi.tools.has('ask_user_question'), 'common tool still registered');
+    for (const tool of ['subagent', 'terminal', 'list_agents', 'terminal_open']) assert.ok(!pi.tools.has(tool), `${mode} must not register ${tool}`);
+    assert.ok(pi.commands.has('todos'));
+    assert.ok(!pi.commands.has('locks'), 'write locks stay herdr-only');
 
-      // A full session lifecycle must not throw and has no herdr to report to.
-      const ctx = { sessionManager: { getBranch: () => [] } };
-      await fire(pi, 'session_start', { reason: 'new' }, ctx);
-      await fire(pi, 'turn_start');
-      await fire(pi, 'tool_execution_start', { toolCallId: 'c1', toolName: 'read' });
-      await fire(pi, 'tool_execution_end', { toolCallId: 'c1' });
-      await fire(pi, 'agent_settled', {}, ctx);
-      await fire(pi, 'session_shutdown');
-      assert.deepEqual(blockedEdges(pi), [], `${mode} never opens a herdr gate`);
-    }));
-  }
+    // A full session lifecycle must not throw and has no herdr to report to.
+    const ctx = { sessionManager: { getBranch: () => [] } };
+    await fire(pi, 'session_start', { reason: 'new' }, ctx);
+    await fire(pi, 'turn_start');
+    await fire(pi, 'tool_execution_start', { toolCallId: 'c1', toolName: 'read' });
+    await fire(pi, 'tool_execution_end', { toolCallId: 'c1' });
+    await fire(pi, 'agent_settled', {}, ctx);
+    await fire(pi, 'session_shutdown');
+    assert.deepEqual(blockedEdges(pi), [], `${mode} never opens a herdr gate`);
+  }));
 });
 
 test('index herdr master: mounts subagent + terminal + locks', withCleanup(async (cleanup) => {
@@ -83,7 +91,7 @@ test('index herdr master: mounts subagent + terminal + locks', withCleanup(async
 /* ── human gate: the herdr:blocked edges pi core and herdr consume ── */
 
 test('ask_user_question emits herdr:blocked once around ui.input (official herdr:pi contract)', withCleanup(async (cleanup) => {
-  const pi = await mountIndex(cleanup, 'worker');
+  const { pi, exec } = await workerAsk(cleanup);
   let officialDepth = 0;
   pi.events.on('herdr:blocked', (data) => {
     if (data && typeof data === 'object' && 'active' in data && data.active === true) officialDepth += 1;
@@ -92,8 +100,6 @@ test('ask_user_question emits herdr:blocked once around ui.input (official herdr
 
   let resolveInput: ((value: string) => void) | undefined;
   const input = new Promise<string>((resolve) => { resolveInput = resolve; });
-  const exec = pi.tools.get('ask_user_question')?.execute;
-  assert.ok(exec, 'ask_user_question must be registered');
   const running = exec!({}, { question: 'deploy staging?' }, undefined, undefined, { ui: { input: () => input } });
 
   assert.deepEqual(blockedEdges(pi), [{ active: true, label: 'deploy staging?' }]);
@@ -108,23 +114,11 @@ test('ask_user_question emits herdr:blocked once around ui.input (official herdr
 }));
 
 test('ask_user_question options path emits herdr:blocked once around select', withCleanup(async (cleanup) => {
-  const pi = await mountIndex(cleanup, 'worker');
+  const { pi, exec } = await workerAsk(cleanup);
   let resolveSelect: (() => void) | undefined;
   const select = new Promise<void>((resolve) => { resolveSelect = resolve; });
-  const exec = pi.tools.get('ask_user_question')?.execute;
-  assert.ok(exec, 'ask_user_question must be registered');
-  const running = exec!({}, {
-    question: 'Which database?',
-    options: [{ label: 'Redis', description: 'mem' }, { label: 'Postgres', description: 'rel' }],
-  }, undefined, undefined, {
-    ui: {
-      select: async (_title: string, options: string[]) => {
-        await select;
-        return options[0];
-      },
-      input: async () => { throw new Error('input must not run for an authored pick'); },
-    },
-  });
+  const running = exec!({}, { question: 'Which database?', options: [{ label: 'Redis', description: 'mem' }, { label: 'Postgres', description: 'rel' }] },
+    undefined, undefined, authoredUi(async (_title, options) => { await select; return options[0]; }));
   assert.deepEqual(blockedEdges(pi), [{ active: true, label: 'Which database?' }]);
   resolveSelect!();
   const result = await running as { content: Array<{ text: string }>; details: { cancelled: boolean } };
@@ -134,25 +128,18 @@ test('ask_user_question options path emits herdr:blocked once around select', wi
 }));
 
 test('ask_user_question questions batch keeps one herdr:blocked around both selects', withCleanup(async (cleanup) => {
-  const pi = await mountIndex(cleanup, 'worker');
-  const exec = pi.tools.get('ask_user_question')?.execute;
-  assert.ok(exec, 'ask_user_question must be registered');
+  const { pi, exec } = await workerAsk(cleanup);
   let selects = 0;
   const running = exec!({}, {
     questions: [
       { question: 'Cache?', options: [{ label: 'Redis', description: 'mem' }, { label: 'Memcached', description: 'dist' }] },
       { question: 'SQL?', options: [{ label: 'Postgres', description: 'rel' }, { label: 'SQLite', description: 'file' }] },
     ],
-  }, undefined, undefined, {
-    ui: {
-      select: async (_title: string, options: string[]) => {
-        selects += 1;
-        assert.equal(blockedEdges(pi).length, 1, 'gate stays open between questions');
-        return options[0];
-      },
-      input: async () => { throw new Error('input must not run'); },
-    },
-  });
+  }, undefined, undefined, authoredUi(async (_title, options) => {
+    selects += 1;
+    assert.equal(blockedEdges(pi).length, 1, 'gate stays open between questions');
+    return options[0];
+  }));
   const result = await running as { content: Array<{ text: string }> };
   assert.equal(selects, 2);
   assert.match(result.content[0]?.text ?? '', /"Cache\?"="Redis"/);
@@ -201,9 +188,7 @@ test('ui_prompt gate: label fallback, resident overlays, stray releases', async 
 });
 
 test('a nested ui prompt inside the ask tool keeps exactly one blocked edge', withCleanup(async (cleanup) => {
-  const pi = await mountIndex(cleanup, 'worker');
-  const exec = pi.tools.get('ask_user_question')?.execute;
-  assert.ok(exec, 'ask_user_question must be registered');
+  const { pi, exec } = await workerAsk(cleanup);
 
   let resolveInput: ((value: string) => void) | undefined;
   const input = new Promise<string>((resolve) => { resolveInput = resolve; });
@@ -249,8 +234,7 @@ test('index session lifecycle: derives the session object root and prunes it on 
   const sessionDir = cleanup.tempDir('index-prune').path;
 
   const sessionId = 'sess_idx_prune';
-  const dirs = ['observation-pack', 'evidence-preserving-reducer']
-    .map((plane) => join(sessionDir, 'herdr-pi', sessionId, plane, 'objects'));
+  const dirs = ['observation-pack', 'evidence-preserving-reducer'].map((plane) => join(sessionDir, 'herdr-pi', sessionId, plane, 'objects'));
   // One file above the default cap (300) per directory, so the shutdown prune must act.
   for (const dir of dirs) {
     await mkdir(dir, { recursive: true });
@@ -277,30 +261,23 @@ test('index: /pier-config reports configuration and hands a guided change to the
   const cwd = cleanup.tempDir('pier-config-ws').path;
   const ctx = { cwd, ui: { notify: (text: string, level?: string) => { notes.push({ text, level }); } }, isProjectTrusted: () => false };
   const run = pi.commands.get('pier-config')!.handler as (...a: unknown[]) => Promise<void>;
+  /** Runs the command and returns the notify text it produced. */
+  const runNotes = async (args: string) => { notes.length = 0; await run(args, ctx); return notes.map((n) => n.text).join('\n'); };
 
-  await run('show efficiency', ctx);
-  const showOutput = notes.map((n) => n.text).join('\n');
-  assert.match(showOutput, /efficiency — Efficiency mechanisms/);
-  assert.match(showOutput, /observationPack\.enabled = /);
-  assert.match(showOutput, /evidencePreservingReducer\.timeoutMs = /);
+  const showOutput = await runNotes('show efficiency');
+  for (const re of [/efficiency — Efficiency mechanisms/, /observationPack\.enabled = /, /evidencePreservingReducer\.timeoutMs = /]) {
+    assert.match(showOutput, re);
+  }
 
-  notes.length = 0;
-  await run('show bogus', ctx);
-  assert.match(notes.map((n) => n.text).join('\n'), /unknown plane "bogus"/);
+  assert.match(await runNotes('show bogus'), /unknown plane "bogus"/);
   assert.equal(notes[0]?.level, 'warning');
 
-  notes.length = 0;
-  await run('check', ctx);
-  assert.match(notes.map((n) => n.text).join('\n'), /pier config check \(workspace trusted: false\)/);
+  assert.match(await runNotes('check'), /pier config check \(workspace trusted: false\)/);
 
-  notes.length = 0;
-  await run('doc', ctx);
-  assert.match(notes.map((n) => n.text).join('\n'), /config report written:/);
+  assert.match(await runNotes('doc'), /config report written:/);
   assert.equal(existsSync(join(cwd, '.pi-herdr', 'config-report.md')), true, 'report file is written into the workspace');
 
-  notes.length = 0;
-  await run('', ctx);
-  assert.match(notes.map((n) => n.text).join('\n'), /asking the agent to guide the change/);
+  assert.match(await runNotes(''), /asking the agent to guide the change/);
   assert.equal(pi.sent.length, 1, 'bare invocation injects exactly one guidance message');
   const injected = pi.sent[0]!.msg;
   assert.equal(injected.customType, 'pi-herdr.config-guide');

@@ -21,30 +21,24 @@ test('simulateSplit: first keeps the original pane, second is the new one', () =
 });
 
 test('planSpawnSplitRatio: 焦点留在原格 = T^(1/depth)，移到新格 = 1-T^(1/depth)，焦点外按热力份额', () => {
-  assert.equal(planSpawnSplitRatio({ root: pane('a'), targetPaneId: 'a', focusPaneId: 'a', direction: 'down' }), FOCUS_SHARE);
-  assert.equal(planSpawnSplitRatio({ root: pane('a'), targetPaneId: 'a', focusPaneId: '__pier_new__', direction: 'down' }), 1 - FOCUS_SHARE);
-
+  const stay = { root: pane('a'), targetPaneId: 'a', focusPaneId: 'a', direction: 'down' as const };
+  const move = { root: pane('a'), targetPaneId: 'a', focusPaneId: '__pier_new__', direction: 'down' as const };
   const root = split('right', pane('focus'), pane('side'));
-  assert.equal(planSpawnSplitRatio({ root, targetPaneId: 'side', focusPaneId: 'focus', direction: 'down' }), 0.5, 'idle vs idle');
-  assert.equal(
-    planSpawnSplitRatio({ root, targetPaneId: 'side', focusPaneId: 'focus', direction: 'down', statuses: { side: 'blocked' } }),
-    3 / 4,
-    'a blocked cell outweighs a new idle one',
-  );
+  const idle = { root, targetPaneId: 'side', focusPaneId: 'focus', direction: 'down' as const };
+  const blocked = { ...idle, statuses: { side: 'blocked' as const } };
+  assert.equal(planSpawnSplitRatio(stay), FOCUS_SHARE);
+  assert.equal(planSpawnSplitRatio(move), 1 - FOCUS_SHARE);
+  assert.equal(planSpawnSplitRatio(idle), 0.5, 'idle vs idle');
+  assert.equal(planSpawnSplitRatio(blocked), 3 / 4, 'a blocked cell outweighs a new idle one');
 
   // every plan stays inside the engine floor, whatever the inputs
-  for (const opts of [
-    { root: pane('a'), targetPaneId: 'a', focusPaneId: 'a', direction: 'down' as const },
-    { root: pane('a'), targetPaneId: 'a', focusPaneId: '__pier_new__', direction: 'down' as const },
-    { root, targetPaneId: 'side', focusPaneId: 'focus', direction: 'down' as const, statuses: { side: 'blocked' as const } },
-  ]) {
+  for (const opts of [stay, move, idle, blocked]) {
     const r = planSpawnSplitRatio(opts);
     assert.ok(r != null && r >= RATIO_FLOOR && r <= 1 - RATIO_FLOOR, `ratio ${r} escapes the engine floor`);
   }
 });
 
-/* ── grid shape ─────────────────────────────────────────────────── */
-
+/* ── grid shape ── */
 test('parseShapeTree: nested pane leaves from layout.export, null for junk', () => {
   const raw = {
     type: 'split', direction: 'right', ratio: 0.5,

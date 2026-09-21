@@ -1,7 +1,5 @@
-/**
- * D102 Evidence-Preserving Reducer core: the diagnostic-command list, credential shapes, receipt
- * validation, the receipt text the model reads, truncation-notice parsing and usage merging.
- */
+/** D102 Evidence-Preserving Reducer core: the diagnostic-command list, credential shapes, receipt
+ * validation, the receipt text the model reads, truncation-notice parsing and usage merging. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -51,14 +49,11 @@ test('containsLikelySecret: detects credential-shaped values, ignores prose shap
 test('extractLikelySecretMatch: masks the value, keeps the keyword shape and a sha8', () => {
   const snippet = extractLikelySecretMatch('Error in run: api_key = "sk-supersecretkey1234567890"');
   assert.ok(snippet);
-  assert.ok(snippet!.startsWith('api_key ='));
-  assert.ok(snippet!.includes('<redacted:'));
-  assert.ok(/sha8=[0-9a-f]{8}/.test(snippet!));
-  assert.ok(!snippet!.includes('supersecretkey'));
+  assert.ok(snippet!.startsWith('api_key =')); assert.ok(snippet!.includes('<redacted:'));
+  assert.ok(/sha8=[0-9a-f]{8}/.test(snippet!)); assert.ok(!snippet!.includes('supersecretkey'));
   // Same secret → same sha8 (correlatable across runs).
   const again = extractLikelySecretMatch('other line\napi_key = sk-supersecretkey1234567890 done');
-  assert.ok(again);
-  assert.equal(again!.slice(again!.indexOf('sha8=')), snippet!.slice(snippet!.indexOf('sha8=')));
+  assert.ok(again); assert.equal(again!.slice(again!.indexOf('sha8=')), snippet!.slice(snippet!.indexOf('sha8=')));
   assert.equal(extractLikelySecretMatch('nothing here'), undefined);
 });
 
@@ -115,12 +110,9 @@ test('formatReceiptText: banner, per-evidence lines and the readback/authority f
     },
   });
   const lines = receipt.split('\n');
-  assert.equal(lines[0], REDUCER_RECEIPT_PREFIX);
-  assert.ok(lines.every((line) => !line.includes('\r')), 'receipt stays LF-joined');
-  assert.match(receipt, /- kind=fatal line=\? /, 'an unknown line number renders as ?');
-  assert.match(receipt, /- kind=failure line=42 /);
-  assert.match(receipt, /source_artifact=\/tmp\/session\/objects\/a\.txt/);
-  assert.match(receipt, /reducer_model=gemini-3\.8-flash-high/);
+  assert.equal(lines[0], REDUCER_RECEIPT_PREFIX); assert.ok(lines.every((line) => !line.includes('\r')), 'receipt stays LF-joined');
+  assert.match(receipt, /- kind=fatal line=\? /, 'an unknown line number renders as ?'); assert.match(receipt, /- kind=failure line=42 /);
+  assert.match(receipt, /source_artifact=\/tmp\/session\/objects\/a\.txt/); assert.match(receipt, /reducer_model=gemini-3\.8-flash-high/);
   assert.match(receipt, /readback=use bash with explicit range on \/tmp\/session\/objects\/a\.txt/);
   // The receipt is evidence, not a verdict: the model must keep adjudicating.
   assert.match(receipt, /authority=this receipt is verified evidence only.*pass\/fail adjudication/);
@@ -154,10 +146,7 @@ test('mergeUsage: always returns a COMPLETE pi Usage (footer reads cost.total un
   const empty = mergeUsage();
   assert.deepEqual(Object.keys(empty).sort(), ['cacheRead', 'cacheWrite', 'cost', 'input', 'output', 'totalTokens']);
   assert.deepEqual(Object.keys(empty.cost).sort(), ['cacheRead', 'cacheWrite', 'input', 'output', 'total']);
-  for (const [k, v] of Object.entries(empty)) {
-    if (k === 'cost') continue;
-    assert.equal(typeof v, 'number', `${k} must be numeric`);
-  }
+  for (const [k, v] of Object.entries(empty)) if (k !== 'cost') assert.equal(typeof v, 'number', `${k} must be numeric`);
   for (const v of Object.values(empty.cost)) assert.equal(typeof v, 'number');
 });
 

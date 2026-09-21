@@ -1,9 +1,5 @@
-/**
- * D-4 focus domain: the pure focus-poller planners (sample parsing / fire decision / reflow spawn) plus
- * the index.ts wiring — session_start starts polling, a focus transition into this pane replays a
- * `pane.focused` reflow, and session_shutdown stops the polling. index.ts builds its own herdr client
- * from the environment (no injection seam), so only that wiring test fakes the herdr socket.
- */
+/** D-4 focus: the pure planners (parse / fire decision / reflow spawn) plus the index.ts wiring.
+ *  index.ts builds its herdr client from the environment (no injection seam), so only the wiring test fakes it. */
 import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as path from 'node:path';
@@ -22,8 +18,7 @@ import { fakePi, fire, withCleanup, type CleanupContext, type FakePi } from './t
 type SpawnFn = NonNullable<SpawnReflowOpts['spawnFn']>;
 
 const sample = (focused: string | null, paneIds: string[]): FocusSample => ({ focusedPaneId: focused, paneIds });
-const state = (focused: string | null, paneIds: string[], lastFireAt = 0): FocusPollerState =>
-  ({ lastFocusedPaneId: focused, lastPaneIds: paneIds, lastFireAt });
+const state = (focused: string | null, paneIds: string[], lastFireAt = 0): FocusPollerState => ({ lastFocusedPaneId: focused, lastPaneIds: paneIds, lastFireAt });
 
 test('collectPaneIds/parseFocusSample: 真实 layout.export 载荷（单 pane / 分屏 / 缺失 focus）', () => {
   // Observed shape: {type:'layout_export', layout:{focused_pane_id, root:{type:'pane',pane_id}}}
@@ -73,10 +68,9 @@ test('planFocusTick: 焦点在别处/没变/空 paneId 都不触发；限流窗�
 
 test('startFocusPoller: 采样→触发一次（样本失败不推进基线）；intervalMs=0 不注册定时器、stop() 幂等', async () => {
   const samples: Array<FocusSample | Error> = [
-    sample('other', ['me', 'other']),
-    sample('me', ['me', 'other']),
+    sample('other', ['me', 'other']), sample('me', ['me', 'other']),
     new Error('socket down'),
-    sample('me', ['me', 'other']), // re-sample after the failure: the baseline never advanced, so this is still a move to "me"
+    sample('me', ['me', 'other']), // the failure never advanced the baseline, so this is still a move to "me"
   ];
   const fired: Array<{ paneId: string; cause: string | null }> = [];
   const errors: unknown[] = [];
@@ -116,9 +110,7 @@ test('spawnReflow: 事件载荷/脚本路径正确，spawn 抛错或子进程 er
   assert.equal(seen[0]!.env.HERDR_PLUGIN_EVENT, 'pane.focused');
   assert.equal(seen[0]!.env.HERDR_SOCKET_PATH, '/tmp/x.sock');
   assert.deepEqual(JSON.parse(String(seen[0]!.env.HERDR_PLUGIN_EVENT_JSON)), {
-    event: 'pane_focused',
-    type: 'pane_focused',
-    data: { type: 'pane_focused', pane_id: 'wD:p9', cause: 'user' },
+    event: 'pane_focused', type: 'pane_focused', data: { type: 'pane_focused', pane_id: 'wD:p9', cause: 'user' },
   });
 
   // the script lives in this repo unless a relocated checkout overrides the root
@@ -141,8 +133,7 @@ test('Herdr 0.9.1 adaptive cadence: isHerdr091OrLater and resolveDefaultFocusPol
   assert.equal(resolveDefaultFocusPollMs(null), 1500);
 });
 
-/* ── index.ts wiring ────────────────────────────────────────────── */
-
+/* ── index.ts wiring ── */
 type HerdrServer = { close(): Promise<void>; calls: string[] };
 
 /** Minimal herdr server: answers layout.export with a scripted focus sequence, records every method. */
@@ -170,36 +161,23 @@ function fakeHerdrServer(socketPath: string, focuses: Array<string | null>): Pro
       sock.end(JSON.stringify({ id: req.id ?? '1', result }) + '\n');
     });
   });
-  const ready = Promise.withResolvers<HerdrServer>();
-  server.listen(herdrSocketTarget(socketPath), () => {
-    ready.resolve({
-      calls,
-      close: () => {
-        const closed = Promise.withResolvers<void>();
-        // net.Server.closeAllConnections exists at runtime (Node ≥18.2) but is missing from these @types/node.
-        const closable = server as unknown as { closeAllConnections?(): void };
-        closable.closeAllConnections?.();
-        server.close(() => closed.resolve());
-        return closed.promise;
-      },
-    });
-  });
-  return ready.promise;
+  return new Promise<HerdrServer>((resolve) => server.listen(herdrSocketTarget(socketPath), () => resolve({
+    calls,
+    close: () => new Promise<void>((done) => {
+      // closeAllConnections exists at runtime (Node ≥18.2) but is missing from these @types/node.
+      const closable = server as unknown as { closeAllConnections?(): void };
+      closable.closeAllConnections?.();
+      server.close(() => done());
+    }),
+  })));
 }
 
-/**
- * Mounts index.ts in a Herdr-shaped env (this pane = wX:pMe) over a scripted herdr socket, with the
- * workbench script replaced by a stub that records the event env it was spawned with.
- */
+/** Mounts index.ts (this pane = wX:pMe) over a scripted socket with a reflow stub recording its env. */
 async function bootFocusIndex(cleanup: CleanupContext): Promise<{ pi: FakePi; server: HerdrServer; marker: string }> {
   const env = cleanup.env();
-  env.delete('PI_HERDR_SUBAGENT');
-  env.delete('PI_HERDR_ROLE_MANIFEST');
-  env.set('HERDR_ENV', '1');
-  env.set('HERDR_PANE_ID', 'wX:pMe');
-  env.set('HERDR_TAB_ID', 'wX:t1');
-  env.set('HERDR_WORKSPACE_ID', 'wX');
-  env.set('PIER_FOCUS_POLL_MS', '40'); // samples fast enough for a test, still a real timer
+  for (const key of ['PI_HERDR_SUBAGENT', 'PI_HERDR_ROLE_MANIFEST']) env.delete(key);
+  // PIER_FOCUS_POLL_MS: fast enough for a test, still a real timer.
+  for (const [key, value] of Object.entries({ HERDR_ENV: '1', HERDR_PANE_ID: 'wX:pMe', HERDR_TAB_ID: 'wX:t1', HERDR_WORKSPACE_ID: 'wX', PIER_FOCUS_POLL_MS: '40' })) env.set(key, value);
 
   const tmp = cleanup.tempDir('pier-focus-d4').path;
   const socketPath = path.join(tmp, 'herdr.sock');

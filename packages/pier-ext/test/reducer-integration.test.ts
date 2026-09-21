@@ -1,8 +1,5 @@
-/**
- * D102 reducer invoker, end to end: gate order (bash → trust → size → jev → archive), the receipt
- * swap, and every fail-open path. "The archive exists" is how a passed gate is observed, since
- * archival is the gate's successor.
- */
+/** D102 reducer invoker end to end: gate order (bash → trust → size → jev → archive), the receipt
+ * swap and every fail-open path. Archival existing is how a passed gate is observed. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { access, readFile, writeFile } from 'node:fs/promises';
@@ -13,9 +10,8 @@ import { DEFAULT_EFFICIENCY_CONFIG, type EvidencePreservingReducerConfig } from 
 import { efficiencyLogPath, reducerObjectPath, resolveSessionRoot } from '../src/efficiency-store.ts';
 import { REDUCER_RECEIPT_PREFIX, REDUCER_RECEIPT_SCHEMA, sha256Hex } from '../src/reducer-core.ts';
 import { withCleanup } from './test-utils.ts';
-const CONFIG: EvidencePreservingReducerConfig = {
-  ...DEFAULT_EFFICIENCY_CONFIG.evidencePreservingReducer, enabled: true, logEnabled: false, minBytes: 512, maxChars: 600_000,
-};
+const CONFIG: EvidencePreservingReducerConfig =
+  { ...DEFAULT_EFFICIENCY_CONFIG.evidencePreservingReducer, enabled: true, logEnabled: false, minBytes: 512, maxChars: 600_000 };
 
 /** 9000 bytes: clears minBytes, carries no credential shape, is not truncated. */
 const BODY = 'out'.repeat(3000);
@@ -35,13 +31,11 @@ function mockContext(opts: { sessionDir: string; sessionId?: string; isTrusted?:
   const trustCalls = { count: 0 };
   const ctx = {
     isProjectTrusted: () => { trustCalls.count++; return opts.isTrusted ?? true; },
-    sessionManager: { getSessionDir: () => opts.sessionDir, getSessionId: () => opts.sessionId ?? 's1' },
-    model: { id: 'default-test-model', provider: 'test' },
+    sessionManager: { getSessionDir: () => opts.sessionDir, getSessionId: () => opts.sessionId ?? 's1' }, model: { id: 'default-test-model', provider: 'test' },
     modelRegistry: {
       find: (provider: string, modelId: string) => ({ id: modelId, provider }),
       complete: async (model: never, context: never) => {
-        completeCalls.push({ model, context });
-        if (opts.completeError) throw opts.completeError;
+        completeCalls.push({ model, context }); if (opts.completeError) throw opts.completeError;
         return opts.completeResponse ?? { content: [{ type: 'text', text: '{}' }] };
       },
     },
@@ -64,12 +58,7 @@ function receiptResponse(body: string, quote: string): unknown {
 async function archiveExists(sessionDir: string, body: string, sessionId = 's1'): Promise<boolean> {
   const root = resolveSessionRoot(sessionDir, sessionId);
   if (!root) return false;
-  try {
-    await access(reducerObjectPath(root, sha256Hex(body)));
-    return true;
-  } catch {
-    return false;
-  }
+  try { await access(reducerObjectPath(root, sha256Hex(body))); return true; } catch { return false; }
 }
 
 async function readRows(sessionDir: string, sessionId = 's1'): Promise<string[]> {
@@ -90,22 +79,17 @@ test('EPR: replacement keeps every non-log block, backfills usage and archives t
     content: [{ type: 'text', text: rawLog }, { type: 'text', text: '⚠️ write lock warning block' }],
   };
   const res = await handleReducerToolResult(event, ctx, { ...CONFIG, logEnabled: true, model: 'test/reducer-model' }, { epoch: 2 });
-  assert.ok(res);
-  assert.equal(completeCalls.length, 1);
+  assert.ok(res); assert.equal(completeCalls.length, 1);
   assert.equal(completeCalls[0]!.model.id, 'reducer-model', 'the configured reducer model is used');
-  assert.equal(res.content!.length, 2, 'block-level replacement');
-  assert.ok(res.content![0]!.text.includes(REDUCER_RECEIPT_PREFIX));
+  assert.equal(res.content!.length, 2, 'block-level replacement'); assert.ok(res.content![0]!.text.includes(REDUCER_RECEIPT_PREFIX));
   assert.match(res.content![0]!.text, /panicked at src\/auth\.rs:120:5/, 'verified evidence is quoted into the receipt');
   assert.equal(res.content![1]!.text, '⚠️ write lock warning block');
   assert.equal(res.usage?.totalTokens, 65, 'reducer usage is added to the tool result usage');
   const root = resolveSessionRoot(dir, 'sess_success');
-  assert.ok(root);
-  assert.equal(await readFile(reducerObjectPath(root, sha256Hex(rawLog)), 'utf8'), rawLog);
+  assert.ok(root); assert.equal(await readFile(reducerObjectPath(root, sha256Hex(rawLog)), 'utf8'), rawLog);
   const rows = await readRows(dir, 'sess_success');
   assert.equal(rows.length, 1);
-  for (const field of ['"action":"applied"', '"verificationOk":true', '"epoch":2', '"sessionId":"sess_success"', '"grossSavedBytes":']) {
-    assert.ok(rows[0]!.includes(field), field);
-  }
+  for (const field of ['"action":"applied"', '"verificationOk":true', '"epoch":2', '"sessionId":"sess_success"', '"grossSavedBytes":']) assert.ok(rows[0]!.includes(field), field);
 }));
 
 test('EPR: fails open on a model error or an unverifiable quote', withCleanup(async (cleanup) => {
@@ -124,8 +108,7 @@ test('EPR: localOnly archives the log and never calls the model', withCleanup(as
   const rawLog = 'Diagnostic build log line...\n'.repeat(60);
   const { ctx, completeCalls } = mockContext({ sessionDir: dir, sessionId: 'sess_local' });
   assert.equal(await handleReducerToolResult(bashEvent('make', rawLog), ctx, { ...CONFIG, localOnly: true }), undefined);
-  assert.equal(completeCalls.length, 0);
-  assert.equal(await archiveExists(dir, rawLog, 'sess_local'), true);
+  assert.equal(completeCalls.length, 0); assert.equal(await archiveExists(dir, rawLog, 'sess_local'), true);
 }));
 
 test('EPR: evidence rows exist only for commands that reached the reduction path', withCleanup(async (cleanup) => {
@@ -143,8 +126,7 @@ test('EPR: evidence rows exist only for commands that reached the reduction path
   assert.deepEqual(jevHit.asks, ['epr-diagnostic-gate']);
   assert.equal(completeCalls.length, 0);
   const row = (await readRows(dir))[0]!;
-  assert.ok(row.includes('"reason":"truncated-source"'));
-  assert.ok(row.includes('"action":"fallback_full_text"'));
+  assert.ok(row.includes('"reason":"truncated-source"')); assert.ok(row.includes('"action":"fallback_full_text"'));
   // A listed command without jev writes the same fail-open row.
   assert.equal(await handleReducerToolResult(truncated('cargo test'), ctx, logging, {}), undefined);
   assert.equal((await readRows(dir)).length, 2);
@@ -156,9 +138,7 @@ test('EPR: evidence rows exist only for commands that reached the reduction path
   assert.deepEqual(secretGate.asks, ['epr-diagnostic-gate']);
   assert.equal(completeCalls.length, 0);
   const rows = await readRows(dir);
-  assert.equal(rows.length, 3);
-  assert.ok(rows[2]!.includes('"reason":"likely-secret"'));
-  assert.ok(!rows[2]!.includes('sk-supersecretkey1234567890'));
+  assert.equal(rows.length, 3); assert.ok(rows[2]!.includes('"reason":"likely-secret"')); assert.ok(!rows[2]!.includes('sk-supersecretkey1234567890'));
   // A gate-rejected command never reaches the secret scan.
   const rejected = makeGate('reject-kind');
   assert.equal(await handleReducerToolResult(bashEvent('deno test --allow-read', secretBody), ctx, logging, { jev: rejected.dep }), undefined);
@@ -215,8 +195,7 @@ test('gate: the trust boundary precedes everything, and tool/size gates precede 
   const { ctx, trustCalls } = mockContext({ sessionDir: dir, isTrusted: false });
   const { dep, asks } = makeGate('hit');
   assert.equal(await handleReducerToolResult(bashEvent('cargo test'), ctx, CONFIG, { jev: dep }), undefined);
-  assert.equal(asks.length, 0, 'an untrusted project must not reach a third-party API');
-  assert.equal(trustCalls.count, 1);
+  assert.equal(asks.length, 0, 'an untrusted project must not reach a third-party API'); assert.equal(trustCalls.count, 1);
   assert.equal(await archiveExists(dir, BODY), false);
   const read = { ...bashEvent('cargo test'), toolName: 'read' };
   assert.equal(await handleReducerToolResult(read, ctx, CONFIG, { jev: dep }), undefined);

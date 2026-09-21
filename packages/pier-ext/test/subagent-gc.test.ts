@@ -1,13 +1,12 @@
-/**
- * Board hygiene: gc-core decision tables (task tabs, panes, isolate sweep, path containment),
- * the registry projection, and the plugin-level GC pass.
- */
+/** Board hygiene: gc-core decision tables (task tabs, panes, isolate sweep, path containment) and
+ * the plugin-level GC pass. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fire, fakeHerdr, mountSubagent, subEntry, subsSnapshot } from './test-utils.ts';
+import type { SubEntry } from '../src/subagent-core.ts';
 import { isPathInside, planIsolateSweep, shouldClosePane, shouldCloseTaskTab, type GcEntryLike } from '../src/gc-core.ts';
 
 const NOW = 1_000_000;
@@ -17,6 +16,12 @@ const work = (over: Partial<GcEntryLike> = {}): GcEntryLike => ({
   status: 'consumed',
   consumedAt: NOW - TTL - 1000,
   ...over,
+});
+
+/** planIsolateSweep input with inert defaults; each test overrides only what it exercises. */
+const sweepPlan = (over: Partial<Parameters<typeof planIsolateSweep>[0]>) => planIsolateSweep({
+  branches: [], worktreesByBranch: new Map(), registeredBranches: new Set(), pendingBranches: new Set(),
+  sessionOwned: [], cwd: '/repo', sweepOrphans: false, ...over,
 });
 
 test('shouldCloseTaskTab: closes only when every work pane finished and the grace TTL elapsed', () => {
@@ -46,30 +51,20 @@ test('shouldClosePane: explicit status gate, previous-turn grace, vanished pane 
 });
 
 test('planIsolateSweep: untracked pier/* branches need an explicit opt-in', () => {
-  const plan = planIsolateSweep({
+  const plan = sweepPlan({
     branches: ['pier/other-session', 'pier/mine'],
     worktreesByBranch: new Map([['pier/other-session', '/wt/other'], ['pier/mine', '/wt/mine']]),
     registeredBranches: new Set(['pier/mine']),
-    pendingBranches: new Set(),
-    sessionOwned: [],
-    cwd: '/repo',
-    sweepOrphans: false,
   });
   assert.deepEqual(plan.candidates, []);
   assert.deepEqual(plan.skipped, []);
 });
 
 test('planIsolateSweep: opt-in skips pending branches and never the worktree we run in', () => {
-  const plan = planIsolateSweep({
+  const plan = sweepPlan({
     branches: ['pier/self', 'pier/other', 'pier/pending', 'pier/branchless'],
-    worktreesByBranch: new Map([
-      ['pier/self', '/wt/self'],
-      ['pier/other', '/wt/other'],
-      ['pier/pending', '/wt/pending'],
-    ]),
-    registeredBranches: new Set(),
+    worktreesByBranch: new Map([['pier/self', '/wt/self'], ['pier/other', '/wt/other'], ['pier/pending', '/wt/pending']]),
     pendingBranches: new Set(['pier/pending']),
-    sessionOwned: [],
     cwd: '/wt/self',
     sweepOrphans: true,
   });
@@ -81,25 +76,16 @@ test('planIsolateSweep: opt-in skips pending branches and never the worktree we 
 });
 
 test('planIsolateSweep: session-owned isolates stay candidates and prefer the live worktree path', () => {
-  const plan = planIsolateSweep({
-    branches: [],
+  const plan = sweepPlan({
     worktreesByBranch: new Map([['pier/mine', '/wt/moved']]),
     registeredBranches: new Set(['pier/mine']),
-    pendingBranches: new Set(),
     sessionOwned: [{ branch: 'pier/mine', worktreePath: '/wt/recorded' }],
-    cwd: '/repo',
-    sweepOrphans: false,
   });
   assert.deepEqual(plan.candidates, [{ branch: 'pier/mine', worktreePath: '/wt/moved' }]);
 
-  const nested = planIsolateSweep({
-    branches: [],
-    worktreesByBranch: new Map(),
-    registeredBranches: new Set(),
-    pendingBranches: new Set(),
+  const nested = sweepPlan({
     sessionOwned: [{ branch: 'pier/nested', worktreePath: '/wt/pier/nested' }],
     cwd: '/wt/pier/nested',
-    sweepOrphans: false,
   });
   assert.deepEqual(nested.candidates, []);
   assert.deepEqual(nested.skipped, [{ branch: 'pier/nested', reason: 'self' }]);
@@ -122,46 +108,37 @@ const consumed = (paneId: string, cwd: string) => subEntry({
   status: 'consumed', consumedAt: Date.now() - 120_000, createdAt: Date.now() - 150_000,
 });
 
-test('GC pass: a live consumed pane is closed, a vanished pane is only recorded closed', async () => {
-  const closePaneCalls: string[] = [];
-  const cwd = mkdtempSync(join(tmpdir(), 'pane-gc-'));
+/** Seeds `subs`, runs one GC pass with `livePanes` listed by herdr, then reports the closePane
+ * targets and the registry snapshot. */
+async function gcPass(livePanes: string[], subs: SubEntry[]): Promise<{ closed: string[]; subs: SubEntry[] }> {
+  const closed: string[] = [];
   const { root, pi } = await mountSubagent({
     env: { tabId: 'tMAIN' },
-    client: {
-      listPanes: async () => [pane('pAlive')],
-      closePane: async (paneId) => { closePaneCalls.push(paneId); },
-    },
-    subs: [consumed('pAlive', cwd), consumed('pGone', cwd)],
+    client: { listPanes: async () => livePanes.map(pane), closePane: async (paneId) => { closed.push(paneId); } },
+    subs,
   });
   try {
     await fire(pi, 'turn_start');
-    assert.deepEqual(closePaneCalls, ['pAlive']);
-    const byId = new Map(subsSnapshot(pi)!.subs.map((s) => [s.paneId, s.status]));
-    assert.equal(byId.get('pAlive'), 'closed');
-    assert.equal(byId.get('pGone'), 'closed');
+    return { closed, subs: subsSnapshot(pi)!.subs };
   } finally {
     await root.fiber.dispose();
   }
+}
+
+test('GC pass: a live consumed pane is closed, a vanished pane is only recorded closed', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'pane-gc-'));
+  const { closed, subs } = await gcPass(['pAlive'], [consumed('pAlive', cwd), consumed('pGone', cwd)]);
+  assert.deepEqual(closed, ['pAlive']);
+  const byId = new Map(subs.map((s) => [s.paneId, s.status]));
+  assert.equal(byId.get('pAlive'), 'closed');
+  assert.equal(byId.get('pGone'), 'closed');
 });
 
 test('GC pass: the master pane is never collected, whatever the registry claims', async () => {
-  const closePaneCalls: string[] = [];
   const cwd = mkdtempSync(join(tmpdir(), 'pane-gc-self-'));
-  const { root, pi } = await mountSubagent({
-    env: { tabId: 'tMAIN' },
-    client: {
-      listPanes: async () => [pane('p0')],
-      closePane: async (paneId) => { closePaneCalls.push(paneId); },
-    },
-    subs: [consumed('p0', cwd)], // p0 is the master itself
-  });
-  try {
-    await fire(pi, 'turn_start');
-    assert.deepEqual(closePaneCalls, [], 'closePane must never target the master');
-    assert.equal(subsSnapshot(pi)!.subs.find((s) => s.paneId === 'p0')!.status, 'consumed', 'the row is left alone');
-  } finally {
-    await root.fiber.dispose();
-  }
+  const { closed, subs } = await gcPass(['p0'], [consumed('p0', cwd)]); // p0 is the master itself
+  assert.deepEqual(closed, [], 'closePane must never target the master');
+  assert.equal(subs.find((s) => s.paneId === 'p0')!.status, 'consumed', 'the row is left alone');
 });
 
 test('registry: startup sweeps zombie running rows whose pane herdr no longer lists', async () => {

@@ -1,6 +1,6 @@
 /**
- * index.ts satellite parts: pipe-protocol dispatch, the D92 settlement-notice buffer, the
- * process-mode planner, and cross-pane write locks. All four are pure/plugin-level modules.
+ * index.ts satellite parts: pipe dispatch, the D92 settlement-notice buffer, the process-mode
+ * planner, cross-pane write locks, and the pi-surface proxy with its tombstone compensation.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -10,8 +10,10 @@ import { collapseNotices, createNoticeBuffer } from '../src/index-notices.ts';
 import { planIndexMode, type IndexMode } from '../src/index-runtime.ts';
 import { installWriteLocks } from '../src/index-locks.ts';
 import { lockTokenKey, lockTokenValue } from '../src/lock-core.ts';
+import { PiSurface } from '../src/pi-surface.ts';
+import { DisposeLedger } from '../src/ledger.ts';
 import type { AgentInfo, HerdrEnv } from '../src/herdr-client.ts';
-import { fakeHerdr, fakePi, type FakePi } from './test-utils.ts';
+import { fakeHerdr, fakePi, fire, type FakePi } from './test-utils.ts';
 
 /* ── index-pipe: common-segment pipe dispatch ───────────────────── */
 
@@ -83,11 +85,8 @@ test('handlePipeRequest: reply binds port, claims once, delivers notice', async 
   const req = { type: 'reply' as const, id: 'r1', paneId: 'p2', text: 'done', sessionFile: '/tmp/s.jsonl' };
   assert.equal((await handlePipeRequest(req, session)).type, 'ok');
   assert.deepEqual(applied, [['p2', '/tmp/s.jsonl']]);
-  assert.match(notices[0], /p2/);
-  assert.match(notices[0], /done/);
-  assert.match(notices[0], /Session: \/tmp\/s.jsonl/);
-  assert.match(notices[0], /stat: clean/);
-  assert.match(notices[0], /Reconciled: x/);
+  // the notice names the pane, the text, the session path, the stat line and the reconciliations
+  for (const frag of [/p2/, /done/, /Session: \/tmp\/s\.jsonl/, /stat: clean/, /Reconciled: x/]) assert.match(notices[0], frag);
 
   await handlePipeRequest(req, session);
   assert.equal(notices.length, 1, 'a duplicate claim must not re-deliver');
@@ -108,10 +107,7 @@ test('handlePipeRequest: the reply claim key is the id the parent pushed (B8)', 
   await handlePipeRequest({ type: 'prompt', id: sentId, text: 'go', from: 'src', push: true }, session);
   assert.equal(state.pending?.id, sentId, 'the pushed id is the pending machine request id');
 
-  await handlePipeRequest(
-    { type: 'reply', id: state.pending!.id, paneId: 'p2', text: 'done', sessionFile: null },
-    session,
-  );
+  await handlePipeRequest({ type: 'reply', id: state.pending!.id, paneId: 'p2', text: 'done', sessionFile: null }, session);
   assert.deepEqual(claims, [`p2:${sentId}`]);
 });
 
@@ -119,15 +115,13 @@ test('handlePipeRequest: role switch ok/error is relayed verbatim', async () => 
   // P0 (RFC §4.4): the master switches a worker's role over the pipe; a mixed-version peer
   // answering `unknown type role` must reach the model as that same error.
   const calls: Array<{ role: string; by: string }> = [];
+  const ROLE_MSG = 'role worker-default → reviewer (+bash)';
   const okSession = pipeSession({
     paneId: 'w1',
-    applyRoleSwitch: async (role, by) => {
-      calls.push({ role, by });
-      return { ok: true, message: 'role worker-default → reviewer (+bash)' };
-    },
+    applyRoleSwitch: async (role, by) => { calls.push({ role, by }); return { ok: true, message: ROLE_MSG }; },
   });
   const ok = await handlePipeRequest({ type: 'role', id: 'r1', role: 'reviewer' }, okSession);
-  assert.deepEqual(ok, { type: 'ok', id: 'r1', detail: 'role worker-default → reviewer (+bash)' });
+  assert.deepEqual(ok, { type: 'ok', id: 'r1', detail: ROLE_MSG });
   assert.deepEqual(calls, [{ role: 'reviewer', by: 'w1' }], 'switchedBy = the pane that asked');
 
   const errSession = pipeSession({
@@ -139,23 +133,22 @@ test('handlePipeRequest: role switch ok/error is relayed verbatim', async () => 
 
 /* ── index-notices: D92 settlement-notice buffer ────────────────── */
 
-test('createNoticeBuffer: idle delivers immediately and drops pane pending', async () => {
+/** A buffer whose delivery sink is observable; `busy` picks the immediate or the queueing branch. */
+const noticeBuf = (busy: boolean) => {
   const sent: Array<{ content: string; mode: string }> = [];
-  const buf = createNoticeBuffer({
-    isBusy: () => false,
-    send: async (content, mode) => { sent.push({ content, mode }); },
-  });
+  const buf = createNoticeBuffer({ isBusy: () => busy, send: async (content, mode) => { sent.push({ content, mode }); } });
+  return { buf, sent };
+};
+
+test('createNoticeBuffer: idle delivers immediately and drops pane pending', async () => {
+  const { buf, sent } = noticeBuf(false);
   await buf.deliverNotice('hello', 'p1');
   assert.deepEqual(sent, [{ content: 'hello', mode: 'followUp' }]);
   assert.equal(buf.noticePending().size, 0);
 });
 
 test('createNoticeBuffer: busy queues; flush steer collapses and clears GC exemption', async () => {
-  const sent: Array<{ content: string; mode: string }> = [];
-  const buf = createNoticeBuffer({
-    isBusy: () => true,
-    send: async (content, mode) => { sent.push({ content, mode }); },
-  });
+  const { buf, sent } = noticeBuf(true);
   await buf.deliverNotice('a', 'p1');
   await buf.deliverNotice('b', 'p2');
   assert.equal(sent.length, 0);
@@ -170,11 +163,7 @@ test('createNoticeBuffer: busy queues; flush steer collapses and clears GC exemp
 
 test('collapseNotices: empty → null; ≤3 verbatim; >3 → first three + count/pointer tail', () => {
   assert.equal(collapseNotices([]), null, 'an empty batch is not injected');
-  const three = [
-    'Background subagent w8:p5 (task) finished.',
-    'Background subagent w8:p6 (task) finished.',
-    'Background subagent w8:p7 (task) finished.',
-  ];
+  const three = [5, 6, 7].map((n) => `Background subagent w8:p${n} (task) finished.`);
   // At or below the cap the panes' own wording survives byte-identical: no wrapper, no tail line.
   for (const batch of [[three[0]!], three]) assert.equal(collapseNotices(batch), batch.join('\n\n'));
 
@@ -210,17 +199,18 @@ async function toolCallVerdict(pi: FakePi, event: unknown, ctx: unknown) {
   return undefined;
 }
 
+/** One `agent.list` entry: the pane id plus whatever the case overrides. */
+const agentAt = (paneId: string, over: Partial<AgentInfo> = {}): AgentInfo =>
+  ({ paneId, agent: 'pi', status: 'working', session: null, stateLabels: {}, tokens: {}, ...over });
+
 test('installWriteLocks: a peer lock blocks a relative write at the pane-resolved cwd', async (t) => {
   const win = process.platform === 'win32';
   const ctxCwd = win ? 'C:\\repo' : '/repo';
   const CASES: Array<{ name: string; own: Partial<AgentInfo>; lockedPath: string }> = [
     // Herdr ≥ 0.9.1 reports the pane's own foregroundCwd, which outranks the event ctx.cwd:
     // 'file.ts' then resolves into /repo/sub and collides with p2's lock on /repo/sub/file.ts.
-    {
-      name: 'foregroundCwd from the live agent list outranks ctx.cwd',
-      own: { foregroundCwd: win ? 'C:\\repo\\sub' : '/repo/sub' },
-      lockedPath: win ? 'c:/repo/sub/file.ts' : '/repo/sub/file.ts',
-    },
+    { name: 'foregroundCwd from the live agent list outranks ctx.cwd', own: { foregroundCwd: win ? 'C:\\repo\\sub' : '/repo/sub' },
+      lockedPath: win ? 'c:/repo/sub/file.ts' : '/repo/sub/file.ts' },
     // Herdr < 0.9.1 reports no foregroundCwd: ctx.cwd is the resolution root.
     { name: 'falls back to ctx.cwd when the pane reports none', own: {}, lockedPath: win ? 'c:/repo/file.ts' : '/repo/file.ts' },
   ];
@@ -231,8 +221,8 @@ test('installWriteLocks: a peer lock blocks a relative write at the pane-resolve
       const client = fakeHerdr({
         listAgents: async (): Promise<AgentInfo[]> => [
           // p1 is our own pane; p2 holds a lock on the resolved target path.
-          { paneId: 'p1', agent: 'pi', status: 'working', session: null, stateLabels: {}, tokens: {}, ...c.own },
-          { paneId: 'p2', agent: 'pi', status: 'working', session: null, stateLabels: {}, tokens: { [lockTokenKey(c.lockedPath)]: lockTokenValue(c.lockedPath, 'p2') } },
+          agentAt('p1', c.own),
+          agentAt('p2', { tokens: { [lockTokenKey(c.lockedPath)]: lockTokenValue(c.lockedPath, 'p2') } }),
         ],
         reportLockTokens: async (tokens) => { reported.push(tokens); },
       });
@@ -248,4 +238,114 @@ test('installWriteLocks: a peer lock blocks a relative write at the pane-resolve
       assert.deepEqual(reported, [], 'a blocked call must not claim the lock in the pane registry');
     });
   }
+});
+
+/* ── pi-surface: the per-module registration proxy (D79) ────────── */
+
+const callTool = (pi: FakePi, name: string, ...a: unknown[]) => pi.tools.get(name)?.execute?.(...a);
+
+/** Mount a generation: a `demo` tool returning `tag`, plus a turn_start handler counting its fires. */
+function mount(s: PiSurface<FakePi>, key: string, tag: string): { fired: () => number } {
+  let fired = 0;
+  const scoped = s.forModule(key);
+  scoped.registerTool({ name: 'demo', execute: async () => tag });
+  scoped.on('turn_start', () => { fired++; });
+  return { fired: () => fired };
+}
+
+test('surface: registrations pass through while the generation is alive', async () => {
+  const pi = fakePi();
+  const scoped = new PiSurface(pi).forModule('core/a');
+  let fired = 0;
+  scoped.on('session_start', () => { fired++; });
+  scoped.registerTool({ name: 't1', execute: async () => 'OK' });
+  await fire(pi, 'session_start');
+  assert.equal(fired, 1);
+  assert.equal(await callTool(pi, 't1'), 'OK');
+});
+
+test('surface: disposeModule tombstones the handler and puts the tool inert', async () => {
+  const pi = fakePi();
+  const s = new PiSurface(pi);
+  const scoped = s.forModule('core/a');
+  let fired = 0;
+  scoped.on('turn_start', () => { fired++; });
+  scoped.registerTool({ name: 't1', execute: async () => 'OK' });
+  assert.equal(s.disposeModule('core/a'), true);
+  await fire(pi, 'turn_start');
+  assert.equal(fired, 0, 'a tombstoned handler must not fire (hmr double-fire fix)');
+  assert.match(((await callTool(pi, 't1')) as { content: Array<{ text: string }> }).content[0]!.text, /disposed/);
+  assert.equal(s.disposeModule('core/a'), false, 'a second dispose is an idempotent false');
+});
+
+test('surface: hot swap — the new generation wins and the old handler stays silent', async () => {
+  const pi = fakePi();
+  const s = new PiSurface(pi);
+  const v1 = mount(s, 'core/a', 'v1');
+  s.disposeModule('core/a'); // hmr compensation tears the old generation down
+  const v2 = mount(s, 'core/a', 'v2');
+  assert.equal(await callTool(pi, 'demo'), 'v2', 'tools overwrite by name: the new version wins');
+  await fire(pi, 'turn_start');
+  assert.equal(v1.fired(), 0, 'the old handler is tombstoned (no double fire)');
+  assert.equal(v2.fired(), 1, 'the new handler fires once');
+});
+
+test('surface: ledger interlock — disposing a key flips its tombstone', async () => {
+  const pi = fakePi();
+  const ledger = new DisposeLedger();
+  const s = new PiSurface(pi, ledger);
+  let fired = 0;
+  s.forModule('core/a').on('session_start', () => { fired++; });
+  ledger.disposeKey('core/a'); // the same path hmr/reload takes
+  await fire(pi, 'session_start');
+  assert.equal(fired, 0, 'ledger compensation is a tombstone');
+});
+
+test('surface: hmr ordering — a disposeKey after the remount must not kill the new generation', async () => {
+  // Real cordis-plugin-hmr order: registry.delete → the replacement remounts on the same key →
+  // emit('hmr/reload') → ledger.disposeKey(file). Generations mounted after the ledger entry are
+  // exempt, so the replacement's tools survive instead of dying on arrival.
+  const pi = fakePi();
+  const ledger = new DisposeLedger();
+  const s = new PiSurface(pi, ledger);
+  const KEY = 'file:///F:/repo/src/plugins/demo.ts';
+  const v1 = mount(s, KEY, 'v1');
+  await fire(pi, 'turn_start');
+  assert.equal(v1.fired(), 1, 'precondition: v1 alive');
+
+  const v2 = mount(s, KEY, 'v2'); // the replacement body runs and re-registers
+  ledger.disposeKey(KEY); // compensation arrives only after the remount
+
+  assert.equal(await callTool(pi, 'demo'), 'v2', 'the new generation must survive (dead-on-arrival regression)');
+  await fire(pi, 'turn_start');
+  assert.equal(v1.fired(), 1, 'the old generation went no-op at remount (no double fire)');
+  assert.equal(v2.fired(), 1, 'the new generation fires');
+});
+
+test('surface: pi 0.86 unsubscribe — retirement removes the listener instead of only tombstoning it', async () => {
+  const base = fakePi();
+  const removed: string[] = [];
+  const pi: FakePi = {
+    ...base,
+    on(event, handler) {
+      base.on(event, handler);
+      return () => {
+        base.listeners.set(event, (base.listeners.get(event) ?? []).filter((h) => h !== handler));
+        removed.push(event);
+      };
+    },
+  };
+  const s = new PiSurface(pi);
+  const scoped = s.forModule('core/a');
+  let fired = 0;
+  scoped.on('turn_start', () => { fired++; });
+  scoped.registerTool({ name: 't1', execute: async () => 'OK' });
+  await fire(pi, 'turn_start');
+  assert.equal(fired, 1);
+  assert.deepEqual(removed, [], 'no early unsubscribe while alive');
+
+  s.disposeModule('core/a');
+  assert.deepEqual(removed, ['turn_start'], 'retirement calls the unsubscribe');
+  assert.deepEqual(pi.listeners.get('turn_start') ?? [], [], 'the dispatch list really shrinks');
+  assert.match(((await callTool(pi, 't1')) as { content: Array<{ text: string }> }).content[0]!.text, /disposed/, 'tools still tombstone: pi has no unregisterTool');
 });

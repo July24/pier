@@ -1,13 +1,12 @@
-/**
- * Small process-level infrastructure, no plugin wiring: DisposeLedger (HMR compensation + D79
- * unregistration), routing-telemetry rows, storage/platform path layout, the PIER_OPTIONS registry
- * with RuntimePolicy, and the swallow/toolError failure bookkeeping.
- */
+/** Process-level infrastructure: DisposeLedger (HMR/D79), telemetry rows, storage layout, PIER_OPTIONS
+ *  + RuntimePolicy, swallow/toolError bookkeeping, and the boot / installer guards. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createCordisApp, detectExposeInternals } from '../src/bootstrap.ts';
 import { DisposeLedger } from '../src/ledger.ts';
 import { createPlatformPaths } from '../src/platform-paths.ts';
 import { PIER_OPTIONS, formatOptionRows, pierOption, pierOptionRows } from '../src/pier-options.ts';
@@ -38,16 +37,14 @@ test('ledger: disposeAll is LIFO (cordis effect order) and survives a throwing d
   led.add('a', () => ran.push('1'));
   led.add('b', () => { throw new Error('boom'); });
   led.add('c', () => ran.push('3'));
-  assert.equal(led.disposeAll(), 3); assert.deepEqual(ran, ['3', '1'], 'LIFO, the throw is swallowed');
-  assert.equal(led.size, 0);
+  assert.equal(led.disposeAll(), 3); assert.deepEqual(ran, ['3', '1'], 'LIFO, the throw is swallowed'); assert.equal(led.size, 0);
 });
 
 test('ledger: add returns an undo fn (self-disposing resource is not torn down twice)', () => {
   const led = new DisposeLedger();
   let disposed = 0;
   led.add('a', () => disposed++)();
-  assert.equal(led.size, 0); assert.equal(led.disposeKey('a'), 0, 'undone entries never match');
-  assert.equal(disposed, 0);
+  assert.equal(led.size, 0); assert.equal(led.disposeKey('a'), 0, 'undone entries never match'); assert.equal(disposed, 0);
 });
 
 test('ledger: keys are normalized (file:// URL vs path, backslashes, logical names)', () => {
@@ -142,8 +139,7 @@ test('piCoreSessionDirName/piSessionDirCandidates: byte-identical to pi core, pi
 
 test('createPlatformPaths: overrides win; sessionsDir defaults under agentDataDir', () => {
   const p = createPlatformPaths({ agentDataDir: '/x/agent', worktreeBaseDir: '/x/wt' });
-  assert.equal(p.agentDataDir, '/x/agent'); assert.equal(p.worktreeBaseDir, '/x/wt');
-  assert.equal(p.sessionsDir, join('/x/agent', 'sessions'));
+  assert.equal(p.agentDataDir, '/x/agent'); assert.equal(p.worktreeBaseDir, '/x/wt'); assert.equal(p.sessionsDir, join('/x/agent', 'sessions'));
   assert.equal(createPlatformPaths({ agentDataDir: '/x/agent', sessionsDir: '/custom/sessions' }).sessionsDir, '/custom/sessions');
 });
 
@@ -242,8 +238,7 @@ test('swallow: records tag/cause/time instead of throwing (cleanup must continue
   resetSwallowedErrors();
   assert.doesNotThrow(() => swallow('todo.persist-edit', new ReferenceError('persistEdit is not defined'), {}));
   const [entry] = swallowedErrors();
-  assert.equal(entry!.tag, 'todo.persist-edit'); assert.match(entry!.message, /ReferenceError: persistEdit is not defined/);
-  assert.ok(entry!.at > 0);
+  assert.equal(entry!.tag, 'todo.persist-edit'); assert.match(entry!.message, /ReferenceError: persistEdit is not defined/); assert.ok(entry!.at > 0);
 });
 
 test('swallow: the ring buffer is bounded (no unbounded growth per session)', () => {
@@ -265,8 +260,7 @@ test('swallow: PIER_TRACE / legacy PI_HERDR_TRACE writes to stderr', () => {
   } finally {
     console.error = orig;
   }
-  assert.equal(seen.length, 2); assert.match(seen[0]!, /swallowed x\.y: Error: loud/);
-  assert.match(seen[1]!, /swallowed x\.w: Error: legacy/);
+  assert.equal(seen.length, 2); assert.match(seen[0]!, /swallowed x\.y: Error: loud/); assert.match(seen[1]!, /swallowed x\.w: Error: legacy/);
 });
 
 test('formatSwallowedErrors: explicit empty state, otherwise the last 10', () => {
@@ -305,4 +299,45 @@ test('A1: toolError drops the redundant "Error: " prefix and keeps the cause', (
   assert.throws(() => toolError('boom'), (err: unknown) => { assert.equal((err as Error).message, 'boom');
     return true;
   });
+});
+
+/* ── boot and installer guards: starting pier outside a dev checkout ─────── */
+// Production must not loader.create() .ts files unless HMR is active (Node cannot strip types under
+// node_modules; the loader path exists for dev HMR only), and the installer CLI must stay runnable
+// from an npx cache (no repo checkout).
+const root = fileURLToPath(new URL('../../../', import.meta.url));
+const master = readFileSync(fileURLToPath(new URL('../src/index-master.ts', import.meta.url)), 'utf8');
+
+test('bootstrap: Loader mounts, hmr stays off, dispose runs the shutdown hook', async () => {
+  let disposed = false;
+  const app = await createCordisApp({ onDispose: () => { disposed = true; } });
+  assert.equal(app.loaderReady, true);
+  const withLoader = app.root as unknown as { loader?: { builtins: Record<string, unknown> } };
+  assert.ok(withLoader.loader, 'the loader service is on the tree'); assert.ok(withLoader.loader.builtins.group, 'the cordis:group builtin is registered (D80③)');
+  assert.equal(app.hmrActive, false, 'no --expose-internals + PI_HERDR_HMR → hmr is not mounted (zero watchers)');
+  assert.equal(typeof detectExposeInternals(), 'boolean');
+  assert.equal(detectExposeInternals(), process.execArgv.includes('--expose-internals'), 'the flag is read from the current execArgv');
+  await app.root.fiber.dispose();
+  assert.equal(disposed, true, 'onDispose runs on tree teardown (session_shutdown path)');
+});
+
+test('production mount uses loader.create only when HMR is active', () => {
+  assert.match(master, /loaderReady && cordisApp\.hmrActive/); assert.match(master, /loadEntry\(sessionRoot, useLoader,/);
+});
+
+test('prepare links node_modules/.bin/pier-setup so in-repo npx finds the CLI', () => {
+  const r = spawnSync(process.execPath, [join(root, 'install.mjs'), '--prepare'], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr + r.stdout); assert.ok(existsSync(join(root, 'node_modules', '.bin', 'pier-setup')));
+});
+
+test('installer CLI: version --json and --help', () => {
+  const cli = join(root, 'install.mjs');
+  const help = spawnSync(process.execPath, [cli, '--help'], { encoding: 'utf8' });
+  assert.equal(help.status, 0, help.stderr); assert.match(help.stdout, /pier-setup version/);
+  assert.match(help.stdout, /pier-setup update/);
+  const ver = spawnSync(process.execPath, [cli, 'version', '--json'], { encoding: 'utf8' });
+  assert.equal(ver.status, 0, ver.stderr);
+  const data = JSON.parse(ver.stdout);
+  assert.equal(data.installer.name, 'pier-setup'); assert.ok(data.installer.version);
+  assert.ok('piExt' in data && 'herdr' in data && 'latest' in data);
 });

@@ -1,8 +1,5 @@
-/**
- * Child-session I/O and output observation: candidate resolution (own/taken exclusions), liveness
- * probes, state derivation with cache invalidation, the output delta, the `output` action, and the
- * reply-session healing paths (resume, poisoned sessionFile, re-armed settlement watch).
- */
+/** Child-session I/O and output observation: candidate resolution, liveness probes, state
+ * derivation with cache invalidation, the output delta, the `output` action and reply healing. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
@@ -12,25 +9,12 @@ import type { AgentInfo, HerdrClientLike } from '../src/herdr-client.ts';
 import { SUBS_CUSTOM_TYPE, type SubEntry } from '../src/subagent-core.ts';
 import { sessionDirName } from '../src/session-tail.ts';
 import {
-  computeSubagentOutputDelta,
-  createSessionIo,
-  formatSubagentOutput,
-  resolveSubagentStatus,
-  type SubagentOutputCursor,
+  computeSubagentOutputDelta, createSessionIo, formatSubagentOutput, resolveSubagentStatus, type SubagentOutputCursor,
 } from '../src/subagent-session.ts';
 import { appendHistory } from '../src/history-store.ts';
 import { preferredHistoryFile } from '../src/storage-layout.ts';
 import {
-  TempHome,
-  fakeHerdr,
-  fire,
-  jsonl,
-  mountSubagent,
-  runSubagent,
-  runSubagentRejects,
-  subsSnapshot,
-  subEntry,
-  transcriptMessage,
+  TempHome, fakeHerdr, fire, jsonl, mountSubagent, runSubagent, runSubagentRejects, subsSnapshot, subEntry, transcriptMessage,
   type FakePi,
 } from './test-utils.ts';
 
@@ -59,9 +43,7 @@ test('subSessionState: a readable session with terminal text settles', async () 
   const dir = sessions();
   const file = join(dir, 'child.jsonl');
   writeSession(file, [transcriptMessage('assistant', 'ok', TS + 10)]);
-  assert.deepEqual(await io(file, dir).subSessionState('wC:p4', dir, TS), {
-    text: 'ok', pendingTool: false, activity: true, turnEnded: true, compacting: false,
-  });
+  assert.deepEqual(await io(file, dir).subSessionState('wC:p4', dir, TS), { ...NO_STATE, text: 'ok', activity: true, turnEnded: true });
 });
 
 test('subSessionState: between tool calls the turn has NOT ended', async () => {
@@ -72,9 +54,7 @@ test('subSessionState: between tool calls the turn has NOT ended', async () => {
     { type: 'message', message: { role: 'assistant', content: [{ type: 'toolCall' }], timestamp: TS + 10, stopReason: 'toolUse' } },
     transcriptMessage('toolResult', 'ok', TS + 20),
   ]);
-  assert.deepEqual(await io(file, dir).subSessionState('wC:p4', dir, TS), {
-    text: null, pendingTool: false, activity: true, turnEnded: false, compacting: false,
-  });
+  assert.deepEqual(await io(file, dir).subSessionState('wC:p4', dir, TS), { ...NO_STATE, activity: true });
 });
 
 test('subSessionState: cache invalidates on append (a stale hit would hang pendingTool forever)', async () => {
@@ -82,13 +62,9 @@ test('subSessionState: cache invalidates on append (a stale hit would hang pendi
   const file = join(dir, 'child-growing.jsonl');
   writeSession(file, [{ type: 'message', message: { role: 'assistant', content: [{ type: 'toolCall' }], timestamp: TS + 10, stopReason: 'toolUse' } }]);
   const session = io(file, dir);
-  assert.deepEqual(await session.subSessionState('wC:p4', dir, TS), {
-    text: null, pendingTool: true, activity: true, turnEnded: false, compacting: false,
-  });
+  assert.deepEqual(await session.subSessionState('wC:p4', dir, TS), { ...NO_STATE, pendingTool: true, activity: true });
   writeSession(file, [transcriptMessage('assistant', 'finished', TS + 20)], true);
-  assert.deepEqual(await session.subSessionState('wC:p4', dir, TS), {
-    text: 'finished', pendingTool: false, activity: true, turnEnded: true, compacting: false,
-  });
+  assert.deepEqual(await session.subSessionState('wC:p4', dir, TS), { ...NO_STATE, text: 'finished', activity: true, turnEnded: true });
 });
 
 test('collectFinalText: a cached null must not stick after the session gains closing text', async () => {
@@ -103,26 +79,15 @@ test('collectFinalText: a cached null must not stick after the session gains clo
 
 test('probeAlive: pane.list decides liveness; an unknown shell is alive and agent.list cannot resurrect a miss', async () => {
   const dir = sessions();
-  const unknown = createSessionIo({
-    client: fakeHerdr({
-      listPanes: async () => [{ paneId: 'wH:p3', tabId: 'wH:t1', workspaceId: 'wH', agentStatus: 'unknown', foregroundCwd: '/tmp/work' }],
-    }),
-    getSessionId: () => '',
-    sessionsDir: () => dir,
-  });
-  const probe = await unknown.probeAlive('wH:p3', dir);
+  const ioFor = (over: Partial<HerdrClientLike>) => createSessionIo({ client: fakeHerdr(over), getSessionId: () => '', sessionsDir: () => dir });
+  const probe = await ioFor({
+    listPanes: async () => [{ paneId: 'wH:p3', tabId: 'wH:t1', workspaceId: 'wH', agentStatus: 'unknown', foregroundCwd: '/tmp/work' }],
+  }).probeAlive('wH:p3', dir);
   assert.equal(probe.paneExists, true);
   assert.equal(probe.agentStatus, 'unknown');
   assert.equal(probe.foregroundCwd, '/tmp/work');
 
-  const gone = createSessionIo({
-    client: fakeHerdr({
-      listPanes: async () => [],
-      listAgents: async () => [{ paneId: 'wH:p3', agent: 'pi', status: 'working', session: null, stateLabels: {}, tokens: {} }],
-    }),
-    getSessionId: () => '',
-    sessionsDir: () => dir,
-  });
+  const gone = ioFor({ listAgents: async () => [agentInfo({ paneId: 'wH:p3' })] });
   assert.equal((await gone.probeAlive('wH:p3', dir)).paneExists, false);
 });
 
@@ -157,24 +122,17 @@ test('resolveSessionFile: the master transcript and sessions claimed by other pa
   utimesSync(stale, 2_000, 2_000);
   utimesSync(master, 3_000, 3_000);
 
-  const fallback = createSessionIo({
-    client: fakeHerdr(),
-    getSessionId: () => MASTER_ID,
-    sessionsDir: () => sessionsDir,
-  });
-  assert.equal(await fallback.resolveSessionFile('wA:p25', cwd), stale);
+  const ioFor = (client: Partial<HerdrClientLike> = {}) =>
+    createSessionIo({ client: fakeHerdr(client), getSessionId: () => MASTER_ID, sessionsDir: () => sessionsDir });
+  assert.equal(await ioFor().resolveSessionFile('wA:p25', cwd), stale);
 
-  const reported = createSessionIo({
-    client: fakeHerdr({
-      // herdr's report itself points at the master's file; another pane claims a bare id.
-      getAgentSessionPath: async () => master,
-      listAgents: async () => [
-        agentInfo({ paneId: 'wA:p1F', status: 'idle', session: master }),
-        agentInfo({ paneId: 'wA:p24', status: 'idle', session: '01a0bd34-1ccd-73e1-a93f-e57e7f124d49' }),
-      ],
-    }),
-    getSessionId: () => MASTER_ID,
-    sessionsDir: () => sessionsDir,
+  // herdr's report itself points at the master's file; another pane claims a bare id.
+  const reported = ioFor({
+    getAgentSessionPath: async () => master,
+    listAgents: async () => [
+      agentInfo({ paneId: 'wA:p1F', status: 'idle', session: master }),
+      agentInfo({ paneId: 'wA:p24', status: 'idle', session: '01a0bd34-1ccd-73e1-a93f-e57e7f124d49' }),
+    ],
   });
   assert.equal(await reported.resolveSessionFile('wA:p25', cwd), sub, 'own and taken reports (paths or bare ids) are rejected');
   home.dispose();
@@ -225,41 +183,28 @@ test('reattributeStaleSessionFile: repairs a stale or poisoned value from herdr,
   const stalePreferred = file('2026-09-16T07-15-46-751Z_44444444-4444-4444-8444-444444444444.jsonl');
   utimesSync(stalePreferred, new Date(Date.now() - 3_600_000), new Date(Date.now() - 3_600_000));
 
-  const poisoned = createSessionIo({
+  const ioFor = (reported: string) => createSessionIo({
     client: fakeHerdr({
-      listAgents: async () => [
-        agentInfo({ paneId: 'wA:pStale', session: ownFile }),
-        agentInfo({ paneId: 'wA:pOther', session: takenFile }),
-      ],
-      getAgentSessionPath: async () => ownFile,
+      listAgents: async () => [agentInfo({ paneId: 'wA:pStale', session: reported }), agentInfo({ paneId: 'wA:pOther', session: takenFile })],
+      getAgentSessionPath: async () => reported,
     }),
     getSessionId: () => ownFile,
     sessionsDir: () => agentDir,
   });
+  const reattribute = (reported: string, preferred: string | null) =>
+    ioFor(reported).reattributeStaleSessionFile('wA:pStale', '/tmp/proj', Date.now(), preferred);
+
   assert.equal(
-    await poisoned.reattributeStaleSessionFile('wA:pStale', '/tmp/proj', Date.now(), stalePreferred),
+    await reattribute(ownFile, stalePreferred),
     null,
     'an own-transcript report is rejected even though the file is fresh',
   );
-
-  const repairing = createSessionIo({
-    client: fakeHerdr({
-      listAgents: async () => [
-        agentInfo({ paneId: 'wA:pStale', session: foreignFile }),
-        agentInfo({ paneId: 'wA:pOther', session: takenFile }),
-      ],
-      getAgentSessionPath: async () => foreignFile,
-    }),
-    getSessionId: () => ownFile,
-    sessionsDir: () => agentDir,
-  });
-  const now = Date.now();
-  assert.equal(await repairing.reattributeStaleSessionFile('wA:pStale', '/tmp/proj', now, stalePreferred), foreignFile);
-  assert.equal(await repairing.reattributeStaleSessionFile('wA:pStale', '/tmp/proj', now, foreignFile), foreignFile, 'a fresh preferred is kept as-is');
+  assert.equal(await reattribute(foreignFile, stalePreferred), foreignFile);
+  assert.equal(await reattribute(foreignFile, foreignFile), foreignFile, 'a fresh preferred is kept as-is');
   // The master rewrites its own transcript continuously, so freshness alone must not preserve poison;
   // the report repairs it instead of returning null (= keep the old value).
-  assert.equal(await repairing.reattributeStaleSessionFile('wA:pStale', '/tmp/proj', now, ownFile), foreignFile);
-  assert.equal(await repairing.reattributeStaleSessionFile('wA:pStale', '/tmp/proj', now, takenFile), foreignFile);
+  assert.equal(await reattribute(foreignFile, ownFile), foreignFile);
+  assert.equal(await reattribute(foreignFile, takenFile), foreignFile);
 });
 
 /* ── output delta (pure) ────────────────────────────────────────── */
@@ -341,21 +286,14 @@ test('resolveSubagentStatus: blocked > working > settled > idle, running as the 
 
 test('formatSubagentOutput: header, body, empty-delta notice and flags', () => {
   const formatted = formatSubagentOutput({
-    paneId: 'wD:p6',
-    status: 'running',
-    revision: 5,
-    bufferTruncated: false,
+    paneId: 'wD:p6', status: 'running', revision: 5, bufferTruncated: false,
     deltaResult: { delta: 'Compiling module A...\nDone.', restart: false, truncated: false },
   });
   assert.match(formatted, /\[Subagent Output \| pane: wD:p6 \| status: running \| revision: 5\]/);
   assert.match(formatted, /Compiling module A\.\.\.\nDone\./);
 
   const flagged = formatSubagentOutput({
-    paneId: 'wD:p6',
-    status: 'blocked',
-    revision: 2,
-    bufferTruncated: true,
-    askQuestion: 'Confirm overwrite?',
+    paneId: 'wD:p6', status: 'blocked', revision: 2, bufferTruncated: true, askQuestion: 'Confirm overwrite?',
     deltaResult: { delta: '', restart: true, truncated: false },
   });
   assert.match(flagged, /status: blocked \(question: "Confirm overwrite\?"\)/);
@@ -388,6 +326,12 @@ async function withWorker(
   }
 }
 
+/** The worker pane's agent report plus the buffer `agent.read` answers with. */
+const outputPane = (text: () => string, over: Partial<AgentInfo> = {}) => ({
+  listAgents: async () => [agentInfo(over)],
+  readAgent: async () => ({ text: text(), revision: 1, truncated: false }),
+});
+
 test('output action: missing and unknown ids fail with actionable messages', async () => {
   const { root, pi } = await mountSubagent();
   try {
@@ -407,10 +351,7 @@ test('output action: incremental reads return only the delta since the last call
     const second = await runSubagent(pi, { action: 'output', agentId: 'pWorker' });
     assert.match(second.content[0]!.text, /Progress: compiling module B/);
     assert.doesNotMatch(second.content[0]!.text, /Initial output line 2/, 'only the delta is returned');
-  }, {
-    listAgents: async () => [agentInfo({ status: 'working' })],
-    readAgent: async () => ({ text: output, revision: 1, truncated: false }),
-  });
+  }, outputPane(() => output));
 });
 
 test('output action: older herdr without agent.read still observes through pane.read', async () => {
@@ -420,7 +361,7 @@ test('output action: older herdr without agent.read still observes through pane.
     assert.equal(readPaneCalled, true);
     assert.match(res.content[0]!.text, /fallback text from readPane/);
   }, {
-    listAgents: async () => [agentInfo({ status: 'working' })],
+    ...outputPane(() => ''),
     readAgent: async () => { throw new Error('unknown method: agent.read'); },
     readPane: async () => {
       readPaneCalled = true;
@@ -434,10 +375,7 @@ test('output action: a human gate is reported with its question', async () => {
     const res = await runSubagent(pi, { action: 'output', agentId: 'pWorker' });
     assert.equal(res.details!.status, 'blocked');
     assert.match(res.content[0]!.text, /status: blocked \(question: "Should we delete existing tables\?"\)/);
-  }, {
-    listAgents: async () => [agentInfo({ status: 'blocked', tokens: { 'pi-ask': 'Should we delete existing tables?' } })],
-    readAgent: async () => ({ text: 'waiting\n', revision: 1, truncated: false }),
-  });
+  }, outputPane(() => 'waiting\n', { status: 'blocked', tokens: { 'pi-ask': 'Should we delete existing tables?' } }));
 });
 
 test('output action: a settled row reports settled even while the pane is idle', async () => {
@@ -445,10 +383,7 @@ test('output action: a settled row reports settled even while the pane is idle',
     const res = await runSubagent(pi, { action: 'output', agentId: 'pWorker' });
     assert.equal(res.details!.status, 'settled');
     assert.match(res.content[0]!.text, /status: settled/);
-  }, {
-    listAgents: async () => [agentInfo({ status: 'idle' })],
-    readAgent: async () => ({ text: 'Task completed successfully.\n', revision: 4, truncated: false }),
-  }, 'settled');
+  }, outputPane(() => 'Task completed successfully.\n', { status: 'idle' }), 'settled');
 });
 
 test('output action: an idle pane showing only its overlay still surfaces the transcript report, once', async () => {
@@ -469,10 +404,7 @@ test('output action: an idle pane showing only its overlay still surfaces the tr
     assert.equal(second.details!.deltaLength, 0);
     assert.equal(second.details!.reportDelivered, false, 'an unchanged report is not re-delivered');
     assert.doesNotMatch(second.content[0]!.text, /Subagent Report/);
-  }, {
-    listAgents: async () => [agentInfo({ status: 'idle', session: report })],
-    readAgent: async () => ({ text: 'todo: 0▶ 0○ 0■ 7✓\n   +3 hidden (7✓) · /todos\n', revision: 0, truncated: false }),
-  });
+  }, outputPane(() => 'todo: 0▶ 0○ 0■ 7✓\n   +3 hidden (7✓) · /todos\n', { status: 'idle', session: report }));
   home.dispose();
 });
 

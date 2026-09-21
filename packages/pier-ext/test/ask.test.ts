@@ -17,10 +17,10 @@ import {
 
 const plain: MinimalTheme = { fg: (_c, t) => t, bold: (t) => t };
 
-const multi = (over: Partial<DialogConfig> = {}): DialogConfig => ({
-  options: [{ label: 'alpha' }, { label: 'beta', description: 'second' }, { label: 'gamma' }],
-  allowOther: true, multi: true, ...over,
-});
+const DIALOG: DialogConfig = {
+  options: [{ label: 'alpha' }, { label: 'beta', description: 'second' }, { label: 'gamma' }], allowOther: true, multi: true,
+};
+const multi = (over: Partial<DialogConfig> = {}): DialogConfig => ({ ...DIALOG, ...over });
 const single = (over: Partial<DialogConfig> = {}): DialogConfig => multi({ multi: false, ...over });
 
 type Key = Parameters<typeof stepDialog>[1];
@@ -107,21 +107,19 @@ const GRAMMAR_CASES: GrammarCase[] = [
 ];
 
 test('stepDialog key grammar', async (t) => {
-  for (const c of GRAMMAR_CASES) {
-    await t.test(c.name, () => {
-      let state = createDialogState(c.config);
-      let outcome: DialogOutcome | undefined;
-      for (const [i, key] of c.keys.entries()) {
-        const step = stepDialog(state, key, c.config);
-        state = step.state;
-        if (i < c.keys.length - 1) assert.equal(step.outcome, undefined, `key ${i} (${key}) ended the dialog early`);
-        outcome = step.outcome;
-      }
-      assert.deepEqual(outcome, c.outcome);
-      if (c.labels) assert.deepEqual(selectedLabels(state, c.config), c.labels);
-      if (c.cursor !== undefined) assert.equal(state.cursor, c.cursor);
-    });
-  }
+  for (const c of GRAMMAR_CASES) await t.test(c.name, () => {
+    let state = createDialogState(c.config);
+    let outcome: DialogOutcome | undefined;
+    for (const [i, key] of c.keys.entries()) {
+      const step = stepDialog(state, key, c.config);
+      state = step.state;
+      if (i < c.keys.length - 1) assert.equal(step.outcome, undefined, `key ${i} (${key}) ended the dialog early`);
+      outcome = step.outcome;
+    }
+    assert.deepEqual(outcome, c.outcome);
+    if (c.labels) assert.deepEqual(selectedLabels(state, c.config), c.labels);
+    if (c.cursor !== undefined) assert.equal(state.cursor, c.cursor);
+  });
 });
 
 test('resolveDialogKey understands host bindings, literals and fallback sequences', () => {
@@ -147,11 +145,9 @@ const ROW_CASES: Array<{ name: string; config: DialogConfig; keys: Key[]; lines:
 ];
 
 test('dialogLines: cursor, toggles, recommendation and the free-text row', async (t) => {
-  for (const c of ROW_CASES) {
-    await t.test(c.name, () => {
-      assert.deepEqual(dialogLines(feed(createDialogState(c.config), c.keys, c.config), c.config, plain), c.lines);
-    });
-  }
+  for (const c of ROW_CASES) await t.test(c.name, () => {
+    assert.deepEqual(dialogLines(feed(createDialogState(c.config), c.keys, c.config), c.config, plain), c.lines);
+  });
 });
 
 /** `width` is the inner (width-2) the component measures hints against; omitted = unbounded. */
@@ -166,12 +162,10 @@ const FOOTER_CASES: Array<{ name: string; config: DialogConfig; keys?: Key[]; wi
 ];
 
 test('dialogFooter: hints, count and the narrow-pane floors', async (t) => {
-  for (const c of FOOTER_CASES) {
-    await t.test(c.name, () => {
-      const state = feed(createDialogState(c.config), c.keys ?? [], c.config);
-      assert.equal(dialogFooter(state, c.config, plain, kb, c.width), c.expected);
-    });
-  }
+  for (const c of FOOTER_CASES) await t.test(c.name, () => {
+    const state = feed(createDialogState(c.config), c.keys ?? [], c.config);
+    assert.equal(dialogFooter(state, c.config, plain, kb, c.width), c.expected);
+  });
 });
 
 test('component: renders the framed chrome and fits every line to width', () => {
@@ -211,23 +205,18 @@ const KEY_SEQUENCE_CASES: Array<{ name: string; keys: string[]; outcomes: Dialog
 ];
 
 test('component: key sequences drive the state machine and finish once', async (t) => {
-  for (const c of KEY_SEQUENCE_CASES) {
-    await t.test(c.name, () => {
-      const outcomes: DialogOutcome[] = [];
-      const component = createDialogComponent({ title: 'Q', config: multi(), theme: plain, keybindings: kb, done: (o) => outcomes.push(o) });
-      for (const key of c.keys) component.handleInput(key);
-      assert.deepEqual(outcomes, c.outcomes);
-    });
-  }
+  for (const c of KEY_SEQUENCE_CASES) await t.test(c.name, () => {
+    const outcomes: DialogOutcome[] = [];
+    const component = createDialogComponent({ title: 'Q', config: multi(), theme: plain, keybindings: kb, done: (o) => outcomes.push(o) });
+    for (const key of c.keys) component.handleInput(key);
+    assert.deepEqual(outcomes, c.outcomes);
+  });
 });
 
 test('component: aborting the signal cancels exactly once and later keys are ignored', () => {
   const outcomes: DialogOutcome[] = [];
   const controller = new AbortController();
-  const component = createDialogComponent({
-    title: 'Q', config: multi(), theme: plain, keybindings: kb, signal: controller.signal,
-    done: (o) => outcomes.push(o),
-  });
+  const component = createDialogComponent({ title: 'Q', config: multi(), theme: plain, keybindings: kb, signal: controller.signal, done: (o) => outcomes.push(o) });
   controller.abort();
   controller.abort(); // second abort must not double-finish
   component.handleInput('\r');
@@ -241,8 +230,7 @@ test('component: ctrl+o toggles tool expansion without touching the state', () =
     matches: (data, id) => (id === 'app.tools.expand' ? data === '\x0f' : kb.matches(data, id)),
   };
   const component = createDialogComponent({
-    title: 'Q', config: multi(), theme: plain, keybindings,
-    toggleToolsExpanded: () => expansions.push(true),
+    title: 'Q', config: multi(), theme: plain, keybindings, toggleToolsExpanded: () => expansions.push(true),
     done: () => { throw new Error('dialog must not finish'); },
   });
   component.handleInput('\x0f');
@@ -291,6 +279,9 @@ function dialogUi(keys: string[], input = 'typed by hand'): AskUi {
   };
 }
 
+/** A one-question questionnaire spec — the envelope every runAsk path below drives. */
+const askOne = (question: AskQuestion, ui: AskUi) => runAsk({ mode: 'questionnaire', questions: [question] }, ui);
+
 test('runAsk: the pier dialog drives both modes and its Other row opens free text', async () => {
   const chosen = specOf({ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }], multi: true });
   const selected = await runAsk(chosen, dialogUi([' ', '\x1b[B', ' ', '\r']));
@@ -313,9 +304,8 @@ test('runAsk: an unusable dialog (RPC mode) falls back to the typed prompt; a de
 const REDIS = { label: 'Redis', description: 'In-memory' };
 const POSTGRES = { label: 'Postgres', description: 'Relational' };
 
-const q = (over: Partial<AskQuestion> = {}): AskQuestion => ({
-  question: 'Which database?', options: [REDIS, POSTGRES], multi: false, allowOther: true, ...over,
-});
+const q = (over: Partial<AskQuestion> = {}): AskQuestion =>
+  ({ question: 'Which database?', options: [REDIS, POSTGRES], multi: false, allowOther: true, ...over });
 
 /** Parse params and return the spec; fails the test when prepareAsk rejects. */
 function specOf(params: unknown): AskSpec {
@@ -351,10 +341,8 @@ test('prepareAsk: question+options wrap into one question; questions overrides t
   assert.equal(wrapped[0]!.recommended, 0);
   assert.equal(wrapped[0]!.multi, false);
 
-  const batched = questionsOf({
-    question: 'ignored?', options: [REDIS, POSTGRES],
-    questions: [{ question: 'Cache?', options: [REDIS, POSTGRES] }, { question: 'SQL?', options: [POSTGRES, REDIS], multi: true }],
-  });
+  const batched = questionsOf({ question: 'ignored?', options: [REDIS, POSTGRES],
+    questions: [{ question: 'Cache?', options: [REDIS, POSTGRES] }, { question: 'SQL?', options: [POSTGRES, REDIS], multi: true }] });
   assert.deepEqual(batched.map((item) => item.question), ['Cache?', 'SQL?']);
   assert.equal(batched[1]?.multi, true);
 });
@@ -432,12 +420,13 @@ test('hasAskUi / noUiResult: a missing input is not a decline', () => {
 });
 
 test('runAsk freeform: answer envelope; Esc declines', async () => {
-  const answered = await runAsk({ mode: 'freeform', question: 'deploy staging?' }, { input: async () => '  ok  ' });
+  const freeform: AskSpec = { mode: 'freeform', question: 'deploy staging?' };
+  const answered = await runAsk(freeform, { input: async () => '  ok  ' });
   assert.equal(answered.details.cancelled, false);
   assert.match(answered.content[0]?.text ?? '', /"deploy staging\?"="ok"/);
   assert.equal(answered.details.answers[0]?.kind, 'custom');
 
-  const declined = await runAsk({ mode: 'freeform', question: 'deploy staging?' }, { input: async () => undefined });
+  const declined = await runAsk(freeform, { input: async () => undefined });
   assert.equal(declined.details.cancelled, true);
   assert.equal(declined.content[0]?.text, DECLINE_TEXT);
 });
@@ -446,17 +435,11 @@ test('runAsk: picking an authored option never opens the free-text input; Other 
   const question = q();
   const lines = optionLines(question);
   let inputCalls = 0;
-  const picked = await runAsk({ mode: 'questionnaire', questions: [question] }, {
-    select: async (_title, options) => options[0],
-    input: async () => { inputCalls += 1; return 'should not run'; },
-  });
+  const picked = await askOne(question, { select: async (_title, options) => options[0], input: async () => { inputCalls += 1; return 'should not run'; } });
   assert.equal(inputCalls, 0);
   assert.deepEqual(picked.details.answers[0], { question: 'Which database?', kind: 'option', answer: 'Redis' });
 
-  const custom = await runAsk({ mode: 'questionnaire', questions: [question] }, {
-    select: async () => lines[2],
-    input: async () => 'SQLite',
-  });
+  const custom = await askOne(question, { select: async () => lines[2], input: async () => 'SQLite' });
   assert.equal(custom.details.answers[0]?.kind, 'custom');
   assert.equal(custom.details.answers[0]?.customInput, 'SQLite');
   assert.match(custom.content[0]?.text ?? '', /user notes: SQLite/);
@@ -464,19 +447,17 @@ test('runAsk: picking an authored option never opens the free-text input; Other 
 
 test('runAsk: numbered input without a select dialog; a non-number becomes a custom answer', async () => {
   const titles: string[] = [];
-  const numbered = await runAsk({ mode: 'questionnaire', questions: [q()] }, {
-    input: async (title) => { titles.push(title); return '2'; },
-  });
+  const numbered = await askOne(q(), { input: async (title) => { titles.push(title); return '2'; } });
   assert.equal(numbered.details.answers[0]?.answer, 'Postgres');
   assert.match(titles[0] ?? '', /3\. Other \(type your own\)/);
 
-  const typed = await runAsk({ mode: 'questionnaire', questions: [q()] }, { input: async () => 'just sqlite' });
+  const typed = await askOne(q(), { input: async () => 'just sqlite' });
   assert.equal(typed.details.answers[0]?.kind, 'custom');
   assert.equal(typed.details.answers[0]?.customInput, 'just sqlite');
 });
 
 test('runAsk multi: comma-separated numbers dedupe; non-numeric is custom; an empty submission is (none)', async () => {
-  const ask = (input: string) => runAsk({ mode: 'questionnaire', questions: [q({ multi: true })] }, { input: async () => input });
+  const ask = (input: string) => askOne(q({ multi: true }), { input: async () => input });
   assert.deepEqual((await ask('2, 2, 1')).details.answers[0]?.selected, ['Postgres', 'Redis']);
   assert.equal((await ask('both, via a sidecar')).details.answers[0]?.kind, 'custom');
   const empty = await ask('  ');
@@ -486,10 +467,7 @@ test('runAsk multi: comma-separated numbers dedupe; non-numeric is custom; an em
 
 test('runAsk: Esc on the second question declines the whole call and keeps the first answer', async () => {
   let n = 0;
-  const ui: AskUi = {
-    select: async (_title, options) => { n += 1; return n === 1 ? options[0] : undefined; },
-    input: async () => 'unused',
-  };
+  const ui: AskUi = { select: async (_title, options) => { n += 1; return n === 1 ? options[0] : undefined; }, input: async () => 'unused' };
   const result = await runAsk({ mode: 'questionnaire', questions: [q(), q({ question: 'SQL?' })] }, ui);
   assert.equal(result.details.cancelled, true);
   assert.equal(result.content[0]?.text, DECLINE_TEXT);

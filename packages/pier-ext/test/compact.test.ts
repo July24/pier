@@ -1,9 +1,5 @@
-/**
- * D100 Online Context Compact. Pure core first (economics, feasibility, cache-ratio resolution), then
- * the CompactCoordinator lifecycle over a mock pi context: boundary sampling, decision guards, the
- * abort→compact→continue chain, cancel/failure outcomes and P1-3 backoff. Formulas are covered in the
- * pure section, so the lifecycle tests only assert state-machine transitions and persistence.
- */
+/** D100 Online Context Compact: the pure economics/feasibility/cache-ratio core, then the
+ * CompactCoordinator lifecycle (sampling, guards, abort→compact→continue, backoff) over a mock pi. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from '@earendil-works/pi-coding-agent';
@@ -76,8 +72,7 @@ test('decideCompaction: one named reason per decision shape', () => {
 
 test('resolveCacheRatioFromCost: explicit config > cost metadata > provider family > token account', () => {
   assert.equal(resolveCacheRatioFromCost(10), 10);
-  assert.equal(resolveCacheRatioFromCost('auto', { cacheRead: 0.1, cacheWrite: 1.25 }), 12.5);
-  assert.equal(resolveCacheRatioFromCost('auto', { cacheRead: 0.25, cacheWrite: 1.0 }), 4.0);
+  assert.equal(resolveCacheRatioFromCost('auto', { cacheRead: 0.1, cacheWrite: 1.25 }), 12.5); assert.equal(resolveCacheRatioFromCost('auto', { cacheRead: 0.25, cacheWrite: 1.0 }), 4.0);
   // Implicit caching: no write SKU, so the rewritten prefix is billed as input.
   assert.equal(resolveCacheRatioFromCost('auto', { input: 0.3, cacheRead: 0.03, cacheWrite: 0 }), 10);
   // A zero price table resolves by provider family and never returns null (null once disabled OCC for
@@ -87,8 +82,7 @@ test('resolveCacheRatioFromCost: explicit config > cost metadata > provider fami
   assert.equal(resolveCacheRatioFromCost('auto', free, { provider: 'xai', modelId: 'grok-4.6' }), 10);
   assert.equal(resolveCacheRatioFromCost('auto', free, { provider: 'opencode-go', modelId: 'deepseek-v4.1-flash' }), 10);
   // Unknown family / missing metadata → the token account 2.0 (a compaction re-reads writeTokens once).
-  assert.equal(resolveCacheRatioFromCost('auto', null), 2);
-  assert.equal(resolveCacheRatioFromCost('auto', { cacheRead: 0, cacheWrite: 0 }), 2);
+  assert.equal(resolveCacheRatioFromCost('auto', null), 2); assert.equal(resolveCacheRatioFromCost('auto', { cacheRead: 0, cacheWrite: 0 }), 2);
   assert.equal(resolveCacheRatioFromCost('auto', { cacheRead: 0, cacheWrite: 0.5 }, { provider: 'other', modelId: 'm1' }), 2);
 });
 
@@ -119,12 +113,9 @@ function mockContext(opts: { tokens?: number; hasPending?: boolean; branch?: unk
   const compactCalls: CompactCall[] = [];
   const ctx = {
     getContextUsage: () => ({ tokens: opts.tokens ?? 50000, contextWindow: 128000 }),
-    getSystemPrompt: () => 'System prompt text',
-    hasPendingMessages: () => opts.hasPending ?? false,
-    isIdle: () => true,
+    getSystemPrompt: () => 'System prompt text', hasPendingMessages: () => opts.hasPending ?? false, isIdle: () => true,
     sessionManager: { getBranch: () => opts.branch ?? [], getSessionDir: () => '/tmp/sessions', getSessionId: () => 'test_sess_01' },
-    abort: () => { abortCalls++; },
-    compact: (options: CompactCall) => { compactCalls.push(options); },
+    abort: () => { abortCalls++; }, compact: (options: CompactCall) => { compactCalls.push(options); },
   } as unknown as ExtensionContext;
   return { ctx, abortCalls: () => abortCalls, compactCalls };
 }
@@ -148,20 +139,15 @@ test('CompactCoordinator: only tool-sourced boundaries are sampled, extension in
   coordinator.onBeforeProviderRequest(1000);
   coordinator.onBeforeProviderRequest(1200);
   coordinator.recordBoundaryCompleted(1, 'tool');
-  assert.equal(coordinator.pendingBoundaryCompleted, true);
-  assert.deepEqual(coordinator.state.completedBoundaryRequestCounts, [2]);
-  coordinator.state.completedBoundaryRequestCounts = [5, 5];
-  coordinator.state.carriedDebtTokens = 10000;
-  coordinator.pendingBoundaryCompleted = true;
+  assert.equal(coordinator.pendingBoundaryCompleted, true); assert.deepEqual(coordinator.state.completedBoundaryRequestCounts, [2]);
+  coordinator.state.completedBoundaryRequestCounts = [5, 5]; coordinator.state.carriedDebtTokens = 10000; coordinator.pendingBoundaryCompleted = true;
   coordinator.onInput({ text: '注意：仍有 1 个后台 subagent 在运行', source: 'extension' });
-  assert.deepEqual(coordinator.state.completedBoundaryRequestCounts, [5, 5]);
-  assert.equal(coordinator.state.carriedDebtTokens, 10000);
+  assert.deepEqual(coordinator.state.completedBoundaryRequestCounts, [5, 5]); assert.equal(coordinator.state.carriedDebtTokens, 10000);
   assert.equal(coordinator.pendingBoundaryCompleted, true);
   // The samples measure requests-per-boundary, which holds across human turns; clearing them would
   // pin the mean at 1 and hide every horizon worth compacting.
   coordinator.onInput({ text: 'Wait, change the direction', source: 'interactive', streamingBehavior: 'steer' });
-  assert.deepEqual(coordinator.state.completedBoundaryRequestCounts, [5, 5]);
-  assert.equal(coordinator.state.carriedDebtTokens, 0);
+  assert.deepEqual(coordinator.state.completedBoundaryRequestCounts, [5, 5]); assert.equal(coordinator.state.carriedDebtTokens, 0);
   assert.equal(coordinator.pendingBoundaryCompleted, false);
 });
 
@@ -177,8 +163,7 @@ test('CompactCoordinator: turn_end does not abort when disabled, with a queued m
   coordinator.onTurnEnd({ ctx: pending.ctx, todos, config: CONFIG });
   assert.equal(pending.abortCalls(), 0, 'queued-message guard');
   // usage.tokens null/0 falls back to the last known context instead of polluting the state.
-  coordinator.state.lastContextTokens = 35000;
-  coordinator.pendingBoundaryCompleted = true;
+  coordinator.state.lastContextTokens = 35000; coordinator.pendingBoundaryCompleted = true;
   const stale = mockContext({});
   stale.ctx.getContextUsage = () => ({ tokens: null, contextWindow: 128000, percent: 0 }) as never;
   coordinator.onTurnEnd({ ctx: stale.ctx, todos: [{ content: 'test', status: 'completed' }], config: CONFIG });
@@ -196,8 +181,7 @@ test('CompactCoordinator: abort → compact → markers → silent continuation'
   const mock = mockContext({ tokens: 60000, branch: bigBranch() });
   let reminderCancelled = false;
   coordinator.onTurnEnd({ ctx: mock.ctx, todos, config: CONFIG, cancelReminder: () => { reminderCancelled = true; } });
-  assert.equal(mock.abortCalls(), 1);
-  assert.equal(coordinator.intentionalAbort, true);
+  assert.equal(mock.abortCalls(), 1); assert.equal(coordinator.intentionalAbort, true);
   assert.equal(reminderCancelled, true, 'cancel the pending reminder before aborting');
   assert.ok(coordinator.selectedCompaction !== null);
   const pi = fakePi();
@@ -208,22 +192,17 @@ test('CompactCoordinator: abort → compact → markers → silent continuation'
   });
   await beforeCompact.promise;
   assert.equal(mock.compactCalls.length, 1);
-  assert.match(mock.compactCalls[0]!.customInstructions, /Remaining task/);
-  assert.match(mock.compactCalls[0]!.customInstructions, /awaiting approval/);
+  assert.match(mock.compactCalls[0]!.customInstructions, /Remaining task/); assert.match(mock.compactCalls[0]!.customInstructions, /awaiting approval/);
   // The inflight marker must land while the summary request is still running: a supervising master
   // polls it and defers settling on it.
   assert.deepEqual(pi.entries.map(([type]) => type), [COMPACTION_INFLIGHT_TYPE]);
   mock.compactCalls[0]!.onComplete({ summary: 'Compacted history summary' });
   await settle;
-  assert.equal(coordinator.compactionInFlight, false);
-  assert.equal(coordinator.intentionalAbort, false);
-  assert.equal(coordinator.state.priorCompactionCount, 1);
+  assert.equal(coordinator.compactionInFlight, false); assert.equal(coordinator.intentionalAbort, false); assert.equal(coordinator.state.priorCompactionCount, 1);
   const markers = pi.entries.map(([type]) => type);
   assert.deepEqual(markers, [COMPACTION_INFLIGHT_TYPE, COMPACT_STATE_CUSTOM_TYPE, COMPACTION_SETTLED_TYPE], 'write order is the protocol the poller depends on');
   assert.equal((pi.entries[2]?.[1] as { outcome?: string })?.outcome, 'completed');
-  assert.equal(pi.sent.length, 1);
-  assert.equal(pi.sent[0]!.msg.customType, COMPACTION_CONTINUE_TYPE);
-  assert.equal(pi.sent[0]!.opts!.triggerTurn, true);
+  assert.equal(pi.sent.length, 1); assert.equal(pi.sent[0]!.msg.customType, COMPACTION_CONTINUE_TYPE); assert.equal(pi.sent[0]!.opts!.triggerTurn, true);
 });
 
 test('CompactCoordinator: a cancelled compaction stays cancelled, a failed one wakes the task', async () => {
@@ -242,9 +221,7 @@ test('CompactCoordinator: a cancelled compaction stays cancelled, a failed one w
   const cancelled = setup();
   cancelled.mock.compactCalls[0]!.onError(new Error('Compaction cancelled'));
   await cancelled.settle;
-  assert.equal(cancelled.pi.sent.length, 0);
-  assert.equal(cancelled.coordinator.compactionInFlight, false);
-  assert.equal(outcome(cancelled.pi), 'cancelled');
+  assert.equal(cancelled.pi.sent.length, 0); assert.equal(cancelled.coordinator.compactionInFlight, false); assert.equal(outcome(cancelled.pi), 'cancelled');
   // 2. A real failure leaves the session on an aborted turn → the continuation must carry a visible notice.
   const failed = setup();
   failed.mock.compactCalls[0]!.onError(new Error('Summarization failed: generation hit the token cap'));
@@ -253,9 +230,7 @@ test('CompactCoordinator: a cancelled compaction stays cancelled, a failed one w
   assert.equal(failed.pi.sent[0]!.opts!.triggerTurn, true);
   assert.equal(failed.pi.sent[0]!.msg.display, true, 'a silent failure left a 209K-token session aware of nothing');
   assert.match(String(failed.pi.sent[0]!.msg.content), /compaction failed/i);
-  assert.equal(failed.coordinator.compactionInFlight, false);
-  assert.equal(failed.coordinator.intentionalAbort, false);
-  assert.equal(outcome(failed.pi), 'failed');
+  assert.equal(failed.coordinator.compactionInFlight, false); assert.equal(failed.coordinator.intentionalAbort, false); assert.equal(outcome(failed.pi), 'failed');
   // 3. AbortError (ESC pressed during compaction) counts as a cancel, not a failure.
   const aborted = setup();
   const abortError = new Error('aborted');
@@ -270,8 +245,7 @@ test('restoreCoordinatorState: the last marker wins and missing fields keep thei
   const branch = [
     { type: 'message', id: 'm1' },
     {
-      type: 'custom',
-      customType: COMPACT_STATE_CUSTOM_TYPE,
+      type: 'custom', customType: COMPACT_STATE_CUSTOM_TYPE,
       data: {
         version: 1, epoch: 3, completedBoundaryRequestCounts: [4, 6], carriedDebtTokens: 12000,
         cacheDebtRepaymentTokens: 5000, priorCompactionCount: 2, positiveContextDeltaTotal: 8000,
@@ -280,15 +254,10 @@ test('restoreCoordinatorState: the last marker wins and missing fields keep thei
     },
   ];
   const restored = restoreCoordinatorState(branch);
-  assert.equal(restored.epoch, 3);
-  assert.deepEqual(restored.completedBoundaryRequestCounts, [4, 6]);
-  assert.equal(restored.carriedDebtTokens, 12000);
-  assert.equal(restored.priorCompactionCount, 2);
-  assert.equal(restored.lastContextTokens, 45000);
+  assert.equal(restored.epoch, 3); assert.deepEqual(restored.completedBoundaryRequestCounts, [4, 6]);
+  assert.equal(restored.carriedDebtTokens, 12000); assert.equal(restored.priorCompactionCount, 2); assert.equal(restored.lastContextTokens, 45000);
   // Fields missing from an old marker must not pollute the state (shallow merge onto defaults).
-  assert.equal(restored.consecutiveCompactionFailures, 0);
-  assert.equal(restored.compactBackoffTurnEnds, 0);
-  assert.equal(restored.version, 1);
+  assert.equal(restored.consecutiveCompactionFailures, 0); assert.equal(restored.compactBackoffTurnEnds, 0); assert.equal(restored.version, 1);
 });
 
 test('CompactCoordinator: every provider request repays the cache debt, clearing the rate at zero', () => {
@@ -298,8 +267,7 @@ test('CompactCoordinator: every provider request repays the cache debt, clearing
   for (const tokens of [10000, 10500, 11000]) coordinator.onBeforeProviderRequest(tokens);
   assert.equal(coordinator.state.carriedDebtTokens, 100);
   coordinator.onBeforeProviderRequest(11500);
-  assert.equal(coordinator.state.carriedDebtTokens, 0);
-  assert.equal(coordinator.state.cacheDebtRepaymentTokens, 0);
+  assert.equal(coordinator.state.carriedDebtTokens, 0); assert.equal(coordinator.state.cacheDebtRepaymentTokens, 0);
 });
 
 test('P1-3: a failed compaction backs off, pays no abort during the window, and resets on success', async () => {
@@ -318,8 +286,7 @@ test('P1-3: a failed compaction backs off, pays no abort during the window, and 
   compactCalls[0]!.onError(new Error('Summarization failed: generation hit the token cap and the summary is incomplete'));
   await settled;
   assert.ok(coordinator.state.compactBackoffTurnEnds >= 2, 'backoff window ≥2');
-  assert.equal(pi.sent[0]!.msg.display, true, 'the failure notice must be visible');
-  assert.match(String(pi.sent[0]!.msg.content), /FAILED/);
+  assert.equal(pi.sent[0]!.msg.display, true, 'the failure notice must be visible'); assert.match(String(pi.sent[0]!.msg.content), /FAILED/);
   rearm();
   coordinator.onTurnEnd({ ctx, todos, config: CONFIG });
   assert.equal(abortCalls(), 1, 'no second abort inside the backoff window');

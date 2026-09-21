@@ -1,8 +1,5 @@
-/**
- * Spawn domain: isolate/worktree planning, readiness failures, and the spawn tool itself (piped
- * prompt injection, foreground/background settlement, rollback). Reply-session healing lives in
- * subagent-session.test.ts.
- */
+/** Spawn domain: isolate/worktree planning, readiness failures, the spawn tool (piped prompt
+ * injection, foreground/background settlement, rollback) and the injectable git adapter. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
@@ -14,23 +11,11 @@ import { pipeNameFor, startPipeServer, type PipeRequest } from '../src/pipe-chan
 import { appendHistory } from '../src/history-store.ts';
 import { preferredHistoryFile } from '../src/storage-layout.ts';
 import {
-  buildIsolatePreamble,
-  evaluateRelease,
-  formatWorktreeStat,
-  parseWorktreePorcelain,
-  planIsolateWorktree,
-  type SubagentPortBox,
+  buildIsolatePreamble, evaluateRelease, formatWorktreeStat, parseWorktreePorcelain, planIsolateWorktree, type SubagentPortBox,
 } from '../src/subagent-core.ts';
-import { createSpawner } from '../src/subagent-spawn.ts';
+import { NodeGitAdapter, createSpawner, type GitExecFile } from '../src/subagent-spawn.ts';
 import {
-  TempHome,
-  jsonl,
-  mountSubagent,
-  runSubagent,
-  runSubagentRejects,
-  subsSnapshot,
-  transcriptMessage,
-  type FakePi,
+  TempHome, jsonl, mountSubagent, runSubagent, runSubagentRejects, subsSnapshot, transcriptMessage, type FakePi,
 } from './test-utils.ts';
 
 /* ── isolate/worktree planning (pure) ──────────────────────────── */
@@ -138,10 +123,7 @@ const spawnerFor = (client: Record<string, unknown>, over: Record<string, unknow
   client: client as unknown as HerdrClientLike,
   env: { paneId: 'p0', tabId: 't0', workspaceId: 'w1' },
   runtime: { nodePath: '/usr/bin/node', cliPath: '/cli.js', extPath: '/ext.ts' },
-  git: {
-    listWorktrees: async () => [], runGit: async () => null, worktreeStatLine: async () => null,
-    invalidateWorktreesCache: () => undefined,
-  },
+  git: { listWorktrees: async () => [], runGit: async () => null, worktreeStatLine: async () => null, invalidateWorktreesCache: () => undefined },
   ...over,
 } as Parameters<typeof createSpawner>[0]);
 
@@ -201,9 +183,8 @@ interface PipeEnv {
   port: SubagentPortBox;
   frames: PipeRequest[];
   closePaneCalls: string[];
-  /** Parks the settlement poller on a `waitAgent` that never resolves, so a row it holds stays
-   * `running` for the rest of the test (the poll loop is uncancellable and would otherwise outlive
-   * the assertions by the whole 30s observation window). */
+  /** Uncancellable poll loop: park it on a `waitAgent` that never resolves so a row it holds stays
+   * `running` for the rest of the test. */
   parkPollers(): void;
   /** Flipped per subtest: the next prompt frame is answered with an error. */
   rejectPrompt: boolean;
@@ -217,14 +198,8 @@ async function withPipeEnv(fn: (env: PipeEnv) => Promise<void>, opts: { childCwd
   const sessionFile = join(cwd, 'sub-session.jsonl');
   let parked = false;
   const env: PipeEnv = {
-    cwd,
-    home,
-    pi: undefined as never,
-    port: undefined as never,
-    frames: [],
-    closePaneCalls: [],
-    parkPollers: () => { parked = true; },
-    rejectPrompt: false,
+    cwd, home, pi: undefined as never, port: undefined as never, frames: [], closePaneCalls: [],
+    parkPollers: () => { parked = true; }, rejectPrompt: false,
   };
   const server = startPipeServer(pipeNameFor(opts.childCwd ?? cwd, 'p2'), async (req) => {
     const isPrompt = req.type === 'prompt' || req.type === 'follow_up';
@@ -375,5 +350,43 @@ test('isolate: mutually exclusive with cwd, and outside a git repo it fails inst
     );
   } finally {
     await root.fiber.dispose();
+  }
+});
+
+/* ── git adapter (folded from git-adapter.test.ts) ──────────────── */
+
+test('run: prefixes git -C cwd, forwards the timeout, and the wrappers build their own argv', async () => {
+  const calls: Array<{ file: string; args: readonly string[]; timeout: number }> = [];
+  const exec: GitExecFile = async (file, args, opts) => {
+    calls.push({ file, args, timeout: opts.timeout });
+    return { stdout: 'ok\n', stderr: '' };
+  };
+  const result = await new NodeGitAdapter('git', 1234, exec).run('/repo', ['rev-parse', 'HEAD']);
+  assert.equal(result.stdout, 'ok\n');
+  assert.deepEqual(calls, [{ file: 'git', args: ['-C', '/repo', 'rev-parse', 'HEAD'], timeout: 1234 }]);
+
+  const seen: string[][] = [];
+  const git = new NodeGitAdapter('git', 1000, async (_file, args) => { seen.push([...args]); return { stdout: 'out', stderr: '' }; });
+  await git.listWorktrees('/wt');
+  await git.status('/wt');
+  assert.deepEqual(seen[0], ['-C', '/wt', 'worktree', 'list', '--porcelain']);
+  assert.deepEqual(seen[1], ['-C', '/wt', 'status', '--short']);
+});
+
+const GIT_FAILURES: Array<{ name: string; args: string[]; thrown: () => unknown; expected: RegExp }> = [
+  { name: 'Error carrying a code', args: ['status', '--porcelain'], thrown: () => Object.assign(new Error('ENOENT'), { code: 'ENOENT' }), expected: /^Git status failed: ENOENT/ },
+  { name: 'non-Error throw', args: ['diff'], thrown: () => 'boom', expected: /^Git diff failed: boom$/ },
+];
+
+test('run: every failure becomes a GitError naming the operation', async () => {
+  for (const c of GIT_FAILURES) {
+    const exec: GitExecFile = async () => { throw c.thrown(); };
+    await assert.rejects(
+      () => new NodeGitAdapter('git', 1000, exec).run('/repo', c.args),
+      (err: Error) => {
+        assert.match(err.message, c.expected, c.name);
+        return true;
+      },
+    );
   }
 });

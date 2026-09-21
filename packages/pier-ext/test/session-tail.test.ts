@@ -1,7 +1,6 @@
-/**
- * Session liveness derivations: transcript tail parsing (session-tail), todo-list staleness
- * (stale-core) and the settled-wake decision (settle-wake-core).
- */
+/** Session liveness: transcript tail parsing (session-tail), todo staleness (stale-core), settled wake. */
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -13,8 +12,6 @@ import { STALE_CLOCK_MS, STALE_TURNS, evaluateStaleness, formatAge, isArchived, 
 import { planSettleWake } from '../src/settle-wake-core.ts';
 import type { TodoItem } from '../src/vocab.ts';
 import { jsonl, transcriptMessage, withCleanup } from './test-utils.ts';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 
 const msg = (role: string, text: string, ts: number, stopReason = 'stop') =>
   transcriptMessage(role, text, ts, stopReason) as SessionEntryLike;
@@ -25,6 +22,13 @@ const toolCall = (ts: number, n = 1): SessionEntryLike => ({
 });
 const toolResult = (ts: number): SessionEntryLike => ({ type: 'message', message: { role: 'toolResult', content: [], timestamp: ts } });
 const idle: SubSessionState = { text: null, pendingTool: false, activity: false, turnEnded: false, compacting: false };
+/** Writes a session transcript at `dir/name` (creating `dir`) and returns its path. */
+const writeTranscript = (dir: string, name: string): string => {
+  const file = path.join(dir, name);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(file, jsonl({ type: 'session' }));
+  return file;
+};
 
 test('parseSessionEntries: tolerates malformed lines, blank lines and non-object records', () => {
   const entries = parseSessionEntries(`{bad json\n\n${jsonl(msg('assistant', 'hello', 100), 'nope', { type: 'session' })}`);
@@ -36,38 +40,22 @@ test('parseSessionEntries: tolerates malformed lines, blank lines and non-object
 test('deriveSubSessionState: role/stopReason/timestamp matrix → tail rows', async (t) => {
   const tail = (over: Partial<SubSessionState>): SubSessionState => ({ ...idle, ...over });
   const cases: Array<{ name: string; entries: SessionEntryLike[]; sinceTs: number; row: SubSessionState }> = [
-    {
-      name: 'stop-finalized text wins over the toolUse intermediate',
-      entries: [msg('user', 'task', 1), msg('assistant', 'thinking...', 2, 'toolUse'), msg('assistant', 'final answer', 3)],
-      sinceTs: 0,
-      row: tail({ text: 'final answer', activity: true, turnEnded: true }),
-    },
+    { name: 'stop-finalized text wins over the toolUse intermediate', sinceTs: 0, row: tail({ text: 'final answer', activity: true, turnEnded: true }),
+      entries: [msg('user', 'task', 1), msg('assistant', 'thinking...', 2, 'toolUse'), msg('assistant', 'final answer', 3)] },
     { name: 'sinceTs drops finalized text written before the injection point', entries: [msg('assistant', 'old', 100), msg('assistant', 'new', 200)], sinceTs: 150, row: tail({ text: 'new', activity: true, turnEnded: true }) },
     { name: 'assistant timestamp at the injection point counts', entries: [msg('assistant', 'a', 100)], sinceTs: 100, row: tail({ text: 'a', activity: true, turnEnded: true }) },
     { name: 'a timestamp older than the injection point is invisible', entries: [msg('assistant', 'a', 100)], sinceTs: 101, row: idle },
     { name: 'no assistant message → idle row', entries: [msg('user', 'hi', 1)], sinceTs: 0, row: idle },
     { name: 'toolUse-only assistant → activity without a finished turn', entries: [msg('assistant', 'mid', 1, 'toolUse')], sinceTs: 0, row: tail({ activity: true }) },
-    {
-      name: 'tool result written but the next assistant not yet → still not ended',
-      entries: [msg('user', 'task', 1), msg('assistant', 'thinking', 2, 'toolUse'), msg('toolResult', 'ok', 3)],
-      sinceTs: 1,
-      row: tail({ activity: true }),
-    },
-    {
-      name: 'assistant without stopReason (streaming) → not ended',
-      entries: [{ type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'x' }], timestamp: 6 } }],
-      sinceTs: 1,
-      row: tail({ activity: true }),
-    },
+    { name: 'tool result written but the next assistant not yet → still not ended', sinceTs: 1, row: tail({ activity: true }),
+      entries: [msg('user', 'task', 1), msg('assistant', 'thinking', 2, 'toolUse'), msg('toolResult', 'ok', 3)] },
+    { name: 'assistant without stopReason (streaming) → not ended', sinceTs: 1, row: tail({ activity: true }),
+      entries: [{ type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'x' }], timestamp: 6 } }] },
     { name: 'pending tool call after injection → waiting on a human', entries: [msg('user', 'q', 1), toolCall(10)], sinceTs: 5, row: tail({ pendingTool: true, activity: true }) },
     { name: 'parallel calls with only one result → still pending', entries: [toolCall(10, 2), toolResult(11)], sinceTs: 5, row: tail({ pendingTool: true, activity: true }) },
     { name: 'tool call before the injection point does not count', entries: [toolCall(3)], sinceTs: 5, row: idle },
   ];
-  for (const c of cases) {
-    await t.test(c.name, () => {
-      assert.deepEqual(deriveSubSessionState(c.entries, c.sinceTs), c.row);
-    });
-  }
+  for (const c of cases) await t.test(c.name, () => assert.deepEqual(deriveSubSessionState(c.entries, c.sinceTs), c.row));
 });
 
 test('deriveSubSessionState/compactionBusy: no settlement inside an OCC marker cycle', () => {
@@ -94,11 +82,8 @@ test('deriveSubSessionState/compactionBusy: no settlement inside an OCC marker c
 
 test('compactionBusy: later unrelated custom entries do not disturb last-marker-wins', () => {
   const entries = [
-    msg('user', 'task', 1),
-    custom(COMPACTION_INFLIGHT_TYPE),
-    custom(COMPACTION_SETTLED_TYPE),
-    msg('assistant', 'continuing', 4, 'toolUse'),
-    custom('pi-herdr.subs'), // another custom entry written to the same session afterwards
+    msg('user', 'task', 1), custom(COMPACTION_INFLIGHT_TYPE), custom(COMPACTION_SETTLED_TYPE),
+    msg('assistant', 'continuing', 4, 'toolUse'), custom('pi-herdr.subs'), // another custom entry written afterwards
   ];
   assert.equal(compactionBusy(entries), false);
 });
@@ -111,10 +96,8 @@ test('sessionDirName: cwd → collision-resistant session dir', () => {
 test('listSessionFiles/sessionFileById: platform dir candidates, newest-first order and legacy fallback', withCleanup(async (cleanup) => {
   const flat = cleanup.tempDir('sess2').path;
   const dir = path.join(flat, '--F--herdr-pi--');
-  fs.mkdirSync(dir, { recursive: true });
-  const at = (n: number) => path.join(dir, `2026-01-01T00-00-0${n}_${['aaaa', 'bbbb', 'cccc'][n]}.jsonl`);
+  const at = (n: number) => writeTranscript(dir, `2026-01-01T00-00-0${n}_${['aaaa', 'bbbb', 'cccc'][n]}.jsonl`);
   const [a, b, c] = [at(0), at(1), at(2)];
-  for (const f of [a, b, c]) fs.writeFileSync(f, '{}');
   const t = Date.now();
   [a, b, c].forEach((f, i) => fs.utimesSync(f, new Date(t - 3000 + i * 1000), new Date(t - 3000 + i * 1000)));
   assert.deepEqual(listSessionFiles('F:\\herdr-pi', flat, 2), [c, b]);
@@ -127,33 +110,25 @@ test('listSessionFiles/sessionFileById: platform dir candidates, newest-first or
   const cwd = '/Users/yehaoyu/Documents/pier';
   const tmp = cleanup.tempDir('sess-a8').path;
   const core = path.join(tmp, '--Users-yehaoyu-Documents-pier--');
-  fs.mkdirSync(core, { recursive: true });
-  const f = path.join(core, '2026-01-01T00-00-00_dead.jsonl');
-  fs.writeFileSync(f, '{}');
+  const f = writeTranscript(core, '2026-01-01T00-00-00_dead.jsonl');
   assert.deepEqual(listSessionFiles(cwd, tmp, 4), [f]);
   assert.equal(sessionFileById(cwd, tmp, 'dead'), f);
   assert.equal(sessionFileById(cwd, tmp, 'beef'), null);
   const legacy = path.join(tmp, '---Users-yehaoyu-Documents-pier--');
-  fs.mkdirSync(legacy, { recursive: true });
-  const g = path.join(legacy, '2026-01-01T00-00-01_beef.jsonl');
-  fs.writeFileSync(g, '{}');
+  const g = writeTranscript(legacy, '2026-01-01T00-00-01_beef.jsonl');
   assert.equal(sessionFileById(cwd, tmp, 'beef'), g);
   assert.equal(listSessionFiles(cwd, tmp, 4).length, 2);
 }));
 
-/* ── staleness: a fully done list left untouched is stale (turns) or archived (clock) ── */
-
+/* ── staleness ── */
 const done = (content: string): TodoItem => ({ content, status: 'completed' });
 const HOUR = 3_600_000;
 const ALL_DONE = [done('Verify gateway'), done('Verify id consistency'), done('Update design doc')];
 
 test('openTodos: pending/in_progress/blocked count, completed/abandoned do not', () => {
   const items: TodoItem[] = [
-    { content: 'a', status: 'pending' },
-    { content: 'b', status: 'in_progress' },
-    { content: 'c', status: 'blocked', blocker: 'x' },
-    { content: 'd', status: 'completed' },
-    { content: 'e', status: 'abandoned' },
+    { content: 'a', status: 'pending' }, { content: 'b', status: 'in_progress' }, { content: 'c', status: 'blocked', blocker: 'x' },
+    { content: 'd', status: 'completed' }, { content: 'e', status: 'abandoned' },
   ];
   assert.equal(openTodos(items), 3);
   assert.equal(openTodos(ALL_DONE), 0);
@@ -200,8 +175,7 @@ test('formatAge: m / floored h / d', () => {
   assert.equal(formatAge(50 * HOUR), '2d');
 });
 
-/* ── settle wake: no wake storm (abort silence, one notice per running set per 10 min) ── */
-
+/* ── settle wake: no wake storm (one notice per running set per 10 min) ── */
 const SUBS = [{ paneId: 'wA:p6' }, { paneId: 'wA:p7' }];
 const KEY = 'wA:p6,wA:p7';
 const T0 = 100 * 60_000;

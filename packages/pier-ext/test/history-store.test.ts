@@ -1,24 +1,13 @@
-/**
- * Delegation ledger (history-store): append-only JSONL, one row per status change, partitioned by cwd.
- */
+/** Delegation ledger (history-store): append-only JSONL, one row per status change, partitioned by cwd. */
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  appendHistory,
-  inheritOutcome,
-  applyReportedSessionFile,
-  generationsByTask,
-  historyFilePath,
-  inspectHistory,
-  latestGeneration,
-  normalizeEntryKind,
-  parseHistoryEntries,
-  readHistory,
-  type HistoryEntry,
+  applyReportedSessionFile, appendHistory, generationsByTask, historyFilePath, inheritOutcome, inspectHistory,
+  latestGeneration, normalizeEntryKind, parseHistoryEntries, readHistory, type HistoryEntry,
 } from '../src/history-store.ts';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import { withCleanup } from './test-utils.ts';
+import { jsonl, withCleanup } from './test-utils.ts';
 
 const mk = (over: Partial<HistoryEntry> = {}): HistoryEntry => ({
   taskId: 't1', kind: 'short', paneId: 'w1:p1', tabId: 'w1:t9', workspaceId: 'w1', cwd: 'F:\\herdr-pi',
@@ -34,11 +23,11 @@ test('historyFilePath: partitioned by cwd (mirrors pi session partitioning)', ()
 });
 
 test('parseHistoryEntries: skips junk lines, non-objects, rows without taskId and invalid statuses', () => {
-  const entries = parseHistoryEntries(['{bad', '', JSON.stringify(mk({})), 'garbage'].join('\n'));
+  const entries = parseHistoryEntries(`{bad\n\n${jsonl(mk())}garbage`);
   assert.equal(entries.length, 1);
   assert.equal(entries[0].taskId, 't1');
-  assert.equal(parseHistoryEntries(JSON.stringify({ paneId: 'p', status: 'running' })).length, 0);
-  assert.equal(parseHistoryEntries(JSON.stringify({ taskId: 't1', status: 'nope' })).length, 0);
+  assert.equal(parseHistoryEntries(jsonl({ paneId: 'p', status: 'running' })).length, 0);
+  assert.equal(parseHistoryEntries(jsonl({ taskId: 't1', status: 'nope' })).length, 0);
 });
 
 test('inspectHistory/readHistory: missing vs unreadable (directory); both read as empty', withCleanup(async (cleanup) => {
@@ -67,8 +56,7 @@ test('append/read round-trip: rows append in order and the directory is created 
 
 test('generationsByTask/latestGeneration: generations fold per task and follow the revival chain', () => {
   const entries = [
-    mk({ paneId: 'w1:p1', status: 'closed', closedAt: 10, taskId: 't1' }),
-    mk({ paneId: 'w1:p2', status: 'running', revivedFrom: 'w1:p1', taskId: 't1', createdAt: 20 }),
+    mk({ paneId: 'w1:p1', status: 'closed', closedAt: 10, taskId: 't1' }), mk({ paneId: 'w1:p2', status: 'running', revivedFrom: 'w1:p1', taskId: 't1', createdAt: 20 }),
     mk({ paneId: 'w1:p3', taskId: 't2', createdAt: 5 }),
   ];
   const gens = generationsByTask(entries);
@@ -107,9 +95,9 @@ test('inheritOutcome: an omitted patch value inherits the latest non-empty outco
 });
 
 test('via: the writer marker survives a round-trip (one row per event, auditable)', () => {
-  const rows = parseHistoryEntries([
-    JSON.stringify({ taskId: 't1', kind: 'task', paneId: 'p1', status: 'consumed', outcome: 'x', createdAt: 1, via: 'poll-settle' }),
-    JSON.stringify({ taskId: 't1', kind: 'task', paneId: 'p1', status: 'closed', createdAt: 2, via: 'gc' }),
-  ].join('\n'));
+  const rows = parseHistoryEntries(jsonl(
+    { taskId: 't1', kind: 'task', paneId: 'p1', status: 'consumed', outcome: 'x', createdAt: 1, via: 'poll-settle' },
+    { taskId: 't1', kind: 'task', paneId: 'p1', status: 'closed', createdAt: 2, via: 'gc' },
+  ));
   assert.deepEqual(rows.map((r) => r.via), ['poll-settle', 'gc']);
 });

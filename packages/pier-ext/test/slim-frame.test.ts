@@ -1,8 +1,4 @@
-/**
- * D97 slim frame: the visibility predicate, width-aware wrapping, frame lines, the overlay
- * registration lifecycle and the three content tiers. Seam: pure functions plus the process-local
- * singleton (isolated through resetForTest).
- */
+/** D97 slim frame: visibility predicate, width-aware wrapping, frame lines, overlay lifecycle, tiers. */
 import { mock, test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -19,25 +15,15 @@ const todo = (content: string, status: TodoItem['status']): TodoItem => ({ conte
 const TWO = [todo('implement auth', 'in_progress'), todo('write tests', 'pending')];
 
 interface Overlay {
-  dispose(): void;
-  render(width: number): string[];
-  viewportSize(): { cols: number; rows: number };
-  onMaybeResized(): void;
+  dispose(): void; render(width: number): string[]; viewportSize(): { cols: number; rows: number }; onMaybeResized(): void;
 }
 
-/**
- * Registers the overlay through the public seam and drives the factory pi would call. `done()` is
- * never invoked, so the overlay stays resident; `renders()` counts requestRender calls.
- */
+/** Drives the factory pi would call; `done()` is never invoked, so the overlay stays resident. */
 function mountOverlay(): { comp: Overlay; options: Record<string, unknown>; renders: () => number } {
   let factory!: (tui: { requestRender(): void }, theme: { fg(c: string, s: string): string }) => object;
   let options!: Record<string, unknown>;
   let count = 0;
-  const custom = (f: typeof factory, o: Record<string, unknown>) => {
-    factory = f;
-    options = o;
-    return new Promise<never>(() => {});
-  };
+  const custom = (f: typeof factory, o: Record<string, unknown>) => { factory = f; options = o; return new Promise<never>(() => {}); };
   registerSlimFrame({ ui: { custom } });
   return { comp: factory({ requestRender: () => { count += 1; } }, { fg: (_c, s) => s }) as unknown as Overlay, options, renders: () => count };
 }
@@ -53,8 +39,7 @@ test('isSlimFrame：任一轴低于 TUI 下限即静帧', async (t) => {
 });
 
 test('frameLines：垂直居中 + 满宽补齐 + 行数钳制；空 title 落一枚 ·', () => {
-  // Every line is padded to the full width: row-wise compositing would otherwise leak the TUI
-  // underneath and reintroduce the flicker the frame hides.
+  // Full-width padding: a partial row would leak the TUI underneath and reintroduce the flicker.
   const lines = frameLines('▶2 ○11 ✓1 · 正在做的事', { width: 10, rows: 5 });
   assert.equal(lines.length, 5);
   assert.ok(lines.every((l) => styledWidth(l) === 10), '每行满宽（不透明冻结，不漏底）');
@@ -77,18 +62,18 @@ test('wrapStyled：CJK 双宽、英文空格让位、短行不折', () => {
 });
 
 test('registerSlimFrame：无 ui / 无 custom / 逃生口都不注册，且不占用单例', withCleanup((cleanup) => {
+  let called = 0;
+  const bump = (): Promise<never> => { called += 1; return new Promise<never>(() => {}); };
   registerSlimFrame(null);
   registerSlimFrame({ ui: {} });
   updateSlimFrame({ title: 'x' }); // no active overlay yet: a no-op
-
-  let called = 0;
-  registerSlimFrame({ ui: { custom: () => { called += 1; return new Promise<never>(() => {}); } } });
+  registerSlimFrame({ ui: { custom: bump } });
   assert.equal(called, 1, '静默跳过的注册不得占用单例');
 
   for (const key of ['PIER_SLIM_FRAME', 'PI_HERDR_SLIM_FRAME']) {
     resetForTest();
     cleanup.env().set(key, '0'); // legacy spelling must keep working
-    registerSlimFrame({ ui: { custom: () => { called += 1; return new Promise<never>(() => {}); } } });
+    registerSlimFrame({ ui: { custom: bump } });
     assert.equal(called, 1, `${key}=0 逃生口`);
   }
 }));

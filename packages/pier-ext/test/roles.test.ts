@@ -24,10 +24,8 @@ test('validateRoleManifest: a good profile passes and keeps every field; omitted
   const r = validateRoleManifest(READONLY);
   assert.equal(r.ok, true, JSON.stringify((r as { issues?: string[] }).issues));
   if (!r.ok) return;
-  assert.equal(r.value.role, 'probe-role');
-  assert.equal(r.value.version, '1.1.0');
-  assert.equal(r.value.manifest.rules?.bash, 'ask');
-  assert.equal(r.value.manifest.rules?.write, 'deny');
+  assert.equal(r.value.role, 'probe-role'); assert.equal(r.value.version, '1.1.0');
+  assert.equal(r.value.manifest.rules?.bash, 'ask'); assert.equal(r.value.manifest.rules?.write, 'deny');
   assert.equal(r.value.services?.todos?.mode, 'serial');
 
   const minimal = validateRoleManifest({ role: 'worker-default', version: '1.0.0', manifest: { tools: ['bash', 'read', 'todo_write', 'ask_user_question'] } });
@@ -123,8 +121,7 @@ test('loadRoleConfig: missing file, illegal names and malformed manifests are cl
 test('bundled manifests: loadable for both built-ins, and worker mirrors master minus the excluded families', () => {
   for (const name of ['worker-default', 'master']) {
     const role = loadRoleConfig(name);
-    assert.equal(role.role, name);
-    assert.match(role.version, /^\d+\.\d+\.\d+$/, name);
+    assert.equal(role.role, name); assert.match(role.version, /^\d+\.\d+\.\d+$/, name);
     assert.equal(role.model, undefined, `${name} leaves model routing to the process default`);
   }
   // D83 inheritance: worker-default.tools ≡ master.tools − subagent − terminal, pinned against drift.
@@ -134,8 +131,7 @@ test('bundled manifests: loadable for both built-ins, and worker mirrors master 
   assert.deepEqual([...new Set(worker.manifest.tools)].sort(), [...new Set(master.manifest.tools.filter((t) => !EXCLUDED.includes(t)))].sort());
   for (const family of EXCLUDED) assert.equal(worker.manifest.rules?.[family], 'deny', `${family} stays denied under unknownTools=allow`);
   for (const need of ['todo_write', 'ask_user_question', 'subagent', 'terminal', 'pwsh', 'web_search']) assert.ok(master.manifest.tools.includes(need), `master.tools should include ${need}`);
-  assert.equal(master.manifest.unknownTools, 'allow');
-  assert.equal(worker.manifest.unknownTools, 'allow');
+  assert.equal(master.manifest.unknownTools, 'allow'); assert.equal(worker.manifest.unknownTools, 'allow');
 });
 
 test('layers: workspace wins over user, user over absent, and a miss lists every layer tried', () => {
@@ -143,37 +139,28 @@ test('layers: workspace wins over user, user over absent, and a miss lists every
   const hit = loadRoleConfig('reviewer', { layerRead: read, baseDir: WIN });
   assert.equal(hit.description, 'from ws');
   // A hit is returned validated and verbatim: the `*`-allow default is added by composeForRole, not here.
-  assert.deepEqual(hit.manifest.tools, CUSTOM.manifest.tools);
-  assert.deepEqual(hit.manifest.rules, CUSTOM.manifest.rules);
+  assert.deepEqual(hit.manifest.tools, CUSTOM.manifest.tools); assert.deepEqual(hit.manifest.rules, CUSTOM.manifest.rules);
   assert.equal(loadRoleConfig('auditor', { layerRead: read, baseDir: WIN }).description, '只读审查');
 
-  assert.throws(
-    () => loadRoleConfig('ghost', { layerRead: layerRead({}), baseDir: WIN }),
-    (e: unknown) => {
-      const message = (e as Error).message;
-      return (e as RoleLoaderError).code === 'ROLE_NOT_FOUND' && /workspace/.test(message) && /user/.test(message) && /builtin/.test(message);
-    },
-  );
+  assert.throws(() => loadRoleConfig('ghost', { layerRead: layerRead({}), baseDir: WIN }), (e: unknown) => {
+    const message = (e as Error).message;
+    return (e as RoleLoaderError).code === 'ROLE_NOT_FOUND' && /workspace/.test(message) && /user/.test(message) && /builtin/.test(message);
+  });
 
   // Layer layout: workspace → user → bundled, with the workspace one derived from the base dir.
   const WS = process.platform === 'win32' ? 'F:\\ws' : '/ws';
-  assert.equal(workspaceRolesDir(WS), join(WS, '.pi-herdr', 'roles'));
-  assert.equal(workspaceRolesDir(), join(process.cwd(), '.pi-herdr', 'roles'));
+  assert.equal(workspaceRolesDir(WS), join(WS, '.pi-herdr', 'roles')); assert.equal(workspaceRolesDir(), join(process.cwd(), '.pi-herdr', 'roles'));
   assert.match(userRolesDir().replace(/\\/g, '/'), /\/\.pi\/agent\/herdr-pi\/roles$/);
   const layers = roleLayers({ baseDir: WS });
-  assert.equal(layers.length, 3);
-  assert.match(layers[0]!.dir.replace(/\\/g, '/'), /\.pi-herdr\/roles$/);
+  assert.equal(layers.length, 3); assert.match(layers[0]!.dir.replace(/\\/g, '/'), /\.pi-herdr\/roles$/);
   assert.match(layers[2]!.dir.replace(/\\/g, '/'), /src\/roles$/);
 });
 
 test('layers: a reserved built-in name may not be overridden, and builtinDirect ignores the bait', () => {
   const read = layerRead({ 'master.json': { ...CUSTOM, role: 'master' } }, { 'worker-default.json': { ...CUSTOM, role: 'worker-default' } });
   for (const name of RESERVED_ROLE_NAMES) {
-    assert.throws(
-      () => loadRoleConfig(name, { layerRead: read, baseDir: WIN }),
-      (e: unknown) => (e as RoleLoaderError).code === 'ROLE_RESERVED' && (e as Error).message.includes(name),
-      name,
-    );
+    assert.throws(() => loadRoleConfig(name, { layerRead: read, baseDir: WIN }),
+      (e: unknown) => (e as RoleLoaderError).code === 'ROLE_RESERVED' && (e as Error).message.includes(name), name);
   }
 
   // builtinDirect is the master's self-application path: skipping the user layers keeps a workspace
@@ -181,8 +168,7 @@ test('layers: a reserved built-in name may not be overridden, and builtinDirect 
   const bundled: LayerReader = (dir, fileName) =>
     dir === ROLES_DIR ? (existsSync(join(dir, fileName)) ? readFileSync(join(dir, fileName), 'utf8') : null) : read(dir, fileName);
   const role = loadRoleConfig('master', { layerRead: bundled, baseDir: WIN, builtinDirect: true });
-  assert.notEqual(role.version, CUSTOM.version);
-  assert.ok(role.manifest.tools.includes('subagent'));
+  assert.notEqual(role.version, CUSTOM.version); assert.ok(role.manifest.tools.includes('subagent'));
 });
 
 test('listRoleNames: the workspace and user layers, deduped and sorted, built-ins excluded', withCleanup(async (cleanup) => {
@@ -209,8 +195,7 @@ test('composeManifest: union of baseline and suggestion, deterministic order, de
 
   // Three-state mix (websearch shape): deny excludes, ask marks, both stay visible in permissions.
   const mixed = composeManifest({ roleBaseline: ['bash', 'read', 'grep', 'web_search', 'todo_write'], modelSuggested: ['bash', 'write'], rulePermissions: { bash: 'ask', write: 'deny', edit: 'deny', '*': 'allow' } });
-  assert.deepEqual(mixed.tools, ['bash', 'grep', 'read', 'todo_write', 'web_search']);
-  assert.equal(mixed.permissions.bash, 'ask');
+  assert.deepEqual(mixed.tools, ['bash', 'grep', 'read', 'todo_write', 'web_search']); assert.equal(mixed.permissions.bash, 'ask');
   assert.equal(mixed.permissions.write, 'deny');
 });
 
@@ -222,20 +207,15 @@ test('composeManifest: `*` supplies the default, explicit rules win, deny rules 
   assert.deepEqual(noStar.permissions, { write: 'deny', read: 'allow', todo_write: 'allow' });
 
   const stance = composeManifest({ roleBaseline: ['bash', 'read', 'todo_write'], modelSuggested: [], rulePermissions: { subagent: 'deny', terminal: 'deny', '*': 'allow' }, unknownTools: 'allow' });
-  assert.equal(stance.unknownTools, 'allow');
-  assert.equal(stance.permissions.subagent, 'deny');
+  assert.equal(stance.unknownTools, 'allow'); assert.equal(stance.permissions.subagent, 'deny');
   assert.ok(!stance.tools.includes('subagent'));
 });
 
 test('composeManifest: empty result and empty baseline are loud, non-string tools are dropped', () => {
-  assert.throws(
-    () => composeManifest({ roleBaseline: ['bash'], modelSuggested: ['read'], rulePermissions: { bash: 'deny', read: 'deny', '*': 'deny' } }),
-    (e: unknown) => e instanceof ManifestError && e.code === 'EMPTY_MANIFEST' && /bash/.test(e.message) && /read/.test(e.message),
-  );
-  assert.throws(
-    () => composeManifest({ roleBaseline: [], modelSuggested: ['bash'], rulePermissions: { '*': 'allow' } }),
-    (e: unknown) => e instanceof ManifestError && e.code === 'INVALID_ROLE_CONFIG' && /todo_write/.test(e.message),
-  );
+  assert.throws(() => composeManifest({ roleBaseline: ['bash'], modelSuggested: ['read'], rulePermissions: { bash: 'deny', read: 'deny', '*': 'deny' } }),
+    (e: unknown) => e instanceof ManifestError && e.code === 'EMPTY_MANIFEST' && /bash/.test(e.message) && /read/.test(e.message));
+  assert.throws(() => composeManifest({ roleBaseline: [], modelSuggested: ['bash'], rulePermissions: { '*': 'allow' } }),
+    (e: unknown) => e instanceof ManifestError && e.code === 'INVALID_ROLE_CONFIG' && /todo_write/.test(e.message));
 
   const dirty = { roleBaseline: ['read', 'todo_write', 42 as never], modelSuggested: [], rulePermissions: {} };
   assert.deepEqual(composeManifest(dirty).tools, ['read', 'todo_write']);
@@ -245,12 +225,9 @@ test('composeManifest: empty result and empty baseline are loud, non-string tool
 test('toRuntimeManifest: one projection from a composed profile to the runtime shape', () => {
   const composed = composeForRole('master', [], { loadRoleOpts: { builtinDirect: true } });
   const runtime = toRuntimeManifest(composed);
-  assert.equal(runtime.role, 'master');
-  assert.equal(runtime.version, composed.role.version);
-  assert.deepEqual(runtime.tools, composed.manifest.tools);
-  assert.deepEqual(runtime.permissions, composed.manifest.permissions);
-  assert.equal(runtime.unknownTools, composed.manifest.unknownTools);
-  assert.deepEqual(runtime.services, composed.role.services ?? {});
+  assert.equal(runtime.role, 'master'); assert.equal(runtime.version, composed.role.version);
+  assert.deepEqual(runtime.tools, composed.manifest.tools); assert.deepEqual(runtime.permissions, composed.manifest.permissions);
+  assert.equal(runtime.unknownTools, composed.manifest.unknownTools); assert.deepEqual(runtime.services, composed.role.services ?? {});
   assert.equal(runtime.guidelines, undefined, 'master ships no guidelines');
 });
 
@@ -299,13 +276,11 @@ test('parseRuntimeManifest: malformed env is null (fail-open), garbage stance de
     assert.equal(parseRuntimeManifest(raw), null, JSON.stringify(raw));
   }
   const ok = parseRuntimeManifest(JSON.stringify({ role: 'worker-readonly', tools: ['bash', 'read'], permissions: { '*': 'allow' }, unknownTools: 'allow' }));
-  assert.equal(ok?.role, 'worker-readonly');
-  assert.deepEqual(ok?.tools, ['bash', 'read']);
+  assert.equal(ok?.role, 'worker-readonly'); assert.deepEqual(ok?.tools, ['bash', 'read']);
   assert.equal(ok?.unknownTools, 'allow');
 
   const garbage = parseRuntimeManifest(JSON.stringify({ role: 'w', tools: ['bash'], permissions: {}, unknownTools: 'maybe' }));
-  assert.equal(garbage?.unknownTools, 'deny');
-  assert.equal(planToolGate('muse_deep_think', garbage).kind, 'deny');
+  assert.equal(garbage?.unknownTools, 'deny'); assert.equal(planToolGate('muse_deep_think', garbage).kind, 'deny');
   assert.deepEqual(parseRuntimeManifest(JSON.stringify({ role: 'w', tools: [], guidelines: [' ok ', 7, ''] }))?.guidelines, [' ok ']);
 });
 
@@ -321,31 +296,21 @@ test('replay: takes the last well-formed entry and skips junk without losing the
     { type: 'custom', customType: 'pi-herdr.role-manifest', data: { version: 1, role: 'reviewer', tools: ['read', 'grep'], permissions: { write: 'deny' }, unknownTools: 'allow', guidelines: ['bash 只用于运行测试'], origin: 'switch', switchedBy: 'p-master', ts: 123 } },
   ];
   const rec = latestRoleManifestRecord(entries);
-  assert.equal(rec?.role, 'reviewer');
-  assert.equal(rec?.origin, 'switch');
-  assert.equal(rec?.switchedBy, 'p-master');
-  assert.equal(rec?.ts, 123);
-  assert.deepEqual(rec?.guidelines, ['bash 只用于运行测试']);
-  assert.equal(latestRoleManifestRecord([entries[3], { type: 'custom', customType: 'x', data: null }]), null);
+  assert.equal(rec?.role, 'reviewer'); assert.equal(rec?.origin, 'switch');
+  assert.equal(rec?.switchedBy, 'p-master'); assert.equal(rec?.ts, 123);
+  assert.deepEqual(rec?.guidelines, ['bash 只用于运行测试']); assert.equal(latestRoleManifestRecord([entries[3], { type: 'custom', customType: 'x', data: null }]), null);
 });
 
 test('replay: malformed fields fall back to defaults and feed manifestFromRecord', () => {
-  const rec = latestRoleManifestRecord([
-    { type: 'custom', customType: 'pi-herdr.role-manifest', data: { role: 'r', tools: ['read'], permissions: 'not-an-object', guidelines: ['ok', 7, null], unknownTools: 'weird' } },
-  ]);
-  assert.ok(rec);
-  assert.deepEqual(rec.guidelines, ['ok']);
-  assert.deepEqual(rec.permissions, {});
-  assert.equal(rec.unknownTools, 'deny');
+  const rec = latestRoleManifestRecord([{ type: 'custom', customType: 'pi-herdr.role-manifest', data: { role: 'r', tools: ['read'], permissions: 'not-an-object', guidelines: ['ok', 7, null], unknownTools: 'weird' } }]);
+  assert.ok(rec); assert.deepEqual(rec.guidelines, ['ok']);
+  assert.deepEqual(rec.permissions, {}); assert.equal(rec.unknownTools, 'deny');
   const manifest = manifestFromRecord(rec);
-  assert.equal(manifest.role, 'r');
-  assert.equal(manifest.version, undefined);
-  assert.deepEqual(manifest.tools, ['read']);
-  assert.deepEqual(manifest.guidelines, ['ok']);
+  assert.equal(manifest.role, 'r'); assert.equal(manifest.version, undefined);
+  assert.deepEqual(manifest.tools, ['read']); assert.deepEqual(manifest.guidelines, ['ok']);
 
   const empty = latestRoleManifestRecord([{ type: 'custom', customType: 'pi-herdr.role-manifest', data: { role: 'r', tools: ['read'], guidelines: [] } }]);
-  assert.ok(empty);
-  assert.equal(empty.guidelines, undefined);
+  assert.ok(empty); assert.equal(empty.guidelines, undefined);
   assert.equal(manifestFromRecord(empty).guidelines, undefined);
 });
 
@@ -387,9 +352,7 @@ test('planSwitchActiveTools: the universe is every registered tool, so a switch 
 
 test('initialRoleState: env origin with no switch trace; a bare pi session carries no manifest', () => {
   const state = initialRoleState(WORKER_STATE_MANIFEST);
-  assert.equal(state.manifest?.role, 'worker-default');
-  assert.equal(state.origin, 'env');
-  assert.equal(state.switchedBy, null);
-  assert.equal(state.switchedAt, null);
+  assert.equal(state.manifest?.role, 'worker-default'); assert.equal(state.origin, 'env');
+  assert.equal(state.switchedBy, null); assert.equal(state.switchedAt, null);
   assert.equal(initialRoleState(null).manifest, null);
 });
