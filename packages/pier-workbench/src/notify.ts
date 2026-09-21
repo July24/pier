@@ -1,10 +1,8 @@
 /**
- * Notification payload builder for Herdr notification.show API.
+ * Notification payload builder for Herdr's notification.show API (protocol 22).
  *
- * Constructs validated notification parameters for subagent state transitions.
- * Conforms to Herdr 0.9.0 protocol 22 NotificationShowParams schema:
- *   { title: string, body?: string | null, position?: ToastHerdrPosition | null, sound?: NotificationShowSound }
- * NotificationShowSound enum: 'none' | 'done' | 'request'
+ * NotificationShowParams = { title: string, body?: string | null, position?: ToastHerdrPosition | null,
+ * sound?: 'none' | 'done' | 'request' }.
  */
 
 export interface NotificationShowParams {
@@ -14,17 +12,17 @@ export interface NotificationShowParams {
   sound?: 'none' | 'done' | 'request';
 }
 
-export const VALID_NOTIFICATION_SOUNDS = new Set<string>(['none', 'done', 'request']);
-
 export interface NotificationOptions {
+  /** Overrides HERDR_NOTIFICATION_SOUND (invalid values fall back to 'request'). */
   soundOverride?: string;
 }
 
+/** Valid notification sounds (protocol 22 enum). */
+const SOUNDS: Record<string, true> = { none: true, done: true, request: true };
+
 /**
- * Validates agent status event and constructs parameters for notification.show.
- * Returns null if the event should be gated out or is malformed.
- *
- * Tight gate: only agents where agent === 'pi' and agent_status === 'blocked' are notified.
+ * Validates an agent status event and builds notification.show params, or null when the event is
+ * malformed or gated out. Tight gate: only pi agents in the blocked state are notified.
  */
 export function buildNotificationParams(
   rawEvent: unknown,
@@ -33,37 +31,20 @@ export function buildNotificationParams(
   if (!rawEvent || typeof rawEvent !== 'object') return null;
   const ev = rawEvent as Record<string, unknown>;
   if (ev.type !== 'pane.agent_status_changed') return null;
-
-  const data = (ev.data && typeof ev.data === 'object') ? (ev.data as Record<string, unknown>) : null;
-  if (!data) return null;
-
-  // Gate: only pi agents managed by pier
-  if (data.agent !== 'pi') return null;
-
-  // Gate: only human-decision blocked state transitions
-  if (data.agent_status !== 'blocked') return null;
-
-  const agentName = typeof data.agent === 'string' && data.agent ? data.agent : 'agent';
-  const title = `Subagent blocked: ${agentName}`;
+  const data = ev.data && typeof ev.data === 'object' ? ev.data as Record<string, unknown> : null;
+  if (!data || data.agent !== 'pi' || data.agent_status !== 'blocked') return null;
 
   const paneId = typeof data.pane_id === 'string' && data.pane_id.trim()
     ? data.pane_id.trim()
     : (typeof data.pane_id === 'number' ? String(data.pane_id) : '?');
-
   const titleSuffix = typeof data.title === 'string' && data.title.trim()
     ? ` — ${data.title.trim()}`
     : '';
-
-  const body = `Pane ${paneId} needs a human decision${titleSuffix}`;
-
-  const soundCandidate = options?.soundOverride ?? process.env.HERDR_NOTIFICATION_SOUND;
-  const sound: 'none' | 'done' | 'request' = (soundCandidate && VALID_NOTIFICATION_SOUNDS.has(soundCandidate))
-    ? (soundCandidate as 'none' | 'done' | 'request')
-    : 'request';
+  const sound = options?.soundOverride ?? process.env.HERDR_NOTIFICATION_SOUND;
 
   return {
-    title,
-    body,
-    sound,
+    title: 'Subagent blocked: pi',
+    body: `Pane ${paneId} needs a human decision${titleSuffix}`,
+    sound: sound && Object.hasOwn(SOUNDS, sound) ? (sound as NotificationShowParams['sound']) : 'request',
   };
 }

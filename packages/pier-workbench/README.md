@@ -5,6 +5,7 @@
 ## 组件
 
 - `herdr-plugin.toml`：插件清单（blocked 通知 + workspace 引导 + 会话恢复 + 热力重排钩子）。
+- `scripts/herdr-rpc.mjs`：钩子脚本共享层（socket 目标解析、NDJSON 请求、boot-config / boot.jsonl 路径、启动命令行拼装）。
 - `scripts/notify-agent-state.mjs`：`pane.agent_status_changed` → blocked 通知。
 - `scripts/bootstrap.mjs` / `restore-layout.mjs`：主 tab 引导与恢复。
 - `scripts/heat-reflow.mjs` + `src/heat-layout.ts`：焦点热力布局（`pane.focused` / `agent_status_changed` / `pane.created` / `pane.closed` → 原地 ratio 重排；pi-tab 判定粘性化：成功 reflow 过的 tab 在全部 pi 退回 shell 后仍保留焦点放大，`enabled:false` 可按 tab 关闭）。

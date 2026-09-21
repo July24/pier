@@ -1,8 +1,6 @@
 /**
- * Pure model and formatting logic for the Pier Ops Dashboard.
- *
- * Composes a readable, formatted ops dashboard from Herdr's session snapshot.
- * Designed as a pure function (no I/O or global state) to allow complete offline unit testing.
+ * Pure model and formatting logic for the Pier Ops Dashboard: turns Herdr's session snapshot into
+ * formatted lines. No I/O and no global state, so the whole surface is offline-unit-testable.
  */
 
 export interface SnapshotWorkspace {
@@ -10,9 +8,6 @@ export interface SnapshotWorkspace {
   number?: number;
   label?: string;
   focused?: boolean;
-  pane_count?: number;
-  tab_count?: number;
-  active_tab_id?: string;
   agent_status?: string;
 }
 
@@ -22,7 +17,6 @@ export interface SnapshotTab {
   number?: number;
   label?: string;
   focused?: boolean;
-  pane_count?: number;
   agent_status?: string;
 }
 
@@ -30,7 +24,6 @@ export interface SnapshotPane {
   pane_id: string;
   workspace_id: string;
   tab_id: string;
-  terminal_id?: string;
   focused?: boolean;
   agent_status?: string;
   agent?: string | null;
@@ -41,7 +34,6 @@ export interface SnapshotPane {
   terminal_title?: string | null;
   terminal_title_stripped?: string | null;
   tokens?: Record<string, string>;
-  state_labels?: Record<string, string>;
 }
 
 export interface SessionSnapshotData {
@@ -60,181 +52,136 @@ export interface ComposeDashboardOptions {
   now?: number;
 }
 
+/** Pane table columns (title + width); the header and its rule are rendered from this table. */
+const PANE_COLUMNS: Array<[string, number]> = [
+  ['PANE ID', 10],
+  ['ROLE', 8],
+  ['STATUS', 10],
+  ['FOC', 4],
+  ['TODO / TITLE / TOKENS', 44],
+];
+
+/** Pier agent statuses tallied per workspace; the summary line renders straight from this table. */
+const PIER_STATUSES: Record<string, number> = { working: 0, blocked: 0, idle: 0 };
+
+const RULE = '--------------------------------------------------------------------------------';
+const BANNER = '================================================================================';
+
 /**
- * Normalizes raw socket responses into SessionSnapshotData.
- * Supports:
- *   - Direct SessionSnapshot object
- *   - Wrapped { snapshot: ... }
- *   - Wrapped { result: { snapshot: ... } }
+ * Normalizes raw socket responses into SessionSnapshotData, accepting a direct snapshot object as
+ * well as the `{ snapshot }` and `{ result: { snapshot } }` envelopes.
  */
 export function normalizeSnapshot(raw: unknown): SessionSnapshotData | null {
   if (!raw || typeof raw !== 'object') return null;
   const root = raw as Record<string, unknown>;
-  const candidate = (root.result && typeof root.result === 'object' && (root.result as Record<string, unknown>).snapshot)
-    ? (root.result as Record<string, unknown>).snapshot
-    : (root.snapshot && typeof root.snapshot === 'object')
-      ? root.snapshot
-      : root;
-
-  if (!candidate || typeof candidate !== 'object') return null;
-  const s = candidate as Record<string, unknown>;
-
-  const workspaces = Array.isArray(s.workspaces) ? (s.workspaces as SnapshotWorkspace[]) : [];
-  const tabs = Array.isArray(s.tabs) ? (s.tabs as SnapshotTab[]) : [];
-  const panes = Array.isArray(s.panes) ? (s.panes as SnapshotPane[]) : [];
+  const envelope = (root.result as Record<string, unknown> | undefined)?.snapshot ?? root.snapshot;
+  const s = (envelope && typeof envelope === 'object' ? envelope : root) as Record<string, unknown>;
+  const list = <T>(value: unknown): T[] => (Array.isArray(value) ? (value as T[]) : []);
+  const str = (value: unknown): string | null => (typeof value === 'string' ? value : null);
 
   return {
-    version: typeof s.version === 'string' ? s.version : undefined,
+    version: str(s.version) ?? undefined,
     protocol: typeof s.protocol === 'number' ? s.protocol : undefined,
-    workspaces,
-    tabs,
-    panes,
-    focused_workspace_id: typeof s.focused_workspace_id === 'string' ? s.focused_workspace_id : null,
-    focused_tab_id: typeof s.focused_tab_id === 'string' ? s.focused_tab_id : null,
-    focused_pane_id: typeof s.focused_pane_id === 'string' ? s.focused_pane_id : null,
+    workspaces: list<SnapshotWorkspace>(s.workspaces),
+    tabs: list<SnapshotTab>(s.tabs),
+    panes: list<SnapshotPane>(s.panes),
+    focused_workspace_id: str(s.focused_workspace_id),
+    focused_tab_id: str(s.focused_tab_id),
+    focused_pane_id: str(s.focused_pane_id),
   };
 }
 
-/**
- * Pads or truncates string to exact width.
- */
+/** Pads or truncates a string to an exact width. */
 function pad(str: string, width: number): string {
   if (str.length > width) return str.slice(0, width - 1) + '…';
   return str.padEnd(width, ' ');
 }
 
-/**
- * Formats unix timestamp to ISO-like time string (HH:MM:SS).
- */
-function formatTime(ts: number): string {
-  const d = new Date(ts);
-  return d.toTimeString().split(' ')[0] ?? '';
-}
-
-/**
- * Generates formatted dashboard text lines from snapshot data.
- */
+/** Generates the formatted dashboard lines from snapshot data. */
 export function composeDashboardLines(
   rawSnapshot: unknown,
   options?: ComposeDashboardOptions
 ): string[] {
   const data = normalizeSnapshot(rawSnapshot);
-  const now = options?.now ?? Date.now();
-  const timeStr = formatTime(now);
+  const timeStr = new Date(options?.now ?? Date.now()).toTimeString().slice(0, 8);
+  const meta = [
+    data?.version ? `Herdr v${data.version}` : 'Herdr (offline)',
+    data?.protocol ? `proto ${data.protocol}` : '',
+  ].filter(Boolean).join(', ');
 
-  const lines: string[] = [];
-  const verStr = data?.version ? `Herdr v${data.version}` : 'Herdr (offline)';
-  const protoStr = data?.protocol ? `proto ${data.protocol}` : '';
-  const meta = [verStr, protoStr].filter(Boolean).join(', ');
-
-  lines.push(`==================== PIER OPS DASHBOARD ==================== [${timeStr}] (${meta})`);
-
-  if (!data || (!data.workspaces?.length && !data.panes?.length)) {
-    lines.push('');
-    lines.push('  No active Herdr session or empty workspace data.');
-    lines.push('  Waiting for Herdr session snapshot...');
-    lines.push('');
-    lines.push('================================================================================');
+  const lines = [`==================== PIER OPS DASHBOARD ==================== [${timeStr}] (${meta})`];
+  if (!data || (!data.workspaces.length && !data.panes.length)) {
+    lines.push(
+      '',
+      '  No active Herdr session or empty workspace data.',
+      '  Waiting for Herdr session snapshot...',
+      '',
+      BANNER,
+    );
     return lines;
   }
 
-  // 1. Workspaces overview line
-  const wsItems = data.workspaces?.map((w) => {
-    const isFocused = w.focused || w.workspace_id === data.focused_workspace_id;
-    const focusMark = isFocused ? '*' : '';
-    const statusMark = w.agent_status && w.agent_status !== 'unknown' ? `:${w.agent_status}` : '';
-    return `[${focusMark}${w.workspace_id}: ${w.label ?? 'unnamed'}${statusMark}]`;
-  }) ?? [];
+  const wsItems = data.workspaces.map((w) => {
+    const focus = w.focused || w.workspace_id === data.focused_workspace_id ? '*' : '';
+    const status = w.agent_status && w.agent_status !== 'unknown' ? `:${w.agent_status}` : '';
+    return `[${focus}${w.workspace_id}: ${w.label ?? 'unnamed'}${status}]`;
+  });
+  lines.push(`Workspaces (${wsItems.length}): ${wsItems.join(' ')}`, RULE);
 
-  lines.push(`Workspaces (${wsItems.length}): ${wsItems.join(' ')}`);
-  lines.push('--------------------------------------------------------------------------------');
-
-  // Determine active/target workspace
-  const targetId = options?.targetWorkspaceId
-    ?? data.focused_workspace_id
-    ?? data.workspaces?.[0]?.workspace_id;
-
-  const currentWs = data.workspaces?.find((w) => w.workspace_id === targetId)
+  const targetId = options?.targetWorkspaceId ?? data.focused_workspace_id ?? data.workspaces[0]?.workspace_id;
+  const ws = data.workspaces.find((w) => w.workspace_id === targetId)
     ?? { workspace_id: targetId ?? 'unknown', label: 'default' };
+  const wsTabs = data.tabs.filter((t) => t.workspace_id === ws.workspace_id);
+  const wsPanes = data.panes.filter((p) => p.workspace_id === ws.workspace_id);
+  lines.push(`Current Workspace: ${ws.workspace_id} (${ws.label ?? 'unnamed'}) | Tabs: ${wsTabs.length} | Panes: ${wsPanes.length}`);
 
-  const wsTabs = data.tabs?.filter((t) => t.workspace_id === currentWs.workspace_id) ?? [];
-  const wsPanes = data.panes?.filter((p) => p.workspace_id === currentWs.workspace_id) ?? [];
-
-  lines.push(`Current Workspace: ${currentWs.workspace_id} (${currentWs.label ?? 'unnamed'}) | Tabs: ${wsTabs.length} | Panes: ${wsPanes.length}`);
-
-  // 2. Tabs in current workspace
   if (wsTabs.length > 0) {
     const tabParts = wsTabs.map((t) => {
-      const isFocused = t.focused || t.tab_id === data.focused_tab_id;
-      const f = isFocused ? '*' : ' ';
-      return `${f}#${t.number ?? '?'}[${t.label ?? t.tab_id}](${t.agent_status ?? 'unknown'})`;
+      const focus = t.focused || t.tab_id === data.focused_tab_id ? '*' : ' ';
+      return `${focus}#${t.number ?? '?'}[${t.label ?? t.tab_id}](${t.agent_status ?? 'unknown'})`;
     });
     lines.push(`Tabs: ${tabParts.join('  ')}`);
   }
+  lines.push(RULE);
 
-  lines.push('--------------------------------------------------------------------------------');
+  lines.push(PANE_COLUMNS.map(([title, width]) => pad(title, width)).join(' '));
+  lines.push(PANE_COLUMNS.map(([, width]) => '-'.repeat(width)).join(' '));
 
-  // 3. Panes table
-  lines.push(
-    `${pad('PANE ID', 10)} ${pad('ROLE', 8)} ${pad('STATUS', 10)} ${pad('FOC', 4)} ${pad('TODO / TITLE / TOKENS', 44)}`
-  );
-  lines.push(
-    `${'-'.repeat(10)} ${'-'.repeat(8)} ${'-'.repeat(10)} ${'-'.repeat(4)} ${'-'.repeat(44)}`
-  );
-
-  let blockedCount = 0;
-  let workingCount = 0;
-  let idleCount = 0;
+  const counts: Record<string, number> = { ...PIER_STATUSES };
   let pierCount = 0;
-
   for (const p of wsPanes) {
-    const isFocused = p.focused || p.pane_id === data.focused_pane_id;
-    const focMark = isFocused ? ' *  ' : '    ';
-    const role = p.display_agent ?? (p.agent ? p.agent : '-');
     const status = p.agent_status ?? 'unknown';
-
     if (p.agent === 'pi' || p.tokens?.['pi-todo']) {
-      pierCount++;
-      if (status === 'blocked') blockedCount++;
-      else if (status === 'working') workingCount++;
-      else if (status === 'idle') idleCount++;
+      pierCount += 1;
+      if (status in counts) counts[status] += 1;
     }
-
-    // Extract todo / title: pi-todo wins; else Herdr 0.9.1 stripped OSC title over raw title/spinner.
+    // pi-todo wins; else the Herdr 0.9.1 stripped OSC title (the raw title may still carry a spinner).
     let desc = p.tokens?.['pi-todo'] ?? p.terminal_title_stripped ?? p.title ?? p.terminal_title ?? '';
-    // Collect active locks if any
-    const lockTokens = Object.keys(p.tokens ?? {}).filter((k) => k.startsWith('lock-'));
-    if (lockTokens.length > 0) {
-      desc += ` [${lockTokens.length} lock${lockTokens.length > 1 ? 's' : ''}]`;
-    }
+    const locks = Object.keys(p.tokens ?? {}).filter((k) => k.startsWith('lock-')).length;
+    if (locks > 0) desc += ` [${locks} lock${locks > 1 ? 's' : ''}]`;
     if (!desc && (p.foreground_cwd || p.cwd)) {
-      const activeCwd = p.foreground_cwd || p.cwd || '';
-      desc = `cwd: ${activeCwd.split('/').pop() || activeCwd}`;
+      const cwd = p.foreground_cwd || p.cwd || '';
+      desc = `cwd: ${cwd.split('/').pop() || cwd}`;
     }
-
-    // Highlight blocked state with indicator
-    const statusDisplay = status === 'blocked' ? '! BLOCKED' : status;
-
-    lines.push(
-      `${pad(p.pane_id, 10)} ${pad(role, 8)} ${pad(statusDisplay, 10)} ${focMark} ${pad(desc, 44)}`
-    );
+    lines.push([
+      pad(p.pane_id, 10),
+      pad(p.display_agent ?? (p.agent || '-'), 8),
+      pad(status === 'blocked' ? '! BLOCKED' : status, 10),
+      p.focused || p.pane_id === data.focused_pane_id ? ' *  ' : '    ',
+      pad(desc, 44),
+    ].join(' '));
   }
 
-  if (wsPanes.length === 0) {
-    lines.push('  (No panes in this workspace)');
+  if (wsPanes.length === 0) lines.push('  (No panes in this workspace)');
+  lines.push(RULE);
+
+  if (counts.blocked > 0) {
+    lines.push(`⚠️  ALERT: ${counts.blocked} SUBAGENT(S) BLOCKED — WAITING ON HUMAN DECISION`);
   }
-
-  lines.push('--------------------------------------------------------------------------------');
-
-  // 4. Alert & Summary
-  if (blockedCount > 0) {
-    lines.push(`⚠️  ALERT: ${blockedCount} SUBAGENT(S) BLOCKED — WAITING ON HUMAN DECISION`);
-  }
-
   lines.push(
-    `Summary: ${wsPanes.length} pane(s) | Pier agents: ${pierCount} (${workingCount} working, ${blockedCount} blocked, ${idleCount} idle)`
+    `Summary: ${wsPanes.length} pane(s) | Pier agents: ${pierCount} (${counts.working} working, ${counts.blocked} blocked, ${counts.idle} idle)`,
+    BANNER,
   );
-  lines.push('================================================================================');
 
   return lines;
 }

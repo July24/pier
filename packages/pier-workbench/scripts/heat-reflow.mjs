@@ -1,88 +1,41 @@
 #!/usr/bin/env node
 /**
- * M23: pane.focused / created / closed / agent_status_changed -> focus heat reflow.
- * Bypasses cordis: user-mode plugin checkout does not have @deepseek-ai/cordis.
+ * Herdr hook (pane.created / pane.focused / pane.closed / pane.agent_status_changed): focus heat reflow.
+ * Bypasses cordis — a user-mode plugin checkout has no node_modules.
  */
-import * as net from 'node:net';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import * as os from 'node:os';
-import { parseEventEnv, runReflow, askFlagsFromListResult } from '../src/reflow.ts';
-import { readJsonSafe, writeJsonAtomic } from '../src/state-file.ts';
-
-const SOCKET = process.env.HERDR_SOCKET_PATH;
-const TARGET = process.platform === 'win32' && SOCKET
-  ? (SOCKET.startsWith('\\\\.\\pipe\\') ? SOCKET : '\\\\.\\pipe\\' + SOCKET)
-  : SOCKET;
+import * as path from 'node:path';
+import { request as rpc } from './herdr-rpc.mjs';
+import {
+  askFlagsFromListResult,
+  parseEventEnv,
+  readJsonSafe,
+  runReflow,
+  writeJsonAtomic,
+} from '../src/reflow.ts';
 
 const STATE_DIR = process.env.HERDR_PLUGIN_STATE_DIR
   || path.join(os.homedir(), '.pi', 'agent', 'herdr-pi');
 const STATE_FILE = path.join(STATE_DIR, 'tab-layout.json');
+const EMPTY_STATE = { tabs: {}, panes: {}, debounce: null };
 
-// F15: concurrent hook processes share this file — read tolerantly, write atomically.
-function loadState() {
-  return readJsonSafe(STATE_FILE, { tabs: {}, panes: {}, debounce: null });
-}
+/** Reflow RPCs run inside a hook process: keep the per-call budget at 8s. */
+const request = (method, params = {}) => rpc(method, params, 8000);
 
-function saveState(state) {
-  writeJsonAtomic(STATE_FILE, state);
-}
-
-function request(method, params = {}, timeoutMs = 8000) {
-  return new Promise((resolve, reject) => {
-    if (!TARGET) return reject(new Error('no socket'));
-    const sock = net.createConnection(TARGET);
-    sock.setEncoding('utf8');
-    let buf = '';
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        sock.destroy();
-        reject(new Error(method + ' timeout'));
-      }
-    }, timeoutMs);
-    sock.on('connect', () => sock.write(JSON.stringify({ id: '1', method, params }) + '\n'));
-    sock.on('data', (chunk) => {
-      buf += chunk;
-      const i = buf.indexOf('\n');
-      if (i < 0) return;
-      clearTimeout(timer);
-      if (settled) return;
-      settled = true;
-      sock.destroy();
-      let msg;
-      try { msg = JSON.parse(buf.slice(0, i).trim()); } catch { return reject(new Error('bad frame')); }
-      msg.error ? reject(new Error(`${msg.error.code}: ${msg.error.message}`)) : resolve(msg.result);
-    });
-    sock.on('error', (err) => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        reject(err);
-      }
-    });
-  });
-}
-
-function parseEvent() {
-  return parseEventEnv();
-}
+const paneList = async () => (await request('pane.list', {}))?.panes ?? [];
 
 async function main() {
-  const ev = parseEvent();
   await runReflow({
-    ev,
+    ev: parseEventEnv(),
     request,
-    loadState,
-    saveState,
+    // F15: concurrent hook processes share this file — read tolerantly, write atomically.
+    loadState: () => readJsonSafe(STATE_FILE, EMPTY_STATE),
+    saveState: (state) => writeJsonAtomic(STATE_FILE, state),
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     listAgentStatuses: async () => {
       try {
-        const result = await request('pane.list', {});
-        const panes = result?.panes ?? [];
         const map = {};
-        for (const p of panes) if (p?.pane_id && p?.agent_status) map[p.pane_id] = p.agent_status;
+        for (const p of await paneList()) if (p?.pane_id && p?.agent_status) map[p.pane_id] = p.agent_status;
         return map;
       } catch {
         return {};
@@ -92,9 +45,9 @@ async function main() {
       try {
         const fromAgents = askFlagsFromListResult(await request('agent.list', {}));
         if (Object.keys(fromAgents).length > 0) return fromAgents;
-      } catch { /* agent.list optional */ }
+      } catch { /* agent.list is optional */ }
       try {
-        return askFlagsFromListResult(await request('pane.list', {}));
+        return askFlagsFromListResult({ panes: await paneList() });
       } catch {
         return {};
       }
@@ -102,11 +55,8 @@ async function main() {
     piTabIds: async () => {
       const tabs = new Set();
       try {
-        const result = await request('pane.list', {});
-        for (const p of result?.panes ?? []) if (p?.agent === 'pi' && p?.tab_id) tabs.add(p.tab_id);
-      } catch {
-        /* Snapshot failure = empty set -> conservative no-op */
-      }
+        for (const p of await paneList()) if (p?.agent === 'pi' && p?.tab_id) tabs.add(p.tab_id);
+      } catch { /* snapshot failure = empty set -> conservative no-op */ }
       return tabs;
     },
   });

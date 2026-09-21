@@ -1,11 +1,6 @@
 /**
- * F05: `boot.jsonl` is append-only — bootstrap.mjs appends one record per `workspace.created` /
- * `worktree.opened`, so a workspace that was opened, closed and reopened has several records.
- * restore-layout.mjs used to walk *every* record, which rebuilds the same main tab/pane repeatedly
- * after a session restore (duplicate master panes in one workspace).
- *
- * These helpers are pure so the restore decision can be tested without a live herdr socket; the
- * script stays a thin socket wrapper.
+ * Pure helpers behind the restore-layout hook, so the restore decision is testable without a live
+ * herdr socket (the script stays a thin socket wrapper).
  */
 
 export interface BootRecord {
@@ -36,9 +31,9 @@ export function parseBootRecords(text: string): BootRecord[] {
 }
 
 /**
- * Newest record per workspace (file order is append order, so the last record wins).
- * The newest record carries the tab/pane ids that were valid at shutdown, which is exactly what the
- * restore path needs.
+ * F05: boot.jsonl is append-only — a workspace opened, closed and reopened has several records, and
+ * walking every one of them rebuilds the same main tab repeatedly (duplicate master panes). Keep the
+ * newest record per workspace: file order is append order, and it carries the ids valid at shutdown.
  */
 export function latestBootRecordPerWorkspace(records: readonly BootRecord[]): BootRecord[] {
   const byWorkspace = new Map<string, BootRecord>();

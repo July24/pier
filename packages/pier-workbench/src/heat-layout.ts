@@ -1,36 +1,25 @@
 /**
  * M23 heat layout planner (D91 Tier 3: in-place grid heat).
  *
- * Core principle (user decision): panes NEVER move position (zero swaps),
- * adjusting only split ratios — focused pane expands in place, remaining
- * cells shrink; small cells without blocked/ask states naturally compress
- * into title bars.
- *
- * Geometry: herdr ratio = split node first child share (from 0.8.2 source
- * split_rect: first_w = width * ratio), clamped by engine to [0.10, 0.90].
- *
- * History: Tier 1 (D67 swap-to-first + 0.65) and Tier 2 (D90 top-of-stack
- * promotion + weight chain) have been superseded by this tier — real-world
- * feedback: "click = expand in place, not move to the first position".
- * Tier 2 also harbored an inverted direction bug (ratio mistaken for second
- * share, escaping notice because live tests asserted position but not dimensions);
- * this tier rewrites against herdr source semantics.
+ * Panes NEVER move position (zero swaps) — only split ratios change: the focused pane expands in place
+ * and the remaining cells shrink. Geometry: herdr's ratio is the split node's first child share
+ * (0.8.2 split_rect: first_w = width * ratio), clamped by the engine to [0.10, 0.90].
  */
 export const MAX_AUTO_LAYOUT_PANES = 10;
 export const PANE_MIN_AGE_MS = 3000;
 export const REFLOW_DEBOUNCE_MS = 150;
-/** Herdr engine silent split ratio clamp lower bound (verified in d90-C; supported by 0.8.2 source set_ratio_at clamp(0.1, 0.9)). */
+/** Herdr engine silent ratio clamp lower bound (0.8.2 set_ratio_at clamps to [0.1, 0.9]). */
 export const RATIO_FLOOR = 0.10;
-/** Target area share of focused pane (whole tab). Distributes geometrically along the path at T^(1/depth) per level to avoid deep compounding shrinkage. */
+/** Target area share of the focused pane (whole tab), split geometrically along the path at T^(1/depth) per level to avoid deep compounding shrinkage. */
 export const FOCUS_SHARE = 0.72;
-/** Focused pane yields share (0.72 -> 0.60) when blocked panes exist outside focus, conceding area to cells most requiring attention. */
+/** Focused pane yields share (0.72 -> 0.60) when blocked panes exist outside the focus. */
 export const FOCUS_SHARE_BLOCKED = 0.60;
 /** D95 sibling subtree status weighting: blocked 3 / ask 2.5 / working 1.4 / idle 1. */
 export const BLOCKED_WEIGHT = 3;
 export const ASK_WEIGHT = 2.5;
 export const WORKING_WEIGHT = 1.4;
 export const IDLE_WEIGHT = 1;
-/** D95 slim threshold: when non-focused panes >= this count, idle/working weights * 0.6 (compressed toward 0.10 floor = title bar visual). */
+/** D95 slim threshold: at this many non-focused panes, idle/working weights * 0.6 (compress toward the 0.10 floor = title bar). */
 export const SLIM_THRESHOLD = 4;
 export const SLIM_FACTOR = 0.6;
 
@@ -163,13 +152,9 @@ function weightedEqualize(node: LayoutNode, path: boolean[], statuses: AgentStat
 }
 
 /**
- * In-place grid heat: focused pane takes r = T^(1/depth) at each level along the path
- * (ratio=r if first is on focus side, else 1-r), compounding to T total tab share
- * for the focused cell; off-path subtrees divide remaining share by status weight.
- *
- * Properties: each split on the tree produces exactly one ratio op (by r along
- * the path, by weight on off-path branches); produces zero swaps — pane positions
- * never move.
+ * In-place grid heat: the focused pane takes r = T^(1/depth) at each level along its path (ratio=r when
+ * first is on the focus side, else 1-r), compounding to T total tab share; off-path subtrees divide their
+ * remaining share by status weight. Every split yields exactly one ratio op and panes never move.
  */
 export function planGridHeat(opts: {
   root: LayoutNode;
@@ -193,29 +178,27 @@ export function planGridHeat(opts: {
   const slim = opts.paneCount - 1 >= SLIM_THRESHOLD;
   const steps = findPath(opts.root, opts.focusPaneId) ?? [];
 
-  // Off-path subtrees at each level of the focus path (with boolean tree path)
+  // One walk down the focus path: on-path ratios wait for r, off-path siblings split by status weight.
+  const onPathPaths: boolean[][] = [];
   const offPath: Array<{ node: LayoutNode; path: boolean[] }> = [];
-  let bools: boolean[] = [];
+  let path: boolean[] = [];
   for (const step of steps) {
-    const siblingSide = step.side === 'first' ? true : false;
-    offPath.push({
-      node: step.side === 'first' ? step.node.second : step.node.first,
-      path: [...bools, siblingSide],
-    });
-    bools = [...bools, step.side === 'first' ? false : true];
+    const first = step.side === 'first';
+    onPathPaths.push(path);
+    offPath.push({ node: first ? step.node.second : step.node.first, path: [...path, first] });
+    path = [...path, !first];
   }
-
   const hasBlocked = offPath.some(({ node }) => flattenPanes(node).some((id) => statuses[id] === 'blocked'));
-  const target = hasBlocked ? FOCUS_SHARE_BLOCKED : FOCUS_SHARE;
-  const r = clampRatio(target ** (1 / steps.length));
+  const r = clampRatio((hasBlocked ? FOCUS_SHARE_BLOCKED : FOCUS_SHARE) ** (1 / steps.length));
 
-  const ops: HeatOp[] = [];
-  bools = [];
-  for (const step of steps) {
-    ops.push({ kind: 'ratio', path: bools, ratio: step.side === 'first' ? r : 1 - r });
-    bools = [...bools, step.side === 'first' ? false : true];
+  const ops: HeatOp[] = steps.map((step, i) => ({
+    kind: 'ratio',
+    path: onPathPaths[i],
+    ratio: step.side === 'first' ? r : 1 - r,
+  }));
+  for (const sibling of offPath) {
+    weightedEqualize(sibling.node, sibling.path, statuses, askFlags, slim, ops);
   }
-  for (const { node, path } of offPath) weightedEqualize(node, path, statuses, askFlags, slim, ops);
   return { type: 'apply', ops };
 }
 

@@ -1,23 +1,14 @@
 #!/usr/bin/env node
 /**
- * Pier Ops Dashboard entrypoint.
- *
- * Runs as a Herdr plugin pane (or CLI tool with --once).
- * Connects to Herdr's socket API, fetches session.snapshot,
- * and renders an auto-refreshing ops dashboard.
+ * Pier Ops Dashboard entrypoint: a herdr plugin pane (or CLI tool with --once).
+ * Fetches session.snapshot over the herdr socket and renders an auto-refreshing dashboard.
  */
-import * as net from 'node:net';
+import { request } from './herdr-rpc.mjs';
 import { composeDashboardLines } from '../src/dashboard-model.ts';
 
-const args = process.argv.slice(2);
-const onceMode = args.includes('--once');
+const onceMode = process.argv.includes('--once');
 
-const SOCKET = process.env.HERDR_SOCKET_PATH;
-const TARGET = process.platform === 'win32' && SOCKET
-  ? (SOCKET.startsWith('\\\\.\\pipe\\') ? SOCKET : '\\\\.\\pipe\\' + SOCKET)
-  : SOCKET;
-
-if (!SOCKET) {
+if (!process.env.HERDR_SOCKET_PATH) {
   console.log(
     [
       '==================== PIER OPS DASHBOARD ==================== (standalone)',
@@ -31,62 +22,20 @@ if (!SOCKET) {
 let targetWorkspaceId = null;
 if (process.env.HERDR_PLUGIN_CONTEXT_JSON) {
   try {
-    const ctx = JSON.parse(process.env.HERDR_PLUGIN_CONTEXT_JSON);
-    targetWorkspaceId = ctx?.workspace_id ?? null;
+    targetWorkspaceId = JSON.parse(process.env.HERDR_PLUGIN_CONTEXT_JSON)?.workspace_id ?? null;
   } catch {
-    // Ignore invalid context JSON
+    // Invalid context JSON: fall back to the focused workspace.
   }
 }
 
-function request(method, params = {}, timeoutMs = 3000) {
-  return new Promise((resolve, reject) => {
-    if (!TARGET) return reject(new Error('no socket path'));
-    const sock = net.createConnection(TARGET);
-    sock.setEncoding('utf8');
-    let buf = '';
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        sock.destroy();
-        reject(new Error(method + ' timeout'));
-      }
-    }, timeoutMs);
-    sock.on('connect', () => sock.write(JSON.stringify({ id: 'dash-1', method, params }) + '\n'));
-    sock.on('data', (chunk) => {
-      buf += chunk;
-      const i = buf.indexOf('\n');
-      if (i < 0) return;
-      clearTimeout(timer);
-      if (settled) return;
-      settled = true;
-      sock.destroy();
-      let msg;
-      try { msg = JSON.parse(buf.slice(0, i).trim()); } catch { return reject(new Error('bad frame')); }
-      msg.error ? reject(new Error(`${msg.error.code}: ${msg.error.message}`)) : resolve(msg.result);
-    });
-    sock.on('error', (err) => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        reject(err);
-      }
-    });
-  });
-}
-
-async function fetchSnapshot() {
-  try {
-    return await request('session.snapshot', {});
-  } catch {
-    return null;
-  }
+async function render() {
+  // A failing/absent socket renders the offline dashboard instead of throwing.
+  const snapshot = await request('session.snapshot', {}, 3000).catch(() => null);
+  return composeDashboardLines(snapshot, { targetWorkspaceId });
 }
 
 async function renderOnce() {
-  const snapshot = await fetchSnapshot();
-  const lines = composeDashboardLines(snapshot, { targetWorkspaceId });
-  console.log(lines.join('\n'));
+  console.log((await render()).join('\n'));
 }
 
 async function closePopupSafe() {
@@ -108,17 +57,14 @@ async function runLoop() {
   process.on('SIGINT', cleanup);
   process.on('SIGTERM', cleanup);
 
-  // Enable raw keyboard handling if in an interactive terminal / popup
+  // Raw keyboard handling when running inside an interactive terminal / popup: q, Q, Esc, Ctrl+C.
   if (process.stdin.isTTY) {
     try {
       process.stdin.setRawMode(true);
       process.stdin.resume();
       process.stdin.setEncoding('utf8');
       process.stdin.on('data', (key) => {
-        // 'q', 'Q', Esc ('\u001b'), Ctrl+C ('\u0003'), Enter ('\r' / '\n')
-        if (key === 'q' || key === 'Q' || key === '\u001b' || key === '\u0003') {
-          void cleanup();
-        }
+        if (key === 'q' || key === 'Q' || key === '\u001b' || key === '\u0003') void cleanup();
       });
     } catch {
       // Non-critical fallback if raw mode fails
@@ -127,8 +73,7 @@ async function runLoop() {
 
   async function tick() {
     if (!running) return;
-    const snapshot = await fetchSnapshot();
-    const lines = composeDashboardLines(snapshot, { targetWorkspaceId });
+    const lines = await render();
     lines.push('Controls: [q / Esc] Close  [Ctrl+C] Exit');
     process.stdout.write('\x1b[2J\x1b[H' + lines.join('\n') + '\n');
   }
