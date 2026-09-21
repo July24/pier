@@ -1,11 +1,12 @@
 /**
  * B10：环境变量命名。canonical 是 `PIER_*`，历史 `PI_HERDR_*` 作为别名继续可用；
  * `PI_HERDR_SUBAGENT`/`_ROLE_MANIFEST`/`_TUI`/`_META_KEY` 是父进程交给子进程的契约，不在此列。
+ * 同时覆盖 runtime-policy：RuntimePolicy 的每个字段都由同一张 PIER_OPTIONS 表供给。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PIER_OPTIONS, formatOptionRows, pierOption, pierOptionRows } from '../src/pier-options.ts';
-import { createRuntimePolicy } from '../src/runtime-policy.ts';
+import { createRuntimePolicy, type RuntimePolicy } from '../src/runtime-policy.ts';
 import {
   POSIX_PROMPT,
   POWERSHELL_PROMPT,
@@ -13,6 +14,38 @@ import {
   terminalIdleMs,
   terminalReminderGraceMs,
 } from '../src/terminal-core.ts';
+
+const POLICY_FIELDS: ReadonlyArray<keyof RuntimePolicy> = [
+  'subagentTimeoutMs',
+  'gcTickMs',
+  'pollIntervalMs',
+  'settlementWindowMs',
+  'observationWindowMs',
+  'foregroundPatienceMs',
+  'sessionTtlSeconds',
+  'gitTimeoutMs',
+  'readinessTimeoutMs',
+];
+
+const OPTION_NAMES = PIER_OPTIONS.flatMap((o) => [o.name, o.legacy].filter((n): n is string => Boolean(n)));
+
+/** Runs `fn` with the given process env applied; `undefined` unsets. Restored afterwards. */
+function withEnv(env: Record<string, string | undefined>, fn: () => void): void {
+  const saved = new Map(OPTION_NAMES.map((name) => [name, process.env[name]]));
+  for (const name of OPTION_NAMES) delete process.env[name];
+  for (const [k, v] of Object.entries(env)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  try {
+    fn();
+  } finally {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
 
 test('pierOption: canonical 优先，legacy 兜底，空串视为未设置', () => {
   assert.equal(pierOption('PIER_GIT_TIMEOUT_MS', { PIER_GIT_TIMEOUT_MS: '5000' }), '5000');
@@ -36,17 +69,49 @@ test('pierOptionRows/formatOptionRows: 标出来源（env / env(legacy) / defaul
   assert.match(lines[0]!, /^\s+PIER_[A-Z_]+ = .+\(default\)/);
 });
 
-test('runtime policy 与 terminal prompt 都接受 legacy 前缀', () => {
-  // legacy 名字通过 pierOption 生效（进程级 env：createRuntimePolicy 读 process.env）
-  const prev = process.env.PI_HERDR_GIT_TIMEOUT_MS;
-  process.env.PI_HERDR_GIT_TIMEOUT_MS = '4321';
-  try {
-    assert.equal(createRuntimePolicy().gitTimeoutMs, 4321);
-  } finally {
-    if (prev === undefined) delete process.env.PI_HERDR_GIT_TIMEOUT_MS;
-    else process.env.PI_HERDR_GIT_TIMEOUT_MS = prev;
-  }
+test('createRuntimePolicy: 每个字段都由目录供给；overrides > env > registry fallback', () => {
+  withEnv({}, () => {
+    const fromRegistry = createRuntimePolicy();
+    assert.deepEqual(Object.keys(fromRegistry).sort(), [...POLICY_FIELDS].sort(), 'RuntimePolicy 字段与目录登记一致');
+    for (const field of POLICY_FIELDS) {
+      const spec = PIER_OPTIONS.find((o) => o.policy === field);
+      assert.ok(spec, `${field} 必须由某个 PIER_OPTIONS 条目供给`);
+      assert.equal(fromRegistry[field], Number(spec.fallback), `${field} 默认值 = 目录 fallback`);
+      assert.equal(PIER_OPTIONS.find((o) => o.policy === field)!.min === undefined, false, `${spec.name} 必须有 min 边界`);
+    }
+    assert.equal(createRuntimePolicy({ gitTimeoutMs: 42, subagentTimeoutMs: 99 }).gitTimeoutMs, 42, 'overrides 优先');
+  });
 
+  withEnv({ PIER_GIT_TIMEOUT_MS: '2500', PI_HERDR_SUBAGENT_TIMEOUT_MS: '8000' }, () => {
+    const p = createRuntimePolicy();
+    assert.equal(p.gitTimeoutMs, 2500, 'canonical env 生效');
+    assert.equal(p.subagentTimeoutMs, 8000, 'legacy 名同样生效');
+    assert.equal(createRuntimePolicy({ gitTimeoutMs: 42 }).gitTimeoutMs, 42, 'override 压过 env');
+  });
+});
+
+test('createRuntimePolicy: 非法/越界 env 告警一次并回落到目录默认值', () => {
+  const warnings: string[] = [];
+  const warn = console.warn;
+  console.warn = (message?: unknown) => { warnings.push(String(message)); };
+  try {
+    withEnv({ PIER_GIT_TIMEOUT_MS: 'nope', PIER_SUBAGENT_TIMEOUT_MS: '-1' }, () => {
+      const p = createRuntimePolicy();
+      assert.equal(p.gitTimeoutMs, 10_000);
+      assert.equal(p.subagentTimeoutMs, 600_000);
+    });
+  } finally {
+    console.warn = warn;
+  }
+  assert.deepEqual(warnings, [
+    'Invalid PIER_GIT_TIMEOUT_MS="nope", using default 10000',
+    'Invalid PIER_SUBAGENT_TIMEOUT_MS="-1", using default 600000',
+  ]);
+  // A14: concurrent isolated workers routinely take longer than 30s to boot.
+  assert.equal(createRuntimePolicy().readinessTimeoutMs, 90_000);
+});
+
+test('terminal prompt 读取点接受 legacy 前缀', () => {
   assert.equal(promptStrategyFor({ PI_HERDR_TERMINAL_PROMPT: 'powershell' }), POWERSHELL_PROMPT);
   assert.equal(promptStrategyFor({ PIER_TERMINAL_PROMPT: 'powershell', PI_HERDR_TERMINAL_PROMPT: 'bash' }), POWERSHELL_PROMPT);
   assert.equal(promptStrategyFor({ PIER_TERMINAL_PROMPT: 'bash' }), POSIX_PROMPT);
@@ -59,53 +124,16 @@ test('B10 收口：terminal/todo/slim-frame/HMR 的读取点都走 catalog（leg
     assert.ok(spec, `${name} 应在目录中`);
     assert.ok(spec!.legacy?.startsWith('PI_HERDR_'), `${name} 应保留 legacy 别名`);
   }
-  const prev = process.env.PI_HERDR_TERM_IDLE_MS;
-  process.env.PI_HERDR_TERM_IDLE_MS = '1234';
-  process.env.PIER_TERM_GRACE_MS = '4321';
-  try {
+  withEnv({ PI_HERDR_TERM_IDLE_MS: '1234', PIER_TERM_GRACE_MS: '4321' }, () => {
     assert.equal(terminalIdleMs(), 1234, 'legacy 名生效');
     assert.equal(terminalReminderGraceMs(), 4321, 'canonical 名生效');
-  } finally {
-    delete process.env.PIER_TERM_GRACE_MS;
-    if (prev === undefined) delete process.env.PI_HERDR_TERM_IDLE_MS;
-    else process.env.PI_HERDR_TERM_IDLE_MS = prev;
-  }
+  });
 });
 
-test('B10 护栏：PIER_* 注册表与 /pier-config 目录不得再漂移（数字默认值必须等于运行时值）', async () => {
-  const { CONFIG_KNOBS } = await import('../src/config-catalog-core.ts');
-  const { createRuntimePolicy } = await import('../src/runtime-policy.ts');
-  const env = CONFIG_KNOBS.filter((k) => k.plane === 'env');
-  const catalogNames = new Set(env.flatMap((k) => [k.key, ...(k.aliases ?? [])]));
-  const registryNames = new Set(PIER_OPTIONS.flatMap((o) => [o.name, ...(o.legacy ? [o.legacy] : [])]));
-
-  // 1. 两个注册表说的是同一批名字（canonical + legacy 别名并集）
-  assert.deepEqual([...registryNames].filter((n) => !catalogNames.has(n)), [], 'registry 里有目录未登记的名字');
-  assert.deepEqual([...catalogNames].filter((n) => !registryNames.has(n)), [], '目录里有 registry 未登记的名字');
-
-  // 2. 数字默认值三方一致：目录条目 = registry fallback = 运行时值。
-  //    这三处曾经各不相同（GIT_TIMEOUT 120000/10000、SUBAGENT_TIMEOUT 300000/600000、
-  //    POLL_INTERVAL 5000/30000），而 /pier-config doctor 显示的是 registry 那个数。
-  // 构造实例而不是读单例：单例在 import 期就固化了 process.env（测试进程里可能被别处改过）。
-  const runtime = createRuntimePolicy() as unknown as Record<string, number>;
-  const runtimeByKnob: Record<string, number> = {
-    PIER_SUBAGENT_TIMEOUT_MS: runtime.subagentTimeoutMs,
-    PIER_GC_TICK_MS: runtime.gcTickMs,
-    PIER_POLL_INTERVAL_MS: runtime.pollIntervalMs,
-    PIER_SETTLEMENT_WINDOW_MS: runtime.settlementWindowMs,
-    PIER_OBSERVATION_WINDOW_MS: runtime.observationWindowMs,
-    PIER_FOREGROUND_PATIENCE_MS: runtime.foregroundPatienceMs,
-    PIER_SESSION_TTL_SECONDS: runtime.sessionTtlSeconds,
-    PIER_GIT_TIMEOUT_MS: runtime.gitTimeoutMs,
-    PIER_READY_TIMEOUT_MS: runtime.readinessTimeoutMs,
-  };
-  for (const [name, value] of Object.entries(runtimeByKnob)) {
-    assert.equal(env.find((k) => k.key === name)?.defaultValue, value, `${name}：目录默认值应等于运行时值`);
-    assert.equal(PIER_OPTIONS.find((o) => o.name === name)?.fallback, String(value), `${name}：registry fallback 应等于运行时值`);
-  }
-  // 3. 目录里每个 canonical 名都必须是 PIER_*（canonical 前缀规则，legacy 只能出现在 aliases）
-  for (const knob of env) {
-    assert.match(knob.key, /^PIER_/, `${knob.key} 应是 canonical 名`);
-    for (const alias of knob.aliases ?? []) assert.match(alias, /^PI_HERDR_/, `${alias} 应是 legacy 名`);
+test('B10 护栏：目录命名与数值格式自洽（canonical PIER_* / legacy PI_HERDR_* / 整数 fallback）', () => {
+  for (const spec of PIER_OPTIONS) {
+    assert.match(spec.name, /^PIER_/, `${spec.name} 应是 canonical 名`);
+    if (spec.legacy) assert.match(spec.legacy, /^PI_HERDR_/, `${spec.legacy} 应是 legacy 名`);
+    if (spec.min !== undefined) assert.match(spec.fallback, /^\d+$/, `${spec.name} 是整数选项，fallback 必须是数字`);
   }
 });

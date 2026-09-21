@@ -1,10 +1,11 @@
 /**
  * Centralized runtime policy and timeouts.
- * 
- * Why: Prevents drift between hardcoded literals and environment overrides;
- * makes timing behavior explicit and testable.
+ *
+ * Every field comes from the `PIER_OPTIONS` registry (canonical/legacy env names, bounds and
+ * default), so the numbers cannot drift from `/pier-config doctor`; an out-of-range or unparsable
+ * value warns once and falls back to the registry default.
  */
-import { pierOption } from './pier-options.ts';
+import { PIER_OPTIONS, pierOption, type PolicyField } from './pier-options.ts';
 
 export interface RuntimePolicy {
   /** Subagent overall timeout (ms) */
@@ -27,33 +28,29 @@ export interface RuntimePolicy {
   readonly readinessTimeoutMs: number
 }
 
-/** B10: read through the option catalog so the legacy `PI_HERDR_*` spelling keeps working. */
-function parseEnvInt(key: string, defaultValue: number, min: number = 0): number {
-  const raw = pierOption(key)
-  if (!raw) return defaultValue
-  
-  const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed) || parsed < min) {
-    console.warn(`Invalid ${key}="${raw}", using default ${defaultValue}`)
-    return defaultValue
+function policyValue(field: PolicyField): number {
+  const spec = PIER_OPTIONS.find((o) => o.policy === field);
+  if (!spec) throw new Error(`no PIER_OPTIONS entry feeds RuntimePolicy.${field}`);
+  const fallback = Number(spec.fallback);
+  const raw = pierOption(spec.name);
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < (spec.min ?? 0)) {
+    console.warn(`Invalid ${spec.name}="${raw}", using default ${spec.fallback}`);
+    return fallback;
   }
-  
-  return parsed
+  return parsed;
 }
 
 export function createRuntimePolicy(overrides?: Partial<RuntimePolicy>): RuntimePolicy {
-  return {
-    subagentTimeoutMs: overrides?.subagentTimeoutMs ?? parseEnvInt('PIER_SUBAGENT_TIMEOUT_MS', 600_000, 1000),
-    gcTickMs: overrides?.gcTickMs ?? parseEnvInt('PIER_GC_TICK_MS', 30_000, 1000),
-    pollIntervalMs: overrides?.pollIntervalMs ?? parseEnvInt('PIER_POLL_INTERVAL_MS', 30_000, 1000),
-    settlementWindowMs: overrides?.settlementWindowMs ?? parseEnvInt('PIER_SETTLEMENT_WINDOW_MS', 60_000, 0),
-    observationWindowMs: overrides?.observationWindowMs ?? parseEnvInt('PIER_OBSERVATION_WINDOW_MS', 30_000, 0),
-    foregroundPatienceMs: overrides?.foregroundPatienceMs ?? parseEnvInt('PIER_FOREGROUND_PATIENCE_MS', 300_000, 0),
-    sessionTtlSeconds: overrides?.sessionTtlSeconds ?? parseEnvInt('PIER_SESSION_TTL_SECONDS', 600, 0),
-    gitTimeoutMs: overrides?.gitTimeoutMs ?? parseEnvInt('PIER_GIT_TIMEOUT_MS', 10_000, 1),
-    // A14: concurrent heavy workers can take far longer than 30s to boot; PIER_READY_TIMEOUT_MS overrides.
-    readinessTimeoutMs: overrides?.readinessTimeoutMs ?? parseEnvInt('PIER_READY_TIMEOUT_MS', 90_000, 1000),
+  const policy = {} as { -readonly [K in keyof RuntimePolicy]: number };
+  for (const spec of PIER_OPTIONS) {
+    if (spec.policy) policy[spec.policy] = policyValue(spec.policy);
   }
+  for (const [key, value] of Object.entries(overrides ?? {})) {
+    if (typeof value === 'number') policy[key as keyof RuntimePolicy] = value;
+  }
+  return policy;
 }
 
 /**
