@@ -1,10 +1,8 @@
 /**
- * D-4: herdr 0.9.0 resolved mouse focus client-side, so `pane.focused` never reached plugins.
- * Each pier pane sampled `layout.export` and replayed `pane.focused` into heat-reflow.mjs.
- *
- * Herdr 0.9.1 delivers `pane.focused` to the workbench hook. Default polling is therefore off
- * (0 ms) on ≥0.9.1 so a click is not followed by a second reflow ~8s later. Herdr <0.9.1 keeps
- * the 1500ms sampler. `PIER_FOCUS_POLL_MS` overrides either default; 0 disables.
+ * D-4: herdr 0.9.0 resolved mouse focus client-side, so `pane.focused` never reached plugins and each pier
+ * pane had to sample `layout.export` itself. 0.9.1 delivers the hook, so default polling is off (0 ms) on
+ * ≥0.9.1 to avoid a second reflow ~8 s after a click; older servers keep the 1500 ms sampler.
+ * `PIER_FOCUS_POLL_MS` overrides either default; 0 disables.
  */
 import { spawn } from 'node:child_process';
 import { dirname, join } from 'node:path';
@@ -88,11 +86,10 @@ export interface FocusTick {
 /**
  * Decide whether one sample should trigger a reflow.
  *
- * Fires only on a *transition* into "I am focused" (so a steady focus never re-triggers) and at most
- * once per `minIntervalMs`. `cause` is 'user' when the pane set did not change in the same sample:
- * a click moves focus and nothing else, whereas a spawn auto-focus always comes with a new pane.
- * The workbench uses that distinction for its 3 s pane-age whitelist (F1: a freshly created pane
- * must not grab the layout through an automatic focus).
+ * Fires only on a *transition* into "I am focused" (a steady focus never re-triggers) and at most once per
+ * `minIntervalMs`. `cause` is 'user' when the pane set did not change in the same sample: a click moves focus
+ * and nothing else, whereas a spawn auto-focus always comes with a new pane. The workbench uses that to keep
+ * its 3 s pane-age whitelist (F1: a freshly created pane must not grab the layout through an automatic focus).
  */
 export function planFocusTick(opts: {
   myPaneId: string;
@@ -139,8 +136,6 @@ export interface FocusPollerDeps {
   intervalMs?: number;
   minIntervalMs?: number;
   now?: () => number;
-  setIntervalFn?: (fn: () => void, ms: number) => NodeJS.Timeout;
-  clearIntervalFn?: (handle: NodeJS.Timeout) => void;
   /** Diagnostics only: polling failures are expected while herdr restarts. */
   onError?: (err: unknown) => void;
 }
@@ -153,10 +148,7 @@ export interface FocusPoller {
 
 export function startFocusPoller(deps: FocusPollerDeps): FocusPoller {
   const intervalMs = deps.intervalMs ?? FOCUS_POLL_DEFAULT_MS;
-  const now = deps.now ?? (() => Date.now());
-  const setIntervalFn = deps.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
-  const clearIntervalFn =
-    deps.clearIntervalFn ?? ((handle: NodeJS.Timeout) => { clearInterval(handle); });
+  const now = deps.now ?? Date.now;
   let state: FocusPollerState | null = null;
   let inFlight = false;
   let stopped = false;
@@ -186,7 +178,7 @@ export function startFocusPoller(deps: FocusPollerDeps): FocusPoller {
   }
 
   if (intervalMs > 0) {
-    handle = setIntervalFn(() => { void tick(); }, intervalMs);
+    handle = setInterval(() => { void tick(); }, intervalMs);
     handle.unref?.(); // never keep pi's event loop alive on our account
   }
 
@@ -195,7 +187,7 @@ export function startFocusPoller(deps: FocusPollerDeps): FocusPoller {
     stop(): void {
       stopped = true;
       if (handle !== null) {
-        clearIntervalFn(handle);
+        clearInterval(handle);
         handle = null;
       }
     },
