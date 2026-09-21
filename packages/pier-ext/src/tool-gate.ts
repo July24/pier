@@ -1,13 +1,18 @@
-/** Why: Preserve the established compatibility and safety behavior (C7, D76, D77, D79, WS-D6). */
+/**
+ * Worker execution enforcement (C7, D76/D77/D82) — pure.
+ *
+ * RuntimeRoleManifest is THE runtime manifest shape: the file-format shape lives in
+ * role-manifest.ts, the composed/persisted shapes derive from this one (see
+ * manifest-compose.ts and role-state.ts).
+ */
 import type { PermissionAction, UnknownToolStance } from './role-manifest.ts';
 
-/** Why: Preserve the established compatibility and safety behavior. */
 export interface RuntimeRoleManifest {
   role: string;
   version?: string;
   tools: string[];
   permissions: Record<string, PermissionAction>;
-  /** Why: Preserve the established compatibility and safety behavior (D82). */
+  /** D82: stance for tools outside `tools`; 'allow' keeps user-installed extensions visible. */
   unknownTools?: UnknownToolStance;
   services?: {
     todos?: {
@@ -18,13 +23,12 @@ export interface RuntimeRoleManifest {
   guidelines?: string[];
 }
 
-/** Why: Preserve the established compatibility and safety behavior. */
+/** Parse the env-carried manifest; malformed input is null (fail-open: no gate) rather than a crash. */
 export function parseRuntimeManifest(envValue: string | undefined): RuntimeRoleManifest | null {
   if (!envValue) return null;
   try {
     const m = JSON.parse(envValue) as RuntimeRoleManifest;
     if (!m || typeof m.role !== 'string' || !Array.isArray(m.tools)) return null;
-    // Why: Preserve the established compatibility and safety behavior (D82).
     if (m.unknownTools !== undefined && m.unknownTools !== 'allow' && m.unknownTools !== 'deny') {
       m.unknownTools = 'deny';
     }
@@ -50,7 +54,6 @@ export function planToolGate(toolName: string, manifest: RuntimeRoleManifest | n
   const perm = manifest.permissions[toolName] ?? manifest.permissions['*'] ?? 'allow';
   const known = manifest.tools.includes(toolName);
   const stance = manifest.unknownTools ?? 'deny';
-  // Why: Preserve the established compatibility and safety behavior (D82).
   if (perm === 'deny' || (!known && stance === 'deny')) {
     return {
       kind: 'deny',
@@ -66,27 +69,36 @@ export function planToolGate(toolName: string, manifest: RuntimeRoleManifest | n
   return { kind: 'allow' };
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D77, D82). */
-export function planActiveTools(
-  manifestTools: string[],
-  currentActive: string[],
+/**
+ * Filter `universe` down to what the stance exposes: 'allow' keeps every tool but the explicit
+ * deny rules (D82 user-installed-extension axis), 'deny' intersects with the manifest.
+ * Shared by planActiveTools (visibility) and role-state's switch planning (all-tools universe).
+ */
+export function filterToolsByStance(
+  manifestTools: readonly string[],
+  universe: readonly string[],
   opts?: { unknownTools?: UnknownToolStance; permissions?: Record<string, PermissionAction> },
-): { next: string[]; changed: boolean } | null {
-  if (manifestTools.length === 0 || currentActive.length === 0) return null;
+): string[] {
   if ((opts?.unknownTools ?? 'deny') === 'allow') {
     const denied = new Set(
       Object.entries(opts?.permissions ?? {})
-        .filter(([, v]) => v === 'deny')
-        .map(([k]) => k),
+        .filter(([, action]) => action === 'deny')
+        .map(([name]) => name),
     );
-    const next = currentActive.filter((t) => !denied.has(t));
-    if (next.length === 0) return null;
-    return { next, changed: next.length !== currentActive.length };
+    return universe.filter((name) => !denied.has(name));
   }
   const wanted = new Set(manifestTools);
-  const next = currentActive.filter((t) => wanted.has(t));
-  if (next.length === 0) return null;
-  const changed = next.length !== currentActive.length;
-  return { next, changed };
+  return universe.filter((name) => wanted.has(name));
 }
 
+/** Null means "keep the current active set": an empty result must never clear every tool (D77). */
+export function planActiveTools(
+  manifestTools: readonly string[],
+  currentActive: readonly string[],
+  opts?: { unknownTools?: UnknownToolStance; permissions?: Record<string, PermissionAction> },
+): { next: string[]; changed: boolean } | null {
+  if (manifestTools.length === 0 || currentActive.length === 0) return null;
+  const next = filterToolsByStance(manifestTools, currentActive, opts);
+  if (next.length === 0) return null;
+  return { next, changed: next.length !== currentActive.length };
+}

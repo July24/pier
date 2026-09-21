@@ -1,11 +1,10 @@
 /**
- * Layer 2 Week 1: role manifest types and validator (D76 v2; 2026-08-18).
+ * Role manifest file format + validator. The contract document is
+ * `schemas/role-manifest.schema.json`; validation is hand-written with zero dependencies so workers
+ * carry no ajv overhead.
  *
- * Mirrors the contract in `schemas/role-manifest.schema.json` (the JSON Schema is the contract document;
- * runtime validation is hand-written with zero dependencies so workers carry no ajv overhead).
- *
- * Strict contract: report unknown top-level keys to prevent typos such as "rulez" from silently failing;
- * collect all errors in one pass so manifests can be repaired efficiently.
+ * Strict: unknown top-level keys are reported (a typo like "rulez" must not silently fail) and every
+ * issue is collected in one pass so a manifest can be repaired in one go.
  */
 export type PermissionAction = 'allow' | 'ask' | 'deny';
 export type TodosMode = 'serial' | 'parallel';
@@ -17,12 +16,12 @@ export interface RoleManifest {
   /** Semantic version x.y.z (for tracing manifest evolution; P2). */
   version: string;
   /**
-   * WS-D10: route models by role using `provider/model` (advisor delegates higher-level third-party judgment).
-   * Omitted means follow the process default (master/worker leave it unset); spawn injects `--provider/--model`.
+   * WS-D10: `provider/model` routing by role. Omitted means follow the process default
+   * (spawn injects `--provider/--model`).
    */
   model?: string;
   description?: string;
-  /** P0 per-role guidelines (RFC §4.6): behavior constraints a tool set cannot express; injected as a prompt section. */
+  /** P0 per-role guidelines (RFC §4.6): constraints a tool set cannot express; injected as a prompt section. */
   guidelines?: string[];
   manifest: {
     /** Baseline tools (non-empty; must include todo_write + ask_user_question for coordination). */
@@ -30,10 +29,10 @@ export interface RoleManifest {
     /** Three-state permissions; `*` supplies the default; omitted means `{"*":"allow"}`. */
     rules?: Record<string, PermissionAction>;
     /**
-     * D82 unknownTools: stance for tools outside the manifest (default deny is the safe default).
-     * master/worker = allow (user-installed extensions are visible and usable by default—install grants access);
-     * custom roles default to deny. `*` in rules and this stance cover separate axes: visibility vs enforcement.
-     * Excluded families (such as worker's subagent/terminal) need explicit deny to remain blocked under allow.
+     * D82 stance for tools outside the manifest (default deny). master/worker = allow — install
+     * grants the user's extension access — while custom roles default to deny. Separate axis from
+     * `rules['*']`: visibility vs enforcement. Excluded families (worker's subagent/terminal) need an
+     * explicit deny to stay blocked under allow.
      */
     unknownTools?: UnknownToolStance;
   };

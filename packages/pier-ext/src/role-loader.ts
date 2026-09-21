@@ -1,21 +1,17 @@
 /**
- * Layer 2 Week 1: load role manifests (2026-08-18); v1.1 (2026-08-22) adds two user-directory layers.
+ * Role manifest loading, three layers in order: workspace `<cwd>/.pi-herdr/roles/` (travels with
+ * the clone) → user `~/.pi/agent/herdr-pi/roles/` → bundled `src/roles/`.
  *
- * Lookup order (v1.1, user-approved):
- *  1. Workspace-level `<cwd>/.pi-herdr/roles/<name>.json` (travels with the clone and is team-shared)
- *  2. User-global `~/.pi/agent/herdr-pi/roles/<name>.json` (personal preference across repositories)
- *  3. Bundled `src/roles/` as the fallback shipped with this package
+ * Reserved built-in names (master / worker-default) may not be overridden by a user layer: tests and
+ * the D82 stance are anchored to the bundled manifests, so allowing overrides would break them.
  *
- * Built-in names remain reserved (master / worker-default): reject collisions in user/workspace layers—D83 mirror.
- * Tests and the D82 stance are anchored to bundled manifests; allowing overrides would break those guarantees.
- *
- * Role names are restricted to [a-z0-9-]—this prevents path traversal and avoids touching disk for invalid names.
- * The manifest role field must match the filename to prevent attaching the wrong manifest.
- * Validation failures are classified as: unreadable = ROLE_NOT_FOUND (reported only after trying every layer);
- * parsed but invalid JSON/validation/name = INVALID_ROLE_CONFIG (report immediately at the hit layer rather than
- * silently falling through, because silence would hide a user editing a manifest incorrectly).
+ * Role names are restricted to [a-z0-9-] (no path traversal; invalid names never touch disk) and the
+ * manifest `role` field must match the filename to prevent attaching the wrong manifest.
+ * Errors: unreadable = ROLE_NOT_FOUND (only after every layer missed); parsed-but-invalid
+ * JSON/validation/name = INVALID_ROLE_CONFIG at the hit layer — falling through would silently hide
+ * a user editing a manifest incorrectly.
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { validateRoleManifest, type RoleManifest } from './role-manifest.ts';
@@ -88,6 +84,27 @@ export function roleLayers(opts?: { baseDir?: string; userDir?: string }): Array
     { label: `user (${'~/.pi/agent/herdr-pi/roles/'})`, dir: opts?.userDir ?? userRolesDir() },
     { label: 'builtin (src/roles/)', dir: ROLES_DIR },
   ];
+}
+
+/**
+ * Role names defined by the two user layers (workspace → user), deduped and sorted. Built-ins are
+ * not listed here — they are exactly RESERVED_ROLE_NAMES, which no user layer may override.
+ * A layer directory that does not exist simply contributes nothing.
+ */
+export function listRoleNames(baseDir?: string): string[] {
+  const names = new Set<string>();
+  for (const layer of roleLayers({ baseDir }).slice(0, 2)) {
+    let entries: string[];
+    try {
+      entries = readdirSync(layer.dir);
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.endsWith('.json')) names.add(entry.slice(0, -'.json'.length));
+    }
+  }
+  return [...names].sort();
 }
 
 export function loadRoleConfig(name: string, opts?: LoadRoleOptions): RoleManifest {

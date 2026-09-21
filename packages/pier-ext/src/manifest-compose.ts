@@ -1,21 +1,21 @@
-/** Why: Preserve the established compatibility and safety behavior (C7). */
+/**
+ * Manifest composition (C7 v2 three-state permissions): role baseline ∪ model suggestion,
+ * minus deny rules, with the D82 unknown-tools stance carried through.
+ */
 import type { PermissionAction, RoleManifest, UnknownToolStance } from './role-manifest.ts';
+import type { RuntimeRoleManifest } from './tool-gate.ts';
 import { loadRoleConfig } from './role-loader.ts';
 
 export interface ManifestSources {
   roleBaseline: readonly string[];
   modelSuggested: readonly string[];
   rulePermissions: Record<string, PermissionAction>;
-  /** Why: Preserve the established compatibility and safety behavior (D82). */
+  /** D82: stance for tools outside the composed set. */
   unknownTools?: UnknownToolStance;
 }
 
-export interface ComposedManifest {
-  tools: string[];
-  permissions: Record<string, PermissionAction>;
-  /** Why: Preserve the established compatibility and safety behavior (D82). */
-  unknownTools: UnknownToolStance;
-}
+/** What composeManifest produces: the runtime manifest minus the identity/section fields. */
+export type ComposedManifest = Omit<RuntimeRoleManifest, 'role' | 'version' | 'services' | 'guidelines'>;
 
 export class ManifestError extends Error {
   readonly code: 'EMPTY_MANIFEST' | 'INVALID_ROLE_CONFIG';
@@ -46,21 +46,18 @@ export function composeManifest(sources: ManifestSources): ComposedManifest {
   ]);
   const rules = sources.rulePermissions ?? {};
   const defaultAction: PermissionAction = rules['*'] ?? 'allow';
-  const stance: UnknownToolStance = sources.unknownTools ?? 'deny';
 
   const tools: string[] = [];
   const permissions: Record<string, PermissionAction> = {};
-  // Why: Preserve the established compatibility and safety behavior (D82).
-  // Why: Preserve the established compatibility and safety behavior.
-  for (const [k, v] of Object.entries(rules)) {
-    if (k === '*') continue; // Why: Preserve the established compatibility and safety behavior.
-    permissions[k] = v;
+  // Rule keys outside the candidate set stay in permissions: an allow-stance role keeps its
+  // deny rules for tools the model never suggested (D82 excluded families).
+  for (const [key, action] of Object.entries(rules)) {
+    if (key !== '*') permissions[key] = action;
   }
   for (const tool of candidates) {
     const action = rules[tool] ?? defaultAction;
     permissions[tool] = action;
-    if (action === 'deny') continue; // Why: Preserve the established compatibility and safety behavior.
-    tools.push(tool);
+    if (action !== 'deny') tools.push(tool);
   }
 
   if (tools.length === 0) {
@@ -72,11 +69,10 @@ export function composeManifest(sources: ManifestSources): ComposedManifest {
     );
   }
 
-  tools.sort(); // Why: Preserve the established compatibility and safety behavior.
-  return { tools, permissions, unknownTools: stance };
+  tools.sort();
+  return { tools, permissions, unknownTools: sources.unknownTools ?? 'deny' };
 }
 
-/** Why: Preserve the established compatibility and safety behavior (WS-D8). */
 export function composeForRole(
   roleName: string,
   modelSuggested: readonly string[],
@@ -91,4 +87,18 @@ export function composeForRole(
     unknownTools: role.manifest.unknownTools,
   });
   return { role, manifest };
+}
+
+/** Project a composed profile onto the runtime shape — the one place role-file fields become runtime fields. */
+export function toRuntimeManifest(composed: ComposedForRole): RuntimeRoleManifest {
+  const { role, manifest } = composed;
+  return {
+    role: role.role,
+    version: role.version,
+    tools: manifest.tools,
+    permissions: manifest.permissions,
+    unknownTools: manifest.unknownTools,
+    services: role.services ?? {},
+    ...(role.guidelines?.length ? { guidelines: role.guidelines } : {}),
+  };
 }

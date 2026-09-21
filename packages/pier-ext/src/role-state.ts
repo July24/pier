@@ -1,30 +1,27 @@
 /**
  * P0 (RFC docs/rfc-pi-0.86-dynamic-tools.md §4): mutable role state for mid-session switching.
  *
- * pi 0.86 records `setActiveTools` changes as transcript tool deltas (toolsRemoved/toolsAdded
- * before the next request), so a switch survives resume and branch navigation on pi's side.
- * This module owns pier's half: replaying the gate manifest from the last `pi-herdr.role-manifest`
- * entry, and planning the active-set transition with ALL registered tools as the universe —
- * a switch may re-admit tools that an earlier session_start prune removed from the active set,
- * so intersecting with the *current* active list (planActiveTools semantics) would lose them.
+ * pi 0.86 records `setActiveTools` changes as transcript tool deltas, so a switch survives resume
+ * and branch navigation on pi's side. This module owns pier's half: replaying the gate manifest
+ * from the last `pi-herdr.role-manifest` entry and planning the active-set transition.
  */
 import type { PermissionAction, UnknownToolStance } from './role-manifest.ts';
 import type { RuntimeRoleManifest } from './tool-gate.ts';
+import { filterToolsByStance } from './tool-gate.ts';
 
-/** Shape persisted in ROLE_MANIFEST_CUSTOM_TYPE entries (v1 payload, switch adds origin/switchedBy). */
-export interface RoleManifestRecord {
+/**
+ * Shape persisted in ROLE_MANIFEST_CUSTOM_TYPE entries: the runtime manifest plus the payload
+ * version and the switch provenance. `version` is the payload discriminator and `manifestVersion`
+ * the manifest semver — replay must not confuse the two.
+ */
+export type RoleManifestRecord = Omit<RuntimeRoleManifest, 'version'> & {
   version: 1;
-  role: string;
   manifestVersion?: string;
-  tools: string[];
-  permissions: Record<string, PermissionAction>;
-  unknownTools: UnknownToolStance;
-  guidelines?: string[];
   /** 'switch' records a mid-session switch; the session_start anchor write omits it (env origin). */
   origin?: 'switch';
   switchedBy?: string;
   ts?: number;
-}
+};
 
 /** State carried across a process for the armed role system; manifest==null means unarmed (bare pi). */
 export interface RoleState {
@@ -57,21 +54,21 @@ export function latestRoleManifestRecord(entries: readonly unknown[]): RoleManif
     ) {
       continue;
     }
+    const guidelines = Array.isArray(data.guidelines)
+      ? data.guidelines.filter((g): g is string => typeof g === 'string')
+      : [];
+    const rawPermissions = data.permissions;
     found = {
       version: 1,
       role: data.role,
       manifestVersion: typeof data.manifestVersion === 'string' ? data.manifestVersion : undefined,
       tools: data.tools as string[],
       permissions:
-        data.permissions && typeof data.permissions === 'object' && !Array.isArray(data.permissions)
-          ? (data.permissions as Record<string, PermissionAction>)
+        rawPermissions && typeof rawPermissions === 'object' && !Array.isArray(rawPermissions)
+          ? (rawPermissions as RuntimeRoleManifest['permissions'])
           : {},
       unknownTools: data.unknownTools === 'allow' ? 'allow' : 'deny',
-      guidelines: (() => {
-        if (!Array.isArray(data.guidelines)) return undefined;
-        const list = data.guidelines.filter((g): g is string => typeof g === 'string');
-        return list.length > 0 ? list : undefined;
-      })(),
+      guidelines: guidelines.length > 0 ? guidelines : undefined,
       origin: data.origin === 'switch' ? 'switch' : undefined,
       switchedBy: typeof data.switchedBy === 'string' ? data.switchedBy : undefined,
       ts: typeof data.ts === 'number' ? data.ts : undefined,
@@ -116,26 +113,15 @@ export function planRoleSwitch(oldTools: readonly string[], newTools: readonly s
 }
 
 /**
- * Active set for a switch, over ALL registered tools (not the current active set — a switch may
- * re-admit tools an earlier session_start prune removed). Mirrors planActiveTools' two-branch
- * stance semantics (tool-gate.ts): unknownTools 'allow' keeps every registered tool except
- * explicit denies (master + D82 user-installed-extension axis), 'deny' intersects with the
- * manifest. Result keeps registration order; the caller relies on the composeManifest contract
- * that every valid manifest baseline includes the coordination tools.
+ * Active set for a switch, over ALL registered tools rather than the current active set: a switch
+ * may re-admit tools an earlier session_start prune removed, which intersection semantics would
+ * lose. Stance handling is shared with planActiveTools (tool-gate.ts); the empty result is NOT a
+ * no-op here — a switch to a role with no overlap is a legitimate shrink.
  */
 export function planSwitchActiveTools(
   manifestTools: readonly string[],
   registeredToolNames: readonly string[],
   opts?: { unknownTools?: UnknownToolStance; permissions?: Record<string, PermissionAction> },
 ): string[] {
-  if ((opts?.unknownTools ?? 'deny') === 'allow') {
-    const denied = new Set(
-      Object.entries(opts?.permissions ?? {})
-        .filter(([, action]) => action === 'deny')
-        .map(([name]) => name),
-    );
-    return registeredToolNames.filter((name) => !denied.has(name));
-  }
-  const wanted = new Set(manifestTools);
-  return registeredToolNames.filter((name) => wanted.has(name));
+  return filterToolsByStance(manifestTools, registeredToolNames, opts);
 }
