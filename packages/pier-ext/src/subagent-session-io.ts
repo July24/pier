@@ -311,7 +311,7 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
       stateCache.set(file, stamp, sinceTs, state);
       return state;
     }
-    return { text: null, pendingTool: false, activity: false, turnEnded: false };
+    return { text: null, pendingTool: false, activity: false, turnEnded: false, compacting: false };
   }
 
   /** Last assistant text (any stopReason) tail of the best candidate — state for the

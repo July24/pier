@@ -11,6 +11,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { piSessionDirCandidates, sessionDirName } from './storage-layout.ts';
 import { isValidSessionId } from './efficiency-store.ts';
+import { COMPACTION_INFLIGHT_TYPE, COMPACTION_SETTLED_TYPE } from './compact-coordinator.ts';
 
 export { sessionDirName };
 
@@ -150,6 +151,37 @@ export interface SubSessionState {
   pendingTool: boolean;
   activity: boolean;
   turnEnded: boolean;
+  /**
+   * True while the child is inside an OCC compaction cycle: from the inflight marker
+   * until the settled marker is followed by an assistant message (the continuation turn).
+   * OCC's intentional abort lands as stopReason 'error' in this transcript, which the
+   * turnEnded check alone would misread as a finished worker (01a0be1f / wA:p2M).
+   */
+  compacting: boolean;
+}
+
+/**
+ * Whether the transcript currently sits inside an OCC compaction cycle.
+ *
+ * Last marker wins: inflight as the final marker means the summary request is running;
+ * a settled marker means the cycle is over — unless no assistant message follows it yet,
+ * in which case the continuation turn has not produced output and the worker is still
+ * machine-paused (must not settle, and must not be mistaken for a user takeover either).
+ */
+export function compactionBusy(entries: readonly SessionEntryLike[]): boolean {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (!entry || entry.type !== 'custom') continue;
+    const customType = entry.customType;
+    if (customType === COMPACTION_INFLIGHT_TYPE) return true;
+    if (customType === COMPACTION_SETTLED_TYPE) {
+      for (let j = i + 1; j < entries.length; j++) {
+        if (messageOf(entries[j])?.role === 'assistant') return false;
+      }
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -162,13 +194,14 @@ export function deriveSubSessionState(
   entries: readonly SessionEntryLike[],
   sinceTs: number,
 ): SubSessionState {
+  const compacting = compactionBusy(entries);
   const r = lastAssistantText(entries, { sinceTs });
-  if (r?.text) return { text: r.text, pendingTool: false, activity: true, turnEnded: true };
-  if (hasPendingToolCall(entries, sinceTs)) return { text: null, pendingTool: true, activity: true, turnEnded: false };
+  if (r?.text) return { text: r.text, pendingTool: false, activity: true, turnEnded: true, compacting };
+  if (hasPendingToolCall(entries, sinceTs)) return { text: null, pendingTool: true, activity: true, turnEnded: false, compacting };
   if (hasAssistantAfter(entries, sinceTs)) {
-    return { text: null, pendingTool: false, activity: true, turnEnded: lastAssistantTurnEnded(entries, sinceTs) };
+    return { text: null, pendingTool: false, activity: true, turnEnded: lastAssistantTurnEnded(entries, sinceTs), compacting };
   }
-  return { text: null, pendingTool: false, activity: false, turnEnded: false };
+  return { text: null, pendingTool: false, activity: false, turnEnded: false, compacting };
 }
 
 /** Newest `limit` session files under cwd's session dir (pi core's name first, then pier's old encodings). */

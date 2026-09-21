@@ -188,6 +188,7 @@ PI_HERDR_COMPACT_ENABLE=1 PI_HERDR_COMPACT_LOG=1 PI_HERDR_CACHE_RATIO=auto pi
 - 批量打包（压缩点顺路打包）上限 **20 条 / 10MB**；占位符 memo 上限 256 条（LRU 近似）。
 - pi 的 `compaction.*` 只在启动时读取一次；改了 pi 设置需要重启会话。
 - `keepRecentTokens` 若在效率配置中显式给出，则以效率配置为准（不继承 pi）。
+- OCC 在 todo 边界 abort 在途回合后，transcript 里会落一条 `stopReason:"error"` 的空 assistant（UI 显示红色 `Error: This operation was aborted`，该文案出自 pi 的 `raceWithAbortSignal`）——这是**预期**的中断痕迹，压缩完成后由 continuation 消息自动续跑；同一时刻会话里会写入 `pi-herdr.compaction-inflight` / `pi-herdr.compaction-settled` 两个 custom 标记，master 的 subagent 结算监督靠它们区分"压缩中"与"真完工"（01a0be1f：worker 压缩 52s > 30s 观察窗，曾被假结算并提前唤醒 master）。标记机制要求 **master 与 worker 两端进程都加载新代码**（扩展随进程启动加载，无 HMR）；任何一端仍是旧进程就退化回旧行为，且对已在跑的会话不回溯生效。
 - 纯核的变异测试证据：`compact-economics-core.ts` 为全量测试集 77.46%；其余 3 个核心为“单元 + 集成 spec 子集”下的**下界**（`observation-core` 66.82% / `efficiency-config-core` 59.80% / `reducer-core` 52.52%，后者经一轮补测从 48.52% 提升）。完整清单见 RFC §9 与 ADR `Known residuals`。
 - EPR 的命令识别（`DIAGNOSTIC_COMMAND`）两侧边界都接受 shell 分隔符：`(npm test)`、`npm test&&echo ok`、`pytest;` 可识别；`makefile`、`coqtop`、`npm run test` 不会误判。
 

@@ -4,6 +4,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  compactionBusy,
+  deriveSubSessionState,
   hasAssistantAfter,
   hasPendingToolCall,
   lastAssistantText,
@@ -13,6 +15,7 @@ import {
   sessionDirName,
   sessionFileById,
 } from '../src/session-tail.ts';
+import { COMPACTION_INFLIGHT_TYPE, COMPACTION_SETTLED_TYPE } from '../src/compact-coordinator.ts';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -136,4 +139,52 @@ test('listSessionFiles/sessionFileById (A8): pi core 的 POSIX 目录名必须�
   assert.equal(sessionFileById(cwd, tmp, 'beef'), g);
   assert.equal(listSessionFiles(cwd, tmp, 4).length, 2);
   fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test('deriveSubSessionState/compactionBusy: OCC 标记期间不结算（01a0be1f 假结算回归）', () => {
+  const mkCustom = (customType: string) => ({ type: 'custom', customType, data: {}, timestamp: 0 });
+  const INFLIGHT = COMPACTION_INFLIGHT_TYPE;
+  const SETTLED = COMPACTION_SETTLED_TYPE;
+  // OCC 在 todo 边界 abort：turn 落在 transcript 里是 stopReason 'error'、空 content 的 assistant。
+  const abortedTurn = mkMsg('assistant', '', 2, 'error');
+  const task = mkMsg('user', 'fix bugs 19795-19799', 1);
+
+  // 1. inflight 标记是最后一条 → 正在压缩总结请求，hold。
+  let state = deriveSubSessionState([task, abortedTurn, mkCustom(INFLIGHT)], 0);
+  assert.equal(state.compacting, true);
+  assert.equal(compactionBusy([task, abortedTurn, mkCustom(INFLIGHT)]), true);
+
+  // 2. settled 标记已写但 continuation 的 assistant 还没来 → 仍是机器停顿，hold。
+  state = deriveSubSessionState([task, abortedTurn, mkCustom(INFLIGHT), mkCustom(SETTLED)], 0);
+  assert.equal(state.compacting, true);
+
+  // 3. continuation 的 assistant 出现在 settled 标记之后 → hold 释放。
+  const continuation = mkMsg('assistant', 'Let me continue: compile and run tests', 4, 'toolUse');
+  state = deriveSubSessionState([task, abortedTurn, mkCustom(INFLIGHT), mkCustom(SETTLED), continuation], 0);
+  assert.equal(state.compacting, false);
+  assert.equal(state.turnEnded, false);
+
+  // 4. 无标记（旧版本/未开 OCC 的子会话）→ 行为不变。
+  state = deriveSubSessionState([task, abortedTurn], 0);
+  assert.equal(state.compacting, false);
+
+  // 5. 已有定稿收尾文本但压缩正在进行 → compacting 仍为 true（结算与否由
+  //    isSettlementCandidate 的 compacting 守卫决定，abort 之前的文本不算最终收尾）。
+  const closing = mkMsg('assistant', 'all tests pass, committed', 5, 'stop');
+  state = deriveSubSessionState([task, closing, mkCustom(INFLIGHT)], 0);
+  assert.equal(state.compacting, true);
+  assert.equal(state.text, 'all tests pass, committed');
+});
+
+test('compactionBusy: 结算后追加的无关 custom 条目不影响判定（最后标记胜出）', () => {
+  const mkCustom = (customType: string) => ({ type: 'custom', customType, data: {}, timestamp: 0 });
+  const continuation = mkMsg('assistant', 'continuing', 4, 'toolUse');
+  const entries = [
+    mkMsg('user', 'task', 1),
+    mkCustom(COMPACTION_INFLIGHT_TYPE),
+    mkCustom(COMPACTION_SETTLED_TYPE),
+    continuation,
+    mkCustom('pi-herdr.subs'), // 同会话后续写入的其它 custom 条目
+  ];
+  assert.equal(compactionBusy(entries), false);
 });

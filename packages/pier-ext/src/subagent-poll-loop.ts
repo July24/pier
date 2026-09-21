@@ -173,7 +173,11 @@ export function createPoller(h: PollerHost): Poller {
             );
           }
           const s = await h.session.subSessionState(paneId, cwd, current.injectTs, entry.sessionFile);
-          pollTrace?.(`state=${state} text=${s.text ? s.text.length : 'null'} pend=${s.pendingTool} act=${s.activity} obs=${String(entry.observationStartedAt ?? null)} takeover=${String(Boolean(entry.userTakeover))}`);
+          pollTrace?.(`state=${state} text=${s.text ? s.text.length : 'null'} pend=${s.pendingTool} act=${s.activity} compact=${String(s.compacting)} obs=${String(entry.observationStartedAt ?? null)} takeover=${String(Boolean(entry.userTakeover))}`);
+          // OCC compaction is live child work (pane reports idle, transcript holds the
+          // inflight marker): keep the vacuum timer fed so the subagent timeout does not
+          // fire mid-summary. Settlement candidacy is suppressed inside isSettlementCandidate.
+          if (s.compacting) lastActivityAt = now();
           if (isSettlementCandidate(s)) {
             const closing = s.text;
             const obs = planObservationTick({

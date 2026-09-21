@@ -7,6 +7,8 @@ import {
   CompactCoordinator,
   COMPACT_STATE_CUSTOM_TYPE,
   COMPACTION_CONTINUE_TYPE,
+  COMPACTION_INFLIGHT_TYPE,
+  COMPACTION_SETTLED_TYPE,
   restoreCoordinatorState,
 } from '../src/compact-coordinator.ts';
 import type { TodoItem } from '../src/todo-core.ts';
@@ -179,9 +181,9 @@ test('CompactCoordinator: full lifecycle from turn_end abort through agent_settl
 
   // 2. agent_settled carries out compaction
   const sentMessages: any[] = [];
-  const appendedEntries: any[] = [];
+  const appendedEntries: Array<{ type: string; data?: { outcome?: string; at?: number } }> = [];
   const mockPi: any = {
-    appendEntry(type: string, data: any) {
+    appendEntry(type: string, data?: { outcome?: string; at?: number }) {
       appendedEntries.push({ type, data });
     },
     sendMessage(msg: any, opts: any) {
@@ -217,6 +219,11 @@ test('CompactCoordinator: full lifecycle from turn_end abort through agent_settl
   assert.ok(compactCall.customInstructions.includes('Remaining task'));
   assert.ok(compactCall.customInstructions.includes('awaiting approval'));
 
+  // The inflight marker must already be on disk while the summary request runs —
+  // the supervising master polls this transcript and must hold settlement (01a0be1f).
+  assert.equal(appendedEntries.length, 1);
+  assert.equal(appendedEntries[0].type, COMPACTION_INFLIGHT_TYPE);
+
   // Trigger completion callback
   compactCall.onComplete({ summary: 'Compacted history summary' });
   await settlePromise;
@@ -226,9 +233,14 @@ test('CompactCoordinator: full lifecycle from turn_end abort through agent_settl
   assert.equal(coordinator.intentionalAbort, false);
   assert.equal(coordinator.state.priorCompactionCount, 1);
 
-  // Verify state persisted to session entry
-  assert.equal(appendedEntries.length, 1);
-  assert.equal(appendedEntries[0].type, COMPACT_STATE_CUSTOM_TYPE);
+  // Verify marker + state persisted to session entries, in write order
+  assert.deepEqual(appendedEntries.map((e) => e.type), [
+    COMPACTION_INFLIGHT_TYPE,
+    COMPACT_STATE_CUSTOM_TYPE,
+    COMPACTION_SETTLED_TYPE,
+  ]);
+  assert.equal(appendedEntries[2]?.data?.outcome, 'completed');
+  assert.ok(typeof appendedEntries[2]?.data?.at === 'number');
 
   // Verify silent continuation message dispatched
   assert.equal(sentMessages.length, 1);
@@ -345,9 +357,12 @@ test('CompactCoordinator: a cancelled compaction stays cancelled, a failed one r
 
     const mock = createMockContext({});
     const sent: Array<{ msg: { content?: unknown }; opts: { triggerTurn?: boolean } }> = [];
+    const appended: Array<{ type: string; data: unknown }> = [];
     // Test double: the coordinator's only touchpoints on `pi` are appendEntry and sendMessage.
     const piStub = {
-      appendEntry: () => {},
+      appendEntry: (type: string, data: unknown) => {
+        appended.push({ type, data });
+      },
       sendMessage: (msg: { content?: unknown }, opts: { triggerTurn?: boolean }) => {
         sent.push({ msg, opts });
       },
@@ -365,7 +380,12 @@ test('CompactCoordinator: a cancelled compaction stays cancelled, a failed one r
         subsequentCompactionMargin: 1.5,
       },
     });
-    return { coordinator, mock, sent, settle };
+    return { coordinator, mock, sent, settle, appended };
+  };
+
+  const settledOutcome = (appended: Array<{ type: string; data: unknown }>): { outcome?: string } => {
+    const found = appended.find((e) => e.type === COMPACTION_SETTLED_TYPE)?.data;
+    return typeof found === 'object' && found !== null ? found : {};
   };
 
   // 1. User cancel (pi throws exactly this) must NOT resurrect the turn the user just stopped.
@@ -374,6 +394,9 @@ test('CompactCoordinator: a cancelled compaction stays cancelled, a failed one r
   await cancelled.settle;
   assert.equal(cancelled.sent.length, 0, 'cancelling must not trigger a continuation turn');
   assert.equal(cancelled.coordinator.compactionInFlight, false);
+  // Cancel still releases the cross-session hold — otherwise the master's poller
+  // would hold settlement forever on a compaction that will never resume.
+  assert.equal(settledOutcome(cancelled.appended).outcome, 'cancelled');
 
   // 2. A real failure left the session parked on the aborted turn, so it must resume.
   const failed = setup();
@@ -384,6 +407,7 @@ test('CompactCoordinator: a cancelled compaction stays cancelled, a failed one r
   assert.match(String(failed.sent[0]!.msg.content), /compaction failed/i);
   assert.equal(failed.coordinator.compactionInFlight, false);
   assert.equal(failed.coordinator.intentionalAbort, false);
+  assert.equal(settledOutcome(failed.appended).outcome, 'failed');
 
   // 3. AbortError (ESC during compaction) is a cancel, not a failure.
   const aborted = setup();
@@ -392,6 +416,7 @@ test('CompactCoordinator: a cancelled compaction stays cancelled, a failed one r
   aborted.mock.compactCalls[0]!.onError(abortError);
   await aborted.settle;
   assert.equal(aborted.sent.length, 0);
+  assert.equal(settledOutcome(aborted.appended).outcome, 'cancelled');
 });
 
 test('CompactCoordinator: turn_end falls back when usage.tokens is null or 0 (P2-11)', () => {

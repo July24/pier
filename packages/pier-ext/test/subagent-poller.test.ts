@@ -98,6 +98,17 @@ test('isSettlementCandidate (A16): 只有 activity 而回合未结束 → 绝不
   assert.equal(isSettlementCandidate({ text: null, pendingTool: true, activity: true, turnEnded: false }), false);
 });
 
+test('isSettlementCandidate: OCC 压缩期一律不结算（01a0be1f 假结算回归）', () => {
+  // 子代理 OCC 在 todo 边界 abort → transcript 尾部是 stopReason 'error' 的空 assistant，
+  // turnEnded 判定会把它当成已结束的回合；压缩标记必须压过其它一切信号。
+  assert.equal(isSettlementCandidate({ text: null, pendingTool: false, activity: true, turnEnded: true, compacting: true }), false);
+  // 已有定稿收尾文本也一样：abort 之前的文本不是最终收尾，continuation 还会继续工作。
+  assert.equal(isSettlementCandidate({ text: 'all done', pendingTool: false, activity: true, compacting: true }), false);
+  // 标记消失（continuation 已产出 assistant / 无 OCC）→ 恢复原判定。
+  assert.equal(isSettlementCandidate({ text: 'all done', pendingTool: false, activity: true, compacting: false }), true);
+  assert.equal(isSettlementCandidate({ text: null, pendingTool: false, activity: true, turnEnded: true, compacting: false }), true);
+});
+
 test('buildSettlementNoticeText: combines notice and optional statLine', () => {
   const withStat = buildSettlementNoticeText('p1 (task)', 'finished all', '1 file changed');
   assert.match(withStat, /Background subagent p1 \(task\) finished/);

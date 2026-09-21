@@ -61,7 +61,7 @@ interface FakeHostFixture {
     throwOnListAgents: boolean;
   };
   sessionIo: {
-    subSessionResponses: Array<{ text: string | null; pendingTool: boolean; activity: boolean; turnEnded?: boolean }>;
+    subSessionResponses: Array<{ text: string | null; pendingTool: boolean; activity: boolean; turnEnded?: boolean; compacting?: boolean }>;
     askFlagResponses: Array<string | null>;
     resolvedSessionFile: string | null;
     /** sinceTs values observed by subSessionState, in call order. */
@@ -161,9 +161,9 @@ function createFakeHost(options?: {
       sessionMock.subSessionSinceTsCalls.push(sinceTs);
       if (sessionMock.subSessionResponses.length > 0) {
         const response = sessionMock.subSessionResponses.shift()!;
-        return { ...response, turnEnded: response.turnEnded ?? false };
+        return { ...response, turnEnded: response.turnEnded ?? false, compacting: response.compacting ?? false };
       }
-      return { text: 'completed task', pendingTool: false, activity: true, turnEnded: false };
+      return { text: 'completed task', pendingTool: false, activity: true, turnEnded: false, compacting: false };
     },
     readAskFlag: async () => {
       if (sessionMock.askFlagResponses.length > 0) {
@@ -735,6 +735,66 @@ test('p25 (01a0c282): follow_up refreshes the tracked request of an ALREADY-RUNN
   assert.ok(f.claimKeys.includes('p-refresh:fu-42'), `settle claim must use the follow-up id (saw ${f.claimKeys.join(',')})`);
   assert.match(f.injectedNotices[0] ?? '', /report for the follow-up/);
 });
+test('pollLoop: OCC compaction hold defers settlement until the continuation lands (01a0be1f regression)', async () => {
+  const entry = makeEntry('p-occ-hold');
+  const f = createFakeHost({ initialTime: 10_000, entry });
+  f.client.waitAgentQueue = ['idle', 'idle'];
+  f.client.agents = [{ paneId: 'p-occ-hold', status: 'idle' }];
+  // 前两次读：OCC abort 后的 transcript 形状（stopReason 'error' → turnEnded=true）且压缩
+  // inflight——整个观察窗口里子代理都在跑总结请求（实测 52s > 30s 窗口）。修复前这里会在
+  // 窗口耗尽后以 closing=null 假结算（"left no closing message"）并唤醒 master。
+  // 后两次读：压缩结束、continuation 产出真正的收尾文本。
+  f.sessionIo.subSessionResponses = [
+    { text: null, pendingTool: false, activity: true, turnEnded: true, compacting: true },
+    { text: null, pendingTool: false, activity: true, turnEnded: true, compacting: true },
+    { text: 'all tests pass, committed on bugfix branch', pendingTool: false, activity: true },
+    { text: 'all tests pass, committed on bugfix branch', pendingTool: false, activity: true },
+  ];
+
+  const origSleep = f.host.sleep!;
+  f.host.sleep = async (ms) => {
+    await origSleep(ms);
+    f.virtualTime.now += 2_500; // advance past observationWindowMs (2000)
+  };
+
+  const poller = createPoller(f.host);
+  await poller.startPoller('p-occ-hold', '/tmp', 0, 0, 'desc', 'req-occ');
+
+  // Settled exactly once, on the REAL closing text — not on the aborted-turn shape.
+  assert.equal(entry.status, 'consumed');
+  assert.equal(f.historyWrites.length, 1);
+  assert.equal(f.historyWrites[0]?.via, 'poll-settle');
+  assert.equal(f.historyWrites[0]?.patch?.outcome, 'all tests pass, committed on bugfix branch');
+  assert.equal(f.injectedNotices.length, 1);
+  assert.match(f.injectedNotices[0]!, /Its closing message: all tests pass, committed on bugfix branch/);
+});
+
+test('pollLoop: OCC compaction hold keeps the vacuum timer fed (no timeout consume mid-compaction)', async () => {
+  const entry = makeEntry('p-occ-vac');
+  const f = createFakeHost({ initialTime: 10_000, entry });
+  f.client.agents = [{ paneId: 'p-occ-vac', status: 'idle' }];
+  // 每次读都在压缩中；waitAgent 每次推进 4s 虚拟时钟。
+  // 修复前 lastActivityAt 停在 10000，第 3 次迭代 22000-10000 > timeoutMs(10000) →
+  // 误报 "observation timeout" 并 consume。压缩是活的子代理工作，必须持续喂时钟。
+  f.host.session.subSessionState = async () => ({
+    text: null, pendingTool: false, activity: true, turnEnded: true, compacting: true,
+  });
+  let calls = 0;
+  f.host.client.waitAgent = async () => {
+    calls++;
+    f.virtualTime.now += 4_000;
+    if (calls >= 5) entry.status = 'settled'; // 结束监督但不经 consume 路径
+    return 'idle';
+  };
+
+  const poller = createPoller(f.host);
+  await poller.startPoller('p-occ-vac', '/tmp', 0, 0, 'desc', 'req-occ-vac');
+
+  assert.equal(entry.status, 'settled');
+  assert.equal(f.historyWrites.length, 0, 'compaction must not be consumed as a timeout');
+  assert.equal(f.injectedNotices.length, 0);
+});
+
 /* ──────────────── Vacuum Branches ──────────────── */
 
 test('pollLoop: vacuum triggers pane-closed when pane is missing from pane.list', async () => {

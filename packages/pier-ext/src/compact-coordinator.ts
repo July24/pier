@@ -28,9 +28,21 @@ import {
   efficiencyLogPath,
   resolveSessionRoot,
 } from './efficiency-store.ts';
+import { swallow } from './swallow.ts';
 
 export const COMPACT_STATE_CUSTOM_TYPE = 'pi-herdr.efficiency-state';
 export const COMPACTION_CONTINUE_TYPE = 'pi-herdr.compaction-continue';
+/**
+ * Cross-session compaction markers. OCC aborts an in-flight turn before compacting, and
+ * the abort lands in the child transcript as an assistant message with stopReason 'error'
+ * ("This operation was aborted") — which a supervising master's poller reads as a ended
+ * turn and settles the subagent mid-compaction (observed 01a0be1f: worker wA:p2M consumed
+ * at 09:53:32 while its compaction ran until 09:53:53; master woken with a false settle
+ * notice). The inflight/settled pair gives the poller a deterministic "do not settle"
+ * window that pane state cannot provide (the pane reports idle while compacting).
+ */
+export const COMPACTION_INFLIGHT_TYPE = 'pi-herdr.compaction-inflight';
+export const COMPACTION_SETTLED_TYPE = 'pi-herdr.compaction-settled';
 export const DEFAULT_KEEP_RECENT_TOKENS = 20_000;
 export const DEFAULT_MEMO_TOKENS = 1_000;
 
@@ -259,6 +271,11 @@ export class CompactCoordinator {
     onBeforeCompact?: (sessionRoot: string, ctx: ExtensionContext) => Promise<void>;
   }): Promise<void> {
     if (!this.selectedCompaction || !opts.ctx.isIdle()) return;
+
+    // Announce the compaction window in the transcript before the summary request
+    // starts: the supervising master polls this file, and its 30s observation window
+    // is shorter than a large-context compaction (52s observed on 01a0be37).
+    this.appendMarker(opts.pi, COMPACTION_INFLIGHT_TYPE, { at: Date.now() });
     const decision = this.selectedCompaction;
     this.selectedCompaction = null;
 
@@ -315,7 +332,7 @@ export class CompactCoordinator {
             this.state.consecutiveCompactionFailures = 0;
             this.state.compactBackoffTurnEnds = 0;
 
-            opts.pi.appendEntry(COMPACT_STATE_CUSTOM_TYPE, this.state);
+            this.appendMarker(opts.pi, COMPACT_STATE_CUSTOM_TYPE, this.state);
 
             if (opts.config.logEnabled) {
               const sessionDir = opts.ctx.sessionManager?.getSessionDir?.();
@@ -356,6 +373,7 @@ export class CompactCoordinator {
               /* ignore continuation failure */
             }
           } finally {
+            this.appendMarker(opts.pi, COMPACTION_SETTLED_TYPE, { outcome: 'completed', at: Date.now() });
             this.compactionInFlight = false;
             this.intentionalAbort = false;
             finish();
@@ -364,13 +382,19 @@ export class CompactCoordinator {
         onError: (error) => {
           this.compactionInFlight = false;
           this.intentionalAbort = false;
-
           // `Compaction cancelled` / AbortError mean the user (or pi) cancelled on purpose.
           // Telemetry must keep those apart from real failures, and a cancelled compaction
           // must NOT be answered with a turn-triggering continuation.
           const cancelled =
             error instanceof Error &&
             (error.name === 'AbortError' || error.message === 'Compaction cancelled');
+
+          // Release the cross-session hold in every outcome — a cancelled compaction
+          // early-returns below, so the marker cannot wait for the continuation.
+          this.appendMarker(opts.pi, COMPACTION_SETTLED_TYPE, {
+            outcome: cancelled ? 'cancelled' : 'failed',
+            at: Date.now(),
+          });
 
           if (opts.config.logEnabled) {
             const sessionDir = opts.ctx.sessionManager?.getSessionDir?.();
@@ -429,6 +453,21 @@ export class CompactCoordinator {
         },
       });
     });
+  }
+
+  /**
+   * Best-effort session entry write. onAgentSettled runs detached (`void`), and
+   * appendEntry bottoms out in a synchronous file append — a full disk or a
+   * session being torn down must not turn into an unhandled rejection that
+   * kills the worker process (same convention as subagent-registry.persist).
+   * A missing marker only costs the master a delayed settlement, never a crash.
+   */
+  private appendMarker(pi: ExtensionAPI, customType: string, data: unknown): void {
+    try {
+      pi.appendEntry(customType, data);
+    } catch (err) {
+      swallow(`compact.append-${customType}`, err);
+    }
   }
 
   rebuildFromBranch(entries: readonly unknown[]): void {

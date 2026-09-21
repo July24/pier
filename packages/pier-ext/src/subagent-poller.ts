@@ -98,13 +98,20 @@ export function planVacuumTick(input: {
  * Merely having an assistant message — the state a worker is in between tool calls, while the next
  * assistant message streams — must NOT qualify: on 2026-09-13 three live workers were announced as
  * "finished … left no closing message" and one was closed mid-task by GC afterwards.
+ *
+ * OCC compaction hold: while the child is compacting (or machine-paused between compaction and
+ * its continuation turn) it is NOT settleable even with closing text — the turn that produced
+ * that text was aborted on purpose and a continuation is coming (01a0be1f: worker consumed
+ * mid-compaction at 09:53:32, compaction finished 09:53:53, false settle woke the master).
  */
 export function isSettlementCandidate(input: {
   text: string | null;
   pendingTool: boolean;
   activity: boolean;
   turnEnded?: boolean;
+  compacting?: boolean;
 }): boolean {
+  if (input.compacting) return false;
   if (input.text) return true;
   return !input.pendingTool && input.turnEnded === true;
 }
