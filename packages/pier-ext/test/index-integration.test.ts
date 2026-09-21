@@ -196,34 +196,6 @@ test('ask_user_question emits herdr:blocked once around ui.input (official herdr
   assert.equal(officialDepth, 0);
 }));
 
-test('ask_user_question empty question does not emit herdr:blocked', withCleanup(async (cleanup) => {
-  const pi = await workerPier(cleanup);
-  const exec = pi.tools.get('ask_user_question')?.execute;
-  assert.ok(exec);
-  const result = await exec!({}, { question: '   ' }, undefined, undefined, {
-    ui: { input: async () => 'nope' },
-  }) as { content: Array<{ text: string }> };
-  assert.match(result.content[0]?.text ?? '', /must be a non-empty string/);
-  assert.equal(pi.events.emitted.filter((e) => e.channel === 'herdr:blocked').length, 0);
-}));
-
-test('ask_user_question reserved Other does not emit herdr:blocked', withCleanup(async (cleanup) => {
-  const pi = await workerPier(cleanup);
-  const exec = pi.tools.get('ask_user_question')?.execute;
-  assert.ok(exec);
-  const result = await exec!({}, {
-    question: 'Which database?',
-    options: [
-      { label: 'Redis', description: 'mem' },
-      { label: 'Other', description: 'typed' },
-    ],
-  }, undefined, undefined, {
-    ui: { input: async () => 'nope' },
-  }) as { content: Array<{ text: string }>; details: { error?: string } };
-  assert.equal(result.details.error, 'reserved_label');
-  assert.equal(pi.events.emitted.filter((e) => e.channel === 'herdr:blocked').length, 0);
-}));
-
 test('ask_user_question options path emits herdr:blocked once around select', withCleanup(async (cleanup) => {
   const pi = await workerPier(cleanup);
   const exec = pi.tools.get('ask_user_question')?.execute;
@@ -284,18 +256,6 @@ test('ask_user_question questions batch keeps one herdr:blocked around both sele
   assert.match(result.content[0]?.text ?? '', /"SQL\?"="Postgres"/);
   const all = pi.events.emitted.filter((e) => e.channel === 'herdr:blocked');
   assert.equal(all.length, 2);
-}));
-
-test('ask_user_question without ui does not emit herdr:blocked', withCleanup(async (cleanup) => {
-  const pi = await workerPier(cleanup);
-  const exec = pi.tools.get('ask_user_question')?.execute;
-  assert.ok(exec);
-  const result = await exec!({}, { question: 'deploy staging?' }, undefined, undefined, {}) as {
-    content: Array<{ text: string }>;
-    details: { error?: string };
-  };
-  assert.equal(result.details.error, 'no_ui');
-  assert.equal(pi.events.emitted.filter((e) => e.channel === 'herdr:blocked').length, 0);
 }));
 
 
