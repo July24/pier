@@ -3,7 +3,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -148,7 +148,7 @@ test('pruneObjectsDirectory: removes oldest objects when file count or total siz
     const removed = await pruneObjectsDirectory(dir, { maxFiles: 2 });
     assert.equal(removed, 1);
 
-    const remaining = await (await import('node:fs/promises')).readdir(dir);
+    const remaining = await readdir(dir);
     assert.equal(remaining.length, 2);
     // file1.txt was oldest, so it must have been pruned
     assert.equal(remaining.includes('file1.txt'), false);
@@ -178,8 +178,8 @@ test('pruneSessionObjects: prunes both content-addressed dirs of one session roo
 
     const removed = await pruneSessionObjects(root, { maxFiles: 1 });
     assert.equal(removed, 2, 'one file pruned per directory');
-    const obsFiles = await (await import('node:fs/promises')).readdir(obsDir);
-    const redFiles = await (await import('node:fs/promises')).readdir(redDir);
+    const obsFiles = await readdir(obsDir);
+    const redFiles = await readdir(redDir);
     assert.equal(obsFiles.length, 1);
     assert.equal(redFiles.length, 1);
   } finally {

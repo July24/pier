@@ -1,16 +1,13 @@
 /**
  * Phase 0 routing telemetry (RFC docs/rfc-jev-role-routing.md §8): observation only, zero
  * behavior change. Three row kinds answer the decision questions before the grants collapse
- * (phase 1) and the jev router (phase 2) are built:
- *  - spawn profile: how often masters manually route (role param / allowed_tools)
- *  - deny hits: which (role, tool) pairs the gate rejects — clamp-table and escalation data
- *  - axis usage: how role files actually use the three axes (ask / stance / explicit denies)
+ * (phase 1) and the jev router (phase 2) are built — spawn profile (how often masters route
+ * manually), deny hits (which (role, tool) pairs the gate rejects) and axis usage (how role files
+ * use ask/stance/explicit denies).
  *
  * Privacy contract: task text and prompt content NEVER enter telemetry — only taskSha8
- * (correlatable, not reversible; same redaction pattern as reducer's secret matches) and
- * tool/role names. Planners are pure and sessionId-free: the central append stamps it once
- * (index.ts), so threaded call sites never each carry a session-id source. All appends are
- * the caller's best-effort concern.
+ * (correlatable, not reversible) and tool/role names. Planners are pure and sessionId-free; the
+ * central append (index.ts) stamps the session id once, and every append is best-effort.
  */
 import { createHash } from 'node:crypto';
 
@@ -89,9 +86,9 @@ export function planDenyHitRow(opts: {
 }
 
 /**
- * Fold role-file texts into the axis-usage summary. Robust by contract: a malformed file counts
- * as invalid and never fails the scan (the summary must observe reality, not gate on it).
- * Mirrors the validator's shapes only — no schema import, so telemetry never breaks on schema drift.
+ * Fold role-file texts into the axis-usage summary. Robust by contract: a malformed file counts as
+ * invalid and never fails the scan. Shapes are mirrored, not imported, so telemetry cannot break
+ * on schema drift.
  */
 export function scanRoleAxisUsage(opts: {
   now: number;
@@ -114,9 +111,8 @@ export function scanRoleAxisUsage(opts: {
       invalid += 1;
       continue;
     }
-    // Schema contract: only role + manifest are required; `rules` may be omitted (implicit
-    // {"*":"allow"}) and unknownTools defaults to deny — a minimal legal custom role must count
-    // as parsed, not invalid, or the phase-1 dataset loses exactly the files it decides on.
+    // Schema contract: only role + manifest are required. `rules` may be omitted (implicit
+    // {"*":"allow"}) and unknownTools defaults to deny, so a minimal legal role counts as parsed.
     if (typeof doc.role !== 'string' || typeof doc.manifest !== 'object' || doc.manifest === null) {
       invalid += 1;
       continue;

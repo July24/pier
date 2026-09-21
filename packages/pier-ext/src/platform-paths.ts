@@ -2,12 +2,10 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 /**
- * Platform-aware storage and workspace path resolution.
- * 
- * Why: Centralizes platform-specific path logic to support Windows (LOCALAPPDATA),
- * Unix XDG conventions, and testability through injection.
+ * Platform-aware storage and workspace path resolution: Windows uses LOCALAPPDATA, Linux XDG,
+ * macOS keeps `~/.pi` (with XDG override); herdr keeps its worktrees next to the data dir on
+ * Windows/Linux but under `~/.herdr` on macOS. Everything is injectable for tests.
  */
-
 export interface PlatformPaths {
   /** Base directory for agent sessions and state */
   readonly agentDataDir: string
@@ -17,51 +15,29 @@ export interface PlatformPaths {
   readonly sessionsDir: string
 }
 
-function getDefaultDataDir(): string {
-  const platform = process.platform
-  
-  if (platform === 'win32') {
-    // Windows: use LOCALAPPDATA or fallback to homedir
-    return process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local')
-  }
-  
-  // Unix: XDG_DATA_HOME or ~/.local/share on Linux, ~/.local/share on macOS
-  if (platform === 'linux') {
-    return process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share')
-  }
-  
-  // macOS: use ~/.local/share for consistency, but .pi is acceptable legacy
-  return process.env.XDG_DATA_HOME || join(homedir(), '.pi')
-}
-
-function getDefaultWorktreeDir(): string {
-  const platform = process.platform
-  
-  if (platform === 'win32') {
-    const localAppData = process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local')
-    return join(localAppData, 'herdr', 'worktrees')
-  }
-  
-  // Unix: use XDG_DATA_HOME or ~/.local/share
-  if (platform === 'linux') {
-    const dataHome = process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share')
-    return join(dataHome, 'herdr', 'worktrees')
-  }
-  
-  // macOS legacy: ~/.herdr/worktrees
-  return join(homedir(), '.herdr', 'worktrees')
+const PLATFORM_DEFAULTS: Record<string, {
+  /** Env var that overrides the data dir when set. */
+  readonly envVar: string
+  /** Data dir under $HOME when the env var is unset. */
+  readonly homeFallback: readonly string[]
+  /** Whether herdr keeps worktrees under the data dir (macOS uses ~/.herdr instead). */
+  readonly worktreesUnderData: boolean
+}> = {
+  win32: { envVar: 'LOCALAPPDATA', homeFallback: ['AppData', 'Local'], worktreesUnderData: true },
+  linux: { envVar: 'XDG_DATA_HOME', homeFallback: ['.local', 'share'], worktreesUnderData: true },
+  darwin: { envVar: 'XDG_DATA_HOME', homeFallback: ['.pi'], worktreesUnderData: false },
 }
 
 export function createPlatformPaths(overrides?: Partial<PlatformPaths>): PlatformPaths {
-  const defaultAgentDataDir = join(getDefaultDataDir(), 'agent')
-  const agentDataDir = overrides?.agentDataDir || defaultAgentDataDir
-  const sessionsDir = overrides?.sessionsDir || join(agentDataDir, 'sessions')
-  const worktreeBaseDir = overrides?.worktreeBaseDir || getDefaultWorktreeDir()
-  
+  const layout = PLATFORM_DEFAULTS[process.platform] ?? PLATFORM_DEFAULTS.darwin!
+  const dataDir = process.env[layout.envVar] || join(homedir(), ...layout.homeFallback)
+  const agentDataDir = overrides?.agentDataDir || join(dataDir, 'agent')
+
   return {
     agentDataDir,
-    sessionsDir,
-    worktreeBaseDir,
+    sessionsDir: overrides?.sessionsDir || join(agentDataDir, 'sessions'),
+    worktreeBaseDir: overrides?.worktreeBaseDir
+      || (layout.worktreesUnderData ? join(dataDir, 'herdr', 'worktrees') : join(homedir(), '.herdr', 'worktrees')),
   }
 }
 

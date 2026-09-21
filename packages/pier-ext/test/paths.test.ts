@@ -1,5 +1,5 @@
 /**
- * storage-layout: collision-resistant session encoding + dual-read migration.
+ * 路径布局合并测试：storage-layout（会话目录编码 + 双读迁移）与 platform-paths（平台数据/工作树目录）。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -19,9 +19,9 @@ import {
   userRolesDir,
   workspaceRolesDir,
 } from '../src/storage-layout.ts';
-import { sessionDirName as sessionDirNameReexport } from '../src/session-tail.ts';
-import { historyFilePath as historyFilePathReexport } from '../src/history-store.ts';
-import { userRolesDir as userRolesDirReexport } from '../src/role-loader.ts';
+import { createPlatformPaths, platformPaths } from '../src/platform-paths.ts';
+
+/* ── storage-layout ─────────────────────────────────────────────────────── */
 
 test('sessionDirName: percent-encodes separators so a/b ≠ a-b', () => {
   assert.equal(sessionDirName('a/b'), '--a%2Fb--');
@@ -39,10 +39,7 @@ test('sessionDirNameLegacy: old flattening kept for dual-read', () => {
 });
 
 test('sessionDirCandidates: new encoding first, then legacy', () => {
-  assert.deepEqual(sessionDirCandidates('F:\\herdr-pi'), [
-    '--F%3A%5Cherdr-pi--',
-    '--F--herdr-pi--',
-  ]);
+  assert.deepEqual(sessionDirCandidates('F:\\herdr-pi'), ['--F%3A%5Cherdr-pi--', '--F--herdr-pi--']);
 });
 
 test('historyFilePath: canonical write path uses new encoding', () => {
@@ -75,31 +72,15 @@ test('preferredSessionDir: missing both → new encoding', () => {
   assert.equal(preferredSessionDir(parent, 'a/b'), join(parent, '--a%2Fb--'));
 });
 
-test('userRolesDir: ~/.pi/agent/herdr-pi/roles (legacy layout, not XDG)', () => {
+test('role dirs: user-global uses the legacy agent layout, workspace is per-project', () => {
   assert.equal(userRolesDir(), join(homedir(), '.pi', 'agent', 'herdr-pi', 'roles'));
-});
-
-test('workspaceRolesDir: <base>/.pi-herdr/roles', () => {
   assert.equal(workspaceRolesDir('/repo'), join('/repo', '.pi-herdr', 'roles'));
 });
 
-test('re-exports stay stable for existing importers', () => {
-  assert.equal(sessionDirNameReexport, sessionDirName);
-  assert.equal(historyFilePathReexport, historyFilePath);
-  assert.equal(userRolesDirReexport, userRolesDir);
-});
-
-/* ──────────── A8：pi core 自有 session 目录名（读 pi 会话必须对齐它，而不是 pier 的编码） ──────────── */
-
-test('piCoreSessionDirName: 与 pi core 逐字节一致（本机实证样例）', () => {
+test('piCoreSessionDirName: 与 pi core 逐字节一致（剥离一个前导分隔符、不转义 %）', () => {
   // pi core（dist/migrations.js:102）: `--${cwd.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`
-  // 与 `~/.pi/agent/sessions/` 下真实目录名对齐：
   assert.equal(piCoreSessionDirName('/Users/yehaoyu/Documents/pier'), '--Users-yehaoyu-Documents-pier--');
-  assert.equal(
-    piCoreSessionDirName('/Users/yehaoyu/.herdr/worktrees/pier/pier-fix-batch-0-regressions-a7-a8-b1-a11'),
-    '--Users-yehaoyu-.herdr-worktrees-pier-pier-fix-batch-0-regressions-a7-a8-b1-a11--',
-  );
-  // Windows：只有一个开头分隔符被剥离（盘符前没有分隔符，等价于 pier 的 legacy 形态）
+  // Windows：盘符前没有分隔符，等价于 pier 的 legacy 形态
   assert.equal(piCoreSessionDirName('F:\\herdr-pi'), '--F--herdr-pi--');
   // `%` 不转义（这正是旧实现 POSIX 全落空的原因：pier 新版编成了 %2F）
   assert.equal(piCoreSessionDirName('/a%2Fb'), '--a%2Fb--');
@@ -115,4 +96,21 @@ test('piSessionDirCandidates: pi core 名在前，pier 旧编码兜底且去重'
   ]);
   // Windows 上 pi core 名与 legacy 相同 → 不重复
   assert.deepEqual(piSessionDirCandidates('F:\\herdr-pi'), ['--F--herdr-pi--', '--F%3A%5Cherdr-pi--']);
+});
+
+/* ── platform-paths ─────────────────────────────────────────────────────── */
+
+test('createPlatformPaths: overrides win; sessionsDir defaults under agentDataDir', () => {
+  const p = createPlatformPaths({ agentDataDir: '/x/agent', worktreeBaseDir: '/x/wt' });
+  assert.equal(p.agentDataDir, '/x/agent');
+  assert.equal(p.worktreeBaseDir, '/x/wt');
+  assert.equal(p.sessionsDir, join('/x/agent', 'sessions'));
+  assert.equal(createPlatformPaths({ agentDataDir: '/x/agent', sessionsDir: '/custom/sessions' }).sessionsDir, '/custom/sessions');
+});
+
+test('platformPaths singleton: required dirs are absolute-ish non-empty', () => {
+  assert.ok(platformPaths.agentDataDir.length > 0);
+  assert.ok(platformPaths.worktreeBaseDir.length > 0);
+  assert.ok(platformPaths.sessionsDir.length > 0);
+  assert.equal(platformPaths.sessionsDir, join(platformPaths.agentDataDir, 'sessions'));
 });

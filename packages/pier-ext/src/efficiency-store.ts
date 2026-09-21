@@ -1,15 +1,9 @@
 /**
- * D101-D103 Efficiency Storage & I/O Adapter.
+ * D101-D103 efficiency storage: content-addressed objects (ObservationPack / EPR), telemetry
+ * appends and the un-truncated bash log reader.
  *
- * Implements safe, content-addressed storage for ObservationPack and
- * Evidence-Preserving Reducer, along with telemetry log appending and
- * secure bash un-truncated output reading.
- *
- * Security & Integrity:
- *  - Mode 0700 for directories, 0600 for object and log files.
- *  - O_NOFOLLOW to forbid symlinks.
- *  - Safe sessionId regex validation.
- *  - EEXIST integrity verification (rejects corrupted collisions).
+ * Integrity: directories 0700, files 0600, O_NOFOLLOW everywhere, session ids regex-validated, and
+ * an EEXIST collision is re-verified (size + sha256) instead of trusted.
  */
 
 import { constants } from 'node:fs';
@@ -23,8 +17,8 @@ import {
   type RecallSliceResult,
 } from './observation-core.ts';
 
-export const SAFE_SESSION_ID_RE = /^[a-z0-9][a-z0-9._-]*$/i;
-export const BASH_LOG_NAME_RE = /^pi-bash-.*\.log$/;
+const SAFE_SESSION_ID_RE = /^[a-z0-9][a-z0-9._-]*$/i;
+const BASH_LOG_NAME_RE = /^pi-bash-.*\.log$/;
 
 const READ_OBJECT_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW;
 const CREATE_OBJECT_FLAGS =
@@ -73,8 +67,8 @@ export function efficiencyLogPath(
   return join(root, 'efficiency-logs', `${mechanism}.jsonl`);
 }
 
-export const MAX_OBJECTS_PER_DIR = 300;
-export const MAX_OBJECTS_TOTAL_BYTES = 50 * 1024 * 1024; // 50MB
+const MAX_OBJECTS_PER_DIR = 300;
+const MAX_OBJECTS_TOTAL_BYTES = 50 * 1024 * 1024;
 
 export async function pruneObjectsDirectory(
   dir: string,
@@ -98,7 +92,7 @@ export async function pruneObjectsDirectory(
           totalBytes += s.size;
         }
       } catch {
-        /* ignore stat errors */
+        // Unreadable entry: skip.
       }
     }
 
@@ -106,7 +100,6 @@ export async function pruneObjectsDirectory(
       return 0;
     }
 
-    // Sort by mtime ascending (oldest first)
     files.sort((a, b) => a.mtimeMs - b.mtimeMs);
 
     let removedCount = 0;
@@ -122,7 +115,7 @@ export async function pruneObjectsDirectory(
           if (k.startsWith(f.path)) verifiedObjectCache.delete(k);
         }
       } catch {
-        /* ignore unlink errors */
+        // Already gone / not removable: leave it to the next pass.
       }
     }
     return removedCount;
@@ -240,7 +233,8 @@ export async function readStoredObjectChunk(
   }
 }
 
-export const MAX_EFFICIENCY_LOG_BYTES = 5 * 1024 * 1024; // 5MB rotation ceiling
+/** Rotation ceiling: rename to `<log>.old` past this size so a log can never grow unbounded. */
+const MAX_EFFICIENCY_LOG_BYTES = 5 * 1024 * 1024;
 
 export async function appendEfficiencyLog(
   logPath: string,
@@ -259,7 +253,7 @@ export async function appendEfficiencyLog(
       await rename(logPath, oldPath);
     }
   } catch {
-    /* file may not exist yet, continue */
+    // No log yet (or not stat-able): nothing to rotate.
   }
 
   let handle;

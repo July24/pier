@@ -1,6 +1,6 @@
 /**
  * M18：文件级写锁（S2：默认软 veto；PI_HERDR_WRITE_LOCK=1 硬启）。
- * 缝：normalizeLockPath / fnv1a64 / token 编解码 / findLockConflict / planWriteGuard。
+ * 缝：normalizeLockPath / fnv1a64 / token 编解码 / planWriteGuard（含 warn/block 文案）。
  * token 契约（schema 实测）：键 ^[A-Za-z0-9_-]{1,32}$、每报 ≤16 键 → 键=哈希、值=paneId|path。
  */
 import { test } from 'node:test';
@@ -12,10 +12,8 @@ import {
   WRITE_LOCK_ENV,
   WRITE_TOOLS,
   acquireTokensFor,
-  findLockConflict,
   findLockHolders,
   fnv1a64,
-  formatConflictWarning,
   isLockTokenKey,
   lockTokenKey,
   lockTokenValue,
@@ -40,26 +38,22 @@ function agent(paneId: string, locks: Record<string, string>): LockAgentView {
   return { paneId, tokens };
 }
 
+const guard = (opts: {
+  toolName: string;
+  input: unknown;
+  agents: readonly LockAgentView[];
+  ownPaneId: string;
+  hard?: boolean;
+}) => planWriteGuard({ cwd: CWD, hard: false, ...opts });
+
 /* ── 路径归一（Windows 大小写/分隔符/相对路径） ────────────────── */
 
 test('normalizeLockPath：分隔符统一、小写、相对→绝对、去尾斜杠', () => {
-  if (process.platform === 'win32') {
-    assert.equal(normalizeLockPath('F:\\A\\B.cs', CWD), 'f:/a/b.cs');
-    assert.equal(normalizeLockPath('f:/a/b.cs', CWD), 'f:/a/b.cs');
-    assert.equal(normalizeLockPath('src/x.ts', CWD), 'f:/proj/src/x.ts');
-    assert.equal(normalizeLockPath('f:/a/', CWD), 'f:/a');
-    assert.equal(
-      normalizeLockPath('F:\\A\\..\\A\\B.cs', CWD),
-      normalizeLockPath('F:\\A\\B.cs', CWD),
-    );
-  } else {
-    assert.equal(normalizeLockPath('/A/B.cs', CWD), '/a/b.cs');
-    assert.equal(normalizeLockPath('src/x.ts', CWD), '/proj/src/x.ts');
-    assert.equal(normalizeLockPath('/a/', CWD), '/a');
-    assert.equal(
-      normalizeLockPath('/A/../A/B.cs', CWD),
-      normalizeLockPath('/A/B.cs', CWD),
-    );
+  const cases: Array<[string, string]> = process.platform === 'win32'
+    ? [['F:\\A\\B.cs', 'f:/a/b.cs'], ['f:/a/b.cs', 'f:/a/b.cs'], ['src/x.ts', 'f:/proj/src/x.ts'], ['f:/a/', 'f:/a'], ['F:\\A\\..\\A\\B.cs', 'f:/a/b.cs']]
+    : [['/A/B.cs', '/a/b.cs'], ['/a/b.cs', '/a/b.cs'], ['src/x.ts', '/proj/src/x.ts'], ['/a/', '/a'], ['/A/../A/B.cs', '/a/b.cs']];
+  for (const [input, expected] of cases) {
+    assert.equal(normalizeLockPath(input, CWD), expected);
   }
 });
 
@@ -82,12 +76,17 @@ test('lockTokenKey 匹配 schema 模式 ^[A-Za-z0-9_-]{1,32}$；isLockTokenKey �
 });
 
 test('lockTokenValue / parseLockTokenValue 往返；畸形值 → null', () => {
-  const v = lockTokenValue('f:/a.cs', 'w6:p9Q');
-  const p = parseLockTokenValue(v);
-  assert.deepEqual(p, { holderPaneId: 'w6:p9Q', path: 'f:/a.cs' });
+  assert.deepEqual(parseLockTokenValue(lockTokenValue('f:/a.cs', 'w6:p9Q')), { holderPaneId: 'w6:p9Q', path: 'f:/a.cs' });
   assert.equal(parseLockTokenValue('no-separator'), null);
   assert.equal(parseLockTokenValue('|lead'), null);
   assert.equal(parseLockTokenValue('trail|'), null);
+});
+
+test('acquire/release tokens：键=哈希、acquire 值=paneId|path、release 值 null', () => {
+  const acq = acquireTokensFor(['f:/a.cs', 'f:/b.cs'], 'pZ');
+  assert.deepEqual(Object.keys(acq).map((k) => k.startsWith('lock-')).every(Boolean), true);
+  assert.deepEqual(acq[lockTokenKey('f:/a.cs')], 'pZ|f:/a.cs');
+  assert.deepEqual(releaseTokensFor(['f:/a.cs']), { [lockTokenKey('f:/a.cs')]: null });
 });
 
 /* ── 工具路径提取（write/edit 才参与） ─────────────────────────── */
@@ -101,99 +100,55 @@ test('writePathsOfTool：write/edit 取 path；其余工具空', () => {
   assert.deepEqual(writePathsOfTool('write', {}), []);
 });
 
-/* ── 冲突判定（异 pane 持有；同 pane 重入放行；null 清除不算） ── */
+/* ── 持有者查询（异 pane 持有、去重、排除自己/null） ────────────── */
 
-test('findLockConflict：异 pane 持有 → holder；自己/无锁/null → null', () => {
-  const agents = [
+test('findLockHolders：列出全部持有者、去重并排除自己；已清除的 token 不算', () => {
+  const agents: LockAgentView[] = [
     agent('pA', { 'f:/a.cs': 'pA' }),
-    agent('pB', { 'f:/b.cs': 'pB' }),
+    agent('pB', { 'f:/a.cs': 'pB' }),
+    agent('pC', { 'f:/a.cs': 'pA' }), // duplicate holder
+    { paneId: 'pD', tokens: { [lockTokenKey('f:/c.cs')]: null, unrelated: 'x' } },
   ];
-  agents[1].tokens[lockTokenKey('f:/c.cs')] = null; // 已清除
-  assert.deepEqual(findLockConflict(agents, 'pB', 'f:/a.cs'), { holderPaneId: 'pA' });
-  assert.equal(findLockConflict(agents, 'pA', 'f:/a.cs'), null); // 重入放行
-  assert.equal(findLockConflict(agents, 'pB', 'f:/b.cs'), null); // 自己
-  assert.equal(findLockConflict(agents, 'pB', 'f:/c.cs'), null); // null
-  assert.equal(findLockConflict(agents, 'pB', 'f:/nope.cs'), null);
+  assert.deepEqual(findLockHolders(agents, 'pZ', 'f:/a.cs'), ['pA', 'pB']);
+  assert.deepEqual(findLockHolders(agents, 'pA', 'f:/a.cs'), ['pB'], 'self is excluded');
+  assert.deepEqual(findLockHolders(agents, 'pZ', 'f:/c.cs'), [], 'a cleared token holds nothing');
+  assert.deepEqual(findLockHolders(agents, 'pZ', 'f:/zz.cs'), []);
 });
 
 /* ── 决策（skip/pass/warn/block） ─────────────────────────────── */
 
-test('planWriteGuard：非写工具 skip；无冲突 pass；同 pane 重入 pass', () => {
+test('planWriteGuard：非写工具/缺路径 skip；无冲突 pass；同 pane 重入 pass', () => {
   const agents = [agent('pA', { [LOCKED]: 'pA' })];
-  assert.equal(planWriteGuard({ toolName: 'read', input: { path: 'a.cs' }, agents, ownPaneId: 'pB', cwd: CWD, hard: true }).kind, 'skip');
-  assert.equal(planWriteGuard({ toolName: 'write', input: { path: 'other.cs', content: '' }, agents, ownPaneId: 'pB', cwd: CWD, hard: true }).kind, 'pass');
-  assert.equal(planWriteGuard({ toolName: 'write', input: { path: 'a.cs', content: '' }, agents, ownPaneId: 'pA', cwd: CWD, hard: true }).kind, 'pass');
+  assert.equal(guard({ toolName: 'read', input: { path: 'a.cs' }, agents, ownPaneId: 'pB', hard: true }).kind, 'skip');
+  assert.equal(guard({ toolName: 'write', input: {}, agents: [], ownPaneId: 'pB' }).kind, 'skip');
+  assert.equal(guard({ toolName: 'write', input: { path: 'other.cs', content: '' }, agents, ownPaneId: 'pB', hard: true }).kind, 'pass');
+  assert.equal(guard({ toolName: 'write', input: { path: 'a.cs', content: '' }, agents, ownPaneId: 'pA', hard: true }).kind, 'pass');
 });
 
-test('planWriteGuard：软模式（默认）→ warn（归一路径匹配，工具放行）', () => {
+test('planWriteGuard：软模式（默认）→ warn，文案含路径/持有者与查询入口，工具放行', () => {
   const agents = [agent('pA', { [LOCKED]: 'pA' })];
-  const g = planWriteGuard({ toolName: 'write', input: { path: LOCKED_ALT, content: '' }, agents, ownPaneId: 'pB', cwd: CWD, hard: false });
+  const g = guard({ toolName: 'write', input: { path: LOCKED_ALT, content: '' }, agents, ownPaneId: 'pB' });
   assert.equal(g.kind, 'warn');
   if (g.kind !== 'warn') return;
   assert.deepEqual(g.holderPaneIds, ['pA']);
+  assert.deepEqual(g.paths, [LOCKED], '归一路径后才匹配 token');
   assert.match(g.warning, /pA/);
   assert.match(g.warning, /a\.cs/i);
-  assert.deepEqual(g.paths, [LOCKED]);
+  assert.match(g.warning, /conflict|locked/i);
+  assert.match(g.warning, /by pane pA /, '单个持有者用单数');
+  assert.match(g.warning, /\/locks/, 'warning points at the human view');
+  assert.match(g.warning, /herdr agent list/, 'warning points at the agent-readable view');
 });
 
-test('planWriteGuard：硬模式 → block（reason 给模型）', () => {
-  const agents = [agent('pA', { [LOCKED]: 'pA' })];
-  const g = planWriteGuard({ toolName: 'edit', input: { path: LOCKED_ALT, edits: [] }, agents, ownPaneId: 'pB', cwd: CWD, hard: true });
+test('planWriteGuard：硬模式 → block（reason 列出全部持有者并附查询提示）', () => {
+  const agents = [agent('pA', { [LOCKED]: 'pA' }), agent('pB', { [LOCKED]: 'pB' })];
+  const g = guard({ toolName: 'edit', input: { path: LOCKED_ALT, edits: [] }, agents, ownPaneId: 'pZ', hard: true });
   assert.equal(g.kind, 'block');
   if (g.kind !== 'block') return;
-  assert.deepEqual(g.holderPaneIds, ['pA']);
-  assert.match(g.reason, /pA/);
+  assert.deepEqual(g.holderPaneIds, ['pA', 'pB']);
+  assert.match(g.reason, /panes pA, pB/);
   assert.match(g.reason, /locked/i);
-});
-
-test('planWriteGuard：缺路径 skip', () => {
-  const g = planWriteGuard({ toolName: 'write', input: {}, agents: [], ownPaneId: 'pB', cwd: CWD, hard: false });
-  assert.equal(g.kind, 'skip');
-});
-
-/* ── token 构造 + 警告文案 + 常量 ──────────────────────────────── */
-
-test('acquire/release tokens：键=哈希、acquire 值=paneId|path、release 值 null', () => {
-  const acq = acquireTokensFor(['f:/a.cs', 'f:/b.cs'], 'pZ');
-  assert.deepEqual(Object.keys(acq).map((k) => k.startsWith('lock-')).every(Boolean), true);
-  assert.deepEqual(acq[lockTokenKey('f:/a.cs')], 'pZ|f:/a.cs');
-  assert.deepEqual(releaseTokensFor(['f:/a.cs']), { [lockTokenKey('f:/a.cs')]: null });
-});
-
-test('formatConflictWarning：含路径与持有者', () => {
-  const w = formatConflictWarning('f:/a.cs', ['pA']);
-  assert.match(w, /pA/);
-  assert.match(w, /a\.cs/);
-  assert.match(w, /conflict|locked/i);
-  assert.match(w, /\/locks/, 'warning points at the human view');
-  assert.match(w, /herdr agent list/, 'warning points at the agent-readable view');
-});
-
-test('findLockHolders / formatConflictWarning：列出全部持有者、去重并排除自己', () => {
-  const agents = [
-    { paneId: 'pA', tokens: { [lockTokenKey('f:/a.cs')]: lockTokenValue('f:/a.cs', 'pA') } },
-    { paneId: 'pB', tokens: { [lockTokenKey('f:/a.cs')]: lockTokenValue('f:/a.cs', 'pB') } },
-    { paneId: 'pC', tokens: { [lockTokenKey('f:/a.cs')]: lockTokenValue('f:/a.cs', 'pA') } }, // duplicate holder
-    { paneId: 'pD', tokens: { unrelated: 'x' } },
-  ];
-  assert.deepEqual(findLockHolders(agents, 'pZ', 'f:/a.cs'), ['pA', 'pB']);
-  assert.deepEqual(findLockHolders(agents, 'pA', 'f:/a.cs'), ['pB'], 'self is excluded');
-  assert.deepEqual(findLockHolders(agents, 'pZ', 'f:/zz.cs'), []);
-
-  const warn = formatConflictWarning('f:/a.cs', ['pA', 'pB']);
-  assert.match(warn, /panes pA, pB/);
-  const single = formatConflictWarning('f:/a.cs', ['pA']);
-  assert.match(single, /by pane pA /);
-});
-
-test('planWriteGuard：硬模式的 block reason 列出全部持有者并附查询提示', () => {
-  const agents = [agent('pA', { [LOCKED]: 'pA' }), agent('pB', { [LOCKED]: 'pB' })];
-  const plan = planWriteGuard({ toolName: 'write', input: { path: LOCKED_ALT, content: '' }, agents, ownPaneId: 'pZ', cwd: CWD, hard: true });
-  assert.equal(plan.kind, 'block');
-  if (plan.kind !== 'block') return;
-  assert.deepEqual(plan.holderPaneIds, ['pA', 'pB']);
-  assert.match(plan.reason, /panes pA, pB/);
-  assert.match(plan.reason, /herdr agent list/);
+  assert.match(g.reason, /herdr agent list/);
 });
 
 test('常量：env 名与工具集锁定', () => {
@@ -223,12 +178,11 @@ test('bashWriteTargets: 抽取明显的重定向/tee/sed -i/truncate 目标', ()
 
 test('planWriteGuard (B7)：bash 撞到别人的锁 → warn（不 block），write 工具仍可硬阻断', () => {
   const agents = [agent('p9', { [LOCKED]: 'p9' })];
-  const bash = planWriteGuard({
+  const bash = guard({
     toolName: 'bash',
     input: { command: `sed -i '' 's/a/b/' ${LOCKED_ALT}` },
     agents,
     ownPaneId: 'pB',
-    cwd: CWD,
     hard: true, // 即便开了硬锁，bash 也不能阻断（没解析 shell，误判代价太高）
   });
   assert.equal(bash.kind, 'warn');
@@ -237,22 +191,11 @@ test('planWriteGuard (B7)：bash 撞到别人的锁 → warn（不 block），wr
   assert.match(bash.warning, /not blocked/);
   assert.match(bash.warning, /re-read the file/);
 
-  const write = planWriteGuard({
-    toolName: 'write',
-    input: { path: LOCKED_ALT, content: '' },
-    agents,
-    ownPaneId: 'pB',
-    cwd: CWD,
-    hard: true,
-  });
+  const write = guard({ toolName: 'write', input: { path: LOCKED_ALT, content: '' }, agents, ownPaneId: 'pB', hard: true });
   assert.equal(write.kind, 'block');
 
   // 没有冲突时 bash 不产生噪音
-  assert.equal(planWriteGuard({
-    toolName: 'bash', input: { command: 'echo hi > free.txt' }, agents, ownPaneId: 'pB', cwd: CWD, hard: true,
-  }).kind, 'pass');
+  assert.equal(guard({ toolName: 'bash', input: { command: 'echo hi > free.txt' }, agents, ownPaneId: 'pB', hard: true }).kind, 'pass');
   // 自己锁自己（重入）也不提示
-  assert.equal(planWriteGuard({
-    toolName: 'bash', input: { command: `echo x > ${LOCKED_ALT}` }, agents, ownPaneId: 'p9', cwd: CWD, hard: true,
-  }).kind, 'pass');
+  assert.equal(guard({ toolName: 'bash', input: { command: `echo x > ${LOCKED_ALT}` }, agents, ownPaneId: 'p9', hard: true }).kind, 'pass');
 });

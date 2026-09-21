@@ -1,16 +1,70 @@
 /**
- * Phase 0（RFC docs/rfc-jev-role-routing.md §8）：路由埋点纯函数。
- * 缝：planSpawnProfileRow / planDenyHitRow（行形状）；scanRoleAxisUsage（三轴使用分布）；
- *      taskFingerprint（隐私红线：任务文本永不入遥测，只有 sha8 指纹）。
+ * 小体量基础设施纯函数的合并测试：DisposeLedger（D80⑤ hmr 补偿 + D79 反注册共用）与
+ * routing-telemetry（RFC docs/rfc-jev-role-routing.md §8 的埋点行规划器）。
+ * 两者都是无文件 I/O 的进程级簿记，故同址。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { pathToFileURL } from 'node:url';
+import { resolve } from 'node:path';
+import { DisposeLedger } from '../src/ledger.ts';
 import {
   planDenyHitRow,
   planSpawnProfileRow,
   scanRoleAxisUsage,
   taskFingerprint,
 } from '../src/routing-telemetry.ts';
+
+/* ── DisposeLedger ──────────────────────────────────────────────────────── */
+
+test('ledger：disposeKey 只拆匹配 key（hmr 补偿语义），未匹配保留', () => {
+  const led = new DisposeLedger();
+  const ran: string[] = [];
+  led.add('F:/x/src/a.ts', () => ran.push('a'));
+  led.add('F:/x/src/b.ts', () => ran.push('b'));
+  led.add('F:/x/src/a.ts', () => ran.push('a2'));
+  const n = led.disposeKey('F:\\x\\src\\a.ts'); // Windows 路径形态也要命中
+  assert.equal(n, 2);
+  assert.deepEqual(ran.sort(), ['a', 'a2']);
+  assert.equal(led.size, 1, 'b 保留');
+});
+
+test('ledger：disposeAll LIFO（与 cordis effect 语义一致）；异常不中断后续拆除', () => {
+  const led = new DisposeLedger();
+  const ran: string[] = [];
+  led.add('a', () => ran.push('1'));
+  led.add('b', () => { throw new Error('boom'); });
+  led.add('c', () => ran.push('3'));
+  assert.equal(led.disposeAll(), 3);
+  assert.deepEqual(ran, ['3', '1'], 'LIFO 且异常被吞');
+  assert.equal(led.size, 0);
+});
+
+test('ledger：add 返回撤销函数（资源自拆后移除，防 hmr 补偿二次拆）', () => {
+  const led = new DisposeLedger();
+  let disposed = 0;
+  const undo = led.add('a', () => disposed++);
+  undo();
+  assert.equal(led.size, 0);
+  assert.equal(led.disposeKey('a'), 0, '已撤销不再拆');
+  assert.equal(disposed, 0);
+});
+
+test('ledger：键归一（file:// URL vs 路径、反斜杠、逻辑名）都可命中', () => {
+  for (const [registered, lookup] of [
+    [resolve('x.ts'), pathToFileURL(resolve('x.ts')).href], // import.meta.url vs hmr filename
+    ['F:\\repo\\pier\\x.ts', 'F:/repo/pier/x.ts'], // Windows hmr filename 形态
+    ['pi-surface', 'pi-surface'], // D79 逻辑名原样
+  ] as const) {
+    const led = new DisposeLedger();
+    const ran: string[] = [];
+    led.add(registered, () => ran.push('hit'));
+    assert.equal(led.disposeKey(lookup), 1, `${registered} ↔ ${lookup}`);
+    assert.deepEqual(ran, ['hit']);
+  }
+});
+
+/* ── routing telemetry（Phase 0 RFC docs/rfc-jev-role-routing.md §8） ───── */
 
 test('taskFingerprint：确定性 8 位 hex；不同任务不同指纹；任务文本不出现在行里', () => {
   const a = taskFingerprint('fix the login bug in auth.ts');
@@ -21,13 +75,12 @@ test('taskFingerprint：确定性 8 位 hex；不同任务不同指纹；任务�
 
 test('spawn 画像行：字段齐全；allowedTools/manifestTools 为拷贝（防外层可变引用污染）', () => {
   const allowedTools = ['bash'];
-  const manifestTools = ['read', 'bash', 'todo_write'];
   const row = planSpawnProfileRow({
     now: 123,
     roleExplicit: false,
     role: 'worker-default',
     allowedTools,
-    manifestTools,
+    manifestTools: ['read', 'bash', 'todo_write'],
     task: 'secret task text',
   });
   assert.deepEqual(row, {
