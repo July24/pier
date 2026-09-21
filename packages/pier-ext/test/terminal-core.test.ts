@@ -21,6 +21,7 @@ import {
   computeIncrement,
   detectFullscreenTUI,
   foldTerminalsRegistry,
+  TERM_REMINDER_CUSTOM_TYPE,
   makeTerminalsRegistry,
   nextTerminalId,
   planIdleTerminalReminder,
@@ -334,20 +335,20 @@ test('planIdleTerminalReminder：闲置超阈值且未催过 → due；催过/�
 /* ── plugins/terminal.ts wiring ─────────────────────────────────── */
 
 interface FakePi {
-  sent: Array<{ customType: string; content: string; display?: boolean }>;
+  sent: Array<{ customType: string; content: string; display?: boolean; opts?: { deliverAs?: string; triggerTurn?: boolean } }>;
   entries: Array<[string, unknown]>;
   tools: Map<string, { execute?: (...a: unknown[]) => unknown; promptSnippet?: string; promptGuidelines?: string[] }>;
   listeners: Map<string, Array<(...a: unknown[]) => unknown>>;
   registerTool(def: { name: string; execute?: (...a: unknown[]) => unknown; promptSnippet?: string; promptGuidelines?: string[] }): void;
   on(event: string, handler: (...a: unknown[]) => unknown): void;
   appendEntry(customType: string, data: unknown): void;
-  sendMessage(message: { customType: string; content: string; display?: boolean }): Promise<void>;
+  sendMessage(message: { customType: string; content: string; display?: boolean }, opts?: { deliverAs?: string; triggerTurn?: boolean }): Promise<void>;
 }
 
 function fakePi(): FakePi {
   // `sent` lives in the closure, not on `this`: the plugin calls sendMessage bare (const send = pi.sendMessage),
   // which would lose a `this` binding.
-  const sent = [] as Array<{ customType: string; content: string; display?: boolean }>;
+  const sent = [] as Array<{ customType: string; content: string; display?: boolean; opts?: { deliverAs?: string; triggerTurn?: boolean } }>;
   const entries = [] as Array<[string, unknown]>;
   return {
     sent,
@@ -363,8 +364,8 @@ function fakePi(): FakePi {
     appendEntry(customType: string, data: unknown) {
       entries.push([customType, data]);
     },
-    sendMessage(message: { customType: string; content: string; display?: boolean }) {
-      sent.push(message);
+    sendMessage(message: { customType: string; content: string; display?: boolean }, opts?: { deliverAs?: string; triggerTurn?: boolean }) {
+      sent.push({ ...message, opts });
       return Promise.resolve();
     },
   };
@@ -473,6 +474,9 @@ test('plugins/terminal：session_shutdown 关停全部 open terminal（防泄漏
 });
 
 test('plugins/terminal：agent_settled 催办闲置 terminal——每个 terminal 只催一次（告别循环守卫）', async (t) => {
+  // Which terminals are due, and the nudge content itself, is the planner's contract
+  // (planIdleTerminalReminder). This test covers the delivery: a queued followUp that never wakes the
+  // agent, the persisted nudgedAt, and the absence of a second nudge.
   const prevIdle = process.env.PI_HERDR_TERM_IDLE_MS;
   const prevGrace = process.env.PI_HERDR_TERM_GRACE_MS;
   process.env.PI_HERDR_TERM_IDLE_MS = '1';
@@ -480,11 +484,7 @@ test('plugins/terminal：agent_settled 催办闲置 terminal——每个 termina
   // Mock Date as well: the tick creates an exact idle duration, so no real-clock millisecond race.
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   try {
-    const client = fakeClient().client;
-    let splitSeq = 2;
-    client.splitPane = async () => `pane-${splitSeq++}`;
-    const { pi, deps } = await mountTerminal(client);
-    await run(pi, { action: 'open' }, { cwd: 'F:/w' });
+    const { pi, deps } = await mountTerminal(fakeClient().client);
     await run(pi, { action: 'open' }, { cwd: 'F:/w' });
     const settled = (pi.listeners.get('agent_settled') ?? [])[0] as (() => Promise<void>) | undefined;
     const settle = async () => {
@@ -495,13 +495,18 @@ test('plugins/terminal：agent_settled 催办闲置 terminal——每个 termina
     };
 
     await settle();
-    assert.equal(pi.sent.length, 1, 'first round: two idle terminals are covered by one nudge');
-    assert.match(pi.sent[0]?.content ?? '', /term-1/);
-    assert.match(pi.sent[0]?.content ?? '', /term-2/);
+    assert.equal(pi.sent.length, 1, 'one nudge for the idle terminal');
+    assert.equal(pi.sent[0]?.customType, TERM_REMINDER_CUSTOM_TYPE);
+    assert.equal(pi.sent[0]?.opts?.deliverAs, 'followUp');
+    assert.equal(pi.sent[0]?.opts?.triggerTurn, undefined, 'a reminder must never wake the agent (goodbye loop)');
+    const nudged = [...pi.entries].reverse().find(([t]) => t === TERMINALS_CUSTOM_TYPE)?.[1] as {
+      terminals: Array<{ nudgedAt: number | null }>;
+    };
+    assert.ok(nudged.terminals[0]!.nudgedAt != null, 'nudgedAt is persisted before the notice is delivered');
 
     await settle();
     assert.equal(pi.sent.length, 1, 'an already-nudged terminal is never nudged again — no farewell loop');
-    assert.deepEqual([...deps.state.activePaneIds()].sort(), ['pane-2', 'pane-3'], 'a nudge only reminds, it never closes panes');
+    assert.deepEqual([...deps.state.activePaneIds()], ['pane-2'], 'a nudge only reminds, it never closes panes');
   } finally {
     t.mock.timers.reset();
     if (prevIdle === undefined) delete process.env.PI_HERDR_TERM_IDLE_MS;
