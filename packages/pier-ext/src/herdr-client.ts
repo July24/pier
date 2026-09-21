@@ -1,25 +1,19 @@
 /**
  * Minimal herdr socket API client used inside the pi extension.
  *
- * Validated against herdr 0.9.1 (protocol 22, Windows named pipe; see WIRE.md). The request shapes
- * pier builds are pinned to herdr's own `api schema` by test/herdr-contract.test.ts — regenerate
- * test/fixtures/herdr-contract.json and bump HERDR_PROTOCOL_EXPECTED when the server moves on:
+ * Validated against herdr 0.9.1 (protocol 22; see WIRE.md). The request shapes pier builds are pinned
+ * to herdr's own `api schema` by test/herdr-contract.test.ts — regenerate test/fixtures/herdr-contract.json
+ * and bump HERDR_PROTOCOL_EXPECTED when the server moves on:
  *  - Transport is NDJSON: request {id, method, params} → response {id, result} | {id, error:{code,message}};
  *  - **Control requests use one connection per request**; the server closes it after replying;
  *  - Windows targets are named pipes whose name is the complete socket_path with a \\.\pipe\ prefix;
- *  - pane.report_agent reports {pane_id, source, agent, state, message?, agent_session_id?, agent_session_path?}
- *    where state ∈ idle|working|blocked|unknown ('done' is server-derived and is not reported by the client);
- *  - pane.report_metadata reports {pane_id, source, title?, state_labels?, clear_title?, clear_state_labels?,
- *    tokens?, ttl_ms?} (ttl_ms is capped at 24 h by the server); the first report of a session also clears
- *    legacy pi-herdr chunk tokens to null;
+ *  - pane.report_agent reports {pane_id, source, agent, state, message?} where state ∈
+ *    idle|working|blocked|unknown ('done' is server-derived and is not reported by the client);
+ *  - pane.report_metadata reports {pane_id, source, title?, state_labels?, clear_*, tokens?, ttl_ms?}
+ *    (ttl_ms is capped at 24 h by the server; the first report of a session also clears legacy
+ *    pi-herdr chunk tokens to null);
  *  - agent.list {} → {type:'agent_list', agents: AgentInfo[]};
- *  - agent.wait {target, until[], timeout_ms?} → the matching agent, or an error on timeout;
- *  - agent.send_keys {target, keys[]} / pane.send_text {pane_id, text}.
- *
- * The v1.1 (DESIGN.md §12) surface reports three projections, lists, spawns, injects
- * text, sends keys, waits via agent.wait, and queries session paths. Removed operations
- * (waitSettled marker polling, readPaneText parsing, onAgentState long-lived subscriptions)
- * are replaced by session JSONL results (session-tail.ts) and server-side agent.wait.
+ *  - agent.wait {target, until[], timeout_ms?} → the matching agent, or an error on timeout.
  *
  * Design (DESIGN.md §4.1): without herdr, fall back to Noop so pi remains independent;
  * failures in reporting calls stay silent and never affect the main pi flow.
@@ -149,34 +143,41 @@ export type WaitForOutputResult =
   | { matched: true }
   | { matched: false; reason: 'timeout' | 'unavailable' };
 
+/** pane.read / agent.read selection: `recent` keeps ANSI so T6 fullscreen detection still sees it. */
+export interface ReadOptions {
+  source?: 'visible' | 'recent' | 'recent_unwrapped';
+  lines?: number;
+  stripAnsi?: boolean;
+}
+
+/** Decoded read payload; `revision` is the server's buffer revision (0 when unreadable). */
+export interface ReadBuffer {
+  text: string;
+  revision: number;
+  truncated: boolean;
+}
+
 export interface HerdrClientLike {
   readonly available: boolean;
   reportAgent(state: PaneAgentState, message: string | null): Promise<void>;
   reportMetadata(meta: { session: string; items: readonly TodoItem[]; progressSuffix?: string | null; lastWriteAt?: number | null }): Promise<void>;
   /** M18: report write-lock tokens (lock-<hash> → paneId|path); null releases, and batches stay within 16 keys. */
   reportLockTokens(tokens: Record<string, string | null>): Promise<void>;
-  /**
-   * D93: sidebar agent display name (display_agent is the role name).
-   * The report persists without a TTL; null clears it back to the detected value. Best effort.
-   */
+  /** D93: sidebar agent display name (display_agent is the role name); null clears it. Persists, no TTL. */
   reportDisplayAgent(name: string | null): Promise<void>;
   /**
-   * D95: ask_user_question waiting marker (tokens['pi-ask']; null clears it).
-   * Sidebar/heatmap grading distinguishes blocked + pi-ask (ask level) from plain blocked (block level).
+   * D95: ask_user_question waiting marker (tokens['pi-ask']; null clears it). Sidebar/heatmap grading
+   * distinguishes blocked + pi-ask (ask level) from plain blocked (block level).
    */
   reportAskFlag(text: string | null): Promise<void>;
   listAgents(): Promise<AgentInfo[]>;
-  /** Start a child pane with argv in a new tab (layout.apply), returning pane/tab IDs. */
-  spawnSubPane(opts: { label: string; command: string[]; cwd: string; env?: Record<string, string> }): Promise<{ tabId: string; paneId: string }>;
   /** Inject text into a pane terminal (pi editor input + Enter); send_text+CR reaches it directly and is used only to start launchLine. */
   sendPaneText(paneId: string, text: string): Promise<void>;
   /** Wait for an agent state server-side; return the matched state, null on timeout, and throw on error. */
   waitAgent(paneId: string, until: HerdrAgentState[], timeoutMs: number): Promise<HerdrAgentState | null>;
   /** Query the child-agent session path (agent_session.value, kind=path); return null when absent. */
   getAgentSessionPath(paneId: string): Promise<string | null>;
-  /** v1.2: Focus a pane before adding it to a group tab. */
-  focusPane(paneId: string): Promise<void>;
-  /** v1.2: Split a new shell pane in the current tab after focus, placing it in the group tab; return its pane ID. */
+  /** v1.2: Split a new shell pane in the current tab, placing it in the group tab; return its pane ID. */
   splitPane(opts: { direction?: 'left' | 'right' | 'up' | 'down'; cwd?: string; env?: Record<string, string>; targetPaneId?: string; focus?: boolean; ratio?: number }): Promise<string>;
   /** v1.2: Close a pane; observed behavior kills its process tree and herdr closes an empty tab. */
   closePane(paneId: string): Promise<void>;
@@ -190,14 +191,10 @@ export interface HerdrClientLike {
   paneLayout(opts?: { paneId?: string }): Promise<PaneLayoutSnapshot | null>;
   /** v1.3: List tabs (tab.list); fields follow the observed schema. */
   tabList(): Promise<TabInfo[]>;
-  /** v1.3: Get tab details (tab.get); return null when absent. */
-  tabGet(tabId: string): Promise<TabInfo | null>;
   /** v1.3: Close a tab (tab.close), cascading to its panes. */
   tabClose(tabId: string): Promise<void>;
   /** 0.9.1: Launch a manifest pane entrypoint with placement (popup/tab/split/overlay/zoomed). */
   openPluginPane(opts: OpenPluginPaneOptions): Promise<OpenPluginPaneResult>;
-  /** 0.9.1: Close active popup if open; returns false if no popup was open. */
-  closePopup(): Promise<boolean>;
   /** 0.9.1: Query agent explain diagnostics. */
   agentExplain(target: string): Promise<Record<string, unknown> | null>;
   /** 0.9.1: Query server version via ping. Cached in memory. */
@@ -205,17 +202,9 @@ export interface HerdrClientLike {
   /** M14: Send a key combination (pane.send_keys; Herdr key combos include ctrl+c, enter, and esc). */
   sendPaneKeys(paneId: string, keys: string[]): Promise<void>;
   /** M14: Read the pane output buffer; recent preserves ANSI data for T6 detection by default. */
-  readPane(paneId: string, opts?: {
-    source?: 'visible' | 'recent' | 'recent_unwrapped';
-    lines?: number;
-    stripAnsi?: boolean;
-  }): Promise<{ text: string; revision: number; truncated: boolean }>;
+  readPane(paneId: string, opts?: ReadOptions): Promise<ReadBuffer>;
   /** Read the agent output buffer via herdr 0.9 agent.read RPC. */
-  readAgent(target: string, opts?: {
-    source?: 'visible' | 'recent' | 'recent_unwrapped';
-    lines?: number;
-    stripAnsi?: boolean;
-  }): Promise<{ text: string; revision: number; truncated: boolean }>;
+  readAgent(target: string, opts?: ReadOptions): Promise<ReadBuffer>;
   /** M14: Wait for output to match a substring or regex; return discriminated result on match/timeout/unavailable. */
   waitForOutput(paneId: string, match: { type: 'substring' | 'regex'; value: string }, timeoutMs: number): Promise<WaitForOutputResult>;
   close(): void;
@@ -247,9 +236,6 @@ export class NoopHerdrClient implements HerdrClientLike {
   async listAgents(): Promise<AgentInfo[]> {
     return [];
   }
-  async spawnSubPane(): Promise<{ tabId: string; paneId: string }> {
-    throw new Error('subagent requires a herdr-managed pane');
-  }
   async sendPaneText(): Promise<void> {}
   async waitAgent(): Promise<null> {
     return null;
@@ -257,7 +243,6 @@ export class NoopHerdrClient implements HerdrClientLike {
   async getAgentSessionPath(): Promise<null> {
     return null;
   }
-  async focusPane(): Promise<void> {}
   async splitPane(): Promise<string> {
     throw new Error('subagent requires a herdr-managed pane');
   }
@@ -277,15 +262,9 @@ export class NoopHerdrClient implements HerdrClientLike {
   async tabList(): Promise<TabInfo[]> {
     return [];
   }
-  async tabGet(): Promise<TabInfo | null> {
-    return null;
-  }
   async tabClose(): Promise<void> {}
   async openPluginPane(): Promise<OpenPluginPaneResult> {
     throw new Error('plugin pane requires a herdr-managed pane');
-  }
-  async closePopup(): Promise<boolean> {
-    return false;
   }
   async agentExplain(): Promise<null> {
     return null;
@@ -294,10 +273,10 @@ export class NoopHerdrClient implements HerdrClientLike {
     return null;
   }
   async sendPaneKeys(): Promise<void> {}
-  async readPane(): Promise<{ text: string; revision: number; truncated: boolean }> {
+  async readPane(): Promise<ReadBuffer> {
     return { text: '', revision: 0, truncated: false };
   }
-  async readAgent(): Promise<{ text: string; revision: number; truncated: boolean }> {
+  async readAgent(): Promise<ReadBuffer> {
     return { text: '', revision: 0, truncated: false };
   }
   async waitForOutput(): Promise<WaitForOutputResult> {
@@ -322,8 +301,8 @@ export class HerdrClient implements HerdrClientLike {
   }
 
   /**
-   * Control requests use one connection per request; the server closes it after replying, as observed in the protocol.
-   * Reading a complete response line finishes the request; responses are {id, result} or {id, error}.
+   * One connection per control request: the server replies with a single {id, result} | {id, error}
+   * line and closes. Reading that complete line finishes the request.
    */
   private request(method: string, params: Record<string, unknown>, timeoutMs = 15000): Promise<unknown> {
     return new Promise((resolve, reject) => {
@@ -397,9 +376,9 @@ export class HerdrClient implements HerdrClientLike {
     }
   }
 
-  // D-2: no reportAgentSession(). herdr's native pi integration owns the session path; pier stopped
-  // sending pane.report_agent_session so the field has a single writer. `report_agent` keeps carrying the
-  // activity badge, because `state` is a required field there and pier's todo/role text is pier-only data.
+  // D-2: herdr's native pi integration owns the session path, so pier never sends
+  // pane.report_agent_session (single writer). The activity badge stays on report_agent, whose
+  // `state` is required and whose todo/role text is pier-only data.
 
   async reportMetadata(meta: { session: string; items: readonly TodoItem[]; progressSuffix?: string | null; lastWriteAt?: number | null }): Promise<void> {
     try {
@@ -409,8 +388,8 @@ export class HerdrClient implements HerdrClientLike {
         lastWriteAt: meta.lastWriteAt,
       });
       const blocked = formatBlockedLabel(meta.items);
-      // D96: separate stale cleanup from the daily report—stale(16) + pi-todo(1) exceeds herdr's 16-token limit,
-      // so one rejected request would lose both title and tokens (the D93 regression root cause). Set stale in its own batch first.
+      // D96: stale cleanup needs its own batch — stale(16) + pi-todo(1) exceeds herdr's 16-token
+      // limit, and the rejected request would drop both the title and the tokens.
       if (!this.clearedStaleTokens) {
         await this.request('pane.report_metadata', {
           pane_id: this.env.paneId,
@@ -427,7 +406,7 @@ export class HerdrClient implements HerdrClientLike {
         ...(blocked
           ? { state_labels: { [BLOCKED_LABEL_KEY]: blocked } }
           : { clear_state_labels: true }),
-        // D93: put the todo summary in a custom token; an empty string clears the key so stale summaries do not remain.
+        // D93: the todo summary is a custom token; an empty string clears the key instead of leaving a stale summary.
         tokens: sidebarTodoTokens(title),
         ttl_ms: 86400000,
       });
@@ -503,16 +482,6 @@ export class HerdrClient implements HerdrClientLike {
     });
   }
 
-  async spawnSubPane(opts: { label: string; command: string[]; cwd: string; env?: Record<string, string> }): Promise<{ tabId: string; paneId: string }> {
-    const result = (await this.request('layout.apply', {
-      tab_label: opts.label,
-      root: { type: 'pane', command: opts.command, cwd: opts.cwd, ...(opts.env ? { env: opts.env } : {}) },
-    })) as Record<string, unknown>;
-    const paneId = findIdIn(result, 'pane_id');
-    if (!paneId) throw new Error('layout.apply: no pane_id in response');
-    return { tabId: findIdIn(result, 'tab_id') ?? '', paneId };
-  }
-
   async sendPaneText(paneId: string, text: string): Promise<void> {
     // A trailing \r acts as Enter; observed behavior sends text to the pi editor and submits it.
     await this.request('pane.send_text', { pane_id: paneId, text: text + '\r' });
@@ -531,8 +500,7 @@ export class HerdrClient implements HerdrClientLike {
       const msg = String((err as Error)?.message ?? err);
       if (/timeout/i.test(msg)) return null;
       // A14: herdr reports agent_not_found while a freshly spawned pane's agent is still registering;
-      // callers poll `waitAgent`, so map it to the same "nothing yet" result as a timeout instead of
-      // failing the whole spawn with a raw server error.
+      // callers poll, so map it to the same "nothing yet" result as a timeout.
       if (/agent_not_found|agent target .* not found/i.test(msg)) return null;
       throw err;
     }
@@ -542,10 +510,6 @@ export class HerdrClient implements HerdrClientLike {
     const agents = await this.listAgents();
     const a = agents.find((x) => x.paneId === paneId);
     return a?.session ?? null;
-  }
-
-  async focusPane(paneId: string): Promise<void> {
-    await this.request('pane.focus', { pane_id: paneId });
   }
 
   async splitPane(opts: { direction?: 'left' | 'right' | 'up' | 'down'; cwd?: string; env?: Record<string, string>; targetPaneId?: string; focus?: boolean; ratio?: number } = {}): Promise<string> {
@@ -676,11 +640,6 @@ export class HerdrClient implements HerdrClientLike {
     return (result?.tabs ?? []).map((t) => this.mapTabInfo(t)).filter((t): t is TabInfo => t !== null);
   }
 
-  async tabGet(tabId: string): Promise<TabInfo | null> {
-    const result = (await this.request('tab.get', { tab_id: tabId })) as { tab?: Record<string, unknown> | null } | null;
-    return this.mapTabInfo(result?.tab ?? null);
-  }
-
   async tabClose(tabId: string): Promise<void> {
     await this.request('tab.close', { tab_id: tabId });
   }
@@ -725,19 +684,6 @@ export class HerdrClient implements HerdrClientLike {
     }
   }
 
-  async closePopup(): Promise<boolean> {
-    try {
-      await this.request('popup.close', {});
-      return true;
-    } catch (err) {
-      const msg = String((err as Error)?.message ?? err);
-      if (/popup_not_open|not found|not supported|unknown method/i.test(msg)) {
-        return false;
-      }
-      throw err;
-    }
-  }
-
   async agentExplain(target: string): Promise<Record<string, unknown> | null> {
     try {
       const result = (await this.request('agent.explain', { target })) as Record<string, unknown> | null;
@@ -772,19 +718,26 @@ export class HerdrClient implements HerdrClientLike {
     await this.request('pane.send_keys', { pane_id: paneId, keys });
   }
 
-  async readPane(paneId: string, opts: {
-    source?: 'visible' | 'recent' | 'recent_unwrapped';
-    lines?: number;
-    stripAnsi?: boolean;
-  } = {}): Promise<{ text: string; revision: number; truncated: boolean }> {
-    // Observed envelope: {type:'pane_read', read:{text, revision, truncated, ...}}; the payload is nested under read.
-    const result = (await this.request('pane.read', {
-      pane_id: paneId,
+  /**
+   * Shared pane.read / agent.read decode. Observed envelope: {type:'<method>', read:{text, revision,
+   * truncated, …}} — the payload is nested under `read`, and older servers answer it flat.
+   */
+  private async readBuffer(
+    method: 'pane.read' | 'agent.read',
+    target: { pane_id: string } | { target: string },
+    opts: ReadOptions,
+    stripAnsiDefault: boolean,
+  ): Promise<ReadBuffer> {
+    const result = (await this.request(method, {
+      ...target,
       source: opts.source ?? 'recent',
       format: 'text',
-      strip_ansi: opts.stripAnsi ?? false,
+      strip_ansi: opts.stripAnsi ?? stripAnsiDefault,
       ...(opts.lines != null ? { lines: opts.lines } : {}),
-    })) as { read?: { text?: unknown; revision?: unknown; truncated?: unknown }; text?: unknown; revision?: unknown; truncated?: unknown } | null;
+    })) as {
+      read?: { text?: unknown; revision?: unknown; truncated?: unknown };
+      text?: unknown; revision?: unknown; truncated?: unknown;
+    } | null;
     const payload = result?.read ?? result ?? {};
     return {
       text: typeof payload.text === 'string' ? payload.text : '',
@@ -793,24 +746,12 @@ export class HerdrClient implements HerdrClientLike {
     };
   }
 
-  async readAgent(target: string, opts: {
-    source?: 'visible' | 'recent' | 'recent_unwrapped';
-    lines?: number;
-    stripAnsi?: boolean;
-  } = {}): Promise<{ text: string; revision: number; truncated: boolean }> {
-    const result = (await this.request('agent.read', {
-      target,
-      source: opts.source ?? 'recent',
-      format: 'text',
-      strip_ansi: opts.stripAnsi ?? true,
-      ...(opts.lines != null ? { lines: opts.lines } : {}),
-    })) as { read?: { text?: unknown; revision?: unknown; truncated?: unknown }; text?: unknown; revision?: unknown; truncated?: unknown } | null;
-    const payload = result?.read ?? result ?? {};
-    return {
-      text: typeof payload.text === 'string' ? payload.text : '',
-      revision: typeof payload.revision === 'number' ? payload.revision : 0,
-      truncated: payload.truncated === true,
-    };
+  async readPane(paneId: string, opts: ReadOptions = {}): Promise<ReadBuffer> {
+    return this.readBuffer('pane.read', { pane_id: paneId }, opts, false);
+  }
+
+  async readAgent(target: string, opts: ReadOptions = {}): Promise<ReadBuffer> {
+    return this.readBuffer('agent.read', { target }, opts, true);
   }
 
   async waitForOutput(paneId: string, match: { type: 'substring' | 'regex'; value: string }, timeoutMs: number): Promise<WaitForOutputResult> {
