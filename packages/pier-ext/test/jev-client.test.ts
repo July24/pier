@@ -1,70 +1,50 @@
 /**
- * jev 直连客户端单测（RFC docs/rfc-jev-integration.md §5/§6）。
- * 缝：fake fetch + 临时 sessionRoot——失败面（disabled/no-key/429/超时/网络/坏 JSON）
- * 全部 fail-open；遥测只落元数据不落 body。
+ * jev direct HTTP client (RFC docs/rfc-jev-integration.md §5/§6): fake fetch + a temp session root.
+ * Every failure surface (disabled/no-key/429/timeout/network/bad JSON) fails open, and telemetry
+ * keeps metadata only — never a request body.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createJevRuntime } from '../src/jev-client.ts';
 import type { JevConfig } from '../src/efficiency-config-core.ts';
 import type { JevQuestion } from '../src/jev-core.ts';
-
-const QUESTIONS: Record<string, JevQuestion> = {
-  kind: { type: 'noul', instructions: 'Is this a test?' },
-};
+import { withCleanup } from './test-utils.ts';
+const QUESTIONS: Record<string, JevQuestion> = { kind: { type: 'noul', instructions: 'Is this a test?' } };
 
 function config(overrides: Partial<JevConfig> = {}): JevConfig {
-  return {
-    enabled: true,
-    logEnabled: true,
-    model: 'jev-1.13.0',
-    timeoutMs: 500,
-    minConfidence: 0.6,
-    apiKey: 'sk-test',
-    ...overrides,
-  };
+  return { enabled: true, logEnabled: true, model: 'jev-1.13.0', timeoutMs: 500, minConfidence: 0.6, apiKey: 'sk-test', ...overrides };
 }
 
-function okBody(): unknown {
-  return {
-    model: 'jev-1.13.0',
-    answers: { kind: { type: 'noul', noul: 0.9 } },
-    usage: { input_tokens: 42, output_tokens: 3 },
-  };
-}
+const okBody = () => ({
+  model: 'jev-1.13.0',
+  answers: { kind: { type: 'noul', noul: 0.9 } },
+  usage: { input_tokens: 42, output_tokens: 3 },
+});
 
-async function readLog(root: string): Promise<string> {
-  return readFile(join(root, 'efficiency-logs', 'jev.jsonl'), 'utf8');
-}
+const readLog = (root: string): Promise<string> => readFile(join(root, 'efficiency-logs', 'jev.jsonl'), 'utf8');
 
-test('disabled / no-api-key：不发请求，fail-open 并记录原因', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'pier-jev-'));
+test('disabled / no-api-key: no request is sent, and both fail open with a reason', withCleanup(async (cleanup) => {
+  const root = cleanup.tempDir('jev').path;
   let fetchCalls = 0;
   const runtime = createJevRuntime(() => config({ enabled: false }), {
-    fetchImpl: () => {
-      fetchCalls++;
-      return Promise.resolve(new Response('{}'));
-    },
+    fetchImpl: () => { fetchCalls++; return Promise.resolve(new Response('{}')); },
     getSessionRoot: () => root,
   });
   assert.equal(runtime.available, false);
   const disabled = await runtime.ask({ state: { command: 'x' }, questions: QUESTIONS }, { questionId: 'q' });
   assert.equal(disabled.ok, false);
   if (!disabled.ok) assert.equal(disabled.reason, 'disabled');
-
   const keyless = createJevRuntime(() => config({ apiKey: undefined }), { getSessionRoot: () => root });
   const noKey = await keyless.ask({ state: { command: 'x' }, questions: QUESTIONS }, { questionId: 'q' });
   if (!noKey.ok) assert.equal(noKey.reason, 'no-api-key');
   assert.equal(fetchCalls, 0);
   assert.match(await readLog(root), /"reason":"disabled"/);
-  await rm(root, { recursive: true, force: true });
-});
+}));
 
-test('enrich 钩子：失败路径收到空答案，判定值写进遥测行', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'pier-jev-'));
+test('enrich hook: failure paths see empty answers, and the decision lands in telemetry', withCleanup(async (cleanup) => {
+  const root = cleanup.tempDir('jev').path;
   const outcomes: string[] = [];
   const runtime = createJevRuntime(() => config(), {
     fetchImpl: async () => new Response('{"oops"', { status: 200 }),
@@ -80,11 +60,10 @@ test('enrich 钩子：失败路径收到空答案，判定值写进遥测行', a
   assert.equal(failed.ok, false);
   assert.deepEqual(outcomes, ['false:true']);
   assert.match(await readLog(root), /"verdict":"unparsed"/);
-  await rm(root, { recursive: true, force: true });
-});
+}));
 
-test('成功路径：解析答案；遥测含 stateHash 不含 body 明文', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'pier-jev-'));
+test('success path: parses answers; telemetry carries the state hash, never the body', withCleanup(async (cleanup) => {
+  const root = cleanup.tempDir('jev').path;
   let seenAuth = '';
   let seenUrl = '';
   const runtime = createJevRuntime(() => config(), {
@@ -110,27 +89,14 @@ test('成功路径：解析答案；遥测含 stateHash 不含 body 明文', asy
   // Telemetry discipline: no request bodies, not even command plaintext.
   assert.ok(!log.includes('SECRET-CMD-XYZ'));
   assert.ok(!log.includes('sk-test'));
-  await rm(root, { recursive: true, force: true });
-});
+}));
 
-test('429 / 网络 / 坏 JSON / 超时：一律 fail-open 带原因', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'pier-jev-'));
-  const mk = (fetchImpl: typeof fetch) => createJevRuntime(() => config(), { fetchImpl, getSessionRoot: () => root });
-
-  const limited = await mk(async () => new Response('rate limited', { status: 429 }))
-    .ask({ state: 's', questions: QUESTIONS }, { questionId: 'q' });
-  if (!limited.ok) assert.equal(limited.reason, 'rate-limited');
-
-  const netFail = await mk(async () => {
-    throw new Error('ECONNRESET');
-  }).ask({ state: 's', questions: QUESTIONS }, { questionId: 'q' });
-  if (!netFail.ok) assert.equal(netFail.reason, 'network-error');
-
-  const badJson = await mk(async () => new Response('not json', { status: 200 }))
-    .ask({ state: 's', questions: QUESTIONS }, { questionId: 'q' });
-  assert.equal(badJson.ok, false);
-
-  const timed = await mk((_input, init) => {
+/** [case, fetch impl, reason the ask fails open with] */
+const FAILURE_CASES: Array<[string, typeof fetch, string]> = [
+  ['rate limited', async () => new Response('rate limited', { status: 429 }), 'rate-limited'],
+  ['network error', async () => { throw new Error('ECONNRESET'); }, 'network-error'],
+  ['unparseable body', async () => new Response('not json', { status: 200 }), 'network-error'],
+  ['timeout', (_input, init) => {
     const { promise, reject } = Promise.withResolvers<Response>();
     init?.signal?.addEventListener('abort', () => {
       const err = new Error('The operation was aborted');
@@ -138,14 +104,21 @@ test('429 / 网络 / 坏 JSON / 超时：一律 fail-open 带原因', async () =
       reject(err);
     });
     return promise;
-  }).ask({ state: 's', questions: QUESTIONS }, { questionId: 'q' });
-  if (!timed.ok) assert.equal(timed.reason, 'timeout');
-  assert.match(await readLog(root), /"reason":"rate-limited"/);
-  await rm(root, { recursive: true, force: true });
-});
+  }, 'timeout'],
+];
 
-test('available getter 跟随配置重载；baseUrl 去尾斜杠', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'pier-jev-'));
+test('429 / network / bad JSON / timeout: every one resolves with a fail-open reason', withCleanup(async (cleanup) => {
+  const root = cleanup.tempDir('jev').path;
+  for (const [name, fetchImpl, expected] of FAILURE_CASES) {
+    const runtime = createJevRuntime(() => config(), { fetchImpl, getSessionRoot: () => root });
+    const result = await runtime.ask({ state: 's', questions: QUESTIONS }, { questionId: 'q' });
+    assert.equal(result.ok, false, name);
+    if (!result.ok) assert.equal(result.reason, expected, name);
+  }
+  assert.match(await readLog(root), /"reason":"rate-limited"/);
+}));
+
+test('the available getter follows config reloads, and baseUrl loses its trailing slash', async () => {
   const mutable = config();
   let seenUrl = '';
   const runtime = createJevRuntime(() => mutable, {
@@ -161,5 +134,4 @@ test('available getter 跟随配置重载；baseUrl 去尾斜杠', async () => {
   mutable.baseUrl = 'https://relay.example.com/';
   await runtime.ask({ state: 's', questions: QUESTIONS }, { questionId: 'q' });
   assert.equal(seenUrl, 'https://relay.example.com/v1/systemone');
-  await rm(root, { recursive: true, force: true });
 });

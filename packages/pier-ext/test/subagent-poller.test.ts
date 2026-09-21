@@ -1,8 +1,5 @@
-/**
- * Settlement poller: pure transition planners plus a lean set of loop-level behaviors
- * (settle claim, takeover recovery, blocked gate, vacuum, compaction hold, request refresh)
- * and the per-pane Cordis scope.
- */
+/** Settlement poller: pure transition planners plus a lean set of loop-level behaviors (settle
+ * claim, takeover recovery, blocked gate, vacuum, compaction hold, request refresh) and the scope. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Context } from '@deepseek-ai/cordis';
@@ -22,6 +19,7 @@ import {
   type PollerHost,
 } from '../src/subagent-poller.ts';
 import type { SubEntry } from '../src/subagent-core.ts';
+import { subEntry } from './test-utils.ts';
 import type { HerdrAgentState, HerdrClientLike } from '../src/herdr-client.ts';
 import type { SubSessionState } from '../src/session-tail.ts';
 import type { SessionIo } from '../src/subagent-session.ts';
@@ -124,21 +122,10 @@ test('pane scope: disposing one fiber leaves its siblings, disposing the root cl
 
 /* ── poll loop ──────────────────────────────────────────────────── */
 
-const makeEntry = (paneId: string, overrides: Partial<SubEntry> = {}): SubEntry => ({
-  taskId: `task-${paneId}`,
-  kind: 'task',
-  paneId,
-  tabId: 'tab-1',
-  tabName: 'main',
-  cwd: '/fake/cwd',
-  description: `task description for ${paneId}`,
-  background: true,
-  status: 'running',
-  consumedAt: null,
-  sessionFile: null,
-  launchCommand: [],
-  createdAt: 10_000,
-  ...overrides,
+/** Fixed createdAt keeps the virtual clock (initialTime 13_000) deterministic. */
+const makeEntry = (paneId: string, overrides: Partial<SubEntry> = {}): SubEntry => subEntry({
+  paneId, tabId: 'tab-1', cwd: '/fake/cwd', description: `task description for ${paneId}`,
+  createdAt: 10_000, ...overrides,
 });
 
 type HistoryWrite = { entry: SubEntry; patch?: { outcome?: string | null; status?: SubEntry['status']; closedAt?: number }; via?: string };
@@ -221,16 +208,9 @@ function fixture(entry: SubEntry | null, initialTime = 13_000): Fixture {
   };
 
   return {
-    host,
-    entry,
-    writes,
-    notices,
-    reconciled,
-    claimKeys,
-    virtual,
+    host, entry, writes, notices, reconciled, claimKeys, virtual, panes,
     state: (s) => { state = { ...state, ...s }; },
     waitState: (s) => { waitState = s; },
-    panes,
     reattribute: (f) => { reattributed = f; },
     setClaim: (v) => { claimResult = v; },
   };

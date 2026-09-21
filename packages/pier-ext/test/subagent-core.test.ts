@@ -1,17 +1,15 @@
 /**
- * Subagent domain unit tests: pure planners and notices (launch line, validation, tab placement,
- * readiness backoff, liveness notices, task-id resolution) plus plugin wiring (tool surface, port
- * binding, action dispatch, list rendering).
+ * Subagent domain units: pure planners and notices (launch line, validation, tab placement,
+ * readiness, liveness, isolate/worktree planning, task-id resolution) plus plugin wiring
+ * (tool surface, port binding, action dispatch, list rendering).
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Context } from '@deepseek-ai/cordis';
-import subagentPlugin from '../src/plugins/subagent.ts';
-import { PiSurface } from '../src/pi-surface.ts';
 import { DisposeLedger } from '../src/ledger.ts';
-import type { HerdrClientLike } from '../src/herdr-client.ts';
+import { mountSubagent, runSubagent } from './test-utils.ts';
 import {
   FOREGROUND_POLL_MS,
+  SUBS_CUSTOM_TYPE,
   TAB_NAME_MAX,
   Semaphore,
   agoText,
@@ -20,7 +18,6 @@ import {
   buildLaunchLine,
   buildLaunchParts,
   classifyWorktreeZone,
-  emptySubagentPortBox,
   foldSubsRegistry,
   formatSubagentResult,
   isAlive,
@@ -35,7 +32,6 @@ import {
   type SubEntry,
 } from '../src/subagent-core.ts';
 import { planReadyAttempt, readyBackoffMs, readyFailureText } from '../src/subagent-spawn.ts';
-import { SUBS_CUSTOM_TYPE } from '../src/subagent-core.ts';
 
 const RT = { nodePath: '/usr/local/bin/node', cliPath: '/opt/pi/dist/cli.js', extPath: '/ext/index.ts' };
 
@@ -79,16 +75,18 @@ const mkSub = (over: Record<string, unknown>) => ({
   launchCommand: ['x'], createdAt: 1, ...over,
 });
 
-const registryBranch = (subs: Array<Record<string, unknown> | SubEntry>) =>
-  [{ type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { version: 2, subs } }] as never;
+const registry = (...rows: unknown[]) =>
+  [{ type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { version: 2, subs: rows } }];
+
+const entryFrom = (row: Record<string, unknown>): SubEntry => foldSubsRegistry(registry(row)).subs[0]!;
 
 test('foldSubsRegistry: last snapshot wins; legacy kinds normalize; v1 rows migrate', () => {
   const reg = foldSubsRegistry([
     { type: 'session' },
     { type: 'custom', customType: 'other', data: { x: 1 } },
-    { type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { version: 2, subs: [mkSub({ paneId: 'w1:p1', status: 'settled' })] } },
-    { type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { version: 2, subs: [mkSub({ paneId: 'w1:p2', status: 'consumed', kind: 'resident', tabName: '调研' })] } },
-  ] as never);
+    ...registry(mkSub({ paneId: 'w1:p1', status: 'settled' })),
+    ...registry(mkSub({ paneId: 'w1:p2', status: 'consumed', kind: 'resident', tabName: '调研' })),
+  ]);
   assert.equal(reg.version, 2);
   assert.equal(reg.subs.length, 1);
   assert.equal(reg.subs[0]!.paneId, 'w1:p2');
@@ -96,39 +94,38 @@ test('foldSubsRegistry: last snapshot wins; legacy kinds normalize; v1 rows migr
   assert.equal(reg.subs[0]!.kind, 'task', 'resident folds to task');
   assert.equal(reg.subs[0]!.tabName, '调研');
 
-  const unknownRole = foldSubsRegistry(registryBranch([mkSub({ paneId: 'w1:p3', kind: 'advisor' })]));
-  assert.equal(unknownRole.subs[0]!.kind, 'advisor', 'unknown role names pass through');
+  assert.equal(entryFrom(mkSub({ paneId: 'w1:p3', kind: 'advisor' })).kind, 'advisor', 'unknown role names pass through');
 
-  const v1 = foldSubsRegistry([
-    { type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { version: 1, subs: [{ paneId: 'w1:p9', description: 'old', background: true, status: 'settled', createdAt: 5 }] } },
-  ] as never);
-  assert.equal(v1.subs[0]!.taskId, 'w1:p9', 'v1 rows default taskId to the pane id');
-  assert.equal(v1.subs[0]!.kind, 'task');
-  assert.equal(v1.subs[0]!.cwd, '');
-  assert.deepEqual(v1.subs[0]!.launchCommand, []);
+  const v1 = entryFrom({ paneId: 'w1:p9', description: 'old', background: true, status: 'settled', createdAt: 5 });
+  assert.equal(v1.taskId, 'w1:p9', 'v1 rows default taskId to the pane id');
+  assert.equal(v1.kind, 'task');
+  assert.equal(v1.cwd, '');
+  assert.deepEqual(v1.launchCommand, []);
 
   assert.deepEqual(foldSubsRegistry([{ type: 'session' }] as never), { version: 2, subs: [] });
 });
 
-test('foldSubsRegistry: takeover fields and isolate metadata survive a persist/rebuild round-trip', () => {
-  const reg = foldSubsRegistry(registryBranch([mkSub({
+test('foldSubsRegistry: takeover fields survive a persist/rebuild round-trip; malformed isolate falls back to none', () => {
+  const isolate = { worktreePath: '/wt/pier-x', branch: 'pier/x', baseSha: 'abc', releasedAt: null, retainNotified: false };
+  const row = entryFrom(mkSub({
     paneId: 'w1:p1',
     status: 'running',
     userTakeover: true,
     observationStartedAt: 1234567890,
     lastAgentStatus: 'working',
-    isolate: { worktreePath: '/wt/pier-x', branch: 'pier/x', baseSha: 'abc', releasedAt: null, retainNotified: false },
-  })]));
-  assert.equal(reg.subs[0]!.userTakeover, true);
-  assert.equal(reg.subs[0]!.observationStartedAt, 1234567890);
-  assert.equal(reg.subs[0]!.lastAgentStatus, 'working');
-  assert.equal(reg.subs[0]!.isolate?.branch, 'pier/x');
+    isolate,
+  }));
+  assert.equal(row.userTakeover, true);
+  assert.equal(row.observationStartedAt, 1234567890);
+  assert.equal(row.lastAgentStatus, 'working');
+  assert.deepEqual(row.isolate, isolate);
 
-  const legacy = foldSubsRegistry(registryBranch([mkSub({ paneId: 'w1:p1', status: 'settled' })]));
-  assert.equal(legacy.subs[0]!.userTakeover, undefined);
-  assert.equal(legacy.subs[0]!.observationStartedAt, null);
-  assert.equal(legacy.subs[0]!.lastAgentStatus, null);
-  assert.equal(legacy.subs[0]!.tabName, '', 'rows without a tab name fall back to empty');
+  const legacy = entryFrom(mkSub({ paneId: 'w1:p1', status: 'settled' }));
+  assert.equal(legacy.userTakeover, undefined);
+  assert.equal(legacy.observationStartedAt, null);
+  assert.equal(legacy.lastAgentStatus, null);
+  assert.equal(legacy.tabName, '', 'rows without a tab name fall back to empty');
+  assert.equal(entryFrom(mkSub({ isolate: { branch: 'pier/y' } })).isolate, undefined);
 });
 
 test('makeProgressUpdate: pi AgentToolResult shape (a bare string crashed the interactive TUI)', () => {
@@ -227,13 +224,12 @@ test('buildBlockedGateNotice: the master must not take over or answer for the hu
   assert.ok(!buildBlockedGateNotice({ paneId: 'wB:p4', description: 'X', question: null }).includes('question:'));
 });
 
-test('planLaunchValidation: herdr, prompt and isolate/cwd gates', () => {
+test('planLaunchValidation: herdr, prompt, isolate/cwd and role/kind normalization', () => {
+  const errorText = (result: { kind: string; text?: string }): string => (result.kind === 'error' ? result.text! : '');
   assert.match(errorText(planLaunchValidation({ prompt: 'x' }, false)), /HERDR_ENV/);
   assert.match(errorText(planLaunchValidation({ prompt: '   ' }, true)), /prompt/);
   assert.match(errorText(planLaunchValidation({ prompt: 'x', isolate: true, cwd: '/tmp' }, true)), /mutually exclusive/);
-});
 
-test('planLaunchValidation: defaults the role, extracts suggested tools, normalizes the kind', () => {
   const ok = planLaunchValidation({
     description: 'scan',
     prompt: 'do it',
@@ -269,24 +265,21 @@ test('planForegroundTick: human gate, finalized text, collect, wait, continue', 
 });
 
 test('readyBackoffMs: exponential with a cap (500ms → 1s → 2s → 4s → 4s)', () => {
-  assert.equal(readyBackoffMs(0), 500);
-  assert.equal(readyBackoffMs(1), 1000);
-  assert.equal(readyBackoffMs(2), 2000);
-  assert.equal(readyBackoffMs(3), 4000);
-  assert.equal(readyBackoffMs(4), 4000);
-  assert.equal(readyBackoffMs(99), 4000);
-  assert.equal(readyBackoffMs(-3), 500);
-  assert.equal(readyBackoffMs(1.7), 1000);
+  for (const [attempt, ms] of [[0, 500], [1, 1000], [2, 2000], [3, 4000], [4, 4000], [99, 4000], [-3, 500], [1.7, 1000]] as const) {
+    assert.equal(readyBackoffMs(attempt), ms, `attempt ${attempt}`);
+  }
 });
 
 test('planReadyAttempt: ready wins; a gone pane fails fast; an unknown probe keeps retrying', () => {
-  assert.deepEqual(planReadyAttempt({ elapsedMs: 10, attempt: 0, timeoutMs: 90_000, alive: true, ready: true }), { kind: 'ready' });
-  assert.deepEqual(planReadyAttempt({ elapsedMs: 10, attempt: 0, timeoutMs: 90_000, alive: false, ready: false }), { kind: 'give-up', reason: 'pane-gone' });
-  assert.deepEqual(planReadyAttempt({ elapsedMs: 10, attempt: 0, timeoutMs: 90_000, alive: null, ready: false }), { kind: 'retry', delayMs: 500 });
-  assert.deepEqual(planReadyAttempt({ elapsedMs: 89_999, attempt: 7, timeoutMs: 90_000, alive: true, ready: false }), { kind: 'retry', delayMs: 4000 });
-  assert.deepEqual(planReadyAttempt({ elapsedMs: 90_000, attempt: 8, timeoutMs: 90_000, alive: true, ready: false }), { kind: 'give-up', reason: 'timeout' });
+  const plan = (over: Partial<Parameters<typeof planReadyAttempt>[0]>) =>
+    planReadyAttempt({ elapsedMs: 10, attempt: 0, timeoutMs: 90_000, alive: true, ready: false, ...over });
+  assert.deepEqual(plan({ ready: true }), { kind: 'ready' });
+  assert.deepEqual(plan({ alive: false }), { kind: 'give-up', reason: 'pane-gone' });
+  assert.deepEqual(plan({ alive: null }), { kind: 'retry', delayMs: 500 });
+  assert.deepEqual(plan({ elapsedMs: 89_999, attempt: 7 }), { kind: 'retry', delayMs: 4000 });
+  assert.deepEqual(plan({ elapsedMs: 90_000, attempt: 8 }), { kind: 'give-up', reason: 'timeout' });
   // A dead pane outranks the timeout: the more accurate reason wins.
-  assert.deepEqual(planReadyAttempt({ elapsedMs: 120_000, attempt: 9, timeoutMs: 90_000, alive: false, ready: false }), { kind: 'give-up', reason: 'pane-gone' });
+  assert.deepEqual(plan({ elapsedMs: 120_000, attempt: 9, alive: false }), { kind: 'give-up', reason: 'pane-gone' });
 });
 
 test('readyFailureText: crash, working-but-slow and never-registered are distinguishable', () => {
@@ -349,142 +342,38 @@ test('tabNameForTask/nextTaskTabName: collapse, truncate, and suffix within the 
 
 test('planTabPlacement: explicit tab joins or creates; D86 zone decides otherwise', () => {
   const knownTabs = [{ tabName: '调研', tabId: 'w1:t9' }, { tabName: 'spike', tabId: 'w1:t10' }];
-  assert.deepEqual(
-    planTabPlacement({ desiredTab: '调研', description: 'x', knownTabs }),
-    { mode: 'append', tabName: '调研', tabId: 'w1:t9' },
-  );
-  assert.deepEqual(
-    planTabPlacement({ desiredTab: '新任务', description: 'x', knownTabs }),
-    { mode: 'new', tabName: '新任务', tabId: null },
-  );
-  assert.deepEqual(
-    planTabPlacement({ desiredTab: undefined, description: '现状', knownTabs, zone: { zone: 'main', tabName: null }, mainTabId: 'w1:t0' }),
-    { mode: 'append', tabName: 'main', tabId: 'w1:t0' },
-  );
-  // Whitespace-only is treated as absent.
-  assert.deepEqual(
-    planTabPlacement({ desiredTab: '   ', description: 'spike', knownTabs, zone: { zone: 'main', tabName: null }, mainTabId: 'w1:t0' }),
-    { mode: 'append', tabName: 'main', tabId: 'w1:t0' },
-  );
-  assert.deepEqual(
-    planTabPlacement({ description: 'bug#2', knownTabs: [{ tabName: 'hotfix-2', tabId: 'w1:t5' }], zone: { zone: 'worktree', tabName: 'hotfix-2' }, mainTabId: 'w1:t0' }),
-    { mode: 'append', tabName: 'hotfix-2', tabId: 'w1:t5' },
-  );
-  assert.deepEqual(
-    planTabPlacement({ description: 'bug#3', knownTabs: [{ tabName: 'hotfix-2', tabId: 'w1:t5' }], zone: { zone: 'worktree', tabName: 'hotfix-3' }, mainTabId: 'w1:t0' }),
-    { mode: 'new', tabName: 'hotfix-3', tabId: null },
-  );
-  // No zone information → derive from the description and always create.
-  assert.deepEqual(
-    planTabPlacement({ description: '网络调研现状', knownTabs: [{ tabName: '网络调研现状', tabId: 'w1:t9' }] }),
-    { mode: 'new', tabName: '网络调研现状-2', tabId: null },
-  );
+  const main = { zone: 'main' as const, tabName: null };
+  const cases: Array<[string, Parameters<typeof planTabPlacement>[0], unknown]> = [
+    ['an existing tab name joins it', { desiredTab: '调研', description: 'x', knownTabs }, { mode: 'append', tabName: '调研', tabId: 'w1:t9' }],
+    ['an unknown tab name creates one', { desiredTab: '新任务', description: 'x', knownTabs }, { mode: 'new', tabName: '新任务', tabId: null }],
+    ['without a tab name the zone decides', { description: '现状', knownTabs, zone: main, mainTabId: 'w1:t0' }, { mode: 'append', tabName: 'main', tabId: 'w1:t0' }],
+    ['a whitespace-only tab name counts as absent', { desiredTab: '   ', description: 'spike', knownTabs, zone: main, mainTabId: 'w1:t0' }, { mode: 'append', tabName: 'main', tabId: 'w1:t0' }],
+    ['a worktree zone with a live tab joins it', { description: 'bug#2', knownTabs: [{ tabName: 'hotfix-2', tabId: 'w1:t5' }], zone: { zone: 'worktree', tabName: 'hotfix-2' }, mainTabId: 'w1:t0' }, { mode: 'append', tabName: 'hotfix-2', tabId: 'w1:t5' }],
+    ['a worktree zone without one creates it', { description: 'bug#3', knownTabs: [{ tabName: 'hotfix-2', tabId: 'w1:t5' }], zone: { zone: 'worktree', tabName: 'hotfix-3' }, mainTabId: 'w1:t0' }, { mode: 'new', tabName: 'hotfix-3', tabId: null }],
+    // No zone information → derive from the description and always create.
+    ['no zone derives the name and creates', { description: '网络调研现状', knownTabs: [{ tabName: '网络调研现状', tabId: 'w1:t9' }] }, { mode: 'new', tabName: '网络调研现状-2', tabId: null }],
+  ];
+  for (const [name, input, expected] of cases) assert.deepEqual(planTabPlacement(input), expected, name);
 });
 
 test('classifyWorktreeZone: main checkout, sibling worktree, unrelated dir, prefix trap', () => {
   const worktrees = ['F:/repo', 'F:/wt/hotfix-2', 'F:/wt/hotfix-3'];
-  assert.deepEqual(
-    classifyWorktreeZone({ cwd: 'F:\\repo\\packages', masterCwd: 'F:/repo', worktrees }),
-    { zone: 'main', tabName: null },
-  );
-  assert.deepEqual(
-    classifyWorktreeZone({ cwd: 'F:\\wt\\hotfix-2\\src', masterCwd: 'F:/repo', worktrees }),
-    { zone: 'worktree', tabName: 'hotfix-2' },
-  );
-  assert.deepEqual(
-    classifyWorktreeZone({ cwd: 'f:/WT/HOTFIX-3', masterCwd: 'F:/repo', worktrees }),
-    { zone: 'worktree', tabName: 'hotfix-3' },
-  );
-  assert.deepEqual(
-    classifyWorktreeZone({ cwd: 'C:\\temp', masterCwd: 'F:/repo', worktrees }),
-    { zone: 'main', tabName: null },
-  );
-  assert.deepEqual(
-    classifyWorktreeZone({ cwd: 'F:/repo-x', masterCwd: 'F:/repo', worktrees }),
-    { zone: 'main', tabName: null },
-    '/repo-x is not under /repo',
-  );
+  const cases: Array<[string, string, unknown]> = [
+    ['the main checkout and its children', 'F:\\repo\\packages', { zone: 'main', tabName: null }],
+    ['a sibling worktree, named after its directory', 'F:\\wt\\hotfix-2\\src', { zone: 'worktree', tabName: 'hotfix-2' }],
+    ['case-insensitive matching', 'f:/WT/HOTFIX-3', { zone: 'worktree', tabName: 'hotfix-3' }],
+    ['an unrelated directory is main', 'C:\\temp', { zone: 'main', tabName: null }],
+    ['a name prefix is not a parent (/repo-x vs /repo)', 'F:/repo-x', { zone: 'main', tabName: null }],
+  ];
+  for (const [name, cwd, expected] of cases) {
+    assert.deepEqual(classifyWorktreeZone({ cwd, masterCwd: 'F:/repo', worktrees }), expected, name);
+  }
 });
 
 /* ── plugin wiring ──────────────────────────────────────────────── */
 
-function errorText(result: { kind: string; text?: string }): string {
-  return result.kind === 'error' ? result.text! : '';
-}
-
-interface FakePi {
-  tools: Map<string, Record<string, unknown>>;
-  listeners: Map<string, Array<(...a: unknown[]) => unknown>>;
-  entries: Array<[string, unknown]>;
-  registerTool(def: Record<string, unknown>): void;
-  on(event: string, handler: (...a: unknown[]) => unknown): void;
-  appendEntry(customType: string, data: unknown): void;
-}
-
-function fakePi(): FakePi {
-  return {
-    tools: new Map<string, Record<string, unknown>>(),
-    listeners: new Map<string, Array<(...a: unknown[]) => unknown>>(),
-    entries: [] as Array<[string, unknown]>,
-    registerTool(def: Record<string, unknown>) {
-      this.tools.set(String(def.name), def);
-    },
-    on(event: string, handler: (...a: unknown[]) => unknown) {
-      this.listeners.set(event, [...(this.listeners.get(event) ?? []), handler]);
-    },
-    appendEntry(customType: string, data: unknown) {
-      this.entries.push([customType, data]);
-    },
-  };
-}
-
-function fakeClient(panes: Array<Record<string, unknown>> = []): HerdrClientLike {
-  return {
-    available: true,
-    tabList: async () => [],
-    listPanes: async () => panes,
-    listAgents: async () => [],
-    waitAgent: async () => null,
-    getAgentSessionPath: async () => null,
-    createTab: async () => ({ tabId: 't1', paneId: 'p1' }),
-    splitPane: async () => 'p2',
-    sendPaneText: async () => undefined,
-    tabClose: async () => undefined,
-    closePane: async () => undefined,
-  } as unknown as HerdrClientLike;
-}
-
-async function mount(pi: FakePi, ledger?: DisposeLedger, panes: Array<Record<string, unknown>> = [], available = true) {
-  const surface = new PiSurface(pi as unknown as object, ledger);
-  const port = emptySubagentPortBox();
-  const root = new Context();
-  root.provide('pi-herdr.surface', surface);
-  root.provide('pi-herdr.subagent-deps', {
-    client: { ...fakeClient(panes), available } as HerdrClientLike,
-    env: { paneId: 'p0', tabId: 't0', workspaceId: 'w1' },
-    extPath: 'F:/repo/pier/packages/pier-ext/src/index.ts',
-    sessionRoot: root,
-    port,
-    getSessionId: () => '',
-    reconcileOnSettlement: () => [],
-    withReconcileNotes: (b: string) => b,
-    claimSettleNotice: () => true,
-    terminalState: { activePaneIds: () => new Set<string>() },
-  });
-  await root.plugin(subagentPlugin);
-  return { root, port, pi };
-}
-
-async function fire(pi: FakePi, event: string, ...args: unknown[]): Promise<void> {
-  for (const h of pi.listeners.get(event) ?? []) await h(...args);
-}
-
-const runTool = (pi: FakePi, params: Record<string, unknown>) =>
-  (pi.tools.get('subagent')!.execute as (id: unknown, p: unknown) => Promise<{ content: Array<{ text: string }> }>)(null, params);
-
 test('subagent plugin: one tool, lifecycle hooks, port binding and unbinding', async () => {
-  const pi = fakePi();
-  const { root, port } = await mount(pi);
+  const { root, pi, port } = await mountSubagent();
   assert.ok(pi.tools.has('subagent'));
   assert.ok(!pi.tools.has('list_agents'), 'no legacy tool aliases');
   assert.ok((pi.listeners.get('session_start') ?? []).length >= 1);
@@ -496,32 +385,29 @@ test('subagent plugin: one tool, lifecycle hooks, port binding and unbinding', a
   port.current.applyReplySession('unknown', null);
   assert.deepEqual(port.current.reconcileOnReply('unknown'), []);
 
-  assert.match((await runTool(pi, { action: 'list' })).content[0]!.text, /No background subagents/);
-  await assert.rejects(runTool(pi, { action: 'explode' }), /unknown action "explode"/);
+  assert.match((await runSubagent(pi, { action: 'list' })).content[0]!.text, /No background subagents/);
+  await assert.rejects(runSubagent(pi, { action: 'explode' }), /unknown action "explode"/);
 
   await root.fiber.dispose();
   assert.equal(port.current, null, 'port unbound on dispose');
 });
 
 test('subagent plugin: ledger tombstone makes the tool inert', async () => {
-  const pi = fakePi();
   const ledger = new DisposeLedger();
-  const { root, port } = await mount(pi, ledger);
+  const { root, pi, port } = await mountSubagent({ ledger });
   assert.equal(ledger.disposeKey(new URL('../src/plugins/subagent.ts', import.meta.url).href), 1);
-  assert.match((await runTool(pi, { action: 'list' })).content[0]!.text, /disposed/);
+  assert.match((await runSubagent(pi, { action: 'list' })).content[0]!.text, /disposed/);
   assert.equal(typeof port.current?.reconcileOnReply, 'function');
   await root.fiber.dispose();
 });
 
 test('subagent plugin: tool_result hook only rewrites our errors, and stays silent for a dead pane', async () => {
-  const pi = fakePi();
-  const { root } = await mount(pi);
-  await fire(pi, 'session_start', {}, {
-    sessionManager: {
-      getBranch: () => registryBranch([
-        mkSub({ paneId: 'w1:p2', cwd: '/tmp', description: 'dead worker', taskId: 'task-1' }),
-      ]),
-    },
+  const { root, pi } = await mountSubagent({
+    subs: [{
+      taskId: 'task-1', kind: 'task', paneId: 'w1:p2', tabId: 't0', tabName: 'main', cwd: '/tmp',
+      description: 'dead worker', background: true, status: 'running', consumedAt: null, sessionFile: null,
+      launchCommand: [], createdAt: 1, revivedFrom: null,
+    }],
   });
   const hook = (pi.listeners.get('tool_result') ?? [])[0]!;
   const call = (event: Record<string, unknown>) => hook(event) as Promise<unknown>;
@@ -533,13 +419,8 @@ test('subagent plugin: tool_result hook only rewrites our errors, and stays sile
 });
 
 test('subagent plugin: prompt surface is present and a missing action normalizes to spawn', async () => {
-  const pi = fakePi();
-  const { root } = await mount(pi);
-  const def = pi.tools.get('subagent')! as {
-    promptSnippet?: string;
-    promptGuidelines?: string[];
-    prepareArguments?: (args: unknown) => Record<string, unknown>;
-  };
+  const { root, pi } = await mountSubagent();
+  const def = pi.tools.get('subagent')!;
   assert.match(String(def.promptSnippet ?? ''), /subagent/);
   assert.ok((def.promptGuidelines?.length ?? 0) >= 4);
   const guidelines = (def.promptGuidelines ?? []).join(' ');
@@ -553,21 +434,23 @@ test('subagent plugin: prompt surface is present and a missing action normalizes
 });
 
 test('subagent plugin: list shows live state, activity and a foreign cwd only when it differs', async () => {
-  const pi = fakePi();
-  const entry = (paneId: string, taskId: string, description: string): SubEntry => ({
-    ...(mkSub({ paneId, taskId, description, tabId: 't-1', cwd: '/workspace/repo' }) as unknown as SubEntry),
-    status: 'running',
+  const worker = (paneId: string, taskId: string, description: string): SubEntry => ({
+    taskId, kind: 'task', paneId, tabId: 't-1', tabName: '', cwd: '/workspace/repo',
+    description, background: true, status: 'running', consumedAt: null, sessionFile: null,
+    launchCommand: [], createdAt: 1, revivedFrom: null,
   });
-  // available:false keeps the session-recovery pollers out of a rendering-only test.
-  const { root } = await mount(pi, undefined, [
-    { paneId: 'p-1', agentStatus: 'working', foregroundCwd: '/workspace/repo/packages/sub' },
-    { paneId: 'p-2', agentStatus: 'working', foregroundCwd: '/workspace/repo' },
-  ], false);
+  const { root, pi } = await mountSubagent({
+    client: {
+      available: false, // keeps the session-recovery pollers out of a rendering-only test
+      listPanes: async () => [
+        { paneId: 'p-1', tabId: 't-1', workspaceId: 'w1', agentStatus: 'working', foregroundCwd: '/workspace/repo/packages/sub' },
+        { paneId: 'p-2', tabId: 't-1', workspaceId: 'w1', agentStatus: 'working', foregroundCwd: '/workspace/repo' },
+      ],
+    },
+    subs: [worker('p-1', 'task-1', 'Worker 1'), worker('p-2', 'task-2', 'Worker 2')],
+  });
   try {
-    await fire(pi, 'session_start', {}, {
-      sessionManager: { getBranch: () => registryBranch([entry('p-1', 'task-1', 'Worker 1'), entry('p-2', 'task-2', 'Worker 2')]) },
-    });
-    const lines = (await runTool(pi, { action: 'list' })).content[0]!.text.split('\n');
+    const lines = (await runSubagent(pi, { action: 'list' })).content[0]!.text.split('\n');
     assert.equal(lines[0], 'p-1 [running working] (task) [cwd: sub] Worker 1');
     assert.equal(lines[1], 'p-2 [running working] (task) Worker 2', 'no cwd tag when the foreground cwd is the worker cwd');
   } finally {

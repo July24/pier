@@ -1,150 +1,308 @@
 /**
- * 小体量基础设施纯函数的合并测试：DisposeLedger（D80⑤ hmr 补偿 + D79 反注册共用）与
- * routing-telemetry（RFC docs/rfc-jev-role-routing.md §8 的埋点行规划器）。
- * 两者都是无文件 I/O 的进程级簿记，故同址。
+ * Small process-level infrastructure, no plugin wiring: DisposeLedger (HMR compensation + D79
+ * unregistration), routing-telemetry rows, storage/platform path layout, the PIER_OPTIONS registry
+ * with RuntimePolicy, and the swallow/toolError failure bookkeeping.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { resolve } from 'node:path';
 import { DisposeLedger } from '../src/ledger.ts';
+import { createPlatformPaths } from '../src/platform-paths.ts';
+import { PIER_OPTIONS, formatOptionRows, pierOption, pierOptionRows } from '../src/pier-options.ts';
+import { createRuntimePolicy, type RuntimePolicy } from '../src/runtime-policy.ts';
+import { planDenyHitRow, planSpawnProfileRow, scanRoleAxisUsage, taskFingerprint } from '../src/routing-telemetry.ts';
 import {
-  planDenyHitRow,
-  planSpawnProfileRow,
-  scanRoleAxisUsage,
-  taskFingerprint,
-} from '../src/routing-telemetry.ts';
+  historyFilePath, historyFilePathLegacy, preferredHistoryFile, piCoreSessionDirName,
+  piSessionDirCandidates, preferredSessionDir, sessionDirName, sessionDirNameLegacy,
+} from '../src/storage-layout.ts';
+import { SWALLOW_BUFFER_MAX, formatSwallowedErrors, resetSwallowedErrors, swallow, swallowedErrors } from '../src/swallow.ts';
+import { POSIX_PROMPT, POWERSHELL_PROMPT, promptStrategyFor, terminalIdleMs, terminalReminderGraceMs } from '../src/terminal-core.ts';
+import { ToolError, toolError } from '../src/tool-error.ts';
+import { withCleanup, type CleanupContext } from './test-utils.ts';
 
 /* ── DisposeLedger ──────────────────────────────────────────────────────── */
 
-test('ledger：disposeKey 只拆匹配 key（hmr 补偿语义），未匹配保留', () => {
-  const led = new DisposeLedger();
-  const ran: string[] = [];
+test('ledger: disposeKey only tears down matching keys (hmr compensation), others stay', () => {
+  const led = new DisposeLedger(), ran: string[] = [];
   led.add('F:/x/src/a.ts', () => ran.push('a'));
   led.add('F:/x/src/b.ts', () => ran.push('b'));
   led.add('F:/x/src/a.ts', () => ran.push('a2'));
-  const n = led.disposeKey('F:\\x\\src\\a.ts'); // Windows 路径形态也要命中
-  assert.equal(n, 2);
-  assert.deepEqual(ran.sort(), ['a', 'a2']);
-  assert.equal(led.size, 1, 'b 保留');
+  assert.equal(led.disposeKey('F:\\x\\src\\a.ts'), 2, 'Windows path shape must hit too'); assert.deepEqual(ran.sort(), ['a', 'a2']);
+  assert.equal(led.size, 1, 'b is kept');
 });
 
-test('ledger：disposeAll LIFO（与 cordis effect 语义一致）；异常不中断后续拆除', () => {
-  const led = new DisposeLedger();
-  const ran: string[] = [];
+test('ledger: disposeAll is LIFO (cordis effect order) and survives a throwing disposer', () => {
+  const led = new DisposeLedger(), ran: string[] = [];
   led.add('a', () => ran.push('1'));
   led.add('b', () => { throw new Error('boom'); });
   led.add('c', () => ran.push('3'));
-  assert.equal(led.disposeAll(), 3);
-  assert.deepEqual(ran, ['3', '1'], 'LIFO 且异常被吞');
+  assert.equal(led.disposeAll(), 3); assert.deepEqual(ran, ['3', '1'], 'LIFO, the throw is swallowed');
   assert.equal(led.size, 0);
 });
 
-test('ledger：add 返回撤销函数（资源自拆后移除，防 hmr 补偿二次拆）', () => {
+test('ledger: add returns an undo fn (self-disposing resource is not torn down twice)', () => {
   const led = new DisposeLedger();
   let disposed = 0;
-  const undo = led.add('a', () => disposed++);
-  undo();
-  assert.equal(led.size, 0);
-  assert.equal(led.disposeKey('a'), 0, '已撤销不再拆');
+  led.add('a', () => disposed++)();
+  assert.equal(led.size, 0); assert.equal(led.disposeKey('a'), 0, 'undone entries never match');
   assert.equal(disposed, 0);
 });
 
-test('ledger：键归一（file:// URL vs 路径、反斜杠、逻辑名）都可命中', () => {
+test('ledger: keys are normalized (file:// URL vs path, backslashes, logical names)', () => {
   for (const [registered, lookup] of [
     [resolve('x.ts'), pathToFileURL(resolve('x.ts')).href], // import.meta.url vs hmr filename
-    ['F:\\repo\\pier\\x.ts', 'F:/repo/pier/x.ts'], // Windows hmr filename 形态
-    ['pi-surface', 'pi-surface'], // D79 逻辑名原样
+    ['F:\\repo\\pier\\x.ts', 'F:/repo/pier/x.ts'], // Windows hmr filename shape
+    ['pi-surface', 'pi-surface'], // D79 logical name, verbatim
   ] as const) {
-    const led = new DisposeLedger();
-    const ran: string[] = [];
+    const led = new DisposeLedger(), ran: string[] = [];
     led.add(registered, () => ran.push('hit'));
-    assert.equal(led.disposeKey(lookup), 1, `${registered} ↔ ${lookup}`);
-    assert.deepEqual(ran, ['hit']);
+    assert.equal(led.disposeKey(lookup), 1, `${registered} ↔ ${lookup}`); assert.deepEqual(ran, ['hit']);
   }
 });
 
-/* ── routing telemetry（Phase 0 RFC docs/rfc-jev-role-routing.md §8） ───── */
+/* ── routing telemetry (docs/rfc-jev-role-routing.md §8) ────────────────── */
 
-test('taskFingerprint：确定性 8 位 hex；不同任务不同指纹；任务文本不出现在行里', () => {
+test('telemetry rows: task fingerprint, spawn profile (snapshot tool lists, no task text), deny hit', () => {
   const a = taskFingerprint('fix the login bug in auth.ts');
-  assert.match(a, /^[0-9a-f]{8}$/);
-  assert.equal(a, taskFingerprint('fix the login bug in auth.ts'), '同任务同指纹（跨 spawn 可关联）');
+  assert.match(a, /^[0-9a-f]{8}$/); assert.equal(a, taskFingerprint('fix the login bug in auth.ts'), 'same task, same fingerprint (correlatable across spawns)');
   assert.notEqual(a, taskFingerprint('write unit tests for auth.ts'));
-});
 
-test('spawn 画像行：字段齐全；allowedTools/manifestTools 为拷贝（防外层可变引用污染）', () => {
   const allowedTools = ['bash'];
-  const row = planSpawnProfileRow({
-    now: 123,
-    roleExplicit: false,
-    role: 'worker-default',
-    allowedTools,
-    manifestTools: ['read', 'bash', 'todo_write'],
-    task: 'secret task text',
-  });
+  const row = planSpawnProfileRow({ now: 123, roleExplicit: false, role: 'worker-default', allowedTools, manifestTools: ['read', 'bash', 'todo_write'], task: 'secret task text' });
   assert.deepEqual(row, {
-    kind: 'spawn',
-    ts: 123,
-    roleExplicit: false,
-    role: 'worker-default',
-    allowedTools: ['bash'],
-    manifestTools: ['read', 'bash', 'todo_write'],
-    taskSha8: taskFingerprint('secret task text'),
+    kind: 'spawn', ts: 123, roleExplicit: false, role: 'worker-default', allowedTools: ['bash'],
+    manifestTools: ['read', 'bash', 'todo_write'], taskSha8: taskFingerprint('secret task text'),
   });
   allowedTools.push('mutated');
-  assert.deepEqual(row.allowedTools, ['bash'], '行持有快照，不随源数组漂移');
-  assert.ok(!JSON.stringify(row).includes('secret task text'), '隐私红线：任务文本不落入行');
+  assert.deepEqual(row.allowedTools, ['bash'], 'the row holds a copy, not the caller array');
+  assert.ok(!JSON.stringify(row).includes('secret task text'), 'privacy: task text never lands in the row');
+  assert.deepEqual(planDenyHitRow({ now: 7, role: 'worker-default', tool: 'subagent' }), { kind: 'deny', ts: 7, role: 'worker-default', tool: 'subagent' });
 });
 
-test('deny 命中行：形状', () => {
-  assert.deepEqual(planDenyHitRow({ now: 7, role: 'worker-default', tool: 'subagent' }), {
-    kind: 'deny',
-    ts: 7,
-    role: 'worker-default',
-    tool: 'subagent',
-  });
-});
+const ROLE_A = JSON.stringify({ role: 'reviewer', manifest: { unknownTools: 'deny', rules: { '*': 'allow', edit: 'ask', write: 'deny' } } });
+const ROLE_B = JSON.stringify({ role: 'worker-default', manifest: { unknownTools: 'allow', rules: { subagent: 'deny', terminal: 'deny', '*': 'allow' } } });
 
-const ROLE_A = JSON.stringify({
-  role: 'reviewer',
-  manifest: { unknownTools: 'deny', rules: { '*': 'allow', edit: 'ask', write: 'deny' } },
-});
-const ROLE_B = JSON.stringify({
-  role: 'worker-default',
-  manifest: { unknownTools: 'allow', rules: { subagent: 'deny', terminal: 'deny', '*': 'allow' } },
-});
-
-test('三轴扫描：省略 rules 的最小合法档案按隐式 {"*":"allow"} 计入 parsed（schema 可省略）', () => {
-  const row = scanRoleAxisUsage({
+test('axis scan: minimal profiles parse, and ask/stance/explicit-deny counts are exact', () => {
+  const minimal = scanRoleAxisUsage({
     now: 1,
     files: [
       { name: 'minimal.json', text: JSON.stringify({ role: 'fast-worker', manifest: { tools: ['read'] } }) },
       { name: 'no-manifest.json', text: JSON.stringify({ role: 'x' }) },
     ],
   });
-  assert.equal(row.parsed, 1, 'rules 省略 ≠ 非法');
-  assert.equal(row.invalid, 1, '缺 manifest 才是非法');
-  assert.equal(row.stanceDeny, 1, 'unknownTools 缺省 = deny（schema 契约）');
-  assert.equal(row.askEntries, 0);
-  assert.deepEqual(row.explicitDenies, []);
-});
+  assert.equal(minimal.parsed, 1, 'omitted rules ≠ invalid'); assert.equal(minimal.invalid, 1, 'a missing manifest is what makes it invalid');
+  assert.equal(minimal.stanceDeny, 1, 'unknownTools defaults to deny (schema contract)'); assert.equal(minimal.askEntries, 0);
+  assert.deepEqual(minimal.explicitDenies, []);
 
-test('三轴扫描：ask/姿态/explicit deny 计数正确；通配 deny 不计入 explicit', () => {
+  // A wildcard `*: deny` is a stance, not an explicit per-tool deny.
   const row = scanRoleAxisUsage({ now: 1, files: [{ name: 'a.json', text: ROLE_A }, { name: 'b.json', text: ROLE_B }] });
   assert.deepEqual(row, {
-    kind: 'axis-usage',
-    ts: 1,
-    files: 2,
-    parsed: 2,
-    invalid: 0,
-    askEntries: 1,
-    stanceAllow: 1,
-    stanceDeny: 1,
-    explicitDenies: [
-      ['reviewer', 'write'],
-      ['worker-default', 'subagent'],
-      ['worker-default', 'terminal'],
-    ],
+    kind: 'axis-usage', ts: 1, files: 2, parsed: 2, invalid: 0, askEntries: 1, stanceAllow: 1, stanceDeny: 1,
+    explicitDenies: [['reviewer', 'write'], ['worker-default', 'subagent'], ['worker-default', 'terminal']],
+  });
+});
+
+/* ── storage-layout / platform-paths ────────────────────────────────────── */
+
+test('sessionDirName: percent-encoded separators (a/b ≠ a-b); legacy flattening kept for dual-read', () => {
+  assert.equal(sessionDirName('a/b'), '--a%2Fb--'); assert.equal(sessionDirName('a-b'), '--a-b--');
+  assert.notEqual(sessionDirName('a/b'), sessionDirName('a-b')); assert.equal(sessionDirName('F:\\herdr-pi'), '--F%3A%5Cherdr-pi--');
+  assert.equal(sessionDirName('/home/u/proj'), '--%2Fhome%2Fu%2Fproj--'); assert.equal(sessionDirName('a%b/c'), '--a%25b%2Fc--');
+  // The legacy flattening stays readable for dual-read migration.
+  assert.equal(sessionDirNameLegacy('F:\\herdr-pi'), '--F--herdr-pi--'); assert.equal(sessionDirNameLegacy('/home/u/proj'), '---home-u-proj--');
+  assert.equal(sessionDirNameLegacy('a/b'), sessionDirNameLegacy('a-b'));
+});
+
+test('historyFilePath/preferredHistoryFile: new encoding is canonical, an existing legacy ledger still wins', withCleanup((cleanup) => {
+  assert.equal(historyFilePath('C:\\home\\.pi\\agent', 'F:\\herdr-pi'), join('C:\\home\\.pi\\agent', 'herdr-pi', 'history', '--F%3A%5Cherdr-pi--', 'history.jsonl'));
+  const root = cleanup.tempDir('hist-mig').path;
+  const cwd = 'F:\\herdr-pi';
+  assert.equal(preferredHistoryFile(root, cwd), historyFilePath(root, cwd), 'neither exists → the new encoding');
+  assert.equal(preferredSessionDir(root, 'a/b'), join(root, '--a%2Fb--'), 'same rule for session dirs');
+  mkdirSync(dirname(historyFilePathLegacy(root, cwd)), { recursive: true });
+  writeFileSync(historyFilePathLegacy(root, cwd), '{}\n');
+  assert.equal(preferredHistoryFile(root, cwd), historyFilePathLegacy(root, cwd), 'legacy is read until the new dir exists');
+  mkdirSync(dirname(historyFilePath(root, cwd)), { recursive: true });
+  writeFileSync(historyFilePath(root, cwd), '{}\n');
+  assert.equal(preferredHistoryFile(root, cwd), historyFilePath(root, cwd), 'the new dir wins once it exists');
+}));
+
+test('piCoreSessionDirName/piSessionDirCandidates: byte-identical to pi core, pier encodings as fallback', () => {
+  // pi core (dist/migrations.js:102): `--${cwd.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`
+  assert.equal(piCoreSessionDirName('/Users/yehaoyu/Documents/pier'), '--Users-yehaoyu-Documents-pier--');
+  assert.equal(piCoreSessionDirName('F:\\herdr-pi'), '--F--herdr-pi--', 'a Windows drive has no leading separator');
+  assert.equal(piCoreSessionDirName('/a%2Fb'), '--a%2Fb--', '`%` stays literal — why the old POSIX dirs all missed');
+  assert.notEqual(piCoreSessionDirName('/home/u/proj'), sessionDirName('/home/u/proj'));
+  assert.notEqual(piCoreSessionDirName('/home/u/proj'), sessionDirNameLegacy('/home/u/proj'));
+  assert.deepEqual(piSessionDirCandidates('/home/u/proj'), ['--home-u-proj--', '--%2Fhome%2Fu%2Fproj--', '---home-u-proj--']);
+  assert.deepEqual(piSessionDirCandidates('F:\\herdr-pi'), ['--F--herdr-pi--', '--F%3A%5Cherdr-pi--'], 'no duplicate on Windows');
+});
+
+test('createPlatformPaths: overrides win; sessionsDir defaults under agentDataDir', () => {
+  const p = createPlatformPaths({ agentDataDir: '/x/agent', worktreeBaseDir: '/x/wt' });
+  assert.equal(p.agentDataDir, '/x/agent'); assert.equal(p.worktreeBaseDir, '/x/wt');
+  assert.equal(p.sessionsDir, join('/x/agent', 'sessions'));
+  assert.equal(createPlatformPaths({ agentDataDir: '/x/agent', sessionsDir: '/custom/sessions' }).sessionsDir, '/custom/sessions');
+});
+
+/* ── PIER_OPTIONS registry + RuntimePolicy ──────────────────────────────── */
+
+const POLICY_FIELDS: ReadonlyArray<keyof RuntimePolicy> = [
+  'subagentTimeoutMs', 'gcTickMs', 'pollIntervalMs', 'settlementWindowMs', 'observationWindowMs',
+  'foregroundPatienceMs', 'sessionTtlSeconds', 'gitTimeoutMs', 'readinessTimeoutMs',
+];
+
+const OPTION_NAMES = PIER_OPTIONS.flatMap((o) => [o.name, o.legacy].filter((n): n is string => Boolean(n)));
+
+/** Unsets every registry name first so the developer's own PIER_* exports cannot leak in. */
+function applyEnv(cleanup: CleanupContext, env: Record<string, string | undefined>): void {
+  const snap = cleanup.env();
+  for (const name of OPTION_NAMES) snap.delete(name);
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) snap.delete(key);
+    else snap.set(key, value);
+  }
+}
+
+test('pierOption: canonical wins, legacy falls back, empty string counts as unset', () => {
+  assert.equal(pierOption('PIER_GIT_TIMEOUT_MS', { PIER_GIT_TIMEOUT_MS: '5000' }), '5000');
+  assert.equal(pierOption('PIER_GIT_TIMEOUT_MS', { PI_HERDR_GIT_TIMEOUT_MS: '7000' }), '7000');
+  // `export X=` is common in shells; a blank canonical value must not shadow a usable legacy one.
+  assert.equal(pierOption('PIER_GIT_TIMEOUT_MS', { PIER_GIT_TIMEOUT_MS: '  ', PI_HERDR_GIT_TIMEOUT_MS: '9' }), '9');
+  assert.equal(pierOption('PIER_GIT_TIMEOUT_MS', {}), undefined);
+  assert.equal(pierOption('NOT_AN_OPTION', { NOT_AN_OPTION: 'x' }), 'x', 'unregistered names are read verbatim');
+});
+
+test('pierOptionRows/formatOptionRows: env / env(legacy) / default provenance', () => {
+  const slim = pierOptionRows({ PI_HERDR_SLIM_FRAME: '0' }).find((r) => r.name === 'PIER_SLIM_FRAME');
+  assert.equal(slim?.value, '0'); assert.equal(slim?.source, 'legacy-env');
+  const both = pierOptionRows({ PIER_SLIM_FRAME: '1', PI_HERDR_SLIM_FRAME: '0' }).find((r) => r.name === 'PIER_SLIM_FRAME');
+  assert.equal(both?.source, 'env', 'canonical beats legacy'); assert.equal(formatOptionRows({}).length, PIER_OPTIONS.length);
+  assert.match(formatOptionRows({})[0]!, /^\s+PIER_[A-Z_]+ = .+\(default\)/);
+});
+
+test('createRuntimePolicy: every field comes from the registry; overrides > env > fallback', withCleanup((cleanup) => {
+  applyEnv(cleanup, {});
+  const fromRegistry = createRuntimePolicy();
+  assert.deepEqual(Object.keys(fromRegistry).sort(), [...POLICY_FIELDS].sort(), 'RuntimePolicy fields match the registry');
+  for (const field of POLICY_FIELDS) {
+    const spec = PIER_OPTIONS.find((o) => o.policy === field);
+    assert.ok(spec, `${field} must be supplied by a PIER_OPTIONS entry`);
+    assert.equal(fromRegistry[field], Number(spec.fallback), `${field} default = registry fallback`);
+    assert.notEqual(spec.min, undefined, `${spec.name} needs a min bound`);
+  }
+  assert.equal(createRuntimePolicy({ gitTimeoutMs: 42, subagentTimeoutMs: 99 }).gitTimeoutMs, 42, 'overrides win');
+
+  applyEnv(cleanup, { PIER_GIT_TIMEOUT_MS: '2500', PI_HERDR_SUBAGENT_TIMEOUT_MS: '8000' });
+  const p = createRuntimePolicy();
+  assert.equal(p.gitTimeoutMs, 2500, 'canonical env applies'); assert.equal(p.subagentTimeoutMs, 8000, 'legacy name applies too');
+  assert.equal(createRuntimePolicy({ gitTimeoutMs: 42 }).gitTimeoutMs, 42, 'override beats env');
+}));
+
+test('createRuntimePolicy: an invalid/out-of-range value warns once and falls back', withCleanup((cleanup) => {
+  applyEnv(cleanup, { PIER_GIT_TIMEOUT_MS: 'nope', PIER_SUBAGENT_TIMEOUT_MS: '-1' });
+  const warnings: string[] = [];
+  const warn = console.warn;
+  console.warn = (message?: unknown) => { warnings.push(String(message)); };
+  try {
+    const p = createRuntimePolicy();
+    assert.equal(p.gitTimeoutMs, 10_000); assert.equal(p.subagentTimeoutMs, 600_000);
+  } finally {
+    console.warn = warn;
+  }
+  assert.deepEqual(warnings, ['Invalid PIER_GIT_TIMEOUT_MS="nope", using default 10000', 'Invalid PIER_SUBAGENT_TIMEOUT_MS="-1", using default 600000']);
+  // A14: concurrent isolated workers routinely take longer than 30s to boot.
+  assert.equal(createRuntimePolicy().readinessTimeoutMs, 90_000);
+}));
+
+test('registry: legacy spellings still reach the real readers', withCleanup((cleanup) => {
+  applyEnv(cleanup, { PI_HERDR_TERM_IDLE_MS: '1234', PIER_TERM_GRACE_MS: '4321' });
+  assert.equal(terminalIdleMs(), 1234, 'legacy name works'); assert.equal(terminalReminderGraceMs(), 4321, 'canonical name works');
+  assert.equal(promptStrategyFor({ PI_HERDR_TERMINAL_PROMPT: 'powershell' }), POWERSHELL_PROMPT, 'legacy prompt name');
+  assert.equal(promptStrategyFor({ PIER_TERMINAL_PROMPT: 'bash' }), POSIX_PROMPT);
+}));
+
+test('registry self-consistency: canonical PIER_*, legacy PI_HERDR_*, integer fallbacks', () => {
+  for (const spec of PIER_OPTIONS) {
+    assert.match(spec.name, /^PIER_/, `${spec.name} is the canonical name`);
+    if (spec.legacy) assert.match(spec.legacy, /^PI_HERDR_/, `${spec.legacy} is the legacy shape`);
+    if (spec.min !== undefined) assert.match(spec.fallback, /^\d+$/, `${spec.name} is an integer option`);
+  }
+  // Readers shipped before the rename must keep their alias — old shell exports cannot break.
+  for (const name of ['PIER_TERM_IDLE_MS', 'PIER_TERM_GRACE_MS', 'PIER_TERM_READ_MAX', 'PIER_TODO_GRACE_MS', 'PIER_HMR']) {
+    assert.ok(PIER_OPTIONS.find((o) => o.name === name)?.legacy?.startsWith('PI_HERDR_'), `${name} keeps its legacy alias`);
+  }
+});
+
+/* ── swallow ────────────────────────────────────────────────────────────── */
+
+test('swallow: records tag/cause/time instead of throwing (cleanup must continue)', () => {
+  resetSwallowedErrors();
+  assert.doesNotThrow(() => swallow('todo.persist-edit', new ReferenceError('persistEdit is not defined'), {}));
+  const [entry] = swallowedErrors();
+  assert.equal(entry!.tag, 'todo.persist-edit'); assert.match(entry!.message, /ReferenceError: persistEdit is not defined/);
+  assert.ok(entry!.at > 0);
+});
+
+test('swallow: the ring buffer is bounded (no unbounded growth per session)', () => {
+  resetSwallowedErrors();
+  for (let i = 0; i < SWALLOW_BUFFER_MAX + 25; i += 1) swallow('t', new Error(`e${i}`), {});
+  const entries = swallowedErrors();
+  assert.equal(entries.length, SWALLOW_BUFFER_MAX); assert.match(entries[entries.length - 1]!.message, /e74$/, 'the newest entry is kept');
+});
+
+test('swallow: PIER_TRACE / legacy PI_HERDR_TRACE writes to stderr', () => {
+  resetSwallowedErrors();
+  const seen: string[] = [];
+  const orig = console.error;
+  console.error = (...args: unknown[]) => { seen.push(args.map(String).join(' ')); };
+  try {
+    swallow('x.y', new Error('loud'), { PIER_TRACE: '1' });
+    swallow('x.z', new Error('quiet'), {});
+    swallow('x.w', new Error('legacy'), { PI_HERDR_TRACE: '1' });
+  } finally {
+    console.error = orig;
+  }
+  assert.equal(seen.length, 2); assert.match(seen[0]!, /swallowed x\.y: Error: loud/);
+  assert.match(seen[1]!, /swallowed x\.w: Error: legacy/);
+});
+
+test('formatSwallowedErrors: explicit empty state, otherwise the last 10', () => {
+  resetSwallowedErrors();
+  assert.match(formatSwallowedErrors(), /none this session/);
+  for (let i = 0; i < 12; i += 1) swallow(`tag${i}`, new Error(`m${i}`), {});
+  const text = formatSwallowedErrors();
+  assert.match(text, /swallowed errors: 12 this session \(last 10\)/); assert.match(text, /tag11: Error: m11/);
+  assert.doesNotMatch(text, /tag1: Error: m1$/m, 'the oldest entries are dropped');
+});
+
+/* ── tool errors (A1) ───────────────────────────────────────────────────── */
+
+// pi only flags a failed tool result when execute() throws; "Error: …" text in returned content is
+// invisible to the model and to hooks keyed on event.isError. Guard the tool modules against it.
+test('A1: tool modules never return a hard failure as text', () => {
+  const offenders: string[] = [];
+  for (const file of ['src/plugins/subagent.ts', 'src/plugins/terminal.ts', 'src/plugins/todo.ts', 'src/plugins/observation.ts']) {
+    const src = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8');
+    src.split('\n').forEach((line, i) => {
+      const code = line.trim();
+      if (code.startsWith('//') || code.startsWith('*') || code.startsWith('/*')) return;
+      if (/content: \[\{ type: 'text', text: (`|')[^`']*Error:/.test(code)
+        || /content: \[\{ type: 'text', text: (resolved\.error|launch\.text|isoGuard\.text)/.test(code)) {
+        offenders.push(`${file}:${i + 1}: ${code.slice(0, 90)}`);
+      }
+    });
+  }
+  assert.deepEqual(offenders, [], `failures still returned as values (the model cannot see isError):\n${offenders.join('\n')}`);
+});
+
+test('A1: toolError drops the redundant "Error: " prefix and keeps the cause', () => {
+  assert.throws(() => toolError('Error: boom'), (err: unknown) => { assert.ok(err instanceof ToolError); assert.equal((err as Error).message, 'boom');
+    return true;
+  });
+  assert.throws(() => toolError('boom'), (err: unknown) => { assert.equal((err as Error).message, 'boom');
+    return true;
   });
 });

@@ -1,5 +1,5 @@
 /**
- * history-store 纯逻辑单测（v1.2）。
+ * Delegation ledger (history-store): append-only JSONL, one row per status change, partitioned by cwd.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -17,88 +17,55 @@ import {
   type HistoryEntry,
 } from '../src/history-store.ts';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
+import { withCleanup } from './test-utils.ts';
 
-const mk = (over: Partial<HistoryEntry>): HistoryEntry => ({
-  taskId: 't1',
-  kind: 'short',
-  paneId: 'w1:p1',
-  tabId: 'w1:t9',
-  workspaceId: 'w1',
-  cwd: 'F:\\herdr-pi',
-  description: 'task',
-  sessionFile: 'C:\\sess\\a.jsonl',
-  launchCommand: ['node', 'cli.js'],
-  status: 'running',
-  createdAt: 1,
-  ...over,
+const mk = (over: Partial<HistoryEntry> = {}): HistoryEntry => ({
+  taskId: 't1', kind: 'short', paneId: 'w1:p1', tabId: 'w1:t9', workspaceId: 'w1', cwd: 'F:\\herdr-pi',
+  description: 'task', sessionFile: 'C:\\sess\\a.jsonl', launchCommand: ['node', 'cli.js'], status: 'running',
+  createdAt: 1, ...over,
 });
 
-test('historyFilePath: 按 cwd 分区（与 pi 会话分区同构）', () => {
+test('historyFilePath: partitioned by cwd (mirrors pi session partitioning)', () => {
   assert.equal(
     historyFilePath('C:\\home\\.pi\\agent', 'F:\\herdr-pi'),
     path.join('C:\\home\\.pi\\agent', 'herdr-pi', 'history', '--F%3A%5Cherdr-pi--', 'history.jsonl'),
   );
 });
 
-test('parseHistoryEntries: 容忍损坏行', () => {
+test('parseHistoryEntries: skips junk lines, non-objects, rows without taskId and invalid statuses', () => {
   const entries = parseHistoryEntries(['{bad', '', JSON.stringify(mk({})), 'garbage'].join('\n'));
   assert.equal(entries.length, 1);
   assert.equal(entries[0].taskId, 't1');
+  assert.equal(parseHistoryEntries(JSON.stringify({ paneId: 'p', status: 'running' })).length, 0);
+  assert.equal(parseHistoryEntries(JSON.stringify({ taskId: 't1', status: 'nope' })).length, 0);
 });
 
-test('parseHistoryEntries: object without taskId is skipped', () => {
-  const entries = parseHistoryEntries(JSON.stringify({ paneId: 'p', status: 'running' }));
-  assert.equal(entries.length, 0);
-});
+test('inspectHistory/readHistory: missing vs unreadable (directory); both read as empty', withCleanup(async (cleanup) => {
+  const missing = path.join(cleanup.tempDir('hist-none').path, 'history.jsonl');
+  assert.equal(inspectHistory(missing).status, 'missing');
+  assert.deepEqual(readHistory(missing), []);
+  assert.equal(inspectHistory(cleanup.tempDir('hist-dir').path).status, 'unreadable');
+}));
 
-test('readHistory: missing file returns []', () => {
-  assert.deepEqual(readHistory(path.join(os.tmpdir(), 'pier-no-such-history.jsonl')), []);
-});
-
-test('parseHistoryEntries: invalid status is skipped', () => {
-  const entries = parseHistoryEntries(JSON.stringify({ taskId: 't1', status: 'nope' }));
-  assert.equal(entries.length, 0);
-});
-
-test('inspectHistory: missing vs unreadable (directory)', () => {
-  const missing = inspectHistory(path.join(os.tmpdir(), 'pier-no-such-history.jsonl'));
-  assert.equal(missing.status, 'missing');
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-dir-'));
-  try {
-    const bad = inspectHistory(dir);
-    assert.equal(bad.status, 'unreadable');
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('appendHistory: parent-is-file returns ok:false', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-block-'));
+test('appendHistory: a file where the parent directory should be → ok:false', withCleanup(async (cleanup) => {
+  const tmp = cleanup.tempDir('hist-block').path;
   const blocker = path.join(tmp, 'notdir');
   fs.writeFileSync(blocker, 'x');
-  try {
-    const r = appendHistory(path.join(blocker, 'history.jsonl'), mk({}));
-    assert.equal(r.ok, false);
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
-  }
-});
+  assert.equal(appendHistory(path.join(blocker, 'history.jsonl'), mk()).ok, false);
+}));
 
-test('append/read 往返 + 目录自动创建', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-'));
-  const file = historyFilePath(tmp, 'F:\\herdr-pi');
-  appendHistory(file, mk({}));
+test('append/read round-trip: rows append in order and the directory is created on demand', withCleanup(async (cleanup) => {
+  const file = historyFilePath(cleanup.tempDir('hist').path, 'F:\\herdr-pi');
+  appendHistory(file, mk());
   appendHistory(file, mk({ status: 'closed', closedAt: 2 }));
   const entries = readHistory(file);
   assert.equal(entries.length, 2);
   assert.equal(entries[1].status, 'closed');
   assert.ok(fs.existsSync(file));
-  fs.rmSync(tmp, { recursive: true, force: true });
-});
+}));
 
-test('generationsByTask/latestGeneration: 代际折叠与复活链', () => {
+test('generationsByTask/latestGeneration: generations fold per task and follow the revival chain', () => {
   const entries = [
     mk({ paneId: 'w1:p1', status: 'closed', closedAt: 10, taskId: 't1' }),
     mk({ paneId: 'w1:p2', status: 'running', revivedFrom: 'w1:p1', taskId: 't1', createdAt: 20 }),
@@ -113,26 +80,23 @@ test('generationsByTask/latestGeneration: 代际折叠与复活链', () => {
   assert.equal(latestGeneration(entries, 'tX'), null);
 });
 
-test('normalizeEntryKind: short/resident/缺省 → task；role 名原样', () => {
+test('normalizeEntryKind: short/resident/missing → task; role names unchanged (also on disk read)', () => {
   assert.equal(normalizeEntryKind('short'), 'task');
   assert.equal(normalizeEntryKind('resident'), 'task');
   assert.equal(normalizeEntryKind(undefined), 'task');
   assert.equal(normalizeEntryKind(''), 'task');
   assert.equal(normalizeEntryKind('advisor'), 'advisor');
   assert.equal(normalizeEntryKind('websearch'), 'websearch');
+  const legacy = parseHistoryEntries(JSON.stringify(mk({ kind: 'resident' })));
+  assert.equal(legacy.length, 1);
+  assert.equal(legacy[0].kind, 'task');
 });
 
-test('applyReportedSessionFile: 只接受 .jsonl；非法不覆盖', () => {
+test('applyReportedSessionFile: only a .jsonl path is accepted; an invalid report never overwrites', () => {
   assert.equal(applyReportedSessionFile('old.jsonl', 'C:\\sess\\a.jsonl'), 'C:\\sess\\a.jsonl');
   assert.equal(applyReportedSessionFile('old.jsonl', 'not-a-path'), 'old.jsonl');
   assert.equal(applyReportedSessionFile(null, 'C:\\sess\\b.jsonl'), 'C:\\sess\\b.jsonl');
   assert.equal(applyReportedSessionFile(null, null), null);
-});
-
-test('parseHistoryEntries: 旧 kind=resident 读盘不炸，折叠为 task', () => {
-  const entries = parseHistoryEntries(JSON.stringify(mk({ kind: 'resident' })));
-  assert.equal(entries.length, 1);
-  assert.equal(entries[0].kind, 'task');
 });
 
 test('inheritOutcome: an omitted patch value inherits the latest non-empty outcome', () => {

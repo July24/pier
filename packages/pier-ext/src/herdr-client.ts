@@ -2,7 +2,7 @@
  * Minimal herdr socket API client used inside the pi extension.
  *
  * Validated against herdr 0.9.1 (protocol 22; see WIRE.md). The request shapes pier builds are pinned
- * to herdr's own `api schema` by test/herdr-contract.test.ts — regenerate test/fixtures/herdr-contract.json
+ * to herdr's own `api schema` by test/herdr-client.test.ts — regenerate test/fixtures/herdr-contract.json
  * and bump HERDR_PROTOCOL_EXPECTED when the server moves on:
  *  - Transport is NDJSON: request {id, method, params} → response {id, result} | {id, error:{code,message}};
  *  - **Control requests use one connection per request**; the server closes it after replying;

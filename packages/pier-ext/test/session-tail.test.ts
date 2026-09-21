@@ -1,80 +1,106 @@
 /**
- * session-tail 纯逻辑单测（v1.1 结果通道）。
+ * Session liveness derivations: transcript tail parsing (session-tail), todo-list staleness
+ * (stale-core) and the settled-wake decision (settle-wake-core).
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  compactionBusy,
-  deriveSubSessionState,
-  hasAssistantAfter,
-  hasPendingToolCall,
-  lastAssistantText,
-  lastAssistantTurnEnded,
-  listSessionFiles,
-  parseSessionEntries,
-  sessionDirName,
-  sessionFileById,
+  compactionBusy, deriveSubSessionState, listSessionFiles, parseSessionEntries, sessionDirName, sessionFileById,
+  type SessionEntryLike, type SubSessionState,
 } from '../src/session-tail.ts';
 import { COMPACTION_INFLIGHT_TYPE, COMPACTION_SETTLED_TYPE } from '../src/compact-coordinator.ts';
+import { STALE_CLOCK_MS, STALE_TURNS, evaluateStaleness, formatAge, isArchived, openTodos } from '../src/stale-core.ts';
+import { planSettleWake } from '../src/settle-wake-core.ts';
+import type { TodoItem } from '../src/vocab.ts';
+import { jsonl, transcriptMessage, withCleanup } from './test-utils.ts';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 
-const mkMsg = (role: string, text: string, ts: number, stopReason = 'stop') => ({
+const msg = (role: string, text: string, ts: number, stopReason = 'stop') =>
+  transcriptMessage(role, text, ts, stopReason) as SessionEntryLike;
+const custom = (customType: string): SessionEntryLike => ({ type: 'custom', customType, data: {}, timestamp: 0 });
+const toolCall = (ts: number, n = 1): SessionEntryLike => ({
   type: 'message',
-  message: { role, content: [{ type: 'text', text }], timestamp: ts, stopReason },
+  message: { role: 'assistant', content: Array.from({ length: n }, () => ({ type: 'toolCall' })), timestamp: ts, stopReason: 'toolUse' },
 });
+const toolResult = (ts: number): SessionEntryLike => ({ type: 'message', message: { role: 'toolResult', content: [], timestamp: ts } });
+const idle: SubSessionState = { text: null, pendingTool: false, activity: false, turnEnded: false, compacting: false };
 
-test('parseSessionEntries: 容忍损坏行与空行', () => {
-  const entries = parseSessionEntries(
-    ['{bad json', '', JSON.stringify(mkMsg('assistant', 'hello', 100)), '{"type":"session"}'].join('\n'),
-  );
+test('parseSessionEntries: tolerates malformed lines, blank lines and non-object records', () => {
+  const entries = parseSessionEntries(`{bad json\n\n${jsonl(msg('assistant', 'hello', 100), 'nope', { type: 'session' })}`);
   assert.equal(entries.length, 2);
   assert.equal(entries[0].type, 'message');
   assert.equal(entries[1].type, 'session');
 });
 
-test('lastAssistantText: 取最后一条 stop 定稿的 assistant 文本（跳过 toolUse 中间态）', () => {
-  const entries = [
-    mkMsg('user', 'task', 1),
-    mkMsg('assistant', 'thinking...', 2, 'toolUse'),
-    mkMsg('assistant', 'final answer', 3, 'stop'),
+test('deriveSubSessionState: role/stopReason/timestamp matrix → tail rows', async (t) => {
+  const tail = (over: Partial<SubSessionState>): SubSessionState => ({ ...idle, ...over });
+  const cases: Array<{ name: string; entries: SessionEntryLike[]; sinceTs: number; row: SubSessionState }> = [
+    {
+      name: 'stop-finalized text wins over the toolUse intermediate',
+      entries: [msg('user', 'task', 1), msg('assistant', 'thinking...', 2, 'toolUse'), msg('assistant', 'final answer', 3)],
+      sinceTs: 0,
+      row: tail({ text: 'final answer', activity: true, turnEnded: true }),
+    },
+    { name: 'sinceTs drops finalized text written before the injection point', entries: [msg('assistant', 'old', 100), msg('assistant', 'new', 200)], sinceTs: 150, row: tail({ text: 'new', activity: true, turnEnded: true }) },
+    { name: 'assistant timestamp at the injection point counts', entries: [msg('assistant', 'a', 100)], sinceTs: 100, row: tail({ text: 'a', activity: true, turnEnded: true }) },
+    { name: 'a timestamp older than the injection point is invisible', entries: [msg('assistant', 'a', 100)], sinceTs: 101, row: idle },
+    { name: 'no assistant message → idle row', entries: [msg('user', 'hi', 1)], sinceTs: 0, row: idle },
+    { name: 'toolUse-only assistant → activity without a finished turn', entries: [msg('assistant', 'mid', 1, 'toolUse')], sinceTs: 0, row: tail({ activity: true }) },
+    {
+      name: 'tool result written but the next assistant not yet → still not ended',
+      entries: [msg('user', 'task', 1), msg('assistant', 'thinking', 2, 'toolUse'), msg('toolResult', 'ok', 3)],
+      sinceTs: 1,
+      row: tail({ activity: true }),
+    },
+    {
+      name: 'assistant without stopReason (streaming) → not ended',
+      entries: [{ type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'x' }], timestamp: 6 } }],
+      sinceTs: 1,
+      row: tail({ activity: true }),
+    },
+    { name: 'pending tool call after injection → waiting on a human', entries: [msg('user', 'q', 1), toolCall(10)], sinceTs: 5, row: tail({ pendingTool: true, activity: true }) },
+    { name: 'parallel calls with only one result → still pending', entries: [toolCall(10, 2), toolResult(11)], sinceTs: 5, row: tail({ pendingTool: true, activity: true }) },
+    { name: 'tool call before the injection point does not count', entries: [toolCall(3)], sinceTs: 5, row: idle },
   ];
-  const r = lastAssistantText(entries);
-  assert.equal(r?.text, 'final answer');
+  for (const c of cases) {
+    await t.test(c.name, () => {
+      assert.deepEqual(deriveSubSessionState(c.entries, c.sinceTs), c.row);
+    });
+  }
 });
 
-test('lastAssistantText: sinceTs 过滤注入前的旧消息', () => {
-  const entries = [mkMsg('assistant', 'old', 100), mkMsg('assistant', 'new', 200)];
-  const r = lastAssistantText(entries, { sinceTs: 150 });
-  assert.equal(r?.text, 'new');
+test('deriveSubSessionState/compactionBusy: no settlement inside an OCC marker cycle', () => {
+  const task = msg('user', 'fix bugs 19795-19799', 1);
+  // OCC aborts at a todo boundary: the turn lands as stopReason 'error' with empty content.
+  const abortedTurn = msg('assistant', '', 2, 'error');
+  const continuation = msg('assistant', 'Let me continue: compile and run tests', 4, 'toolUse');
+  const closed = [task, abortedTurn, custom(COMPACTION_INFLIGHT_TYPE)];
+  const cases: Array<[name: string, entries: SessionEntryLike[], text: string | null, turnEnded: boolean, compacting: boolean]> = [
+    ['inflight marker last → the summary request is running', closed, null, true, true],
+    ['settled marker without a continuation turn yet → still machine-paused', [...closed, custom(COMPACTION_SETTLED_TYPE)], null, true, true],
+    ['continuation assistant after settled → released', [...closed, custom(COMPACTION_SETTLED_TYPE), continuation], null, false, false],
+    ['no markers (older pi / OCC off) → behaviour unchanged', [task, abortedTurn], null, true, false],
+    ['closing text written before the cycle is not a settlement while compacting', [task, msg('assistant', 'all tests pass, committed', 5), custom(COMPACTION_INFLIGHT_TYPE)], 'all tests pass, committed', true, true],
+  ];
+  for (const [name, entries, text, turnEnded, compacting] of cases) {
+    const state = deriveSubSessionState(entries, 0);
+    assert.equal(state.compacting, compacting, `${name}: compacting`);
+    assert.equal(compactionBusy(entries), compacting, `${name}: compactionBusy`);
+    assert.equal(state.text, text, `${name}: text`);
+    assert.equal(state.turnEnded, turnEnded, `${name}: turnEnded`);
+  }
 });
 
-test('lastAssistantText: 无定稿 assistant → null', () => {
-  assert.equal(lastAssistantText([mkMsg('user', 'hi', 1)]), null);
-  assert.equal(lastAssistantText([mkMsg('assistant', 'mid', 1, 'toolUse')]), null);
-});
-
-test('hasAssistantAfter: 时间点之后的任意 assistant 消息', () => {
-  const entries = [mkMsg('assistant', 'a', 100)];
-  assert.equal(hasAssistantAfter(entries, 100), true);
-  assert.equal(hasAssistantAfter(entries, 101), false);
-});
-
-test('hasPendingToolCall: 挂起工具调用 = 未结算（等人类输入）', () => {
-  const tc = (ts: number, n = 1) => ({
-    type: 'message',
-    message: { role: 'assistant', content: Array.from({ length: n }, () => ({ type: 'toolCall' })), timestamp: ts, stopReason: 'toolUse' },
-  });
-  const tr = (ts: number) => ({ type: 'message', message: { role: 'toolResult', content: [], timestamp: ts } });
-  // 单调用挂起
-  assert.equal(hasPendingToolCall([mkMsg('user', 'q', 1), tc(10)], 5), true);
-  // 调用后有结果 → 不挂起
-  assert.equal(hasPendingToolCall([tc(10), tr(11)], 5), false);
-  // 并行两调用、一个结果 → 仍挂起
-  assert.equal(hasPendingToolCall([tc(10, 2), tr(11)], 5), true);
-  // sinceTs 之前的旧调用不算
-  assert.equal(hasPendingToolCall([tc(3)], 5), false);
+test('compactionBusy: later unrelated custom entries do not disturb last-marker-wins', () => {
+  const entries = [
+    msg('user', 'task', 1),
+    custom(COMPACTION_INFLIGHT_TYPE),
+    custom(COMPACTION_SETTLED_TYPE),
+    msg('assistant', 'continuing', 4, 'toolUse'),
+    custom('pi-herdr.subs'), // another custom entry written to the same session afterwards
+  ];
+  assert.equal(compactionBusy(entries), false);
 });
 
 test('sessionDirName: cwd → collision-resistant session dir', () => {
@@ -82,109 +108,142 @@ test('sessionDirName: cwd → collision-resistant session dir', () => {
   assert.equal(sessionDirName('/home/u/proj'), '--%2Fhome%2Fu%2Fproj--');
 });
 
-test('listSessionFiles/sessionFileById: 候选定位（v1.3 M7 结算串线修复）', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-sess2-'));
-  const dir = path.join(tmp, '--F--herdr-pi--');
+test('listSessionFiles/sessionFileById: platform dir candidates, newest-first order and legacy fallback', withCleanup(async (cleanup) => {
+  const flat = cleanup.tempDir('sess2').path;
+  const dir = path.join(flat, '--F--herdr-pi--');
   fs.mkdirSync(dir, { recursive: true });
-  const a = path.join(dir, '2026-01-01T00-00-00_aaaa.jsonl');
-  const b = path.join(dir, '2026-01-01T00-00-01_bbbb.jsonl');
-  const c = path.join(dir, '2026-01-01T00-00-02_cccc.jsonl');
+  const at = (n: number) => path.join(dir, `2026-01-01T00-00-0${n}_${['aaaa', 'bbbb', 'cccc'][n]}.jsonl`);
+  const [a, b, c] = [at(0), at(1), at(2)];
   for (const f of [a, b, c]) fs.writeFileSync(f, '{}');
   const t = Date.now();
-  fs.utimesSync(a, new Date(t - 3000), new Date(t - 3000));
-  fs.utimesSync(b, new Date(t - 2000), new Date(t - 2000));
-  fs.utimesSync(c, new Date(t - 1000), new Date(t - 1000));
-  const list = listSessionFiles('F:\\herdr-pi', tmp, 2);
-  assert.deepEqual(list, [c, b]);
-  assert.equal(sessionFileById('F:\\herdr-pi', tmp, 'bbbb'), b);
-  assert.equal(sessionFileById('F:\\herdr-pi', tmp, 'zzzz'), null);
-  assert.equal(sessionFileById('Z:\\nowhere', tmp, 'bbbb'), null);
-  fs.rmSync(tmp, { recursive: true, force: true });
-});
+  [a, b, c].forEach((f, i) => fs.utimesSync(f, new Date(t - 3000 + i * 1000), new Date(t - 3000 + i * 1000)));
+  assert.deepEqual(listSessionFiles('F:\\herdr-pi', flat, 2), [c, b]);
+  assert.equal(sessionFileById('F:\\herdr-pi', flat, 'bbbb'), b);
+  assert.equal(sessionFileById('F:\\herdr-pi', flat, 'zzzz'), null);
+  assert.equal(sessionFileById('Z:\\nowhere', flat, 'bbbb'), null);
 
-test('lastAssistantTurnEnded (A16): 只有结束的回合才算结束，toolUse 中间态不算', () => {
-  const entries = [
-    mkMsg('user', 'task', 1),
-    mkMsg('assistant', 'thinking', 2, 'toolUse'),
-    mkMsg('toolResult', 'ok', 3),
-  ];
-  // 工具已回、下一条 assistant 还没来——真实工作流里最常见的一刻，绝不能当作结算。
-  assert.equal(lastAssistantTurnEnded(entries, 1), false);
-  // 补上真正的收尾（stop）后就结束了。
-  assert.equal(lastAssistantTurnEnded([...entries, mkMsg('assistant', 'done', 4, 'stop')], 1), true);
-  // 没有 assistant 消息 / 早于注入点：都不算结束。
-  assert.equal(lastAssistantTurnEnded([mkMsg('user', 'task', 1)], 1), false);
-  assert.equal(lastAssistantTurnEnded([mkMsg('assistant', 'done', 5, 'stop')], 10), false);
-  // stopReason 缺失（流式中间态）保守地按"未结束"处理。
-  const streaming = [{ type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'x' }], timestamp: 6 } }];
-  assert.equal(lastAssistantTurnEnded(streaming, 1), false);
-});
-
-test('listSessionFiles/sessionFileById (A8): pi core 的 POSIX 目录名必须能定位到会话', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-sess-a8-'));
+  // pi core's own POSIX dir name must resolve (the old %2F/--- encodings failed silently on it),
+  // while pier's legacy flattened dir stays readable through the dual read.
   const cwd = '/Users/yehaoyu/Documents/pier';
-  const dir = path.join(tmp, '--Users-yehaoyu-Documents-pier--'); // pi core 的真实命名
-  fs.mkdirSync(dir, { recursive: true });
-  const f = path.join(dir, '2026-01-01T00-00-00_dead.jsonl');
+  const tmp = cleanup.tempDir('sess-a8').path;
+  const core = path.join(tmp, '--Users-yehaoyu-Documents-pier--');
+  fs.mkdirSync(core, { recursive: true });
+  const f = path.join(core, '2026-01-01T00-00-00_dead.jsonl');
   fs.writeFileSync(f, '{}');
-  // 旧实现用 `--%2FUsers…--` / `---Users…--` 找，返回空而不报错（静默失效）
   assert.deepEqual(listSessionFiles(cwd, tmp, 4), [f]);
   assert.equal(sessionFileById(cwd, tmp, 'dead'), f);
   assert.equal(sessionFileById(cwd, tmp, 'beef'), null);
-  // 双读不回归：pier 旧编码目录仍可读
   const legacy = path.join(tmp, '---Users-yehaoyu-Documents-pier--');
   fs.mkdirSync(legacy, { recursive: true });
   const g = path.join(legacy, '2026-01-01T00-00-01_beef.jsonl');
   fs.writeFileSync(g, '{}');
   assert.equal(sessionFileById(cwd, tmp, 'beef'), g);
   assert.equal(listSessionFiles(cwd, tmp, 4).length, 2);
-  fs.rmSync(tmp, { recursive: true, force: true });
-});
+}));
 
-test('deriveSubSessionState/compactionBusy: OCC 标记期间不结算（01a0be1f 假结算回归）', () => {
-  const mkCustom = (customType: string) => ({ type: 'custom', customType, data: {}, timestamp: 0 });
-  const INFLIGHT = COMPACTION_INFLIGHT_TYPE;
-  const SETTLED = COMPACTION_SETTLED_TYPE;
-  // OCC 在 todo 边界 abort：turn 落在 transcript 里是 stopReason 'error'、空 content 的 assistant。
-  const abortedTurn = mkMsg('assistant', '', 2, 'error');
-  const task = mkMsg('user', 'fix bugs 19795-19799', 1);
+/* ── staleness: a fully done list left untouched is stale (turns) or archived (clock) ── */
 
-  // 1. inflight 标记是最后一条 → 正在压缩总结请求，hold。
-  let state = deriveSubSessionState([task, abortedTurn, mkCustom(INFLIGHT)], 0);
-  assert.equal(state.compacting, true);
-  assert.equal(compactionBusy([task, abortedTurn, mkCustom(INFLIGHT)]), true);
+const done = (content: string): TodoItem => ({ content, status: 'completed' });
+const HOUR = 3_600_000;
+const ALL_DONE = [done('Verify gateway'), done('Verify id consistency'), done('Update design doc')];
 
-  // 2. settled 标记已写但 continuation 的 assistant 还没来 → 仍是机器停顿，hold。
-  state = deriveSubSessionState([task, abortedTurn, mkCustom(INFLIGHT), mkCustom(SETTLED)], 0);
-  assert.equal(state.compacting, true);
-
-  // 3. continuation 的 assistant 出现在 settled 标记之后 → hold 释放。
-  const continuation = mkMsg('assistant', 'Let me continue: compile and run tests', 4, 'toolUse');
-  state = deriveSubSessionState([task, abortedTurn, mkCustom(INFLIGHT), mkCustom(SETTLED), continuation], 0);
-  assert.equal(state.compacting, false);
-  assert.equal(state.turnEnded, false);
-
-  // 4. 无标记（旧版本/未开 OCC 的子会话）→ 行为不变。
-  state = deriveSubSessionState([task, abortedTurn], 0);
-  assert.equal(state.compacting, false);
-
-  // 5. 已有定稿收尾文本但压缩正在进行 → compacting 仍为 true（结算与否由
-  //    isSettlementCandidate 的 compacting 守卫决定，abort 之前的文本不算最终收尾）。
-  const closing = mkMsg('assistant', 'all tests pass, committed', 5, 'stop');
-  state = deriveSubSessionState([task, closing, mkCustom(INFLIGHT)], 0);
-  assert.equal(state.compacting, true);
-  assert.equal(state.text, 'all tests pass, committed');
-});
-
-test('compactionBusy: 结算后追加的无关 custom 条目不影响判定（最后标记胜出）', () => {
-  const mkCustom = (customType: string) => ({ type: 'custom', customType, data: {}, timestamp: 0 });
-  const continuation = mkMsg('assistant', 'continuing', 4, 'toolUse');
-  const entries = [
-    mkMsg('user', 'task', 1),
-    mkCustom(COMPACTION_INFLIGHT_TYPE),
-    mkCustom(COMPACTION_SETTLED_TYPE),
-    continuation,
-    mkCustom('pi-herdr.subs'), // 同会话后续写入的其它 custom 条目
+test('openTodos: pending/in_progress/blocked count, completed/abandoned do not', () => {
+  const items: TodoItem[] = [
+    { content: 'a', status: 'pending' },
+    { content: 'b', status: 'in_progress' },
+    { content: 'c', status: 'blocked', blocker: 'x' },
+    { content: 'd', status: 'completed' },
+    { content: 'e', status: 'abandoned' },
   ];
-  assert.equal(compactionBusy(entries), false);
+  assert.equal(openTodos(items), 3);
+  assert.equal(openTodos(ALL_DONE), 0);
+});
+
+test('fresh: open items keep a list fresh at any age (the settled notice is the other guard)', () => {
+  const items: TodoItem[] = [done('a'), { content: 'b', status: 'pending' }];
+  const st = evaluateStaleness({ items, lastWriteAt: 0, turnsSinceWrite: 999, now: 1e12 });
+  assert.equal(st.kind, 'fresh');
+  assert.equal(st.open, 1);
+});
+
+test('thresholds: turns 6 → stale, wall clock ≥1h → archived (clock outranks turns), below → fresh', () => {
+  const at = (now: number, turnsSinceWrite: number) => evaluateStaleness({ items: ALL_DONE, lastWriteAt: 10 * HOUR, turnsSinceWrite, now });
+  assert.equal(at(10 * HOUR + 30 * 60_000, 3).kind, 'fresh');
+  assert.equal(at(10 * HOUR + 30 * 60_000, STALE_TURNS - 1).kind, 'fresh');
+  const stale = at(10 * HOUR + 30 * 60_000, STALE_TURNS);
+  assert.equal(stale.kind, 'stale');
+  assert.equal(stale.open, 0);
+  const archived = at(10 * HOUR + STALE_CLOCK_MS, 1);
+  assert.equal(archived.kind, 'archived');
+  assert.equal(archived.ageMs, STALE_CLOCK_MS);
+});
+
+test('conservative: unknown lastWriteAt (old sessions) suppresses only the clock axis; empty list is fresh', () => {
+  const st = evaluateStaleness({ items: ALL_DONE, lastWriteAt: null, turnsSinceWrite: 99, now: 1e12 });
+  assert.equal(st.kind, 'stale');
+  assert.equal(st.ageMs, null);
+  assert.equal(isArchived(ALL_DONE, null, 1e12), false);
+  assert.equal(evaluateStaleness({ items: [], lastWriteAt: 0, turnsSinceWrite: 99, now: 1e12 }).kind, 'fresh');
+});
+
+test('isArchived: title path uses the clock axis only, and open items are never archived', () => {
+  const t0 = 100 * HOUR;
+  assert.equal(isArchived(ALL_DONE, t0, t0 + HOUR - 1), false);
+  assert.equal(isArchived(ALL_DONE, t0, t0 + HOUR), true);
+  assert.equal(isArchived([{ content: 'x', status: 'in_progress' }], t0, t0 + 10 * HOUR), false);
+});
+
+test('formatAge: m / floored h / d', () => {
+  assert.equal(formatAge(45 * 60_000), '45m');
+  assert.equal(formatAge(90 * 60_000), '1h');
+  assert.equal(formatAge(16 * HOUR), '16h');
+  assert.equal(formatAge(50 * HOUR), '2d');
+});
+
+/* ── settle wake: no wake storm (abort silence, one notice per running set per 10 min) ── */
+
+const SUBS = [{ paneId: 'wA:p6' }, { paneId: 'wA:p7' }];
+const KEY = 'wA:p6,wA:p7';
+const T0 = 100 * 60_000;
+
+test('abort suppression: a settled turn after ESC wakes nothing and keeps the dedup anchor', () => {
+  const plan = planSettleWake({ lastStopReason: 'aborted', running: SUBS, lastNoticeKey: null, lastNoticeAt: 0, now: T0 });
+  assert.equal(plan.wake, false);
+  assert.equal(plan.notice, false);
+  assert.equal(plan.noticeKey, null);
+  assert.equal(plan.noticeAt, 0);
+});
+
+test('natural settle with a new running set → one notice carrying the set key', () => {
+  const plan = planSettleWake({ lastStopReason: 'stop', running: SUBS, lastNoticeKey: null, lastNoticeAt: 0, now: T0 });
+  assert.equal(plan.wake, true);
+  assert.equal(plan.notice, true);
+  assert.equal(plan.noticeKey, KEY);
+  assert.equal(plan.noticeAt, T0);
+});
+
+test('same running set: a settle seconds later stays silent, 10 minutes later re-notifies', () => {
+  const at = (now: number) => planSettleWake({ lastStopReason: 'stop', running: SUBS, lastNoticeKey: KEY, lastNoticeAt: T0, now });
+  const selfLoop = at(T0 + 1000); // the run started by the notice settles within seconds
+  assert.equal(selfLoop.wake, true);
+  assert.equal(selfLoop.notice, false);
+  assert.equal(selfLoop.noticeKey, KEY, 'the anchor is untouched');
+  assert.equal(at(T0 + 10 * 60_000 - 1).notice, false);
+  const due = at(T0 + 10 * 60_000);
+  assert.equal(due.notice, true);
+  assert.equal(due.noticeAt, T0 + 10 * 60_000);
+});
+
+test('a changed running set bypasses the cooldown; an empty set resets the anchor', () => {
+  const grown = planSettleWake({ lastStopReason: 'stop', running: [...SUBS, { paneId: 'wA:p9' }], lastNoticeKey: KEY, lastNoticeAt: T0, now: T0 + 5000 });
+  assert.equal(grown.notice, true, 'a new sub bypasses the cooldown');
+  const emptied = planSettleWake({ lastStopReason: 'stop', running: [], lastNoticeKey: KEY, lastNoticeAt: T0, now: T0 + 5000 });
+  assert.equal(emptied.notice, false);
+  assert.equal(emptied.noticeKey, null, 'an empty set resets the anchor so the next subs notify again');
+});
+
+test('unknown stopReason (null, older pi) counts as a natural end: no notice is lost', () => {
+  const plan = planSettleWake({ lastStopReason: null, running: SUBS, lastNoticeKey: null, lastNoticeAt: 0, now: T0 });
+  assert.equal(plan.wake, true);
+  assert.equal(plan.notice, true);
 });

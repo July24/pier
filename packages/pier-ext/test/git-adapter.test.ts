@@ -1,69 +1,47 @@
 /**
- * git-adapter: injectable exec, timeout, error normalization.
+ * git-adapter: injectable exec, timeout forwarding, and error normalization at the boundary.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { NodeGitAdapter, type GitExecFile } from '../src/subagent-spawn.ts';
 
-function fakeExec(impl: GitExecFile): GitExecFile {
-  return impl;
-}
-
-test('run: prefixes git -C cwd and forwards timeout', async () => {
+test('run: prefixes git -C cwd, forwards the timeout, and the wrappers build their own argv', async () => {
   const calls: Array<{ file: string; args: readonly string[]; timeout: number }> = [];
-  const exec = fakeExec(async (file, args, opts) => {
+  const exec: GitExecFile = async (file, args, opts) => {
     calls.push({ file, args, timeout: opts.timeout });
     return { stdout: 'ok\n', stderr: '' };
-  });
-  const git = new NodeGitAdapter('git', 1234, exec);
-  const result = await git.run('/repo', ['rev-parse', 'HEAD']);
+  };
+  const result = await new NodeGitAdapter('git', 1234, exec).run('/repo', ['rev-parse', 'HEAD']);
   assert.equal(result.stdout, 'ok\n');
-  assert.deepEqual(calls, [{
-    file: 'git',
-    args: ['-C', '/repo', 'rev-parse', 'HEAD'],
-    timeout: 1234,
-  }]);
-});
+  assert.deepEqual(calls, [{ file: 'git', args: ['-C', '/repo', 'rev-parse', 'HEAD'], timeout: 1234 }]);
 
-test('listWorktrees / status: convenience wrappers around run', async () => {
   const seen: string[][] = [];
-  const exec = fakeExec(async (_file, args) => {
-    seen.push([...args]);
-    return { stdout: 'out', stderr: '' };
-  });
-  const git = new NodeGitAdapter('git', 1000, exec);
+  const git = new NodeGitAdapter('git', 1000, async (_file, args) => { seen.push([...args]); return { stdout: 'out', stderr: '' }; });
   await git.listWorktrees('/wt');
   await git.status('/wt');
   assert.deepEqual(seen[0], ['-C', '/wt', 'worktree', 'list', '--porcelain']);
   assert.deepEqual(seen[1], ['-C', '/wt', 'status', '--short']);
 });
 
-test('run: normalizes thrown errors with operation name', async () => {
-  const exec = fakeExec(async () => {
-    const err = new Error('ENOENT');
-    (err as Error & { code: string }).code = 'ENOENT';
-    throw err;
-  });
-  const git = new NodeGitAdapter('git', 1000, exec);
-  await assert.rejects(
-    () => git.run('/repo', ['status', '--porcelain']),
-    (err: Error) => {
-      assert.match(err.message, /^Git status failed: ENOENT/);
-      return true;
-    },
-  );
-});
+const FAILURES: Array<{ name: string; args: string[]; thrown: () => unknown; expected: RegExp }> = [
+  {
+    name: 'Error carrying a code',
+    args: ['status', '--porcelain'],
+    thrown: () => Object.assign(new Error('ENOENT'), { code: 'ENOENT' }),
+    expected: /^Git status failed: ENOENT/,
+  },
+  { name: 'non-Error throw', args: ['diff'], thrown: () => 'boom', expected: /^Git diff failed: boom$/ },
+];
 
-test('run: non-Error throw still becomes GitError', async () => {
-  const exec = fakeExec(async () => {
-    throw 'boom';
-  });
-  const git = new NodeGitAdapter('git', 1000, exec);
-  await assert.rejects(
-    () => git.run('/repo', ['diff']),
-    (err: Error) => {
-      assert.equal(err.message, 'Git diff failed: boom');
-      return true;
-    },
-  );
+test('run: every failure becomes a GitError naming the operation', async () => {
+  for (const c of FAILURES) {
+    const exec: GitExecFile = async () => { throw c.thrown(); };
+    await assert.rejects(
+      () => new NodeGitAdapter('git', 1000, exec).run('/repo', c.args),
+      (err: Error) => {
+        assert.match(err.message, c.expected, c.name);
+        return true;
+      },
+    );
+  }
 });
