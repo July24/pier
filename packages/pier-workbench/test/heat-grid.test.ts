@@ -1,13 +1,13 @@
 /**
- * M23 档 3（D91）：网格原地热力规划器单测。
- * D95：ask 分级 + 窄条衰减 + 权重表扩展。
- * 缝：planGridHeat 纯函数——零 swap / 路径几何均摊 / 旁支权重分饼 / 全覆盖不变量。
+ * Grid planner geometry: zero swaps / path geometry / off-path weight split / full coverage invariant,
+ * plus the D95 ask tier and slim decay. Mirrored constants live in pier-ext heat-plan.ts (lockstep).
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ASK_WEIGHT,
   BLOCKED_WEIGHT,
+  applyHeatOps,
   FOCUS_SHARE,
   FOCUS_SHARE_BLOCKED,
   RATIO_FLOOR,
@@ -38,20 +38,6 @@ function grid2x2(): LayoutNode {
 function countSplits(node: LayoutNode): number {
   return node.type === 'pane' ? 0 : 1 + countSplits(node.first) + countSplits(node.second);
 }
-/** 把 ops 应用到树副本上（只改 ratio）。 */
-function applied(root: LayoutNode, ops: HeatOp[]): LayoutNode {
-  const clone: LayoutNode = structuredClone(root);
-  for (const op of ops) {
-    let node = clone;
-    for (const go of op.path) {
-      if (node.type !== 'split') throw new Error('bad path');
-      node = go ? node.second : node.first;
-    }
-    if (node.type !== 'split') throw new Error('path 指向 pane');
-    node.ratio = op.ratio;
-  }
-  return clone;
-}
 function ratioOps(ops: HeatOp[]): Array<[string, number]> {
   return ops.map((o) => [o.path.map((b) => (b ? '1' : '0')).join(''), o.ratio] as [string, number]);
 }
@@ -80,7 +66,7 @@ test('2×2 网格、焦点 p3（左下）：每层 √0.72，乘积 = 0.72；其
   if (p.type !== 'apply') throw new Error('apply');
   // 路径：root→first(A)，A→second(p3)：root ratio=r，A ratio=1-r；旁支 B 均分 0.5
   assert.deepEqual(ratioOps(p.ops), [['', R2], ['0', 1 - R2], ['1', 0.5]]);
-  const shares = paneAreaShares(applied(grid2x2(), p.ops));
+  const shares = paneAreaShares(applyHeatOps(grid2x2(), p.ops));
   assert.ok(Math.abs(shares.p3 - FOCUS_SHARE) < 1e-9, `p3=${shares.p3}`);
   assert.ok(shares.p1 < 0.2 && shares.p2 < 0.1 && shares.p4 < 0.1, JSON.stringify(shares));
 });
@@ -91,7 +77,7 @@ test('blocked 在旁支：聚焦让位 0.60，blocked 在其子树内拿 3/4', (
   // 路径 root→second(B)，B→second(p4)：root ratio=1-r，B ratio=1-r（r=√0.60）；
   // 旁支 A：p1(blocked,3) vs p3(1) → first 份额 0.75
   assert.deepEqual(ratioOps(p.ops), [['', 1 - RB2], ['1', 1 - RB2], ['0', 0.75]]);
-  const shares = paneAreaShares(applied(grid2x2(), p.ops));
+  const shares = paneAreaShares(applyHeatOps(grid2x2(), p.ops));
   assert.ok(Math.abs(shares.p4 - FOCUS_SHARE_BLOCKED) < 1e-9, `p4=${shares.p4}`);
   assert.ok(shares.p1 > shares.p3 * 2, `blocked p1=${shares.p1} 应显著大于 p3=${shares.p3}`);
 });
@@ -100,7 +86,7 @@ test('深层链（5 pane 焦点在末叶）：每层钳 0.9，焦点仍占 0.9^4
   const root = split('right', pane('a'), split('right', pane('b'), split('right', pane('c'), split('right', pane('d'), pane('e')))));
   const p = planGridHeat({ root, focusPaneId: 'e', paneCount: 5 });
   if (p.type !== 'apply') throw new Error('apply');
-  const shares = paneAreaShares(applied(root, p.ops));
+  const shares = paneAreaShares(applyHeatOps(root, p.ops));
   assert.ok(Math.abs(shares.e - 0.9 ** 4) < 1e-9, `e=${shares.e}`);
   for (const id of ['a', 'b', 'c', 'd']) {
     assert.ok(shares.e > shares[id] * 2, `e=${shares.e} 必须碾压 ${id}=${shares[id]}`);
@@ -123,7 +109,7 @@ test('statuses 空：旁支均分（退化为纯几何热力，无状态语义�
   if (p.type !== 'apply') throw new Error('apply');
   // p1 路径 depth2（root→first, A→first）：两节各 √0.72，乘积 0.72；旁支 B 均分
   assert.deepEqual(ratioOps(p.ops), [['', R2], ['0', R2], ['1', 0.5]]);
-  const shares = paneAreaShares(applied(grid2x2(), p.ops));
+  const shares = paneAreaShares(applyHeatOps(grid2x2(), p.ops));
   assert.ok(Math.abs(shares.p1 - FOCUS_SHARE) < 1e-9);
   assert.equal(countPanes(grid2x2()), 4);
 });
@@ -151,7 +137,7 @@ test('D95 ask 分级：ask(blocked+pi-ask) 比纯 blocked 小，但仍大于 wor
     askFlags: { p3: true },
   });
   if (p.type !== 'apply') throw new Error('apply');
-  const shares = paneAreaShares(applied(root, p.ops));
+  const shares = paneAreaShares(applyHeatOps(root, p.ops));
   assert.ok(shares.p1 > shares.p3, `blocked p1=${shares.p1} > ask p3=${shares.p3}`);
   assert.ok(shares.p3 > shares.p2, `ask p3=${shares.p3} > working p2=${shares.p2}`);
 });
@@ -163,8 +149,8 @@ test('D95 窄条衰减：非焦点 pane ≥ SLIM_THRESHOLD 时 idle/working 权�
   const slimmed = planGridHeat({ root: slimTree(), focusPaneId: 'focus', paneCount: 7, statuses });
   const unslimmed = planGridHeat({ root: slimTree(), focusPaneId: 'focus', paneCount: 3, statuses: { a: 'working', b: 'working' } });
   if (slimmed.type !== 'apply' || unslimmed.type !== 'apply') throw new Error('apply');
-  const s1 = paneAreaShares(applied(slimTree(), slimmed.ops));
-  const s2 = paneAreaShares(applied(slimTree(), unslimmed.ops));
+  const s1 = paneAreaShares(applyHeatOps(slimTree(), slimmed.ops));
+  const s2 = paneAreaShares(applyHeatOps(slimTree(), unslimmed.ops));
   // 窄条模式下同权重的 working pane 占比更低
   assert.ok(s1.a < s2.a, `slim working a=${s1.a} 应小于未衰减 a=${s2.a}`);
 });

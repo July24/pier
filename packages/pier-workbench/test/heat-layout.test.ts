@@ -1,7 +1,6 @@
 /**
- * M23 热力规划器基础缝（D91 档 3 后的守卫与工具）。
- * 缝：planGridHeat 守卫 / shouldAcceptFocus / shouldFireDebounced / unwrapLayout。
- * 不测 RPC、不测钩子进程。几何与面积断言见 heat-grid.test.ts。
+ * Planner guards and helpers (planGridHeat guards / shouldAcceptFocus / shouldFireDebounced / unwrapLayout).
+ * No RPC and no hook-process coverage here; geometry and area assertions live in heat-grid.test.ts.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
