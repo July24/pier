@@ -1,6 +1,6 @@
 /**
  * D101 ObservationPack plugin: the `obs_recall` tool plus the `context` interceptor projecting
- * placeholders for large tool results after their first fullSends requests, leaving the JSONL intact.
+ * placeholders for large tool results after their first fullSends requests (JSONL stays intact).
  * Cache-aware packing decisions, role visibility gates, append-only telemetry.
  */
 import type {
@@ -24,7 +24,6 @@ const MAX_MEMO_ENTRIES = 256;
 const MAX_BATCH_PACK_ITEMS = 20;
 const MAX_BATCH_PACK_BYTES = 10 * 1024 * 1024;
 
-/** Observation ids already written to observation.jsonl (at most one packed record per id). */
 const loggedPackedObsIds = new Set<string>();
 
 interface MemoizedPlaceholder { placeholder: string; obsId: string }
@@ -34,7 +33,6 @@ const placeholderMemo = new Map<string, MemoizedPlaceholder>();
 /** Subset of pi context messages this plugin reads; anything else is left untouched. */
 interface ContextMessage { role?: unknown; isError?: unknown; toolName?: unknown; toolCallId?: unknown; content?: unknown }
 
-/** Text-block characters including the newline separators; used for the memo key. */
 function contentCharLength(content: readonly unknown[]): number {
   let length = content.length - 1;
   for (const b of content as Array<{ text?: unknown }>) {

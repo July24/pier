@@ -73,7 +73,7 @@ function initialCoordinatorState(): CoordinatorState {
   };
 }
 
-/** Last state marker wins; missing/older fields keep their defaults. */
+/** Last valid state marker wins; missing fields keep defaults and invalid markers are skipped. */
 export function restoreCoordinatorState(entries: readonly unknown[]): CoordinatorState {
   const base = initialCoordinatorState();
   if (!Array.isArray(entries)) return base;
@@ -81,7 +81,6 @@ export function restoreCoordinatorState(entries: readonly unknown[]): Coordinato
     const entry = entries[i] as { type?: string; customType?: string; data?: unknown };
     if (entry?.type !== 'custom' || entry.customType !== COMPACT_STATE_CUSTOM_TYPE) continue;
     const d = entry.data as Partial<CoordinatorState> | null | undefined;
-    // Older/invalid marker: keep scanning, the previous valid one still describes the pacing samples.
     if (!d || d.version !== 1 || !Array.isArray(d.completedBoundaryRequestCounts)) continue;
     for (const field of NUMERIC_STATE_FIELDS) {
       const value = d[field];
