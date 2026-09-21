@@ -4,10 +4,10 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { RECOMMENDED_SUFFIX } from '../src/ask-dialog.ts';
 import {
   DECLINE_TEXT,
   OTHER_OPTION,
-  RECOMMENDED_SUFFIX,
   formatAskContent,
   gateLabel,
   hasAskUi,

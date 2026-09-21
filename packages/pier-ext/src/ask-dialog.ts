@@ -1,24 +1,24 @@
 /**
- * ask_user_question dialog: one pier-owned selector for single- and multi-select
- * questions, rendered through `ctx.ui.custom`.
+ * ask_user_question dialog: one pier-owned selector for single- and multi-select questions,
+ * rendered through `ctx.ui.custom`.
  *
- * Why: pi's built-in `ui.select` (ExtensionSelectorComponent) and pier's former
- * hand-rolled multi toggle list styled the same question differently — frame,
- * cursor glyph, numbering, hint line and navigation semantics all diverged.
- * Both question modes now share this component; only the checkbox column, the
- * extra key hints and the selection counter differ between modes.
+ * pi's built-in selector and pier's former toggle list styled the same question differently
+ * (frame, cursor glyph, numbering, hints, navigation), so both modes share this component; only the
+ * checkbox column, the key hints and the selection counter differ.
  *
- * The chrome deliberately mirrors pi's ExtensionSelectorComponent: a border rule
- * above and below, an accent+bold title, a `→ ` cursor, dim description text and
- * keyHint-style footer hints (dim key + muted verb, double-space separated)
- * resolved from the keybindings manager pi hands to custom factories.
+ * The chrome deliberately mirrors pi's ExtensionSelectorComponent: border rules above and below, an
+ * accent+bold title, a `→ ` cursor, dim description text and keyHint-style footer hints (dim key +
+ * muted verb, double-space separated) resolved from the keybindings manager pi hands the factory.
  */
 import { styledWidth, truncateStyled, wrapStyled } from './ansi-text.ts';
 
 /** Label of the trailing free-text row; ask-user reuses it for the typed fallback list. */
 export const OTHER_ROW_LABEL = 'Other (type your own)';
 
-export interface DialogOption {
+/** Marker the UI appends to the recommended row; the typed fallback list uses the same one. */
+export const RECOMMENDED_SUFFIX = ' (Recommended)';
+
+interface DialogOption {
   label: string;
   description?: string;
 }
@@ -44,7 +44,7 @@ export interface DialogState {
   selected: readonly boolean[];
 }
 
-export type DialogKey = 'up' | 'down' | 'toggle' | 'confirm' | 'cancel' | 'all' | 'ignore';
+type DialogKey = 'up' | 'down' | 'toggle' | 'confirm' | 'cancel' | 'all' | 'ignore';
 
 export type DialogOutcome =
   | { kind: 'selected'; labels: string[] }
@@ -136,28 +136,26 @@ export interface KeybindingsLike {
 }
 
 /**
- * Raw sequences used when the factory's keybindings manager is absent (older
- * hosts, direct construction in tests). Mirrors pi's defaults; j/k are included
- * so vim keys work in both resolution paths, like pi's own selector.
+ * Key resolution, in order (first match wins). `binding` is the host action id consulted when the
+ * factory received a keybindings manager; `sequences` are the raw fallbacks used when it did not
+ * (older hosts, direct construction in tests). Mirrors pi's defaults; j/k are included so vim keys
+ * work in both paths, like pi's own selector. `toggle` has no pi action of its own.
  */
-export const FALLBACK_KEY_SEQUENCES: Record<'up' | 'down' | 'toggle' | 'confirm' | 'cancel', readonly string[]> = {
-  up: ['\x1b[A', '\x1bOA', 'k'],
-  down: ['\x1b[B', '\x1bOB', 'j'],
-  toggle: [' '],
-  confirm: ['\r', '\n'],
-  cancel: ['\x1b', '\x03'],
-};
+const KEY_RESOLUTION: ReadonlyArray<{ key: DialogKey; binding?: string; sequences: readonly string[] }> = [
+  { key: 'up', binding: 'tui.select.up', sequences: ['\x1b[A', '\x1bOA', 'k'] },
+  { key: 'down', binding: 'tui.select.down', sequences: ['\x1b[B', '\x1bOB', 'j'] },
+  { key: 'toggle', sequences: [' '] },
+  { key: 'confirm', binding: 'tui.select.confirm', sequences: ['\r', '\n'] },
+  { key: 'cancel', binding: 'tui.select.cancel', sequences: ['\x1b', '\x03'] },
+];
 
-/** Map one raw input chunk to a dialog key using the host bindings plus fallbacks. */
+/** Map one raw input chunk to a dialog key using the host bindings plus the literal fallbacks. */
 export function resolveDialogKey(data: string, keybindings?: KeybindingsLike): DialogKey {
-  const kb = (id: string): boolean => keybindings?.matches?.(data, `tui.select.${id}`) === true;
-  if (kb('up') || FALLBACK_KEY_SEQUENCES.up.includes(data)) return 'up';
-  if (kb('down') || FALLBACK_KEY_SEQUENCES.down.includes(data)) return 'down';
-  if (FALLBACK_KEY_SEQUENCES.toggle.includes(data)) return 'toggle';
-  if (kb('confirm') || FALLBACK_KEY_SEQUENCES.confirm.includes(data)) return 'confirm';
-  if (kb('cancel') || FALLBACK_KEY_SEQUENCES.cancel.includes(data)) return 'cancel';
-  if (data === 'a' || data === 'A') return 'all';
-  return 'ignore';
+  for (const entry of KEY_RESOLUTION) {
+    if (entry.binding !== undefined && keybindings?.matches?.(data, entry.binding) === true) return entry.key;
+    if (entry.sequences.includes(data)) return entry.key;
+  }
+  return data === 'a' || data === 'A' ? 'all' : 'ignore';
 }
 
 /* ── TUI component ─────────────────────────────────────────────────── */
@@ -167,13 +165,13 @@ export interface MinimalTheme {
   bold(text: string): string;
 }
 
-export interface DialogComponent {
+interface DialogComponent {
   render(width: number): string[];
   handleInput(data: string): void;
   invalidate(): void;
 }
 
-export interface DialogUiOptions {
+interface DialogUiOptions {
   title: string;
   config: DialogConfig;
   theme: MinimalTheme;
@@ -189,14 +187,22 @@ export interface DialogUiOptions {
   requestRender?: () => void;
 }
 
-const RECOMMENDED = ' (Recommended)';
+/**
+ * Numbered line for the typed-prompt fallback list (`1. Label (Recommended) — description`);
+ * the dialog itself renders unnumbered rows.
+ */
+export function numberedOptionLine(option: DialogOption, index: number, recommended?: number): string {
+  const marker = recommended === index ? RECOMMENDED_SUFFIX : '';
+  const description = option.description ? ` — ${option.description}` : '';
+  return `${index + 1}. ${option.label}${marker}${description}`;
+}
 
 export function dialogLines(state: DialogState, config: DialogConfig, theme: MinimalTheme): string[] {
   const lines: string[] = [];
   config.options.forEach((option, i) => {
     const onCursor = i === state.cursor;
     const cursor = onCursor ? theme.fg('accent', '→ ') : '  ';
-    const label = `${option.label}${config.recommended === i ? RECOMMENDED : ''}`;
+    const label = `${option.label}${config.recommended === i ? RECOMMENDED_SUFFIX : ''}`;
     const desc = option.description ? theme.fg('dim', ` — ${option.description}`) : '';
     if (config.multi) {
       const box = state.selected[i] ? theme.fg('success', '[x]') : '[ ]';

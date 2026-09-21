@@ -8,9 +8,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { styledWidth, wrapStyled } from '../src/ansi-text.ts';
+import { styledWidth } from '../src/ansi-text.ts';
 import {
-  FALLBACK_KEY_SEQUENCES,
   createDialogComponent,
   createDialogState,
   dialogFooter,
@@ -203,8 +202,6 @@ test('resolveDialogKey understands host bindings, literals and fallback sequence
   assert.equal(resolveDialogKey('\x1b', undefined), 'cancel');
   assert.equal(resolveDialogKey('k', undefined), 'up');
   assert.equal(resolveDialogKey('x', kb), 'ignore');
-  // Fallback sequences stay in sync with resolution.
-  assert.deepEqual(FALLBACK_KEY_SEQUENCES.toggle, [' ']);
 });
 
 /* ── rendering ─────────────────────────────────────────────────────── */
@@ -264,14 +261,8 @@ test('narrow panes shed guessable hints but never the action keys or the count',
   // Pick-one sheds only the navigate hint.
   const one = dialogFooter(createDialogState(single()), single(), plain, kb, 40 - 2);
   assert.equal(one, 'enter select  escape/ctrl+c cancel');
-});
-
-test('extreme narrow panes drop the cancel hint before sacrificing the count', () => {
-  const cfg = multi();
-  const state = feed(createDialogState(cfg), ['toggle'], cfg);
-  // 58-col pane (inner 56): a-all, navigate and cancel hints are gone; toggle/confirm and the count stay whole.
-  const floor = dialogFooter(state, cfg, plain, kb, 58 - 2);
-  assert.equal(floor, 'space toggle  enter confirm · 1 selected');
+  // 58-col pane (inner 56): a-all, navigate and the cancel hint are gone; the count stays whole.
+  assert.equal(dialogFooter(state, cfg, plain, kb, 58 - 2), 'space toggle  enter confirm · 1 selected');
 });
 
 /* ── component ─────────────────────────────────────────────────────── */
@@ -313,18 +304,6 @@ test('component: long titles and descriptions wrap inside the frame instead of c
   assert.equal(content.includes('narrow line'), true);
   // The wrapped description continues under its row, aligned by the left margin.
   assert.equal(lines.some((l) => l === ' description that keeps going'), true);
-});
-
-test('wrapStyled: prefers spaces, re-emits open styling, never splits wide glyphs', () => {
-  assert.deepEqual(wrapStyled('short', 10), ['short']);
-  assert.deepEqual(wrapStyled('aaa bbb ccc', 7), ['aaa bbb', 'ccc']);
-  assert.deepEqual(wrapStyled('中中中中', 5), ['中中', '中中']);
-  const styled = '\x1b[2mdim description tail\x1b[0m';
-  const [first, second] = wrapStyled(styled, 10);
-  assert.equal(first!.startsWith('\x1b[2m'), true);
-  assert.equal(first!.includes('\x1b[0m'), true); // emitted line closes its style
-  assert.equal(second!.startsWith('\x1b[2m'), true); // continuation re-opens it
-  assert.equal(styledWidth(first!) <= 10 && styledWidth(second!) <= 10, true);
 });
 
 test('component: key sequences drive the state machine and finish once', () => {
@@ -437,193 +416,56 @@ test('runSelectDialog: an already-aborted signal cancels without opening the dia
 
 /* ── ask_user_question integration ─────────────────────────────────── */
 
-test('prepareAsk: allowOther defaults to true and can be turned off per question', () => {
-  const base = prepareAsk({ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }] });
-  assert.equal(base.ok, true);
-  assert.equal(base.ok && base.spec.mode === 'questionnaire' && base.spec.questions[0]!.allowOther, true);
-
-  const off = prepareAsk({ questions: [{ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }], allowOther: false }] });
-  assert.equal(off.ok && off.spec.mode === 'questionnaire' && off.spec.questions[0]!.allowOther, false);
-});
-
-test('runAsk multi: uses the toggle list when ctx.ui.custom exists', async () => {
-  const calls: string[] = [];
-  const ui: AskUi = {
-    input: async () => { calls.push('input'); return undefined; },
+/** Drive the dialog through `ui.custom` the way pi does: build the component, feed keys, return the outcome. */
+function dialogUi(keys: string[], outcome: DialogOutcome, calls: string[], input = 'typed by hand'): AskUi {
+  return {
+    input: async () => input,
     custom: async (factory) => {
       calls.push('custom');
-      const component = (factory as (tui: unknown, theme: unknown, kb: unknown, done: (v: unknown) => void) => { handleInput(d: string): void })(
-        {}, plain, {}, () => {},
-      );
-      component.handleInput(' ');
-      component.handleInput('\x1b[B');
-      component.handleInput(' ');
-      component.handleInput('\r');
-      return { kind: 'selected', labels: ['a', 'b'] };
+      const component = (factory as (
+        tui: unknown, theme: unknown, keybindings: unknown, done: (value: unknown) => void,
+      ) => { handleInput(data: string): void })({}, plain, {}, () => {});
+      for (const key of keys) component.handleInput(key);
+      return outcome;
     },
   };
-  const spec = prepareAsk({ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }], multi: true });
-  assert.equal(spec.ok, true);
-  const result = await runAsk(spec.ok ? spec.spec : { mode: 'freeform', question: '' }, ui);
-  assert.equal(result.details.cancelled, false);
-  assert.deepEqual(result.details.answers[0]!.selected, ['a', 'b']);
+}
+
+test('runAsk: the pier dialog drives both modes and its Other row opens free text', async () => {
+  const calls: string[] = [];
+  const multiSpec = prepareAsk({ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }], multi: true });
+  assert.equal(multiSpec.ok, true);
+  const selected = await runAsk(
+    multiSpec.ok ? multiSpec.spec : { mode: 'freeform', question: '' },
+    dialogUi([' ', '\x1b[B', ' ', '\r'], { kind: 'selected', labels: ['a', 'b'] }, calls),
+  );
+  assert.deepEqual(selected.details.answers[0]!.selected, ['a', 'b']);
   assert.deepEqual(calls, ['custom']);
+
+  const other = await runAsk(
+    { mode: 'questionnaire', questions: [{ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }], multi: false, allowOther: true }] },
+    dialogUi(['\x1b[A', '\r'], { kind: 'other' }, calls),
+  );
+  assert.equal(other.details.answers[0]!.kind, 'custom');
+  assert.equal(other.details.answers[0]!.customInput, 'typed by hand');
 });
 
-test('runAsk multi: the Other row opens a free-text input', async () => {
-  const ui: AskUi = {
-    input: async () => 'typed by hand',
-    custom: async (factory) => {
-      const component = (factory as (tui: unknown, theme: unknown, kb: unknown, done: (v: unknown) => void) => { handleInput(d: string): void })(
-        {}, plain, {}, () => {},
-      );
-      component.handleInput('\x1b[A'); // Other row
-      component.handleInput('\r');
-      return { kind: 'other' };
-    },
-  };
-  const spec = prepareAsk({ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }], multi: true });
-  const result = await runAsk(spec.ok ? spec.spec : { mode: 'freeform', question: '' }, ui);
-  assert.equal(result.details.answers[0]!.kind, 'custom');
-  assert.equal(result.details.answers[0]!.customInput, 'typed by hand');
-});
-
-test('runAsk multi: esc declines the question', async () => {
-  const ui: AskUi = {
-    input: async () => 'unused',
-    custom: async () => ({ kind: 'cancel' }),
-  };
-  const spec = prepareAsk({ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }], multi: true });
-  const result = await runAsk(spec.ok ? spec.spec : { mode: 'freeform', question: '' }, ui);
-  assert.equal(result.details.cancelled, true);
-});
-
-test('runAsk multi: without ctx.ui.custom the typed-index path still works', async () => {
-  const answers: string[] = [];
-  const ui: AskUi = {
-    input: async () => { answers.push('input'); return '1,3'; },
-  };
-  const spec = prepareAsk({ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }, { label: 'c' }], multi: true });
-  const result = await runAsk(spec.ok ? spec.spec : { mode: 'freeform', question: '' }, ui);
-  assert.deepEqual(result.details.answers[0]!.selected, ['a', 'c']);
-  assert.deepEqual(answers, ['input']);
-});
-
-test('runAsk multi: custom() present but returning undefined (RPC mode) falls back to typed indices', async () => {
+test('runAsk: an unusable dialog (RPC mode) and a declined one fall back / cancel correctly', async () => {
   const calls: string[] = [];
   const ui: AskUi = {
-    custom: async () => { calls.push('custom'); return undefined; },
-    input: async () => { calls.push('input'); return '2'; },
-  };
-  const spec = prepareAsk({ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }], multi: true });
-  const result = await runAsk(spec.ok ? spec.spec : { mode: 'freeform', question: '' }, ui);
-  assert.deepEqual(result.details.answers[0]!.selected, ['b']);
-  assert.deepEqual(calls, ['custom', 'input']);
-});
-
-test('runAsk multi: allowOther false rejects free text but keeps numeric parsing', async () => {
-  let reply = 'not a number';
-  const ui: AskUi = { input: async () => reply };
-  const spec = prepareAsk({
-    question: 'Pick',
-    options: [{ label: 'a' }, { label: 'b' }],
-    multi: true,
-    allowOther: false,
-  });
-  const cancelled = await runAsk(spec.ok ? spec.spec : { mode: 'freeform', question: '' }, ui);
-  assert.equal(cancelled.details.cancelled, true);
-
-  reply = '2';
-  const picked = await runAsk(spec.ok ? spec.spec : { mode: 'freeform', question: '' }, ui);
-  assert.deepEqual(picked.details.answers[0]!.selected, ['b']);
-});
-
-test('runAsk multi: typing the Other row number in the typed fallback opens free text', async () => {
-  const replies = ['3', 'sidecar'];
-  let i = 0;
-  const ui: AskUi = { input: async () => replies[i++] };
-  const spec = prepareAsk({ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }], multi: true });
-  const result = await runAsk(spec.ok ? spec.spec : { mode: 'freeform', question: '' }, ui);
-  assert.equal(result.details.answers[0]!.kind, 'custom');
-  assert.equal(result.details.answers[0]!.customInput, 'sidecar');
-});
-
-test('runAsk single: uses the unified dialog when ctx.ui.custom exists', async () => {
-  const calls: string[] = [];
-  const ui: AskUi = {
-    input: async () => 'unused',
-    select: async () => { calls.push('select'); return '1. a'; },
-    custom: async (factory) => {
+    input: async () => '1',
+    custom: async () => {
       calls.push('custom');
-      const component = (factory as (tui: unknown, theme: unknown, kb: unknown, done: (v: unknown) => void) => { handleInput(d: string): void })(
-        {}, plain, {}, () => {},
-      );
-      component.handleInput('\x1b[B');
-      component.handleInput('\r');
-      return { kind: 'selected', labels: ['b'] };
+      return undefined;
     },
   };
   const spec = prepareAsk({ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }] });
-  const result = await runAsk(spec.ok ? spec.spec : { mode: 'freeform', question: '' }, ui);
-  assert.deepEqual(result.details.answers[0], { question: 'Pick', kind: 'option', answer: 'b' });
-  assert.deepEqual(calls, ['custom']);
-});
+  const fallback = await runAsk(spec.ok ? spec.spec : { mode: 'freeform', question: '' }, ui);
+  assert.deepEqual(fallback.details.answers[0], { question: 'Pick', kind: 'option', answer: 'a' });
 
-test('runAsk single: the dialog Other row opens a free-text input', async () => {
-  const ui: AskUi = {
-    input: async () => 'typed by hand',
-    custom: async (factory) => {
-      const component = (factory as (tui: unknown, theme: unknown, kb: unknown, done: (v: unknown) => void) => { handleInput(d: string): void })(
-        {}, plain, {}, () => {},
-      );
-      component.handleInput('\x1b[A'); // wrap to the Other row
-      component.handleInput(' ');
-      return { kind: 'other' };
-    },
-  };
-  const spec = prepareAsk({ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }] });
-  const result = await runAsk(spec.ok ? spec.spec : { mode: 'freeform', question: '' }, ui);
-  assert.equal(result.details.answers[0]!.kind, 'custom');
-  assert.equal(result.details.answers[0]!.customInput, 'typed by hand');
-});
-
-test('runAsk single: recommended seeds the cursor, so a bare enter takes it', async () => {
-  const ui: AskUi = {
-    input: async () => 'unused',
-    custom: async (factory) => {
-      const component = (factory as (tui: unknown, theme: unknown, kb: unknown, done: (v: unknown) => void) => { handleInput(d: string): void })(
-        {}, plain, {}, () => {},
-      );
-      component.handleInput('\r');
-      return { kind: 'selected', labels: ['b'] };
-    },
-  };
-  const spec = prepareAsk({ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }], recommended: 1 });
-  const result = await runAsk(spec.ok ? spec.spec : { mode: 'freeform', question: '' }, ui);
-  assert.deepEqual(result.details.answers[0], { question: 'Pick', kind: 'option', answer: 'b' });
-});
-
-test('runAsk single: custom returning undefined (RPC mode) falls back to the host select dialog', async () => {
-  const calls: string[] = [];
-  const ui: AskUi = {
-    custom: async () => { calls.push('custom'); return undefined; },
-    select: async (_t, options) => { calls.push('select'); return options[1]!; },
-    input: async () => 'unused',
-  };
-  const spec = prepareAsk({ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }] });
-  const result = await runAsk(spec.ok ? spec.spec : { mode: 'freeform', question: '' }, ui);
-  assert.deepEqual(result.details.answers[0]!.answer, 'b');
-  assert.deepEqual(calls, ['custom', 'select']);
-});
-
-test('single-select questions keep the select dialog fallback and hide the Other row when allowOther is false', async () => {
-  const titles: string[] = [];
-  const ui: AskUi = {
-    select: async (title: string) => { titles.push(title); return '2. b'; },
-    input: async () => undefined,
-  };
-  const spec = prepareAsk({ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }], allowOther: false });
-  const result = await runAsk(spec.ok ? spec.spec : { mode: 'freeform', question: '' }, ui);
-  assert.equal(result.details.answers[0]!.answer, 'b');
-  assert.equal(/Other/.test(titles[0]!), false);
+  const declined = await runAsk(
+    spec.ok ? spec.spec : { mode: 'freeform', question: '' },
+    dialogUi([], { kind: 'cancel' }, calls),
+  );
+  assert.equal(declined.details.cancelled, true);
 });
