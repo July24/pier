@@ -64,32 +64,6 @@ test('isDiagnosticCommand: pins every alternation, separator and word boundary',
   }
 });
 
-test('formatReceiptText: newline-separated lines and a placeholder for unknown line numbers', () => {
-  const receipt = formatReceiptText({
-    command: 'npm test',
-    sourceHash: 'a'.repeat(64),
-    sourceBytes: 100,
-    sourceLines: 3,
-    sourceArtifactPath: '/tmp/artifact.txt',
-    model: 'test-model',
-    validated: {
-      status: 'failure',
-      uncertain: false,
-      evidence: [
-        { kind: 'fatal', line: undefined, quote: 'boom', quoteSha256: 'b'.repeat(64) },
-        { kind: 'failure', line: 7, quote: 'assert failed', quoteSha256: 'c'.repeat(64) },
-      ],
-    },
-  });
-  const lines = receipt.split('\n');
-  assert.equal(lines[0], REDUCER_RECEIPT_PREFIX);
-  assert.match(receipt, /- kind=fatal line=\? /);
-  assert.match(receipt, /- kind=failure line=7 /);
-  assert.match(receipt, /source_artifact=\/tmp\/artifact.txt/);
-  assert.match(receipt, /reducer_model=test-model/);
-  assert.ok(lines.every((l) => !l.includes('\r')), 'receipt stays LF-joined');
-});
-
 test('containsLikelySecret: detects credential-shaped values, ignores prose shapes', () => {
   assert.equal(containsLikelySecret('Authorization: Bearer secret_token_12345'), true);
   assert.equal(containsLikelySecret('const api_key = "sk-1234567890abcdef"'), true);
@@ -233,50 +207,49 @@ test('validateReceipt: enforces failure evidence when failure signals present', 
   assert.equal(res.reason, 'missing-failure-evidence');
 });
 
-test('formatReceiptText: generates receipt banner with source artifact path and readback info', () => {
+test('formatReceiptText: banner, per-evidence lines and the readback/authority footer', () => {
   const receipt = formatReceiptText({
     command: 'npm test',
-    sourceHash: 'abcdef1234567890',
+    sourceHash: 'a'.repeat(64),
     sourceBytes: 15000,
     sourceLines: 200,
-    sourceArtifactPath: '/tmp/session/objects/abcdef1234567890.txt',
-    model: 'cliproxy/gemini-3.8-flash-high',
+    sourceArtifactPath: '/tmp/session/objects/a.txt',
+    model: 'gemini-3.8-flash-high',
     totalTokens: 520,
     validated: {
       status: 'failure',
       uncertain: false,
       evidence: [
-        {
-          kind: 'failure',
-          line: 42,
-          quote: 'AssertionError: expected 1 to equal 2',
-          quoteSha256: 'quote1234',
-        },
+        { kind: 'fatal', line: undefined, quote: 'boom', quoteSha256: 'b'.repeat(64) },
+        { kind: 'failure', line: 42, quote: 'AssertionError: expected 1 to equal 2', quoteSha256: 'c'.repeat(64) },
       ],
     },
   });
 
-  assert.ok(receipt.includes(REDUCER_RECEIPT_PREFIX));
-  assert.ok(receipt.includes('source_artifact=/tmp/session/objects/abcdef1234567890.txt'));
-  assert.ok(receipt.includes('readback=use bash with explicit range'));
-  assert.ok(receipt.includes('reducer_model=cliproxy/gemini-3.8-flash-high'));
-  // The receipt is evidence, not a verdict: the model must keep adjudicating (see authority=).
-  assert.ok(receipt.includes('authority=this receipt is verified evidence only'));
-  assert.ok(receipt.includes('pass/fail adjudication'));
-  // provider is optional: omitted when the model registry did not supply it.
+  const lines = receipt.split('\n');
+  assert.equal(lines[0], REDUCER_RECEIPT_PREFIX);
+  assert.ok(lines.every((line) => !line.includes('\r')), 'receipt stays LF-joined');
+  assert.match(receipt, /- kind=fatal line=\? /, 'an unknown line number renders as ?');
+  assert.match(receipt, /- kind=failure line=42 /);
+  assert.match(receipt, /source_artifact=\/tmp\/session\/objects\/a\.txt/);
+  assert.match(receipt, /reducer_model=gemini-3\.8-flash-high/);
+  assert.match(receipt, /readback=use bash with explicit range on \/tmp\/session\/objects\/a\.txt/);
+  // The receipt is evidence, not a verdict: the model must keep adjudicating.
+  assert.match(receipt, /authority=this receipt is verified evidence only.*pass\/fail adjudication/);
+  // A known provider is recorded for cost attribution; an unknown one is omitted, not faked.
   assert.equal(receipt.includes('reducer_provider='), false);
-  assert.ok(
+  assert.match(
     formatReceiptText({
       command: 'npm test',
-      sourceHash: 'abcdef1234567890',
+      sourceHash: 'a'.repeat(64),
       sourceBytes: 15000,
       sourceLines: 200,
-      sourceArtifactPath: '/tmp/session/objects/abcdef1234567890.txt',
+      sourceArtifactPath: '/tmp/session/objects/a.txt',
       model: 'gemini-3.8-flash-high',
       provider: 'cliproxy',
       validated: { status: 'success', uncertain: false, evidence: [] },
-    }).includes('reducer_provider=cliproxy'),
-    'a known provider must be recorded for cost attribution',
+    }),
+    /reducer_provider=cliproxy/,
   );
 });
 

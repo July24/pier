@@ -1,10 +1,7 @@
 /**
- * D102 Evidence-Preserving Reducer Core.
- *
- * Pure algorithmic functions for diagnostic command recognition, secret filtering,
- * receipt schema checking, and byte-for-byte quote verification.
- *
- * No I/O in this core; storage I/O lives in efficiency-store.ts.
+ * D102 Evidence-Preserving Reducer core: diagnostic-command recognition, secret filtering, receipt
+ * schema checking and byte-for-byte quote verification. Pure — storage I/O lives in
+ * efficiency-store.ts.
  */
 
 import { createHash } from 'node:crypto';
@@ -12,8 +9,8 @@ import { createHash } from 'node:crypto';
 export const REDUCER_RECEIPT_SCHEMA = 'sol-pi-evidence-receipt/1' as const;
 export const REDUCER_RECEIPT_PREFIX = 'sol_pi_evidence_receipt_v1' as const;
 
-export const MAX_EVIDENCE_ITEMS = 12;
-export const MAX_QUOTE_CHARS = 600;
+const MAX_EVIDENCE_ITEMS = 12;
+const MAX_QUOTE_CHARS = 600;
 
 export const DEFAULT_MIN_BYTES = 4096;
 export const DEFAULT_MAX_CHARS = 600_000;
@@ -21,10 +18,9 @@ export const DEFAULT_MAX_OUTPUT_TOKENS = 2048;
 export const DEFAULT_TIMEOUT_MS = 5000;
 
 /**
- * Diagnostic (test/build) command gate for EPR.
- * Boundaries accept any shell separator on both sides so that subshells and chains such as
- * `(npm test)`, `npm test&&echo ok` or `pytest;` are still recognized; a word character
- * after the keyword (`makefile`, `coqtop`, `npm run test`) must NOT match.
+ * Diagnostic (test/build) command gate for EPR. Any shell separator is accepted on either side so
+ * subshells and chains (`(npm test)`, `npm test&&echo ok`, `pytest;`) still match, while a word
+ * character after the keyword (`makefile`, `coqtop`, `npm run test`) must not.
  */
 export const DIAGNOSTIC_COMMAND =
   /(?:^|[;&|()\s])(?:lake\s+build|lake\s+env\s+lean|lean|coq|cargo(?:\s+(?:build|test|check))?|zig\s+build|pytest|python(?:3)?\s+-m\s+(?:pytest|unittest|py_compile)|ctest|cmake\s+--build|ninja|make|npm\s+test|pnpm\s+test|yarn\s+test|go\s+test|bazel\s+test|node\s+--test|npx\s+tsx\s+--test|vitest|jest|mvn|mvnw|gradle|gradlew)(?:[;&|()\s]|$)/i;
@@ -33,14 +29,11 @@ export const FAILURE_SIGNAL =
   /error|failed|failure|fatal|exception|panic|timeout|unsolved|type mismatch|assert/i;
 
 /**
- * Credential heuristics for the EPR fail-open gate.
- *
- * Precision comes from the VALUE shape, not the keyword: after the separator the
- * text must contain a token-looking run — a known credential prefix (sk-, ghp_,
- * github_pat_, xox*, AKIA, eyJ) or >= 15 contiguous token characters containing
- * a digit. Keywords alone matched test names (`containsLikelySecret: detects …`),
- * JSON keys (`"Authorization":[]`), URL paths and function calls, which blocked
- * pier's own `npm test` output 7/7 times during the 2026-09-17 trial.
+ * Credential heuristics for the EPR fail-open gate. Precision comes from the VALUE shape, not the
+ * keyword: after the separator the text must carry a token-looking run — a known credential prefix
+ * (sk-, ghp_, github_pat_, xox*, AKIA, eyJ) or >= 15 contiguous token characters with a digit.
+ * Keywords alone matched test names, JSON keys (`"Authorization":[]`), URL paths and function
+ * calls, which blocked pier's own `npm test` output on every trial run.
  */
 export const LIKELY_SECRET =
   /(?:api[_-]?key|api[_-]?secret|access[_-]?token|refresh[_-]?token|secret[_-]?key|client[_-]?secret|authorization|bearer|password|passwd|secret)[^\n]{0,40}[=:][\s"']*(?:bearer\s+|basic\s+)?[\s"']*(?:(?:sk-|ghp_|github_pat_|xox[baprs]-|AKIA|eyJ)[A-Za-z0-9_-]{10,}|(?=[A-Za-z0-9_\-.+~]*[0-9])[A-Za-z0-9_\-.+~]{15,})/i;
@@ -73,16 +66,13 @@ export function isDiagnosticCommand(command: string): boolean {
 }
 
 /**
- * Recover the untruncated-log path from Pi's inline truncation notice.
+ * Recover the untruncated-log path from Pi's inline truncation notice —
+ * `[Output truncated. Full output: /tmp/pi-bash-abc.log]`,
+ * `[Showing lines 1-2000 of 5000. Full output: …]`,
+ * `[Showing last 50KB of line 12 (line is 80KB). Full output: …]`.
  *
- * Pi appends one of these to a large bash tool result:
- *   `[Output truncated. Full output: /tmp/pi-bash-abc.log]`
- *   `[Showing lines 1-2000 of 5000. Full output: /tmp/pi-bash-abc.log]`
- *   `[Showing last 50KB of line 12 (line is 80KB). Full output: /tmp/pi-bash-abc.log]`
- *
- * `details.fullOutputPath` carries the same value, but a replayed or re-shaped event can keep
- * only the text. Recovering the path there lets the receipt be verified against the exact bytes
- * the command produced instead of a truncated preview.
+ * `details.fullOutputPath` carries the same value, but a replayed or re-shaped event can keep only
+ * the text, and verifying a receipt against a truncated preview would be wrong.
  *
  * The returned path is NOT trusted: callers must still gate it (see `readBashFullOutput`, which
  * requires a `pi-bash-*.log` basename resolving to a regular non-symlink file inside tmpdir).
@@ -103,10 +93,9 @@ export function containsLikelySecret(text: string): boolean {
 }
 
 /**
- * First matched credential-shaped snippet for reducer.jsonl fallback rows, with
- * the VALUE masked to its length — the keyword and separator are not secret and
- * identify the false-positive shape (test name vs JSON key vs real credential);
- * the value never enters telemetry (contract pinned by reducer-integration test).
+ * First matched credential-shaped snippet for reducer.jsonl fallback rows, with the VALUE masked to
+ * its length: the keyword and separator identify the false-positive shape (test name vs JSON key vs
+ * real credential) while the value never enters telemetry.
  */
 export function extractLikelySecretMatch(text: string): string | undefined {
   const match = LIKELY_SECRET.exec(text);
@@ -121,21 +110,20 @@ export function extractLikelySecretMatch(text: string): string | undefined {
 }
 
 /**
- * Reducer models frequently wrap their JSON in a Markdown fence even when told
- * not to; strip it before parsing (2026-09-17 trial: 3/8 workbench attempts
- * failed as invalid-json, same command as successes).
+ * Reducer models frequently wrap their JSON in a Markdown fence even when told not to; strip it
+ * before parsing (3/8 trial attempts failed as invalid-json for the same command that succeeded).
  */
-export function stripReceiptJsonFences(raw: string): string {
+function stripReceiptJsonFences(raw: string): string {
   const trimmed = raw.trim();
   const fenced = /^```[a-zA-Z0-9_-]*\s*\n([\s\S]*?)\n?```$/.exec(trimmed);
   return fenced?.[1]?.trim() ?? trimmed;
 }
 
-export function isRecord(v: unknown): v is Record<string, unknown> {
+function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-export function lineNumberOf(body: string, quote: string): number | undefined {
+function lineNumberOf(body: string, quote: string): number | undefined {
   const index = body.indexOf(quote);
   if (index < 0) return undefined;
   let line = 1;
@@ -312,12 +300,10 @@ export function formatReceiptText(opts: {
 /**
  * Usage shapes accepted from / returned to pi.
  *
- * pi persists a tool result's `usage` into the session and renders it in the footer through
- * `addUsageToTotals`, which reads `usage.cost.total` WITHOUT a guard. Returning a partial object
- * (for example only `{ input, output, totalTokens }`) therefore crashes the whole pi process with
- * "TypeError: Cannot read properties of undefined (reading 'total')" — observed 2026-09-13 in a
- * subagent pane (stack: FooterComponent.render -> addUsageToTotals). pi's own definition lives in
- * docs/session-format.md; always emit the complete `UsageTotals` below.
+ * pi persists a tool result's `usage` and renders it through `addUsageToTotals`, which reads
+ * `usage.cost.total` WITHOUT a guard, so a partial object (say only `{ input, output, totalTokens }`)
+ * crashes the whole pi process with "TypeError: Cannot read properties of undefined (reading
+ * 'total')". Always emit the complete `UsageTotals` below; see docs/session-format.md.
  */
 export interface UsageLike {
   input?: number;

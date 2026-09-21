@@ -1,15 +1,11 @@
 /**
- * D102 Evidence-Preserving Reducer Invoker & Tool Result Handler.
+ * D102 Evidence-Preserving Reducer invoker: intercepts `bash` diagnostic tool results and replaces
+ * the log block with a verified receipt.
  *
- * Implements:
- *  - Interception of diagnostic command tool results from `bash`.
- *  - Full untruncated output retrieval from Pi temporary files.
- *  - P0 content-addressed archival of original source log before replacement.
- *  - Secret pattern detection and project trust verification (security boundaries).
- *  - Fast in-process model invocation with timeout protection (default 5s).
- *  - Zero-tolerance byte-for-byte quotation validation against original source.
- *  - Block-level content replacement (preserves write-lock warnings).
- *  - Fail-open resilience: errors or validation failures transparently fallback to full text.
+ * Fail-open throughout — every stage that cannot be satisfied (untrusted project, size, credential
+ * shape, failed archive, model error, unverifiable quote, no size win) returns undefined and the
+ * original text reaches the model unchanged. The swap happens only after a receipt validates
+ * byte-for-byte against a source that was archived first.
  */
 
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
@@ -67,24 +63,45 @@ export interface ReducerInvocationResult {
   usage?: UsageTotals;
 }
 
+/** The subset of pi's AssistantMessage the reducer reads. */
+type ReducerModelOutput = {
+  content?: readonly unknown[];
+  text?: unknown;
+  usage?: UsageLike;
+};
+
+/** A resolved reducer target: pi's model handle plus the telemetry label for it. */
+type ReducerModel = NonNullable<ExtensionContext['model']>;
+
+/** The reduction candidate: the log block, where the full log lives, and the size limits it must clear. */
+interface ReducerCandidate {
+  command: string;
+  block: { type: string; text?: string; [k: string]: unknown };
+  text: string;
+  fullOutputPath?: string;
+  fullOutputSource: 'details' | 'notice' | 'none';
+  isTruncated: boolean;
+  minBytes: number;
+  maxChars: number;
+}
+
+type ReducerLog = (record: Record<string, unknown>) => Promise<void>;
+
 let untrustedWarningEmitted = false;
 
-export async function handleReducerToolResult(
+/**
+ * Steps 1–5. The trust boundary sits BEFORE the jev gate: an untrusted project must not send commands
+ * to a third-party API even with user-level EPR on, and a refusing host must not be second-guessed.
+ */
+function resolveCandidate(
   event: ToolResultEventLike,
   ctx: ExtensionContext,
   config: EvidencePreservingReducerConfig,
-  opts?: { epoch?: number; jev?: JevEprGateDependency },
-): Promise<ReducerInvocationResult | undefined> {
-  if (!config.enabled) return undefined;
-  const epoch = opts?.epoch ?? 0;
-
-  // 1. Candidate command & tool gate: strictly bash only
+): ReducerCandidate | undefined {
   if (event.toolName !== 'bash') return undefined;
   const command = typeof event.input?.command === 'string' ? event.input.command.trim() : '';
   if (!command) return undefined;
-  // 1.5 Project trust boundary — BEFORE the jev gate: an untrusted project must
-  // not send commands to a third-party API even when user-level EPR is on;
-  // the host mechanism refuses here, so its second opinion must not fire either.
+
   const isTrusted =
     typeof (ctx as { isProjectTrusted?: () => boolean }).isProjectTrusted === 'function'
       ? (ctx as { isProjectTrusted: () => boolean }).isProjectTrusted()
@@ -97,266 +114,275 @@ export async function handleReducerToolResult(
     return undefined;
   }
 
-  // 3. Find primary log text block
-  const logBlock = event.content.find((b) => b && b.type === 'text' && typeof b.text === 'string');
-  if (!logBlock || typeof logBlock.text !== 'string') return undefined;
+  const block = event.content.find((b) => b && b.type === 'text' && typeof b.text === 'string');
+  if (!block || typeof block.text !== 'string') return undefined;
+  const text = block.text;
 
-  // 4. Truncation metadata (the full-text retrieval itself waits behind the gate)
-  const maxChars = config.maxChars ?? DEFAULT_MAX_CHARS;
   const minBytes = config.minBytes ?? DEFAULT_MIN_BYTES;
+  const maxChars = config.maxChars ?? DEFAULT_MAX_CHARS;
   const detailPath = typeof event.details?.fullOutputPath === 'string' ? event.details.fullOutputPath : undefined;
-  // Pi repeats the path inside the truncation notice that ships with the result text; a replayed
-  // or re-shaped event can keep only that text, and reducing the preview would lose the evidence.
-  const noticePath = fullOutputPathFromNotice(logBlock.text);
-  const fullOutputPath = detailPath ?? noticePath;
-  const fullOutputSource = detailPath ? 'details' : noticePath ? 'notice' : 'none';
+  // Pi repeats the path inside the truncation notice that ships with the result text; a replayed or
+  // re-shaped event can keep only that text, and reducing the preview would lose the evidence.
+  const noticePath = fullOutputPathFromNotice(text);
   const isTruncated =
     (event.details?.truncation as { truncated?: boolean } | undefined)?.truncated === true;
 
-  const sessionDir = ctx.sessionManager?.getSessionDir?.();
-  const sessionId = ctx.sessionManager?.getSessionId?.();
-  const sessionRoot = resolveSessionRoot(sessionDir, sessionId);
-  if (!sessionRoot) return undefined;
-
-  // 5. Cheap reducibility precondition: a truncated output is presumed large
-  //    (that is why pi truncated it); anything else must clear minBytes/maxChars
-  //    on the preview text, which for non-truncated results IS the full body.
-  //    Commands below this line never pay for the gate call or the full read.
-  if (!isTruncated && (Buffer.byteLength(logBlock.text, 'utf8') < minBytes || logBlock.text.length > maxChars)) {
+  // Cheap reducibility precondition: a truncated output is presumed large (that is why pi truncated
+  // it); anything else must clear minBytes/maxChars on the preview, which for non-truncated results
+  // IS the full body. Commands below this line never pay for the gate call or the full read.
+  if (!isTruncated && (Buffer.byteLength(text, 'utf8') < minBytes || text.length > maxChars)) {
     return undefined;
   }
 
-  // 6. Diagnostic-command gate — jev first (2026-09-19 flip, RFC §3 P0-1):
-  //    every reduction candidate is classified by jev; the regex list only
-  //    decides when jev is absent, fails, or answers below the confidence
-  //    gate. A confident jev rejection is authoritative even for commands the
-  //    regex list would have matched.
-  const gate = opts?.jev;
+  const fullOutputPath = detailPath ?? noticePath;
+  return {
+    command,
+    block,
+    text,
+    ...(fullOutputPath ? { fullOutputPath } : {}),
+    fullOutputSource: detailPath ? 'details' : noticePath ? 'notice' : 'none',
+    isTruncated,
+    minBytes,
+    maxChars,
+  };
+}
+
+/**
+ * Step 6, jev first (RFC §3 P0-1): every candidate is classified by jev, and the regex list decides
+ * only when jev is absent, fails or answers below the confidence gate. A confident jev rejection is
+ * authoritative even for regex-listed commands; credential-shaped command lines stay local and are
+ * judged by the regex list alone.
+ */
+async function isDiagnosticCandidate(
+  command: string,
+  gate: JevEprGateDependency | undefined,
+  sessionId: string | undefined,
+): Promise<boolean> {
   const regexHit = isDiagnosticCommand(command);
-  let diagnostic: boolean;
-  if (gate && !containsLikelySecret(command)) {
-    // Credential-shaped command lines never leave the process (privacy
-    // boundary, docs/efficiency-trial.md §8): the regex list decides alone.
-    const result = await gate.ask(diagnosticGateRequest(command), {
-      questionId: 'epr-diagnostic-gate',
-      timeoutMs: 1500, // measured: cold TLS handshake hit 1002ms and timed out at 1s (e2e 2026-09-18); warm calls run 250-770ms
-      sessionId,
-      // regex_hit makes the flip's regression surface observable: how often
-      // and in which direction jev overrides the regex list (jev.jsonl).
-      extra: { site: 'epr-gate', commandSha256: sha256Hex(command), regexHit },
-      enrich: ({ answers }) => {
-        if (!answers) return {};
-        const verdict = evaluateDiagnosticGate(answers, gate.getMinConfidence());
-        return { verdict: verdict.hit ? 'hit' : verdict.reason, choice: verdict.choice, noul: verdict.noul, confidence: verdict.confidence };
-      },
+  if (!gate || containsLikelySecret(command)) return regexHit;
+  const result = await gate.ask(diagnosticGateRequest(command), {
+    questionId: 'epr-diagnostic-gate',
+    timeoutMs: 1500, // cold TLS handshake hit 1002ms and timed out at 1s, warm calls run 250-770ms
+    sessionId,
+    // regex_hit makes the flip's regression surface observable: how often and in which direction
+    // jev overrides the regex list (jev.jsonl).
+    extra: { site: 'epr-gate', commandSha256: sha256Hex(command), regexHit },
+    enrich: ({ answers }) => {
+      if (!answers) return {};
+      const verdict = evaluateDiagnosticGate(answers, gate.getMinConfidence());
+      return {
+        verdict: verdict.hit ? 'hit' : verdict.reason,
+        choice: verdict.choice,
+        noul: verdict.noul,
+        confidence: verdict.confidence,
+      };
+    },
+  });
+  if (!result.ok) return regexHit; // jev failed — regex fallback
+  const verdict = evaluateDiagnosticGate(result.answers, gate.getMinConfidence());
+  if (verdict.hit) return true;
+  return isDiagnosticGateUnanswered(verdict) ? regexHit : false;
+}
+
+/**
+ * Step 7: the untruncated source. Both failure modes write the same `truncated-source` evidence row,
+ * which lands only for candidates that got here — gate-rejected commands never read a file.
+ */
+async function readSource(
+  candidate: ReducerCandidate,
+  config: EvidencePreservingReducerConfig,
+  log: ReducerLog,
+): Promise<string | null> {
+  const truncatedRow = (): Promise<void> =>
+    log({
+      model: config.model ?? 'default',
+      verificationOk: false,
+      reason: 'truncated-source',
+      action: 'fallback_full_text',
+      fullOutputSource: candidate.fullOutputSource,
     });
-    if (result.ok) {
-      const verdict = evaluateDiagnosticGate(result.answers, gate.getMinConfidence());
-      if (verdict.hit) {
-        diagnostic = true;
-      } else if (isDiagnosticGateUnanswered(verdict)) {
-        // jev never produced a usable answer — the regex list decides.
-        diagnostic = regexHit;
-      } else {
-        // Confident rejection is authoritative (flip): even a regex-listed
-        // command is not reduced when jev says it is not diagnostic.
-        return undefined;
-      }
-    } else {
-      diagnostic = regexHit; // jev failed — regex fallback
-    }
-  } else {
-    // jev off, or a credential-shaped command line kept local.
-    diagnostic = regexHit;
+
+  if (candidate.isTruncated && !candidate.fullOutputPath) {
+    await truncatedRow();
+    return null; // Truncated with no recoverable full log: fail open rather than reduce the preview.
   }
-  if (!diagnostic) return undefined;
-
-  // 7. Full untruncated source retrieval — candidates only. The fail-open
-  //    evidence rows (truncated-source / likely-secret) therefore land
-  //    exclusively for commands that actually reached the reduction path —
-  //    including "regex-missed + jev-hit", the flip's core win — and
-  //    non-candidates never read the file at all.
-  if (isTruncated && !fullOutputPath) {
-    if (config.logEnabled) {
-      await logReducerAttempt(sessionRoot, sessionId ?? 'unknown', epoch, {
-        commandSha256: sha256Hex(command),
-        model: config.model ?? 'default',
-        verificationOk: false,
-        reason: 'truncated-source',
-        action: 'fallback_full_text',
-        fullOutputSource,
-      });
-    }
-    return undefined;
+  if (!candidate.fullOutputPath) return candidate.text;
+  const full = await readBashFullOutput(candidate.fullOutputPath, candidate.maxChars);
+  if (!full) {
+    await truncatedRow();
+    return null;
   }
+  return full.content;
+}
 
-  let body = logBlock.text;
-  if (fullOutputPath) {
-    const full = await readBashFullOutput(fullOutputPath, maxChars);
-    if (!full) {
-      if (config.logEnabled) {
-        await logReducerAttempt(sessionRoot, sessionId ?? 'unknown', epoch, {
-          commandSha256: sha256Hex(command),
-          model: config.model ?? 'default',
-          verificationOk: false,
-          reason: 'truncated-source',
-          action: 'fallback_full_text',
-          fullOutputSource,
-        });
-      }
-      // Log was truncated but full file could not be read safely -> fallback to avoid hallucinated receipts
-      return undefined;
-    }
-    body = full.content;
-  }
-
-  // 8. Size gates on the resolved body (a truncated output's true size is only known here)
-  const sourceBytes = Buffer.byteLength(body, 'utf8');
-  if (sourceBytes < minBytes || body.length > maxChars) return undefined;
-
-  // 9. Secret detection check
-  if (containsLikelySecret(body)) {
-    if (config.logEnabled) {
-      await logReducerAttempt(sessionRoot, sessionId ?? 'unknown', epoch, {
-        commandSha256: sha256Hex(command),
-        sourceBytes,
-        model: config.model ?? 'default',
-        verificationOk: false,
-        reason: 'likely-secret',
-        action: 'fallback_full_text',
-        // Which shape tripped the gate — the 2026-09-17 trial had 10 fallbacks
-        // with zero evidence of what matched (test names vs real credentials).
-        secretSnippet: extractLikelySecretMatch(body),
-      });
-    }
-    return undefined; // Fail-open on sensitive data
-  }
-
-  const sourceHash = sha256Hex(body);
-  const sourceLines = countLines(body);
-  const archivePath = reducerObjectPath(sessionRoot, sourceHash);
-
-  // 7. P0: Mandatory source archive before any receipt modification
+/** Steps 7/P0: the source archive is mandatory before any modification; a failed write fails open. */
+async function archiveSource(sessionRoot: string, body: string): Promise<string | null> {
+  const path = reducerObjectPath(sessionRoot, sha256Hex(body));
   try {
-    await storeContentAddressedObject(archivePath, body);
+    await storeContentAddressedObject(path, body);
   } catch {
-    return undefined; // Fail-open if storage fails
+    return null;
   }
+  return path;
+}
 
-  // If localOnly mode, archival is complete; leave content unmodified
-  if (config.localOnly) return undefined;
-  // 8. Resolve model: configured cheap reducer first, session model as fallback
-  //    (2026-09-17: user directive — gemini-3.8-flash-high stays the reducer;
-  //    unavailability must degrade to the session model, not skip reduction).
-  let targetModel: any = undefined;
-  let reducerModelSource: 'configured' | 'session-fallback' = 'configured';
+/** Step 8: the configured cheap reducer first, the session model as fallback. */
+function resolveReducerModel(
+  ctx: ExtensionContext,
+  config: EvidencePreservingReducerConfig,
+): { model: ReducerModel; label: string; source: 'configured' | 'session-fallback' } | undefined {
+  let model: ReducerModel | undefined;
   if (config.model && typeof config.model === 'string' && config.model.includes('/')) {
     const [provider, ...rest] = config.model.split('/');
-    const modelId = rest.join('/');
     try {
-      targetModel = ctx.modelRegistry?.find?.(provider, modelId);
+      model = ctx.modelRegistry?.find?.(provider, rest.join('/'));
     } catch {
-      targetModel = undefined;
+      model = undefined;
     }
   }
-  if (!targetModel) {
-    targetModel = ctx.model;
-    reducerModelSource = 'session-fallback';
-  }
-  if (!targetModel || typeof ctx.modelRegistry?.complete !== 'function') {
-    return undefined;
-  }
-  // Unified provider/id label: the 2026-09-17 logs split one session into
-  // "cliproxy/gemini-3.8-flash-high" (fallback rows) and "gemini-3.8-flash-high"
-  // (applied rows), fragmenting per-model grouping.
-  const reducerModelLabel =
-    typeof targetModel.provider === 'string' && typeof targetModel.id === 'string'
-      ? `${targetModel.provider}/${targetModel.id}`
-      : (config.model ?? 'unknown');
+  const source = model ? 'configured' : 'session-fallback';
+  if (!model) model = ctx.model;
+  if (!model || typeof ctx.modelRegistry?.complete !== 'function') return undefined;
+  // Unified provider/id label: split labels fragmented per-model grouping in the 2026-09-17 logs.
+  const label =
+    model.provider && model.id ? `${model.provider}/${model.id}` : (config.model ?? 'unknown');
+  return { model, label, source };
+}
 
-  // 9. Invoke model in-process with timeout
-  const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const timeoutSignal = AbortSignal.timeout(timeoutMs);
-  const signal =
-    ctx.signal && typeof (AbortSignal as any).any === 'function'
-      ? (AbortSignal as any).any([ctx.signal, timeoutSignal])
-      : timeoutSignal;
-
-  const promptInput = reducerInputPrompt({
-    command,
-    isError: event.isError,
-    sourceHash,
-    sourceBytes,
-    sourceLines,
-    body,
-  });
-
+/**
+ * Step 9: in-process model call under a total-latency budget, through pi's own completion so the
+ * reducer runs on the session's provider auth. Failure text is returned for telemetry.
+ */
+async function invokeReducer(
+  ctx: ExtensionContext,
+  config: EvidencePreservingReducerConfig,
+  model: ReducerModel,
+  promptInput: string,
+): Promise<{ output: ReducerModelOutput; durationMs: number } | { error: string; durationMs: number }> {
+  const timeoutSignal = AbortSignal.timeout(config.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const signal = ctx.signal ? AbortSignal.any([ctx.signal, timeoutSignal]) : timeoutSignal;
   const startMs = Date.now();
-  let modelResult: any;
   try {
-    modelResult = await ctx.modelRegistry.complete(
-      targetModel,
+    const output: ReducerModelOutput = await ctx.modelRegistry.complete(
+      model,
       {
         systemPrompt: reducerInstructions(),
         messages: [{ role: 'user', content: [{ type: 'text', text: promptInput }], timestamp: Date.now() }],
       },
-      {
-        maxTokens: config.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
-        cacheRetention: 'none',
-        signal,
-      },
+      { maxTokens: config.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS, cacheRetention: 'none', signal },
     );
+    return { output, durationMs: Date.now() - startMs };
   } catch (err) {
-    // Fail-open, but no longer silent: the 2026-09-17 trial lost 3+ attempts
-    // (timeout / provider error) with no jsonl trace at all.
-    if (config.logEnabled) {
-      await logReducerAttempt(sessionRoot, sessionId ?? 'unknown', epoch, {
-        commandSha256: sha256Hex(command),
-        sourceBytes,
-        model: reducerModelLabel,
-        reducerModelSource,
-        verificationOk: false,
-        reason: 'invoke-failed',
-        action: 'fallback_full_text',
-        error: err instanceof Error ? err.message : String(err),
-        durationMs: Date.now() - startMs,
-      });
-    }
-    return undefined; // Fail-open on timeout or provider error
+    return { error: err instanceof Error ? err.message : String(err), durationMs: Date.now() - startMs };
   }
+}
 
-  const modelOutput = Array.isArray(modelResult?.content)
-    ? modelResult.content.map((b: any) => (typeof b.text === 'string' ? b.text : '')).join('')
-    : typeof modelResult?.text === 'string'
-      ? modelResult.text
-      : '';
+export async function handleReducerToolResult(
+  event: ToolResultEventLike,
+  ctx: ExtensionContext,
+  config: EvidencePreservingReducerConfig,
+  opts?: { epoch?: number; jev?: JevEprGateDependency },
+): Promise<ReducerInvocationResult | undefined> {
+  if (!config.enabled) return undefined;
+  const epoch = opts?.epoch ?? 0;
 
-  if (!modelOutput.trim()) return undefined;
+  const candidate = resolveCandidate(event, ctx, config);
+  if (!candidate) return undefined;
+  const { command, block, minBytes, maxChars } = candidate;
 
-  // 10. Strict byte-for-byte quotation validation
-  const validated = validateReceipt(modelOutput, sourceHash, body, event.isError);
-  if (!validated.ok) {
-    if (config.logEnabled) {
-      const failReason = validated.reason;
-      await logReducerAttempt(sessionRoot, sessionId ?? 'unknown', epoch, {
-        commandSha256: sha256Hex(command),
-        sourceBytes,
-        model: reducerModelLabel,
-        reducerModelSource,
-        verificationOk: false,
-        reason: failReason,
-        action: 'fallback_full_text',
-        // invalid-json rows carried no evidence of what the model actually
-        // returned (fences? truncation? prose?) — keep a sanitized head.
-        ...(failReason === 'invalid-json' ? { rawOutputHead: JSON.stringify(modelOutput.slice(0, 200)) } : {}),
-        durationMs: Date.now() - startMs,
-      });
-    }
+  const sessionId = ctx.sessionManager?.getSessionId?.();
+  const sessionRoot = resolveSessionRoot(ctx.sessionManager?.getSessionDir?.(), sessionId);
+  if (!sessionRoot) return undefined;
+
+  if (!(await isDiagnosticCandidate(command, opts?.jev, sessionId))) return undefined;
+
+  const log: ReducerLog = async (record) => {
+    if (!config.logEnabled) return;
+    await logReducerAttempt(sessionRoot, sessionId ?? 'unknown', epoch, {
+      commandSha256: sha256Hex(command),
+      ...record,
+    });
+  };
+
+  const body = await readSource(candidate, config, log);
+  if (body === null) return undefined;
+
+  // Step 8: size gates on the resolved body (a truncated output's true size is only known here).
+  const sourceBytes = Buffer.byteLength(body, 'utf8');
+  if (sourceBytes < minBytes || body.length > maxChars) return undefined;
+
+  // Step 9: credential heuristic. `secretSnippet` names the shape that tripped the gate — the
+  // 2026-09-17 trial had 10 fallbacks with no evidence of what matched (test names vs real secrets).
+  if (containsLikelySecret(body)) {
+    await log({
+      sourceBytes,
+      model: config.model ?? 'default',
+      verificationOk: false,
+      reason: 'likely-secret',
+      action: 'fallback_full_text',
+      secretSnippet: extractLikelySecretMatch(body),
+    });
     return undefined;
   }
 
-  const modelName = targetModel.id ?? config.model ?? 'default';
-  const providerName = typeof targetModel.provider === 'string' ? targetModel.provider : undefined;
+  const sourceHash = sha256Hex(body);
+  const sourceLines = countLines(body);
+  const archivePath = await archiveSource(sessionRoot, body);
+  if (archivePath === null) return undefined;
+  if (config.localOnly) return undefined; // Archival is the whole job in local-only mode.
+
+  const reducer = resolveReducerModel(ctx, config);
+  if (!reducer) return undefined;
+  /** Evidence row for a fail-open exit taken after the reducer model was resolved. */
+  const fallbackRow = (reason: string, durationMs: number, extra: Record<string, unknown> = {}): Promise<void> =>
+    log({
+      sourceBytes,
+      model: reducer.label,
+      reducerModelSource: reducer.source,
+      verificationOk: false,
+      reason,
+      action: 'fallback_full_text',
+      durationMs,
+      ...extra,
+    });
+
+  const invocation = await invokeReducer(
+    ctx,
+    config,
+    reducer.model,
+    reducerInputPrompt({ command, isError: event.isError, sourceHash, sourceBytes, sourceLines, body }),
+  );
+  if ('error' in invocation) {
+    // Fail-open, but not silent: earlier trials lost attempts with no jsonl trace at all.
+    await fallbackRow('invoke-failed', invocation.durationMs, { error: invocation.error });
+    return undefined;
+  }
+  const { output, durationMs } = invocation;
+
+  const blocks: readonly unknown[] | undefined = Array.isArray(output.content) ? output.content : undefined;
+  const modelOutput = blocks
+    ? blocks
+        .map((block) => {
+          const text = (block as { text?: unknown }).text;
+          return typeof text === 'string' ? text : '';
+        })
+        .join('')
+    : typeof output.text === 'string'
+      ? output.text
+      : '';
+  if (!modelOutput.trim()) return undefined;
+
+  // Step 10: byte-for-byte quotation validation against the archived source.
+  const validated = validateReceipt(modelOutput, sourceHash, body, event.isError);
+  if (!validated.ok) {
+    // invalid-json rows used to carry no evidence of what the model actually returned (fences?
+    // truncation? prose?), so keep a sanitized head.
+    const head = validated.reason === 'invalid-json' ? { rawOutputHead: JSON.stringify(modelOutput.slice(0, 200)) } : {};
+    await fallbackRow(validated.reason, durationMs, head);
+    return undefined;
+  }
+
+  // Step 11: block-level replacement — only the log block, so write-lock warnings survive.
   const receipt = formatReceiptText({
     command,
     sourceHash,
@@ -364,47 +390,31 @@ export async function handleReducerToolResult(
     sourceLines,
     sourceArtifactPath: archivePath,
     validated: validated.value,
-    model: modelName,
-    provider: providerName,
-    totalTokens: modelResult?.usage?.totalTokens,
+    model: reducer.model.id ?? config.model ?? 'default',
+    provider: typeof reducer.model.provider === 'string' ? reducer.model.provider : undefined,
+    totalTokens: output.usage?.totalTokens,
+  });
+  const receiptBytes = Buffer.byteLength(receipt, 'utf8');
+  if (receiptBytes >= sourceBytes) return undefined; // Must be smaller to be worth the swap.
+
+  await log({
+    sourceBytes,
+    receiptBytes,
+    grossSavedBytes: sourceBytes - receiptBytes,
+    compressionRatio: Number((receiptBytes / sourceBytes).toFixed(3)),
+    model: reducer.label,
+    reducerModelSource: reducer.source,
+    verificationOk: true,
+    action: 'applied',
+    fullOutputSource: candidate.fullOutputSource,
+    durationMs,
   });
 
-  const receiptBytes = Buffer.byteLength(receipt, 'utf8');
-  if (receiptBytes >= sourceBytes) {
-    return undefined; // Must be smaller
-  }
-
-  // 11. Block-level replacement: only replace the log text block, preserving warnings
-  const nextContent = event.content.map((b): { type: 'text'; text: string } =>
-    (b === logBlock ? { ...b, text: receipt } : b) as { type: 'text'; text: string });
-
-  // Backfill usage tokens: the nested reducer model call plus whatever the tool result already carried.
-  // MUST stay a COMPLETE pi `Usage`: pi persists this onto the tool-result message and its footer
-  // renders it through `addUsageToTotals`, which reads `usage.cost.total` unguarded. Emitting only
-  // { input, output, totalTokens } killed the whole pi process with
-  // "TypeError: Cannot read properties of undefined (reading 'total')" (observed 2026-09-13 in a
-  // subagent pane, stack: FooterComponent.render -> addUsageToTotals). See docs/session-format.md.
-  const nextUsage = mergeUsage(event.usage, modelResult?.usage);
-
-  if (config.logEnabled) {
-    await logReducerAttempt(sessionRoot, sessionId ?? 'unknown', epoch, {
-      commandSha256: sha256Hex(command),
-      sourceBytes,
-      receiptBytes,
-      grossSavedBytes: sourceBytes - receiptBytes,
-      compressionRatio: Number((receiptBytes / sourceBytes).toFixed(3)),
-      model: reducerModelLabel,
-      reducerModelSource,
-      verificationOk: true,
-      action: 'applied',
-      fullOutputSource,
-      durationMs: Date.now() - startMs,
-    });
-  }
-
   return {
-    content: nextContent,
-    usage: nextUsage,
+    content: event.content.map((b): { type: 'text'; text: string } =>
+      (b === block ? { ...b, text: receipt } : b) as { type: 'text'; text: string }),
+    // Complete pi `Usage` (see mergeUsage): pi's footer reads `usage.cost.total` unguarded.
+    usage: mergeUsage(event.usage, output.usage),
   };
 }
 
@@ -414,9 +424,8 @@ async function logReducerAttempt(
   epoch: number,
   record: Record<string, unknown>,
 ): Promise<void> {
-  const logPath = efficiencyLogPath(sessionRoot, 'reducer');
   try {
-    await appendEfficiencyLog(logPath, {
+    await appendEfficiencyLog(efficiencyLogPath(sessionRoot, 'reducer'), {
       schema: 'pier-efficiency/1',
       mechanism: 'evidencePreservingReducer',
       ts: new Date().toISOString(),
@@ -425,6 +434,6 @@ async function logReducerAttempt(
       ...record,
     });
   } catch {
-    /* ignore logging error */
+    /* Telemetry is best-effort. */
   }
 }
