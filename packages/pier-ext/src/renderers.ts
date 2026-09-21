@@ -30,15 +30,12 @@ export interface RenderComponent {
   invalidate(): void;
 }
 
+/** Entry and message renderers share this signature: the payload, the expanded flag, the theme. */
+type Renderer = (payload: unknown, options: { expanded: boolean }, theme: RenderTheme) => RenderComponent | undefined;
+
 export interface RendererApi {
-  registerEntryRenderer?(
-    customType: string,
-    renderer: (entry: unknown, options: { expanded: boolean }, theme: RenderTheme) => RenderComponent | undefined,
-  ): void;
-  registerMessageRenderer?(
-    customType: string,
-    renderer: (message: unknown, options: { expanded: boolean }, theme: RenderTheme) => RenderComponent | undefined,
-  ): void;
+  registerEntryRenderer?(customType: string, renderer: Renderer): void;
+  registerMessageRenderer?(customType: string, renderer: Renderer): void;
 }
 
 /* ── Pure line builders ────────────────────────────────────────────── */
