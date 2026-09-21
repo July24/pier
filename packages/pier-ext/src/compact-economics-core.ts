@@ -1,19 +1,12 @@
 /**
- * D100 Online Context Compact Economics & Feasibility Core.
- *
- * Implements pure economics decision-making, request horizon estimation,
- * cache debt tracking, and native compaction feasibility preflights.
- *
- * Zero-dependency / pure algorithm core (except Pi's public cut point helper).
+ * D100 Online Context Compact economics & feasibility core: pure decision-making, request horizon
+ * estimation, cache debt tracking, and native compaction feasibility preflights.
+ * Zero dependencies except pi's public cut-point helper.
  */
 
-import {
-  findCutPoint,
-  sessionEntryToContextMessages,
-  type SessionEntry,
-} from '@earendil-works/pi-coding-agent';
+import { findCutPoint, sessionEntryToContextMessages, type SessionEntry } from '@earendil-works/pi-coding-agent';
 
-export interface CompactionEconomics {
+interface CompactionEconomics {
   readonly remainingRequestScale: number;
   readonly remainingRequestStddevK: number;
   readonly windowReserveTokens: number;
@@ -30,11 +23,10 @@ export const DEFAULT_COMPACTION_ECONOMICS: CompactionEconomics = Object.freeze({
 });
 
 /**
- * Token-account cache ratio: a compaction request re-reads the whole current
- * context once (writeTokens), so breakeven = writeTokens / savingTokens ⇔ ratio 2.
- * `auto` fallback when no usable cache pricing exists (2026-09-17 review: every
- * model actually in use reports zero cacheWrite; the old `null` disabled OCC
- * for all of them — 61/61 decisions `cache_ratio_unavailable`, zero compactions).
+ * Token-account cache ratio: a compaction request re-reads the whole current context once
+ * (writeTokens), so breakeven = writeTokens / savingTokens ⇔ ratio 2. This is the `auto` fallback
+ * when no usable cache pricing exists, and it is a floor: a ratio ≤ 1 would zero the incremental
+ * cost and compact even on the last boundary with nothing left to amortize.
  */
 export const TOKEN_ACCOUNT_CACHE_RATIO = 2.0;
 
@@ -45,7 +37,7 @@ const PROVIDER_FAMILY_CACHE_RATIOS: Readonly<Record<string, number>> = Object.fr
   deepseek: 10,
 });
 
-export type CompactionReason =
+type CompactionReason =
   | 'economic'
   | 'window_protection'
   | 'deferred_economic'
@@ -57,12 +49,10 @@ export type CompactionReason =
   | 'failure_backoff'
   | 'non_positive_saving';
 
-export interface RequestHorizonEstimate {
-  readonly completedBoundaryRequestCounts: readonly number[];
+interface RequestHorizonEstimate {
   readonly requestsPerBoundaryMean: number;
   readonly requestsPerBoundaryLowerBound: number;
   readonly unboundedExpectedRemainingRequests: number;
-  readonly averageContextTokenIncrement: number | null;
   readonly windowRequestUpperBound: number | null;
   readonly expectedRemainingRequests: number;
 }
@@ -72,15 +62,8 @@ export interface CompactionDecision {
   readonly archiveTokens: number;
   readonly memoTokens: number;
   readonly contextTokens: number;
-  readonly completedBoundaryRequestCounts: readonly number[] | null;
-  readonly requestsPerBoundaryMean: number | null;
-  readonly requestsPerBoundaryLowerBound: number | null;
-  readonly unboundedExpectedRemainingRequests: number | null;
-  readonly averageContextTokenIncrement: number | null;
-  readonly windowRequestUpperBound: number | null;
   readonly expectedRemainingRequests: number | null;
   readonly breakevenRequests: number | null;
-  readonly combinedBreakevenRequests: number | null;
   readonly effectiveHorizonRequests: number | null;
   readonly remainingBoundaries: number;
   readonly cacheWriteReadRatio: number | null;
@@ -107,9 +90,7 @@ export function estimateRemainingRequests(input: {
   readonly averageContextTokenIncrement: number | null;
 }): RequestHorizonEstimate {
   const counts = input.completedBoundaryRequestCounts;
-  const mean =
-    counts.reduce((total, count) => total + count, 0) /
-    Math.max(1, counts.length);
+  const mean = counts.reduce((total, count) => total + count, 0) / Math.max(1, counts.length);
   let lowerBound = mean;
   if (input.standardDeviationK !== 0) {
     if (counts.length < MINIMUM_VARIANCE_SAMPLES) {
@@ -134,11 +115,9 @@ export function estimateRemainingRequests(input: {
         );
 
   return {
-    completedBoundaryRequestCounts: [...counts],
     requestsPerBoundaryMean: mean,
     requestsPerBoundaryLowerBound: lowerBound,
     unboundedExpectedRemainingRequests,
-    averageContextTokenIncrement: input.averageContextTokenIncrement,
     windowRequestUpperBound,
     expectedRemainingRequests:
       windowRequestUpperBound === null
@@ -163,97 +142,93 @@ export function decideCompaction(input: {
   readonly economics?: CompactionEconomics;
 }): CompactionDecision {
   const economics = input.economics ?? DEFAULT_COMPACTION_ECONOMICS;
-  const horizon =
-    input.completedBoundaryRequestCounts === null
-      ? null
-      : estimateRemainingRequests({
-          completedBoundaryRequestCounts: input.completedBoundaryRequestCounts,
-          remainingBoundaries: input.remainingBoundaries,
-          scale: economics.remainingRequestScale,
-          standardDeviationK: economics.remainingRequestStddevK,
-          contextTokens: input.contextTokens,
-          contextWindowTokens: input.contextWindowTokens,
-          averageContextTokenIncrement: input.averageContextTokenIncrement,
-        });
+  const horizon = input.completedBoundaryRequestCounts === null ? null : estimateRemainingRequests({
+    completedBoundaryRequestCounts: input.completedBoundaryRequestCounts,
+    remainingBoundaries: input.remainingBoundaries,
+    scale: economics.remainingRequestScale,
+    standardDeviationK: economics.remainingRequestStddevK,
+    contextTokens: input.contextTokens,
+    contextWindowTokens: input.contextWindowTokens,
+    averageContextTokenIncrement: input.averageContextTokenIncrement,
+  });
 
   const savingTokens = input.archiveTokens - input.memoTokens;
+  const compressible = savingTokens > 0;
   const incrementalCacheCostRatio =
     input.cacheWriteReadRatio === null ? null : Math.max(0, input.cacheWriteReadRatio - 1);
+  const incrementalWriteCost = incrementalCacheCostRatio === null
+    ? null
+    : input.writeTokens * incrementalCacheCostRatio;
 
-  const breakevenRequests =
-    savingTokens > 0 && incrementalCacheCostRatio !== null
-      ? (input.writeTokens * incrementalCacheCostRatio) / savingTokens
-      : null;
+  const breakevenRequests = compressible && incrementalWriteCost !== null
+    ? incrementalWriteCost / savingTokens
+    : null;
+  const combinedBreakevenRequests = compressible && incrementalWriteCost !== null
+    ? (input.carriedDebtTokens + incrementalWriteCost) / savingTokens
+    : null;
 
-  const combinedBreakevenRequests =
-    savingTokens > 0 && incrementalCacheCostRatio !== null
-      ? (input.carriedDebtTokens + input.writeTokens * incrementalCacheCostRatio) / savingTokens
-      : null;
   const firstCompaction = input.priorCompactionCount === 0;
-  // The first-compaction relaxation survives cold-start sample noise when real work
-  // remains. With zero remaining boundaries the horizon is 1 (nothing left to amortize
-  // over); scaling it by firstCompactionRequestScale would "discover" a horizon of 2
-  // and burn a full-context summarization for zero future benefit (2026-09-17 review).
+  const horizonRequests = horizon?.expectedRemainingRequests ?? null;
+  // The first-compaction relaxation absorbs cold-start sample noise, but only when work remains:
+  // with zero remaining boundaries the horizon is 1, and scaling it to 2 would burn a full-context
+  // summarization for zero future benefit.
   const relaxFirstCompaction = firstCompaction && input.remainingBoundaries > 0;
-  const effectiveHorizonRequests =
-    horizon === null
-      ? null
-      : relaxFirstCompaction
-        ? Math.min(
-            horizon.expectedRemainingRequests * economics.firstCompactionRequestScale,
-            horizon.windowRequestUpperBound ?? Number.POSITIVE_INFINITY,
-          )
-        : horizon.expectedRemainingRequests;
+  const effectiveHorizonRequests = horizon === null
+    ? null
+    : relaxFirstCompaction
+      ? Math.min(
+          horizon.expectedRemainingRequests * economics.firstCompactionRequestScale,
+          horizon.windowRequestUpperBound ?? Number.POSITIVE_INFINITY,
+        )
+      : horizon.expectedRemainingRequests;
 
   const windowProtection =
     input.contextWindowTokens !== null &&
     input.contextTokens >= input.contextWindowTokens - economics.windowReserveTokens;
-
   const baseEconomic =
-    horizon !== null &&
-    horizon.expectedRemainingRequests > 0 &&
+    horizonRequests !== null &&
+    horizonRequests > 0 &&
     breakevenRequests !== null &&
-    breakevenRequests <= horizon.expectedRemainingRequests;
-
+    breakevenRequests <= horizonRequests;
   const firstEconomic =
     firstCompaction &&
     effectiveHorizonRequests !== null &&
     effectiveHorizonRequests > 0 &&
     breakevenRequests !== null &&
     breakevenRequests <= effectiveHorizonRequests;
-
   const subsequentMarginOpen =
     !firstCompaction &&
-    horizon !== null &&
+    horizonRequests !== null &&
     breakevenRequests !== null &&
-    breakevenRequests * economics.subsequentCompactionMargin <= horizon.expectedRemainingRequests;
-
+    breakevenRequests * economics.subsequentCompactionMargin <= horizonRequests;
   const carriedDebtGateOpen =
     !firstCompaction &&
-    horizon !== null &&
+    horizonRequests !== null &&
     combinedBreakevenRequests !== null &&
-    combinedBreakevenRequests <= horizon.expectedRemainingRequests;
+    combinedBreakevenRequests <= horizonRequests;
 
   const economic = firstCompaction ? firstEconomic : baseEconomic && subsequentMarginOpen && carriedDebtGateOpen;
-  const compressible = savingTokens > 0;
   const compact = compressible && (windowProtection || economic);
+
+  // Ordered guards: first hit wins, so the tail entry is the fallback.
+  const reason = ([
+    ['non_positive_saving', !compressible],
+    ['window_protection', windowProtection],
+    ['economic', economic],
+    ['horizon_unavailable', horizon === null],
+    ['cache_ratio_unavailable', breakevenRequests === null],
+    ['deferred_subsequent_margin', !firstCompaction && baseEconomic && !subsequentMarginOpen],
+    ['deferred_carried_debt', !firstCompaction && baseEconomic && !carriedDebtGateOpen],
+    ['deferred_economic', true],
+  ] as Array<[CompactionReason, boolean]>).find(([, hit]) => hit)![0];
 
   return {
     writeTokens: input.writeTokens,
     archiveTokens: input.archiveTokens,
     memoTokens: input.memoTokens,
     contextTokens: input.contextTokens,
-    ...(horizon ?? {
-      completedBoundaryRequestCounts: null,
-      requestsPerBoundaryMean: null,
-      requestsPerBoundaryLowerBound: null,
-      unboundedExpectedRemainingRequests: null,
-      averageContextTokenIncrement: input.averageContextTokenIncrement,
-      windowRequestUpperBound: null,
-      expectedRemainingRequests: null,
-    }),
+    expectedRemainingRequests: horizonRequests,
     breakevenRequests,
-    combinedBreakevenRequests,
     effectiveHorizonRequests,
     remainingBoundaries: input.remainingBoundaries,
     cacheWriteReadRatio: input.cacheWriteReadRatio,
@@ -262,56 +237,26 @@ export function decideCompaction(input: {
     carriedDebtTokens: input.carriedDebtTokens,
     cacheDebtRepaymentTokens: input.cacheDebtRepaymentTokens,
     compact,
-    reason: !compressible
-      ? 'non_positive_saving'
-      : windowProtection
-        ? 'window_protection'
-        : economic
-          ? 'economic'
-          : horizon === null
-            ? 'horizon_unavailable'
-            : breakevenRequests === null
-              ? 'cache_ratio_unavailable'
-              : !firstCompaction && baseEconomic && !subsequentMarginOpen
-                ? 'deferred_subsequent_margin'
-                : !firstCompaction && baseEconomic && !carriedDebtGateOpen
-                  ? 'deferred_carried_debt'
-                  : 'deferred_economic',
+    reason,
   };
 }
 
 /**
- * Resolve the cache write/read cost ratio for economic compaction decisions.
- *
- * Priority:
- *  1. Explicit numeric config → use as-is (e.g. 12.5 for Anthropic-style pricing)
- *  2. Model cost metadata:
- *     a. cacheWrite > 0 && cacheRead > 0 → write/read (explicit cache SKU)
- *     b. cacheWrite == 0 && cacheRead > 0 && input > 0 → input/cacheRead
- *        (implicit cache: rewriting the prefix is billed at the input price)
- *  3. Provider-family fallback (gemini≈4, grok/deepseek≈10 — implicit-cache
- *     families without a local cacheWrite SKU)
- *  4. Token-account fallback 2.0: a compaction re-reads writeTokens once,
- *     so breakeven = writeTokens/savingTokens ⇔ ratio 2
- *
- * Returns null only for an explicitly invalid numeric config.
- *
- * History (P0-1): `auto` used to return null when cacheWrite==0, reading that
- * as "no KV cache at all". The 2026-09-17 trial disproved it on this machine:
- * grok/deepseek/gemini sessions all show non-zero cacheRead usage while
- * cacheWrite stays 0 — there is no separate write SKU, not "no cache". null
- * disabled OCC for every model actually used (61/61 decisions
- * `cache_ratio_unavailable`, zero compactions). The floor matters as much as
- * the fix: never implicitly fall back below 2.0, because ratio <= 1 zeroes the
- * incremental cost and would compact even on the last boundary with nothing
- * left to amortize (the original P0-1 failure mode).
+ * Resolve the cache write/read cost ratio for compaction decisions:
+ *  1. explicit numeric config → as-is (e.g. 12.5 for Anthropic-style pricing);
+ *  2. model cost metadata: cacheWrite>0 && cacheRead>0 → write/read; cacheWrite==0 && cacheRead>0
+ *     && input>0 → input/cacheRead (implicit cache: rewriting the prefix bills at the input price);
+ *  3. provider-family fallback (gemini ≈ 4, grok/deepseek ≈ 10);
+ *  4. TOKEN_ACCOUNT_CACHE_RATIO.
+ * Returns null only for an explicitly invalid numeric config. `auto` must never resolve to null:
+ * a zero-price table means "no local cacheWrite SKU", not "no cache", and null would disable OCC
+ * for every model in actual use.
  */
 export function resolveCacheRatioFromCost(
   ratioConfig: number | 'auto',
   cost?: { input?: number; cacheRead?: number; cacheWrite?: number } | null,
   identity?: { provider?: string; modelId?: string } | null,
 ): number | null {
-  // Explicit config takes absolute precedence
   if (typeof ratioConfig === 'number') {
     return Number.isFinite(ratioConfig) && ratioConfig >= 0 ? ratioConfig : null;
   }
@@ -320,7 +265,6 @@ export function resolveCacheRatioFromCost(
     const read = cost.cacheRead ?? 0;
     const write = cost.cacheWrite ?? 0;
     const input = cost.input ?? 0;
-
     if (read > 0 && write > 0) return write / read;
     if (read > 0 && write === 0 && input > 0) return input / read;
   }
@@ -336,37 +280,27 @@ function compactionMessageCount(entries: readonly SessionEntry[], startIndex: nu
   let count = 0;
   for (let index = startIndex; index < endIndex; index++) {
     const entry = entries[index];
-    if (entry && entry.type !== 'compaction' && sessionEntryToContextMessages(entry).length > 0) {
-      count++;
-    }
+    if (entry && entry.type !== 'compaction' && sessionEntryToContextMessages(entry).length > 0) count++;
   }
   return count;
 }
 
+/** Appends the abort marker pi's cut-point search expects after our intentional abort. */
 function branchAfterAbort(entries: readonly SessionEntry[]): SessionEntry[] {
-  const last = entries.at(-1);
-  const markerProvider = 'pi-herdr';
   return [
     ...entries,
     {
       type: 'message',
       id: 'pi-herdr-online-context-compact-abort-marker',
-      parentId: last?.id ?? null,
+      parentId: entries.at(-1)?.id ?? null,
       timestamp: new Date(0).toISOString(),
       message: {
         role: 'assistant',
         content: [],
-        api: markerProvider,
-        provider: markerProvider,
+        api: 'pi-herdr',
+        provider: 'pi-herdr',
         model: 'aborted',
-        usage: {
-          input: 0,
-          output: 0,
-          cacheRead: 0,
-          cacheWrite: 0,
-          totalTokens: 0,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-        },
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
         stopReason: 'aborted',
         timestamp: 0,
       },
@@ -374,6 +308,7 @@ function branchAfterAbort(entries: readonly SessionEntry[]): SessionEntry[] {
   ];
 }
 
+/** Would pi's own compaction find history to summarize on this branch? OCC must not abort otherwise. */
 export function nativeCompactionFeasible(entries: readonly SessionEntry[], keepRecentTokens: number): boolean {
   if (!Array.isArray(entries) || entries.length === 0) return false;
   const path = branchAfterAbort(entries);

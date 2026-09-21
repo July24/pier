@@ -1,24 +1,14 @@
-/** Why: Preserve the established compatibility and safety behavior (D34–D43, M10). */
-import {
-  TODO_DETAILS_KEY,
-  TODO_STATUSES,
-  TODO_TOOL_NAME,
-  type TodoCounts,
-  type TodoItem,
-  type TodoSnapshot,
-  type TodoStatus,
-} from './vocab.ts';
-import { countTodos } from './vocab.ts';
+/** Pure todo-list core: validation, diffing, edit and branch-replay folding (D34–D43, M10). */
+import { TODO_DETAILS_KEY, TODO_STATUSES, TODO_TOOL_NAME, type TodoItem, type TodoSnapshot, type TodoStatus } from './vocab.ts';
 
-export type { TodoItem, TodoSnapshot, TodoStatus, TodoCounts };
+export type { TodoItem, TodoSnapshot, TodoStatus };
 
-/** Why: Preserve the established compatibility and safety behavior (D43). */
-export const PHASE_MAX_LEN = 30;
+/** D43 phase label cap, mirrored by the todo_write tool description. */
+const PHASE_MAX_LEN = 30;
 
-/** Why: Preserve the established compatibility and safety behavior (D38). */
+/** Session entry type for human/automated edits, replayed during branch rebuild (D38). */
 export const TODO_EDIT_CUSTOM_TYPE = 'pi-herdr.todo-edit';
 
-/** Why: Preserve the established compatibility and safety behavior (D38, M17). */
 export type TodoEditOp = 'done' | 'drop' | 'rm' | 'unblock';
 
 export interface TodoEdit {
@@ -38,28 +28,20 @@ export interface TodoValidationResult {
   error?: string;
 }
 
-/** Why: Preserve the established compatibility and safety behavior (B2, D34, D43). */
 export function validateTodos(
   todos: unknown,
   allowParallelInProgress = true,
 ): TodoValidationResult {
-  if (!Array.isArray(todos)) {
-    return { ok: false, error: 'invalid todos: `todos` must be an array' };
-  }
+  if (!Array.isArray(todos)) return { ok: false, error: 'invalid todos: `todos` must be an array' };
   const seen = new Set<string>();
   let inProgress = 0;
   const items: TodoItem[] = [];
   for (const raw of todos) {
-    if (typeof raw !== 'object' || raw === null) {
-      return { ok: false, error: 'invalid todos: each todo must be an object' };
-    }
+    if (typeof raw !== 'object' || raw === null) return { ok: false, error: 'invalid todos: each todo must be an object' };
     const entry = raw as Record<string, unknown>;
-    const allowed = ['content', 'status', 'blocker', 'phase'];
-    const keys = Object.keys(entry);
-    for (const k of keys) {
-      if (!allowed.includes(k)) {
-        return { ok: false, error: `invalid todos: unknown field "${k}" (allowed: content, status, blocker, phase)` };
-      }
+    const unknownField = Object.keys(entry).find((k) => !['content', 'status', 'blocker', 'phase'].includes(k));
+    if (unknownField) {
+      return { ok: false, error: `invalid todos: unknown field "${unknownField}" (allowed: content, status, blocker, phase)` };
     }
     if (!('content' in entry) || !('status' in entry)) {
       return { ok: false, error: 'invalid todos: each todo must have `content` and `status`' };
@@ -68,20 +50,17 @@ export function validateTodos(
     if (typeof content !== 'string' || content.trim() === '') {
       return { ok: false, error: 'invalid todo: `content` must be a non-empty string' };
     }
-    if (seen.has(content)) {
-      return { ok: false, error: `invalid todos: duplicate content "${content}"` };
-    }
+    if (seen.has(content)) return { ok: false, error: `invalid todos: duplicate content "${content}"` };
     seen.add(content);
     const status = entry.status;
     if (typeof status !== 'string' || !(TODO_STATUSES as readonly string[]).includes(status)) {
       return { ok: false, error: `invalid todo: \`status\` must be one of ${TODO_STATUSES.join('|')}` };
     }
     const item: TodoItem = { content, status: status as TodoStatus };
+    // blocker/phase tolerate empty-string filler (models fill optional fields with ''), but a
+    // malformed type is a hard reject: it would hide intent.
     if ('blocker' in entry) {
       const blocker = entry.blocker;
-      // Why: Preserve the established compatibility and safety behavior.
-      // Why: Preserve the established compatibility and safety behavior.
-      // Why: Preserve the established compatibility and safety behavior.
       if (blocker != null && typeof blocker !== 'string') {
         return { ok: false, error: 'invalid todo: `blocker` must be a non-empty string' };
       }
@@ -94,41 +73,30 @@ export function validateTodos(
     }
     if ('phase' in entry) {
       const phase = entry.phase;
-      if (phase != null && typeof phase !== 'string') {
-        return { ok: false, error: `invalid todo: \`phase\` must be a non-empty string ≤ ${PHASE_MAX_LEN} chars` };
-      }
-      // Why: Preserve the established compatibility and safety behavior.
+      const phaseError = { ok: false, error: `invalid todo: \`phase\` must be a non-empty string ≤ ${PHASE_MAX_LEN} chars` };
+      if (phase != null && typeof phase !== 'string') return phaseError;
       if (typeof phase === 'string') {
-        if (phase.length > PHASE_MAX_LEN) {
-          return { ok: false, error: `invalid todo: \`phase\` must be a non-empty string ≤ ${PHASE_MAX_LEN} chars` };
-        }
+        if (phase.length > PHASE_MAX_LEN) return phaseError;
         if (phase.trim() !== '') item.phase = phase;
       }
     }
-    if (status === 'in_progress') {
-      inProgress++;
-      if (!allowParallelInProgress && inProgress > 1) {
-        return {
-          ok: false,
-          error: `invalid todos: at most one task may be in_progress (got ${inProgress})`,
-        };
-      }
+    if (status === 'in_progress' && ++inProgress > 1 && !allowParallelInProgress) {
+      return { ok: false, error: `invalid todos: at most one task may be in_progress (got ${inProgress})` };
     }
     items.push(item);
   }
   return { ok: true, items };
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D42). */
+/** Keep exactly one in_progress item, promoting the first pending one when none exists (D42). */
 export function normalizeStrict(items: readonly TodoItem[]): TodoItem[] {
   if (items.length === 0) return [];
   const out = items.map((it) => ({ ...it }));
   let kept = false;
   for (const it of out) {
-    if (it.status === 'in_progress') {
-      if (kept) it.status = 'pending';
-      else kept = true;
-    }
+    if (it.status !== 'in_progress') continue;
+    if (kept) it.status = 'pending';
+    else kept = true;
   }
   if (!kept) {
     const firstPending = out.find((it) => it.status === 'pending');
@@ -137,7 +105,6 @@ export function normalizeStrict(items: readonly TodoItem[]): TodoItem[] {
   return out;
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D35). */
 export function listsEqual(a: readonly TodoItem[], b: readonly TodoItem[]): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) {
@@ -148,38 +115,34 @@ export function listsEqual(a: readonly TodoItem[], b: readonly TodoItem[]): bool
   return true;
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D36). */
+/** Items completed by this write (D36: surfaced back to the caller). */
 export function completionTransitions(prev: readonly TodoItem[], next: readonly TodoItem[]): string[] {
   const prevMap = new Map(prev.map((it) => [it.content, it.status]));
-  const out: string[] = [];
-  for (const it of next) {
-    if (it.status === 'completed' && prevMap.get(it.content) !== 'completed') out.push(it.content);
-  }
-  return out;
+  return next
+    .filter((it) => it.status === 'completed' && prevMap.get(it.content) !== 'completed')
+    .map((it) => it.content);
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D37). */
+/** Completed items pushed back to open by this write (D37: reversible, but warn). */
 export function revertedCompleted(prev: readonly TodoItem[], next: readonly TodoItem[]): string[] {
   const nextMap = new Map(next.map((it) => [it.content, it.status]));
-  const out: string[] = [];
-  for (const it of prev) {
-    if (it.status !== 'completed') continue;
-    const now = nextMap.get(it.content);
-    if (now === 'pending' || now === 'in_progress') out.push(it.content);
-  }
-  return out;
+  return prev
+    .filter((it) => {
+      if (it.status !== 'completed') return false;
+      const now = nextMap.get(it.content);
+      return now === 'pending' || now === 'in_progress';
+    })
+    .map((it) => it.content);
 }
 
-/** Why: Preserve the established compatibility and safety behavior. */
 export function makeSnapshot(items: readonly TodoItem[]): TodoSnapshot {
   // Copy: the snapshot is persisted, the service list stays owned by TodosService.
   return { version: 1, items: [...items] };
 }
 
-export interface BranchEntryLike {
-  /** Why: Preserve the established compatibility and safety behavior. */
+/** Loose shape of pi session JSONL entries we fold over; only the fields we read. */
+interface BranchEntryLike {
   type?: string;
-  /** Why: Preserve the established compatibility and safety behavior. */
   timestamp?: unknown;
   message?: {
     role?: string;
@@ -190,33 +153,31 @@ export interface BranchEntryLike {
   data?: unknown;
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D37, D38, M17). */
+/** Edit semantics (D37/D38): done/drop keep completed|abandoned terminal; unblock returns blocked to pending. */
 export function applyTodoEdits(items: readonly TodoItem[], edits: readonly TodoEdit[]): TodoItem[] {
   let out = items.map((it) => ({ ...it }));
   for (const edit of edits) {
+    if (edit.op === 'rm') {
+      out = out.filter((it) => it.content !== edit.content);
+      continue;
+    }
     const target = out.find((it) => it.content === edit.content);
     if (!target) continue;
     switch (edit.op) {
       case 'done':
-        if (target.status !== 'completed') {
-          target.status = 'completed';
-          delete target.blocker;
-        }
+        if (target.status === 'completed') break;
+        target.status = 'completed';
+        delete target.blocker;
         break;
       case 'drop':
-        if (target.status !== 'completed' && target.status !== 'abandoned') {
-          target.status = 'abandoned';
-          delete target.blocker;
-        }
-        break;
-      case 'rm':
-        out = out.filter((it) => it.content !== edit.content);
+        if (target.status === 'completed' || target.status === 'abandoned') break;
+        target.status = 'abandoned';
+        delete target.blocker;
         break;
       case 'unblock':
-        if (target.status === 'blocked') {
-          target.status = 'pending';
-          delete target.blocker;
-        }
+        if (target.status !== 'blocked') break;
+        target.status = 'pending';
+        delete target.blocker;
         break;
     }
   }
@@ -241,10 +202,9 @@ function extractEditPayload(data: unknown): TodoEditPayload | null {
   return { version: 1, edits, ts: typeof raw.ts === 'number' ? raw.ts : 0 };
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D38). */
 export interface FoldedTodos {
   items: TodoItem[];
-  /** Why: Preserve the established compatibility and safety behavior. */
+  /** Timestamp of the last write that shaped these items; null when the entry carried none. */
   writtenAt: number | null;
 }
 
@@ -258,7 +218,7 @@ function entryTimestamp(entry: BranchEntryLike): number | null {
   return null;
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D38). */
+/** Fold the branch to the authoritative list: last todo snapshot, then interleaved edits (D38). */
 export function foldLatestTodosMeta(entries: readonly BranchEntryLike[]): FoldedTodos | null {
   let found: TodoItem[] | null = null;
   let writtenAt: number | null = null;
@@ -283,12 +243,7 @@ export function foldLatestTodosMeta(entries: readonly BranchEntryLike[]): Folded
   return found ? { items: found, writtenAt } : null;
 }
 
-/** Why: Preserve the established compatibility and safety behavior. */
-export function foldLatestTodos(entries: readonly BranchEntryLike[]): TodoItem[] | null {
-  return foldLatestTodosMeta(entries)?.items ?? null;
-}
-
-export function extractSnapshotFromDetails(details: unknown): TodoSnapshot | null {
+function extractSnapshotFromDetails(details: unknown): TodoSnapshot | null {
   if (typeof details !== 'object' || details === null) return null;
   const raw = (details as Record<string, unknown>)[TODO_DETAILS_KEY];
   if (typeof raw !== 'object' || raw === null) return null;
@@ -297,7 +252,7 @@ export function extractSnapshotFromDetails(details: unknown): TodoSnapshot | nul
   return { version: 1, items: snap.items as TodoItem[] };
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D38). */
+/** Exact match, then unique prefix, then substring candidates (D38 `/todos <verb> <query>`). */
 export function fuzzyFind(items: readonly TodoItem[], query: string): string[] {
   const q = query.trim();
   if (!q) return [];
@@ -306,26 +261,22 @@ export function fuzzyFind(items: readonly TodoItem[], query: string): string[] {
   const prefix = items.filter((it) => it.content.startsWith(q));
   if (prefix.length === 1) return [prefix[0].content];
   if (prefix.length > 1) return prefix.map((it) => it.content);
-  const substr = items.filter((it) => it.content.includes(q));
-  return substr.map((it) => it.content);
+  return items.filter((it) => it.content.includes(q)).map((it) => it.content);
 }
 
-/** Why: Preserve the established compatibility and safety behavior (D39). */
 export interface BoundedView {
   visible: TodoItem[];
-  /** Why: Preserve the established compatibility and safety behavior. */
   hiddenCompleted: number;
   hiddenOpen: number;
 }
 
+/** Keep the newest open items, then fill leftover budget with the newest completions (D39). */
 export function boundedView(items: readonly TodoItem[], budget: number): BoundedView {
   if (items.length <= budget) {
     return { visible: items.map((it) => ({ ...it })), hiddenCompleted: 0, hiddenOpen: 0 };
   }
   const completed = items.filter((it) => it.status === 'completed');
   const open = items.filter((it) => it.status !== 'completed');
-  // Why: Preserve the established compatibility and safety behavior.
-  // Why: Preserve the established compatibility and safety behavior.
   const visible = open.length > budget ? open.slice(-budget) : open;
   const hiddenOpen = open.length - visible.length;
   let hiddenCompleted = completed.length;
@@ -338,9 +289,6 @@ export function boundedView(items: readonly TodoItem[], budget: number): Bounded
   return { visible: final, hiddenCompleted, hiddenOpen };
 }
 
-/** Why: Preserve the established compatibility and safety behavior. */
 export function currentActivity(items: readonly TodoItem[]): string | null {
   return items.find((it) => it.status === 'in_progress')?.content ?? null;
 }
-
-export { countTodos };

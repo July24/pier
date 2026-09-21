@@ -1,13 +1,6 @@
-/** Why: Preserve the established compatibility and safety behavior (D65, D75). */
+/** Single owner of todo state; every mutation path (tool, human edit, M17 reconcile, archive) lands here (D65, D75). */
 import { EventEmitter } from 'node:events';
-import {
-  applyTodoEdits,
-  foldLatestTodosMeta,
-  listsEqual,
-  type TodoEdit,
-  type TodoItem,
-} from './todo-core.ts';
-import { countCompletedTransitions } from './progress-core.ts';
+import { applyTodoEdits, completionTransitions, foldLatestTodosMeta, listsEqual, type TodoEdit, type TodoItem } from './todo-core.ts';
 import type { RuntimeRoleManifest } from './tool-gate.ts';
 
 export interface TodosConfig {
@@ -17,21 +10,13 @@ export interface TodosConfig {
 
 export type TodoCompletionSource = 'tool' | 'reconcile' | 'human' | 'archive';
 
-export interface TodoCompletedEvent {
-  count: number;
-  at: number;
-  source: TodoCompletionSource;
-}
-
 export class TodosService extends EventEmitter {
   private _items: TodoItem[] = [];
-  /**
-   * Live list (read-only). Mutations must go through replace/applyEdits/rebuild.
-   */
+  /** Live list (read-only). Mutations must go through replace/applyEdits/rebuild. */
   get items(): readonly TodoItem[] {
     return this._items;
   }
-  /** Why: Preserve the established compatibility and safety behavior. */
+  /** Clock anchor for staleness/archiving; null until the first write. */
   lastWriteAt: number | null = null;
   readonly config: TodosConfig;
 
@@ -40,12 +25,14 @@ export class TodosService extends EventEmitter {
     this.config = config;
   }
 
-  /** Why: Preserve the established compatibility and safety behavior (D75). */
+  /** D75: subagents are strict (one in_progress); the role manifest may force parallel mode. */
   static configFromRuntime(manifest: RuntimeRoleManifest | null, isSubagent: boolean): TodosConfig {
     const strict = isSubagent;
     const mode = manifest?.services?.todos?.mode;
-    const allowParallelInProgress = mode === 'parallel' || mode === 'serial' ? mode === 'parallel' : !strict;
-    return { strict, allowParallelInProgress };
+    return {
+      strict,
+      allowParallelInProgress: mode === 'parallel' || mode === 'serial' ? mode === 'parallel' : !strict,
+    };
   }
 
   /** Defensive copy for callers that must not mutate service state. */
@@ -76,19 +63,18 @@ export class TodosService extends EventEmitter {
     return { changed: true };
   }
 
-  /** Why: Preserve the established compatibility and safety behavior (M16). */
+  /** M16: ETA and compaction boundaries feed off this single completion diff (same rule as the tool's D36 report). */
   private emitCompletedTransitions(
     before: readonly TodoItem[],
     after: readonly TodoItem[],
     source: TodoCompletionSource = 'tool',
   ): void {
-    const count = countCompletedTransitions(before, after);
+    const count = completionTransitions(before, after).length;
     if (count > 0) this.emit('todo.completed', { count, at: Date.now(), source });
   }
 
+  /** Branch replay: fold the JSONL to the authoritative list, or keep current state when absent. */
   rebuild(entries: readonly unknown[]): void {
-    // Why: Preserve the established compatibility and safety behavior.
-    // Why: Preserve the established compatibility and safety behavior.
     const folded = foldLatestTodosMeta(entries as Parameters<typeof foldLatestTodosMeta>[0]);
     if (folded) {
       this._items = folded.items;

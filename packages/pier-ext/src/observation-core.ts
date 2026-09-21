@@ -1,23 +1,20 @@
 /**
- * D101 ObservationPack Core.
- *
- * Pure algorithmic functions for large observation detection, deterministic ID derivation,
- * complete-line excerpt generation, chunk slicing with UTF-8 safety, and rolling prefix cache
- * economics.
- *
- * No I/O in this core; storage I/O lives in efficiency-store.ts.
+ * D101 ObservationPack core: pure algorithms for large-observation detection, deterministic ids,
+ * complete-line excerpts, UTF-8-safe chunk slicing, and rolling prefix cache economics. Storage I/O
+ * lives in efficiency-store.ts.
  */
 import { createHash } from 'node:crypto';
 import { TOKEN_ACCOUNT_CACHE_RATIO } from './compact-economics-core.ts';
 import { FAILURE_SIGNAL } from './reducer-core.ts';
 
-export const DEFAULT_THRESHOLD_BYTES = 10 * 1024; // 10KB
-export const DEFAULT_FULL_SENDS = 2;
-export const DEFAULT_EXCERPT_BYTES = 1024;
-export const CHARS_PER_TOKEN = 4;
-export const OBSERVATION_ID_RE = /^obs_[a-f0-9]{24}$/;
+// Fallbacks used only when a caller omits a field; DEFAULT_EFFICIENCY_CONFIG.observationPack in
+// efficiency-config-core.ts is the canonical set (thresholdBytes lives there alone — every pack
+// decision goes through resolved config).
+const DEFAULT_FULL_SENDS = 2;
+const DEFAULT_EXCERPT_BYTES = 1024;
+const CHARS_PER_TOKEN = 4;
 
-/** Marker from Evidence-Preserving Reducer to avoid double packing. */
+/** Marker from the evidence-preserving reducer, used to avoid double packing. */
 export const REDUCER_RECEIPT_PREFIX = 'sol_pi_evidence_receipt_v1';
 
 export function sha256Hex(val: string | Buffer): string {
@@ -38,60 +35,42 @@ export function countLines(text: string): number {
 }
 
 export function isObservationId(id: string): boolean {
-  return OBSERVATION_ID_RE.test(id);
+  return /^obs_[a-f0-9]{24}$/.test(id);
 }
 
 export function deriveObservationId(toolName: string, toolCallId: string, contentHash: string): string {
-  const combined = `${toolName}\0${toolCallId}\0${contentHash}`;
-  return `obs_${sha256Hex(combined).slice(0, 24)}`;
+  return `obs_${sha256Hex(`${toolName}\0${toolCallId}\0${contentHash}`).slice(0, 24)}`;
 }
 
+/** A receipt must be a line of its own — a mere mention inside a log body is not a receipt. */
 export function containsReducerReceipt(text: string): boolean {
   if (!text.includes(REDUCER_RECEIPT_PREFIX)) return false;
   return text.split('\n').some((line) => line.trim() === REDUCER_RECEIPT_PREFIX);
 }
 
+/** Whole lines only, from the head or the tail; the scanned window never exceeds budgetBytes * 4 chars. */
 export function completeLineExcerpt(text: string, budgetBytes: number, fromEnd: boolean): string {
   if (budgetBytes <= 0 || text.length === 0) return '';
 
-  if (!fromEnd) {
-    // Head excerpt: candidate never exceeds budgetBytes * 4 chars
-    const candidate = text.slice(0, Math.min(text.length, budgetBytes * 4));
-    let lastEnd = 0;
-    let totalBytes = 0;
-    let searchIndex = 0;
-    while (searchIndex < candidate.length) {
-      const nextNewline = candidate.indexOf('\n', searchIndex);
-      if (nextNewline === -1) break;
-      const lineEnd = nextNewline + 1;
-      const line = candidate.slice(lastEnd, lineEnd);
-      const lineBytes = Buffer.byteLength(line, 'utf8');
-      if (totalBytes + lineBytes > budgetBytes) break;
-      totalBytes += lineBytes;
-      lastEnd = lineEnd;
-      searchIndex = lineEnd;
-    }
-    return candidate.slice(0, lastEnd);
-  } else {
-    // Tail excerpt: candidate never exceeds budgetBytes * 4 chars from end
-    const startOffset = Math.max(0, text.length - budgetBytes * 4);
-    const candidate = text.slice(startOffset);
-    const lines = candidate.split(/(?<=\n)/);
-    const selected: string[] = [];
-    let selectedBytes = 0;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i]!;
-      // If startOffset > 0, the first line of candidate might be partial, skip unless it follows a newline
-      if (i === 0 && startOffset > 0 && text[startOffset - 1] !== '\n') {
-        break;
-      }
-      const lineBytes = Buffer.byteLength(line, 'utf8');
-      if (selectedBytes + lineBytes > budgetBytes) break;
-      selected.unshift(line);
-      selectedBytes += lineBytes;
-    }
-    return selected.join('');
+  const window = budgetBytes * 4;
+  const start = fromEnd ? Math.max(0, text.length - window) : 0;
+  const end = fromEnd ? text.length : Math.min(text.length, window);
+  const lines = text.slice(start, end).split(/(?<=\n)/);
+  const selected: string[] = [];
+  let selectedBytes = 0;
+  for (let i = fromEnd ? lines.length - 1 : 0; i >= 0 && i < lines.length; i += fromEnd ? -1 : 1) {
+    const line = lines[i]!;
+    // The head keeps terminated lines only; the tail also keeps the log's final unterminated line.
+    if (!fromEnd && !line.endsWith('\n')) break;
+    // A leading partial line (cut by the window) is dropped unless it starts at a line boundary.
+    if (fromEnd && i === 0 && start > 0 && text[start - 1] !== '\n') break;
+    const lineBytes = Buffer.byteLength(line, 'utf8');
+    if (selectedBytes + lineBytes > budgetBytes) break;
+    selectedBytes += lineBytes;
+    if (fromEnd) selected.unshift(line);
+    else selected.push(line);
   }
+  return selected.join('');
 }
 
 export interface ObservationPlaceholderInput {
@@ -104,10 +83,8 @@ export interface ObservationPlaceholderInput {
   fullSends?: number;
   excerptBudget?: number;
   /**
-   * P0-3 (RFC docs/rfc-jev-integration.md §3): a selected middle window that
-   * replaces whichever head/tail half carries fewer failure-signal lines.
-   * Absent (jev off / low confidence / no signal lines) -> byte-identical
-   * legacy head+tail layout.
+   * P0-3 (RFC docs/rfc-jev-integration.md §3): a selected middle window replacing whichever
+   * head/tail half carries fewer failure-signal lines. Absent → byte-identical legacy layout.
    */
   middle?: { text: string; label: string };
 }
@@ -133,8 +110,8 @@ export function formatObservationPlaceholder(input: ObservationPlaceholderInput)
   let tailLabel = `[middle omitted; last complete lines, up to ${tailBudget} bytes]`;
 
   if (input.middle) {
-    // Fewer signal lines loses its slot; ties replace head because the tail
-    // half usually carries the log's final summary.
+    // Fewer signal lines loses its slot; ties replace head because the tail half usually carries
+    // the log's final summary.
     if (signalLineCount(tail) < signalLineCount(head)) {
       tail = completeLineExcerpt(input.middle.text, tailBudget, false);
       tailLabel = `[middle omitted; selected excerpt — ${input.middle.label}, up to ${tailBudget} bytes]`;
@@ -168,10 +145,8 @@ export interface RecallSliceResult {
   eof: boolean;
 }
 
-/**
- * Trims multi-byte UTF-8 sequence from buffer boundary if cut mid-character.
- */
-export function trimUtf8End(buffer: Buffer, limit: number): number {
+/** Trims a multi-byte UTF-8 sequence that would be cut at the buffer boundary. */
+function trimUtf8End(buffer: Buffer, limit: number): number {
   let end = limit;
   while (end > 0 && end < buffer.length && ((buffer[end] ?? 0) & 0xc0) === 0x80) {
     end -= 1;
@@ -179,9 +154,7 @@ export function trimUtf8End(buffer: Buffer, limit: number): number {
   return end;
 }
 
-/**
- * Slices a memory buffer safely at byte offsets without cutting UTF-8 characters.
- */
+/** Slice a buffer at byte offsets without cutting a UTF-8 character. */
 export function sliceBufferChunk(
   buf: Buffer,
   offset: number,
@@ -191,40 +164,31 @@ export function sliceBufferChunk(
     return { text: '', bytes: 0, lines: 0, nextOffset: buf.length, eof: true };
   }
 
-  const available = buf.length - offset;
-  let end = Math.min(available, limits.maxBytes);
+  let end = Math.min(buf.length - offset, limits.maxBytes);
   let newlineCount = 0;
-
   for (let i = 0; i < end; i++) {
-    if (buf[offset + i] === 0x0a) {
-      newlineCount++;
-      if (newlineCount === limits.maxLines) {
-        end = i + 1;
-        break;
-      }
+    if (buf[offset + i] === 0x0a && ++newlineCount === limits.maxLines) {
+      end = i + 1;
+      break;
     }
   }
 
-  const trimmedEnd = trimUtf8End(buf.subarray(offset), end);
-  const chunkBuf = buf.subarray(offset, offset + trimmedEnd);
+  const chunkBuf = buf.subarray(offset, offset + trimUtf8End(buf.subarray(offset), end));
   const text = chunkBuf.toString('utf8');
-  const bytes = chunkBuf.length;
-  const lines = countLines(text);
-  const nextOffset = offset + bytes;
-  const eof = nextOffset >= buf.length;
-
-  return { text, bytes, lines, nextOffset, eof };
+  const nextOffset = offset + chunkBuf.length;
+  return {
+    text,
+    bytes: chunkBuf.length,
+    lines: countLines(text),
+    nextOffset,
+    eof: nextOffset >= buf.length,
+  };
 }
 
 /**
- * Evaluates whether replacing an earlier message with a placeholder is profitable
- * under rolling prefix cache models.
- *
- * `cacheWriteReadRatio` must already be resolved by the caller via
- * `resolveCacheRatioFromCost` (same value OCC uses). It used to coerce
- * `'auto'|null` to a hardcoded 12.5 here, which silently diverged from OCC's
- * resolution and made OBS under-pack on implicit-cache models (2026-09-17
- * review: 20/72 packs deferred to sendCount 3–175).
+ * Is replacing an earlier message with a placeholder profitable under rolling prefix cache models?
+ * `cacheWriteReadRatio` must already be resolved by the caller via `resolveCacheRatioFromCost`
+ * (the same value OCC uses) — a raw `'auto'` here would silently diverge from OCC's resolution.
  */
 export function shouldPackForCache(opts: {
   removedTokens: number;
@@ -234,15 +198,8 @@ export function shouldPackForCache(opts: {
 }): boolean {
   if (opts.removedTokens <= 0) return false;
   const ratio = opts.cacheWriteReadRatio ?? TOKEN_ACCOUNT_CACHE_RATIO;
+  if (ratio <= 1.0) return true; // No incremental write cost over reads.
 
-  if (ratio <= 1.0) {
-    return true; // No incremental write cost over reads
-  }
-
-  const incrementalRatio = ratio - 1.0;
   const remaining = Math.max(1, opts.expectedRemainingRequests);
-  const benefitTokens = opts.removedTokens * remaining;
-  const costTokens = opts.tailTokensAfter * incrementalRatio;
-
-  return benefitTokens > costTokens;
+  return opts.removedTokens * remaining > opts.tailTokensAfter * (ratio - 1.0);
 }

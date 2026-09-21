@@ -1,11 +1,10 @@
 /**
  * D78/D81 todo loader entry.
  *
- * A Cordis plugin keeps the master surface hot-swappable while allowing workers to mount the
- * one-shot subset directly. Injected services preserve the D79 registration boundary and keep
- * session-owned todo state in index. This module owns the tool, command, widget, read hook,
- * and master stop reminder; reconciliation, mirroring, and agent reporting stay with the
- * session state layer to avoid a dependency cycle.
+ * A Cordis plugin keeps the master surface hot-swappable while workers mount the one-shot subset
+ * directly; injected services preserve the D79 registration boundary and keep session-owned todo
+ * state in index. This module owns the tool, command, widget, read hook, and master stop reminder —
+ * reconciliation, mirroring, and agent reporting stay in the session state layer (cycle avoidance).
  */
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
@@ -14,24 +13,15 @@ import type { TodosService } from '../todos-service.ts';
 import { planTodoReadHook } from '../todo-read-hook.ts';
 import { TODO_REMINDER_CUSTOM_TYPE, planStopTodoReminder, todoReminderGraceMs } from '../todo-reminder-core.ts';
 import { makeProgressUpdate } from '../subagent-core.ts';
-import { TODO_DETAILS_KEY, TODO_TOOL_NAME, formatTodoConfirmation, type TodoItem } from '../vocab.ts';
-import { toolError } from '../tool-error.ts'
-
-/** Raw tool arguments: every field is validated inside the action handlers. */
-type ToolParams = Record<string, unknown> | undefined;;
+import { TODO_DETAILS_KEY, TODO_STATUSES, TODO_TOOL_NAME, formatTodoConfirmation, type TodoItem } from '../vocab.ts';
+import { toolError } from '../tool-error.ts';
 import { formatAge, isArchived } from '../stale-core.ts';
-import {
-  TODO_EDIT_CUSTOM_TYPE,
-  completionTransitions,
-  fuzzyFind,
-  listsEqual,
-  makeSnapshot,
-  normalizeStrict,
-  revertedCompleted,
-  validateTodos,
-} from '../todo-core.ts';
+import { TODO_EDIT_CUSTOM_TYPE, completionTransitions, fuzzyFind, listsEqual, makeSnapshot, normalizeStrict, revertedCompleted, validateTodos, type TodoEditOp } from '../todo-core.ts';
 import { anchorTodoRange, formatTodoSummary, renderTodoGroups } from '../todo-window.ts';
 import { swallow } from '../swallow.ts';
+
+/** Raw tool arguments: every field is validated inside the action handlers. */
+type ToolParams = Record<string, unknown> | undefined;
 
 export interface TodoUiSlot {
   /** Lets index lifecycle events render through the currently mounted plugin. */
@@ -71,24 +61,30 @@ const TOOL_DESCRIPTION = [
   'Delegated work belongs on this list too. When you hand an entry to a subagent, append ` <sub>` to its content (the subagent is doing it, not you); when the subagent settles, a matching entry is auto-completed — you will see "Reconciled:" in the settlement note. If no auto-match fired, update the entry yourself.',
 ].join(' ');
 
-/** Stay within pi interactive mode's ten-line widget cap instead of relying on head truncation. */
-export const WIDGET_MAX_LINES = 10;
+/** pi interactive mode renders at most ten widget lines. */
+const WIDGET_MAX_LINES = 10;
+
+/** `/todos <op> <query>` verbs; the value is the user-facing past-tense feedback. */
+const OP_VERBS: Record<TodoEditOp, string> = {
+  done: 'completed',
+  drop: 'abandoned',
+  unblock: 'unblocked (back to pending)',
+  rm: 'removed',
+};
 
 /**
- * Keep the active task visible within WIDGET_MAX_LINES instead of truncating to a fixed head or
- * tail. The window anchors on the first in-progress item, then the last open item, then recent
- * completions. A +N line points to /todos when the full plan cannot fit. This fixes 01a03c0d,
- * where active work scrolled out while only the final entries remained visible.
+ * Keep the active task visible within WIDGET_MAX_LINES rather than truncating to a fixed head or
+ * tail: the window anchors on the first in-progress item, then the last open item, then recent
+ * completions, and a +N line points to /todos when the full plan cannot fit.
  */
 export function widgetLines(
   items: readonly TodoItem[],
   opts?: { archivedAgeMs?: number | null; blockedDepth?: number | null },
 ): string[] {
   if (items.length === 0) return [];
-  // Human gate open (ask_user_question waiting): the question + editor own the fixed area, so the
-  // widget collapses to the one-line summary — /todos still reaches the full list. Without this,
-  // a 10-line widget plus a multi-line question leaves almost no scrollable transcript
-  // (user-reported: both blocks visible ⇒ history range too small).
+  // Human gate open (ask_user_question waiting): the question and editor own the fixed area, so the
+  // widget collapses to one summary line — otherwise a 10-line widget plus a multi-line question
+  // leaves almost no scrollable transcript.
   if ((opts?.blockedDepth ?? 0) > 0) {
     return [`${formatTodoSummary(items)} · /todos 全量`];
   }
@@ -100,8 +96,8 @@ export function widgetLines(
     ];
   }
 
-  // Reserve summary and overflow lines, then shrink around the anchor because phase headers also consume the budget.
-  const renderBudget = WIDGET_MAX_LINES - 1 - 1;
+  // Reserve summary and overflow lines; phase headers consume the budget too, hence the shrink loop.
+  const renderBudget = WIDGET_MAX_LINES - 2;
   const [start, end] = anchorTodoRange(
     items,
     (s, e) => renderTodoGroups(items.slice(s, e)).length <= renderBudget,
@@ -129,21 +125,13 @@ export default function todoPlugin(ctx: Context): void {
       : null;
   }
 
-  /** Name the guarded event UI once so callers do not repeat unsafe inline assertions. */
-  function widgetUi(eventCtx: unknown): { setWidget?: (id: string, lines: string[]) => void } | undefined {
-    if (eventCtx === null || typeof eventCtx !== 'object' || !('ui' in eventCtx)) return undefined;
-    const ui = (eventCtx as { ui: unknown }).ui; // Safe after the property guard above.
-    return ui !== null && typeof ui === 'object'
-      ? (ui as { setWidget?: (id: string, lines: string[]) => void })
-      : undefined;
-  }
-
   /** Gate transitions fire outside lifecycle events; remember one ctx so rerenderWidget can target the live ui. */
   let lastEventCtx: unknown = null;
   function renderWidget(eventCtx: unknown): void {
     if (eventCtx !== null && eventCtx !== undefined) lastEventCtx = eventCtx;
+    const ui = (eventCtx as { ui?: { setWidget?: (id: string, lines: string[]) => void } } | null | undefined)?.ui;
     try {
-      widgetUi(eventCtx)?.setWidget?.('todos', widgetLines(todos.items, {
+      ui?.setWidget?.('todos', widgetLines(todos.items, {
         archivedAgeMs: archivedAgeMs(),
         blockedDepth: getBlockedDepth?.() ?? 0,
       }));
@@ -164,7 +152,6 @@ export default function todoPlugin(ctx: Context): void {
   let staleNotices = 0;
   let lastStaleGuardTurn: number | null = null;
 
-  // Any real edit ends the current stale period because the plan is active again.
   todos.on('todo.updated', () => {
     lastWriteTurn = todoReadTurn;
     staleNotices = 0;
@@ -185,21 +172,20 @@ export default function todoPlugin(ctx: Context): void {
       staleNotices += 1;
       lastStaleGuardTurn = todoReadTurn;
     }
-    // Share cadence across empty, archive, and R2 rewrite notices so adjacent notices do not
+    // Empty, archive, and R2 rewrite notices share one cadence so adjacent notices do not each
     // consume the grace window.
     if (plan.inject && (plan.effect === 'empty-guard' || plan.archived)) {
       lastEmptyGuardTurn = todoReadTurn;
     }
-    // R1 clears archived entries after notice because retaining dead items suppresses the empty
-    // guard that restored tracking after the 01a03c0d two-hour gap. Persist removals for replay;
-    // the session log still retains history.
+    // R1: persist the clear as one rm-per-item edit so replay folds to an empty list. The session
+    // log keeps the history; a dead in-memory list would suppress the empty guard.
     if (plan.inject && plan.effect === 'archive-notice' && plan.clearArchived && todos.items.length > 0) {
       const edits = todos.items.map((it) => ({ op: 'rm' as const, content: it.content }));
       try {
         appendEntry(TODO_EDIT_CUSTOM_TYPE, { version: 1, edits, ts: Date.now() });
       } catch (err) {
-        // Persistence is best-effort because the in-memory clear must still proceed, but a silent
-        // failure here is exactly how the archive/replay path broke unnoticed before (SA-13).
+        // The in-memory clear must proceed, but a silent failure here is how the archive/replay
+        // path broke unnoticed before (SA-13).
         swallow('todo.persist-archive', err);
       }
       todos.replace([], { source: 'archive' });
@@ -233,24 +219,18 @@ export default function todoPlugin(ctx: Context): void {
     }
     state.cancelReminder = cancelTodoReminder;
     scoped.on('turn_end', async (event: unknown) => {
-      if (event === null || typeof event !== 'object' || !('message' in event)) return;
-      const msg = (event as { message: unknown }).message;
+      const msg = (event as { message?: unknown } | null | undefined)?.message;
       if (msg === null || typeof msg !== 'object') return;
       const { role, stopReason } = msg as { role?: unknown; stopReason?: unknown };
-      if (role === 'assistant' && typeof stopReason === 'string') {
-        lastAssistantStopReason = stopReason;
-      }
+      if (role === 'assistant' && typeof stopReason === 'string') lastAssistantStopReason = stopReason;
     });
-    scoped.on('agent_start', () => cancelTodoReminder());
-    scoped.on('session_shutdown', () => cancelTodoReminder());
+    for (const ev of ['agent_start', 'session_shutdown']) scoped.on(ev, () => cancelTodoReminder());
     scoped.on('agent_settled', async () => {
       cancelTodoReminder();
-      const inFlight = stopReminder.isCompactionInFlight?.() ?? false;
-      const intentional = stopReminder.isIntentionalAbort?.() ?? false;
       const plan = planStopTodoReminder({
         lastStopReason: lastAssistantStopReason,
-        intentionalAbort: intentional,
-        compactionInFlight: inFlight,
+        intentionalAbort: stopReminder.isIntentionalAbort?.() ?? false,
+        compactionInFlight: stopReminder.isCompactionInFlight?.() ?? false,
         reminders: todoReminders,
         runningSubs: stopReminder.getRunningSubs(),
         blockedDepth: stopReminder.getBlockedDepth(),
@@ -261,19 +241,12 @@ export default function todoPlugin(ctx: Context): void {
       todoReminderTimer = setTimeout(() => {
         todoReminderTimer = null;
         if (stopReminder.isCompactionInFlight?.()) return;
-        void (async () => {
-          const send = pi.sendMessage;
-          if (typeof send !== 'function') return;
-          try {
-            await send(
-              { customType: TODO_REMINDER_CUSTOM_TYPE, content, display: true },
-              { deliverAs: 'followUp', triggerTurn: true },
-            );
-            todoReminders += 1;
-          } catch {
-            /* Delivery failure is non-fatal. */
-          }
-        })();
+        const send = pi.sendMessage;
+        if (typeof send !== 'function') return;
+        void send(
+          { customType: TODO_REMINDER_CUSTOM_TYPE, content, display: true },
+          { deliverAs: 'followUp', triggerTurn: true },
+        ).then(() => { todoReminders += 1; }, () => {});
       }, todoReminderGraceMs());
       todoReminderTimer.unref?.();
     });
@@ -292,13 +265,10 @@ export default function todoPlugin(ctx: Context): void {
         Type.Object(
           {
             content: Type.String({ description: 'What the task is — a short imperative line' }),
-            status: Type.Union([
-              Type.Literal('pending'),
-              Type.Literal('in_progress'),
-              Type.Literal('completed'),
-              Type.Literal('blocked'),
-              Type.Literal('abandoned'),
-            ], { description: 'pending | in_progress | completed | blocked | abandoned' }),
+            status: Type.Union(
+              TODO_STATUSES.map((status) => Type.Literal(status)),
+              { description: TODO_STATUSES.join(' | ') },
+            ),
             blocker: Type.Optional(Type.String({ description: 'Only when status is "blocked": what it is waiting for. Omit the field entirely (never an empty string) for other statuses' })),
             phase: Type.Optional(Type.String({ description: 'Optional group name (≤30 chars); omit for a flat list (never an empty string)' })),
           },
@@ -315,10 +285,9 @@ export default function todoPlugin(ctx: Context): void {
         // A1: an invalid list is a hard failure — throw so pi flags isError for the model.
         return toolError(result.error ?? 'invalid todo list');
       }
-      const strictMode = todos.config.strict; // D75 phase 2 keeps policy in the service config.
       let next = result.items!;
       const strictNotes: string[] = [];
-      if (strictMode) {
+      if (todos.config.strict) {
         const strict = normalizeStrict(next);
         const demoted = next
           .filter((it, i) => it.status === 'in_progress' && strict[i]?.status === 'pending')
@@ -329,11 +298,10 @@ export default function todoPlugin(ctx: Context): void {
         if (promoted) strictNotes.push(`auto-promoted to in_progress: ${promoted}`);
         next = strict;
       }
-      // D35 avoids persistence and mirroring when the authoritative list is unchanged.
+      // D35: skip persistence and mirroring when the authoritative list is unchanged.
       if (listsEqual(todos.items, next)) {
         return { content: [{ type: 'text', text: 'No change: todo list already matches.' }], details: {} };
       }
-      // D36/D37 surface completion transitions and regressions to the caller.
       const completed = completionTransitions(todos.items, next);
       const reverted = revertedCompleted(todos.items, next);
       todos.replace(next, { source: 'tool' });
@@ -363,12 +331,11 @@ export default function todoPlugin(ctx: Context): void {
     description: 'Show the todo list, or edit it: /todos done|drop|rm|unblock <fuzzy content match>',
     handler: async (args: unknown, eventCtx: unknown) => {
       const ui = (eventCtx as { ui?: { notify?: (text: string, level?: string) => void } }).ui;
-      const ops = ['done', 'drop', 'rm', 'unblock'] as const;
       const raw = typeof args === 'string'
         ? args.split(/\s+/).filter(Boolean)
         : Array.isArray(args) ? args.map(String) : [];
       const opArg = raw[0];
-      if (opArg && (ops as readonly string[]).includes(opArg)) {
+      if (opArg && opArg in OP_VERBS) {
         const query = raw.slice(1).join(' ').trim();
         if (!query) {
           ui?.notify?.('usage: /todos done|drop|rm|unblock <content>', 'warning');
@@ -384,14 +351,14 @@ export default function todoPlugin(ctx: Context): void {
           return;
         }
         const content = candidates[0];
-        const edit = { op: opArg as 'done' | 'drop' | 'rm' | 'unblock', content };
+        const edit = { op: opArg as TodoEditOp, content };
         const before = todos.items;
         todos.applyEdits([edit], { source: 'human' });
         if (listsEqual(before, todos.items)) {
           ui?.notify?.(`no change: "${content}" is already in that state`, 'info');
           return;
         }
-        // D38 persists human edits so branch replay rebuilds the same authoritative state.
+        // D38: persist human edits so branch replay rebuilds the same authoritative state.
         try {
           appendEntry(TODO_EDIT_CUSTOM_TYPE, { version: 1, edits: [edit], ts: Date.now() });
         } catch {
@@ -399,11 +366,7 @@ export default function todoPlugin(ctx: Context): void {
         }
         mirrorTodos();
         renderWidget(eventCtx);
-        const verb = opArg === 'done' ? 'completed'
-          : opArg === 'drop' ? 'abandoned'
-          : opArg === 'unblock' ? 'unblocked (back to pending)'
-          : 'removed';
-        ui?.notify?.(`"${content}" ${verb}`, 'info');
+        ui?.notify?.(`"${content}" ${OP_VERBS[edit.op]}`, 'info');
         return;
       }
       // /todos is the unbounded view because the widget intentionally prioritizes active context.
@@ -419,4 +382,3 @@ export default function todoPlugin(ctx: Context): void {
     },
   });
 }
-

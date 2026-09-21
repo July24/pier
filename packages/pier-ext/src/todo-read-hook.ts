@@ -1,32 +1,32 @@
 /**
- * D69: Plan the todo read hook (before_agent_start + display:false).
- * Stale-core prevents a fully completed list from being recited forever:
- *  - stale (turn-based) → warn with old entries for rewriting, rate-limited and capped;
- *  - archived (wall-clock based) → treat it as absent, sharing the guard cadence with empty lists.
+ * D69: plan the todo read hook (before_agent_start + display:false). Stale-core keeps a fully
+ * completed list from being recited forever: stale (turn-based) warns with the old entries as rewrite
+ * references, rate-limited and capped; archived (wall-clock) treats the list as absent, sharing the
+ * guard cadence with empty lists.
  */
 import { boundedView, currentActivity, type TodoItem } from './todo-core.ts';
 import { countTodos } from './vocab.ts';
 import { STALE_NOTICE_MAX, evaluateStaleness, formatAge } from './stale-core.ts';
+import { TODO_MARKS } from './todo-window.ts';
 
-/** Share one injection cadence across empty-list guards, stale warnings, and archive notices. */
-export const EMPTY_GUARD_EVERY_N = 4;
-export const TODO_READ_CUSTOM_TYPE = 'pi-herdr.todo-read';
+/** Cadence shared by empty-list guards, stale warnings, and archive notices. */
+const EMPTY_GUARD_EVERY_N = 4;
+const TODO_READ_CUSTOM_TYPE = 'pi-herdr.todo-read';
 
-export type TodoReadEffect =
+type TodoReadEffect =
   | 'recite' // Recite normally while the list is fresh.
   | 'empty-guard' // Guard against an empty list.
-  | 'stale-notice' // A: warn when the list is stale by turns.
-  | 'archive-notice' // B: notify when the list is archived by wall-clock age.
+  | 'stale-notice' // Warn when the list is stale by turns, or when archiving is one window away.
+  | 'archive-notice' // Notify once the list is archived by wall-clock age.
   | 'none'; // Skip because of rate limits or caps.
 
-export interface TodoReadPlan {
+interface TodoReadPlan {
   inject: boolean;
   effect: TodoReadEffect;
   /** Current archive state, independent of injection, so callers can refresh widget/title projections. */
   archived: boolean;
-  /** R1: Clear the in-memory list when injecting the archive notice; callers persist the empty JSONL
-   * so a dead list cannot block the before-stopping empty guard (01a03c0d observed 2h of untracked
-   * multi-step work after archiving). */
+  /** R1: clear the in-memory list when injecting the archive notice; the caller persists the empty JSONL.
+   * Keeping a dead list would suppress the empty guard that resumes tracking after an idle gap. */
   clearArchived: boolean;
   message: {
     customType: string;
@@ -34,14 +34,6 @@ export interface TodoReadPlan {
     display: false;
   };
 }
-
-const MARKS: Record<TodoItem['status'], string> = {
-  pending: '○',
-  in_progress: '▶',
-  completed: '✓',
-  blocked: '■',
-  abandoned: '✗',
-};
 
 export function planTodoReadHook(opts: {
   items: readonly TodoItem[];
@@ -86,16 +78,13 @@ export function planTodoReadHook(opts: {
   });
 
   if (st.kind === 'archived') {
-    const c = countTodos(opts.items as TodoItem[]);
+    const c = countTodos(opts.items);
     const age = st.ageMs == null ? '' : ` ${formatAge(st.ageMs)} ago`;
-    // R2: Preserve one rewrite window with old entries as a reference before archiving.
-    // Idle periods do not consume turns, so the wall clock can reach one hour before a turns-based
-    // warning fires; 01a03c0d showed that the final notice then caused five todo_write calls to be ignored.
-    // B + R1/R3: The terminal notice no longer injects details and clears the list in the same
-    // injection; removing the [] escape hatch ensures multi-step work gets tracked while single-step
-    // Q&A remains explicitly allowed.
+    // R2: idle periods do not consume turns, so give one rewrite window with the old entries as
+    // reference before the terminal notice — a list archived without warning had its final notice
+    // (and five todo_write calls) ignored in 01a03c0d.
     if (opts.staleNotices === 0 && guardDue) {
-      const lines = opts.items.map((it) => `  ${MARKS[it.status]} ${it.content}`);
+      const lines = opts.items.map((it) => `  ${TODO_MARKS[it.status]} ${it.content}`);
       const head = `todos ✓${c.completed} (all completed, last updated${age}) — about to be archived`;
       const warn = 'One rewrite window before archiving: if the work you are doing now is multi-step, rewrite the full list with todo_write to track it (old entries below as reference — reuse what still applies). Single-step Q&A may skip tracking. If the list stays untouched, it will be archived and cleared on the next reminder.';
       return {
@@ -106,9 +95,8 @@ export function planTodoReadHook(opts: {
         message: msg([head, ...lines, warn].join('\n')),
       };
     }
-    // B + R1/R3: The terminal notice no longer injects details and clears the list in the same
-    // injection; removing the [] escape hatch ensures multi-step work gets tracked while single-step
-    // Q&A remains explicitly allowed.
+    // R1/R3: the terminal notice carries no details and no "skip tracking" escape hatch — multi-step
+    // work must get a fresh list, single-step Q&A is allowed to proceed untracked.
     return {
       inject: guardDue,
       effect: 'archive-notice',
@@ -123,16 +111,15 @@ export function planTodoReadHook(opts: {
   }
 
   if (st.kind === 'stale') {
-    // A: Turn recitation into a warning while retaining old entries as rewrite references; cap at STALE_NOTICE_MAX.
     const staleDue = opts.lastStaleGuardTurn == null
       || opts.turn - opts.lastStaleGuardTurn >= EMPTY_GUARD_EVERY_N;
     if (!staleDue || opts.staleNotices >= STALE_NOTICE_MAX) {
       return { inject: false, effect: 'none', archived: false, clearArchived: false, message: msg('') };
     }
-    const c = countTodos(opts.items as TodoItem[]);
+    const c = countTodos(opts.items);
     const head = `todos ▶${c.inProgress} ○${c.pending} ■${c.blocked} ✓${c.completed}`
       + ` · unchanged for ${opts.turnsSinceWrite} turns, nothing open`;
-    const lines = opts.items.map((it) => `  ${MARKS[it.status]} ${it.content}`);
+    const lines = opts.items.map((it) => `  ${TODO_MARKS[it.status]} ${it.content}`);
     const warn = 'This list no longer reflects the work you are doing. Rewrite the full list with todo_write to match current work, or send [] to clear it.';
     return {
       inject: true,
@@ -146,7 +133,7 @@ export function planTodoReadHook(opts: {
   // Fresh lists are recited every turn to keep current work visible.
   const c = countTodos(opts.items);
   const view = boundedView(opts.items, 6);
-  const lines = view.visible.map((it) => `${MARKS[it.status]} ${it.content}`);
+  const lines = view.visible.map((it) => `${TODO_MARKS[it.status]} ${it.content}`);
   const activity = currentActivity(opts.items);
   const head = `todos ▶${c.inProgress} ○${c.pending} ■${c.blocked} ✓${c.completed}`
     + (activity ? ` · ${activity}` : '');

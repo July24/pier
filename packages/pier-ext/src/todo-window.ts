@@ -1,9 +1,7 @@
 /**
- * Activity-anchored todo window used by the pi widget and the slim overlay.
- *
- * Why: both surfaces must keep the in-progress row visible instead of a fixed
- * head/tail slice. The widget budgets unwrapped render lines; the overlay
- * supplies its own `fits` so wrapping can consume extra rows.
+ * Activity-anchored todo window shared by the pi widget and the slim overlay. The widget passes a
+ * budget of unwrapped render lines, the overlay supplies its own `fits` so wrapping can consume extra
+ * rows; either way the in-progress row stays visible.
  */
 import { countTodos, type TodoItem, type TodoStatus } from './vocab.ts';
 
@@ -16,11 +14,11 @@ export const TODO_MARKS: Record<TodoStatus, string> = {
 };
 
 export function formatTodoSummary(items: readonly TodoItem[]): string {
-  const c = countTodos(items as TodoItem[]);
+  const c = countTodos(items);
   return `todo: ${c.inProgress}▶ ${c.pending}○ ${c.blocked}■ ${c.completed}✓`;
 }
 
-/** Share phase rendering so widget and overlay order entries identically. */
+/** Shared phase rendering so widget and overlay order entries identically. */
 export function renderTodoGroups(items: readonly TodoItem[]): string[] {
   const groups = new Map<string, TodoItem[]>();
   for (const it of items) {
@@ -41,9 +39,9 @@ export function renderTodoGroups(items: readonly TodoItem[]): string[] {
 }
 
 /**
- * Expand around the active anchor while `fits(start, end)` remains true.
- * Prefers upcoming work; the anchor stays visible. All-completed lists keep
- * the original head-shrink (widget-compatible).
+ * Expand around the active anchor while `fits(start, end)` holds: the first in_progress item,
+ * else the last open one, growing toward the tail first so upcoming work wins. All-completed
+ * lists shrink from the head instead.
  */
 export function anchorTodoRange(
   items: readonly TodoItem[],

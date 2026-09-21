@@ -1,22 +1,22 @@
 /**
- * M17: pure planner for automatic todo↔subagent reconciliation (development plan §M17; P2 = do not check off low-confidence matches, only prompt).
+ * M17: pure planner for automatic todo↔subagent reconciliation, run after a settlement push and
+ * before the followUp is injected.
  *
- * Timing (adapter): after the controller receives a settlement push (pollLoop / pipe reply), before injecting followUp.
- * Semantics (aligned with omp reconcileTodosWithSubagents):
- *  - Match description ↔ todo.content: normalize (lowercase + collapse whitespace), then exact → bidirectional prefix
- *    → substring, in the same family as D38 fuzzyFind;
- *  - Auto-complete only when settled and the unique best tier is in {exact, prefix}; at most one item per settlement;
- *  - Unblock blocked items whose blocker ↔ description matches at any tier (exact/prefix)
- *    (multiple allowed; failed/low-confidence matches do not unblock);
- *  - Low confidence/ambiguity/failure: leave the list unchanged and add a noteLines prompt to the settlement notice (P2 decision);
- *  - Persistence: edits use the D38 authoritative path (pi-herdr.todo-edit custom entry, effective during branch replay).
+ * Match description ↔ todo.content after normalize (lowercase + collapse whitespace) at tiers
+ * exact → prefix → substring, the same family as D38 fuzzyFind.
+ *  - Auto-complete only a settled subagent's unique best candidate at exact/prefix, at most one item;
+ *  - Unblock blocked items whose blocker matches at any tier (blockers are phrases like "waiting for
+ *    X to finish", so substring matters and a soft return to pending is safe);
+ *  - Low confidence / ambiguity / failure leaves the list untouched and adds a prompt line (P2: never
+ *    check off a guess);
+ *  - Edits persist through the D38 authoritative path (pi-herdr.todo-edit), so branch replay reproduces them.
  */
 
 import { applyTodoEdits, type TodoEdit, type TodoItem } from './todo-core.ts';
 
-export type ReconcileOutcome = 'settled' | 'failed';
-export type MatchTier = 'exact' | 'prefix' | 'substring' | null;
-export interface ReconcilePlan {
+type ReconcileOutcome = 'settled' | 'failed';
+type MatchTier = 'exact' | 'prefix' | 'substring' | null;
+interface ReconcilePlan {
   /** List after applying edits (original reference when there are no edits). */
   items: TodoItem[];
   /** Edits persisted through the authoritative path (at most one done plus any unblocks). */
@@ -25,11 +25,10 @@ export interface ReconcilePlan {
   completed: TodoItem | null;
   /** Best matching tier for auto-completion (null when there are no candidates). */
   tier: MatchTier;
-  /** Items unblocked by a blocker match. */
   unblocked: TodoItem[];
-  /** Prompt lines injected into the settlement notice (aligned with D36 feedback tone; empty when none). */
+  /** Prompt lines appended to the settlement notice (empty when none). */
   noteLines: string[];
-  /** Match-rate metric (P2: collected with the settlement notice in session JSONL). */
+  /** Match-rate metric, collected with the settlement notice in session JSONL (P2). */
   metric: {
     description: string;
     outcome: ReconcileOutcome;
@@ -64,9 +63,9 @@ export function reconcileTodos(
   const edits: TodoEdit[] = [];
   const noteLines: string[] = [];
 
-  // 1) Check-off candidates: pending / in_progress (completed/abandoned never participate).
-  const matchable = prev.filter((t) => t.status === 'pending' || t.status === 'in_progress');
-  const scored = matchable
+  // Check-off candidates: completed/abandoned never participate.
+  const scored = prev
+    .filter((t) => t.status === 'pending' || t.status === 'in_progress')
     .map((t) => ({ item: t, tier: matchTier(description, t.content) }))
     .filter((c): c is { item: TodoItem; tier: Exclude<MatchTier, null> } => c.tier !== null)
     .sort((a, b) => TIER_ORDER[a.tier] - TIER_ORDER[b.tier]);
@@ -80,35 +79,30 @@ export function reconcileTodos(
       edits.push({ op: 'done', content: completed.content });
       noteLines.push(`Reconciled: completed "${completed.content}" (${bestTier} match with subagent description).`);
     } else if (best.length > 1) {
-      // Ambiguous match: list candidates and leave the decision to a person.
       noteLines.push(
         `Todo match ambiguous between: ${best.map((c) => `"${c.item.content}"`).join(', ')} — update todo_write yourself.`,
       );
-    } else if (outcome === 'failed') {
-      // High-confidence candidate, but the subagent did not settle successfully: keep it open and prompt.
+    } else {
+      // High-confidence candidate, but the subagent did not settle successfully: keep it open.
       for (const c of best) {
         noteLines.push(`Todo kept open: "${c.item.content}" (subagent did not settle successfully).`);
       }
     }
   } else if (bestTier === 'substring') {
-    // Low-confidence match (P2): do not check it off; prompt with the candidate.
     for (const c of best) {
       noteLines.push(`Todo not auto-completed (low-confidence match): "${c.item.content}" — update todo_write if this work is done.`);
     }
   }
 
-  // 2) Unblock on any blocker match, including substring—real blockers are phrases such as "waiting for X to finish",
-  //    so the description may be embedded in the middle and prefix would miss it. The low-confidence gate applies only
-  //    to check-offs; returning an unblocked item to pending is a soft operation. Only settled subagents can unblock (possibly multiple).
+  // Unblocking is a soft operation, so any tier counts; only a settled subagent can unblock.
   const unblocked: TodoItem[] = [];
   if (outcome === 'settled') {
     for (const t of prev) {
       if (t.status !== 'blocked' || typeof t.blocker !== 'string') continue;
-      if (matchTier(description, t.blocker) !== null) {
-        unblocked.push(t);
-        edits.push({ op: 'unblock', content: t.content });
-        noteLines.push(`Unblocked "${t.content}" (was waiting on: ${t.blocker}).`);
-      }
+      if (matchTier(description, t.blocker) === null) continue;
+      unblocked.push(t);
+      edits.push({ op: 'unblock', content: t.content });
+      noteLines.push(`Unblocked "${t.content}" (was waiting on: ${t.blocker}).`);
     }
   }
 

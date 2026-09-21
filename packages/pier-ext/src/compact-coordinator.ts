@@ -1,52 +1,33 @@
 /**
- * D100 Online Context Compact Coordinator.
- *
- * Orchestrates:
- *  - Tracking todo completion boundaries (filtered to source === 'tool').
- *  - Evaluating KV-cache economics & window protection on turn_end.
- *  - Guarding against ejecting queued messages (hasPendingMessages check).
- *  - Aborting turn and executing Pi native compaction with custom instructions.
- *  - Feeding remaining tasks forward and injecting continuation turn.
- *  - Persisting state to session entries across branches and restores.
+ * D100 Online Context Compact Coordinator: tracks tool-sourced todo completion boundaries, evaluates
+ * KV-cache economics and window protection on turn_end, aborts the in-flight turn, then runs pi's
+ * native compaction and continues the task. State persists to session entries, so branch rebuilds
+ * restore the same pacing samples and debt.
  */
 
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
-import {
-  decideCompaction,
-  DEFAULT_COMPACTION_ECONOMICS,
-  estimateRemainingRequests,
-  MAX_BOUNDARY_SAMPLES,
-  nativeCompactionFeasible,
-  resolveCacheRatioFromCost,
-  type CompactionDecision,
-} from './compact-economics-core.ts';
+import { decideCompaction, DEFAULT_COMPACTION_ECONOMICS, estimateRemainingRequests, MAX_BOUNDARY_SAMPLES, nativeCompactionFeasible, resolveCacheRatioFromCost, type CompactionDecision } from './compact-economics-core.ts';
 import type { TodoItem } from './todo-core.ts';
 import type { TodoCompletionSource } from './todos-service.ts';
 import type { OnlineContextCompactConfig } from './efficiency-config-core.ts';
-import {
-  appendEfficiencyLog,
-  efficiencyLogPath,
-  resolveSessionRoot,
-} from './efficiency-store.ts';
+import { appendEfficiencyLog, efficiencyLogPath, resolveSessionRoot } from './efficiency-store.ts';
 import { swallow } from './swallow.ts';
 
 export const COMPACT_STATE_CUSTOM_TYPE = 'pi-herdr.efficiency-state';
 export const COMPACTION_CONTINUE_TYPE = 'pi-herdr.compaction-continue';
 /**
- * Cross-session compaction markers. OCC aborts an in-flight turn before compacting, and
- * the abort lands in the child transcript as an assistant message with stopReason 'error'
- * ("This operation was aborted") — which a supervising master's poller reads as a ended
- * turn and settles the subagent mid-compaction (observed 01a0be1f: worker wA:p2M consumed
- * at 09:53:32 while its compaction ran until 09:53:53; master woken with a false settle
- * notice). The inflight/settled pair gives the poller a deterministic "do not settle"
- * window that pane state cannot provide (the pane reports idle while compacting).
+ * Cross-session compaction markers. OCC aborts the in-flight turn, and that abort lands in the child
+ * transcript as an assistant message with stopReason 'error', which a supervising master's poller
+ * would read as a settled turn. The inflight/settled pair gives it a deterministic "do not settle"
+ * window that pane state cannot provide (a pane reports idle while compacting).
  */
 export const COMPACTION_INFLIGHT_TYPE = 'pi-herdr.compaction-inflight';
 export const COMPACTION_SETTLED_TYPE = 'pi-herdr.compaction-settled';
-export const DEFAULT_KEEP_RECENT_TOKENS = 20_000;
-export const DEFAULT_MEMO_TOKENS = 1_000;
+const DEFAULT_KEEP_RECENT_TOKENS = 20_000;
+const DEFAULT_MEMO_TOKENS = 1_000;
 
-export interface CoordinatorState {
+/** Fields persisted in the state marker; `version: 1` gates restores. */
+interface CoordinatorState {
   version: 1;
   epoch: number;
   completedBoundaryRequestCounts: number[];
@@ -63,7 +44,19 @@ export interface CoordinatorState {
   compactBackoffTurnEnds: number;
 }
 
-export function initialCoordinatorState(): CoordinatorState {
+const NUMERIC_STATE_FIELDS = [
+  'epoch',
+  'carriedDebtTokens',
+  'cacheDebtRepaymentTokens',
+  'priorCompactionCount',
+  'positiveContextDeltaTotal',
+  'positiveContextDeltaCount',
+  'currentBoundaryRequestCount',
+  'consecutiveCompactionFailures',
+  'compactBackoffTurnEnds',
+] as const satisfies readonly (keyof CoordinatorState)[];
+
+function initialCoordinatorState(): CoordinatorState {
   return {
     version: 1,
     epoch: 0,
@@ -80,31 +73,49 @@ export function initialCoordinatorState(): CoordinatorState {
   };
 }
 
+/** Last state marker wins; missing/older fields keep their defaults. */
 export function restoreCoordinatorState(entries: readonly unknown[]): CoordinatorState {
-  if (!Array.isArray(entries)) return initialCoordinatorState();
+  const base = initialCoordinatorState();
+  if (!Array.isArray(entries)) return base;
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i] as { type?: string; customType?: string; data?: unknown };
-    if (entry && entry.type === 'custom' && entry.customType === COMPACT_STATE_CUSTOM_TYPE) {
-      const d = entry.data as Partial<CoordinatorState>;
-      if (d && d.version === 1 && Array.isArray(d.completedBoundaryRequestCounts)) {
-        return {
-          version: 1,
-          epoch: typeof d.epoch === 'number' ? d.epoch : 0,
-          completedBoundaryRequestCounts: [...d.completedBoundaryRequestCounts],
-          carriedDebtTokens: typeof d.carriedDebtTokens === 'number' ? d.carriedDebtTokens : 0,
-          cacheDebtRepaymentTokens: typeof d.cacheDebtRepaymentTokens === 'number' ? d.cacheDebtRepaymentTokens : 0,
-          priorCompactionCount: typeof d.priorCompactionCount === 'number' ? d.priorCompactionCount : 0,
-          positiveContextDeltaTotal: typeof d.positiveContextDeltaTotal === 'number' ? d.positiveContextDeltaTotal : 0,
-          positiveContextDeltaCount: typeof d.positiveContextDeltaCount === 'number' ? d.positiveContextDeltaCount : 0,
-          lastContextTokens: typeof d.lastContextTokens === 'number' ? d.lastContextTokens : null,
-          currentBoundaryRequestCount: typeof d.currentBoundaryRequestCount === 'number' ? d.currentBoundaryRequestCount : 0,
-          consecutiveCompactionFailures: typeof d.consecutiveCompactionFailures === 'number' ? d.consecutiveCompactionFailures : 0,
-          compactBackoffTurnEnds: typeof d.compactBackoffTurnEnds === 'number' ? d.compactBackoffTurnEnds : 0,
-        };
-      }
+    if (entry?.type !== 'custom' || entry.customType !== COMPACT_STATE_CUSTOM_TYPE) continue;
+    const d = entry.data as Partial<CoordinatorState> | null | undefined;
+    if (!d || d.version !== 1 || !Array.isArray(d.completedBoundaryRequestCounts)) break;
+    for (const field of NUMERIC_STATE_FIELDS) {
+      const value = d[field];
+      if (typeof value === 'number') base[field] = value;
     }
+    if (typeof d.lastContextTokens === 'number') base.lastContextTokens = d.lastContextTokens;
+    base.completedBoundaryRequestCounts = [...d.completedBoundaryRequestCounts];
+    return base;
   }
-  return initialCoordinatorState();
+  return base;
+}
+
+/** Mean positive context growth per provider request; null until the first sample. */
+function averageContextIncrement(state: CoordinatorState): number | null {
+  return state.positiveContextDeltaCount > 0
+    ? state.positiveContextDeltaTotal / state.positiveContextDeltaCount
+    : null;
+}
+
+function remainingTodos(todos: readonly TodoItem[]): readonly TodoItem[] {
+  return todos.filter((it) => it.status !== 'completed' && it.status !== 'abandoned');
+}
+
+/** P1-3: bound the payload — a huge open-task list inflates the summary request itself. */
+function compactionInstructions(todos: readonly TodoItem[]): string {
+  const remaining = remainingTodos(todos);
+  const taskLines = remaining
+    .slice(0, 25)
+    .map((it) => `- [${it.status}] ${it.content.slice(0, 160)}${it.blocker ? ` (waiting on: ${it.blocker.slice(0, 80)})` : ''}`)
+    .join('\n');
+  const elided = remaining.length > 25 ? `\n… (+${remaining.length - 25} more, elided)` : '';
+  return [
+    'Preserve completed work, verification results, important decisions, and remaining work.',
+    remaining.length > 0 ? `Active/remaining tasks to preserve:\n${taskLines}${elided}` : 'All listed tasks are completed.',
+  ].join('\n\n');
 }
 
 export class CompactCoordinator {
@@ -115,19 +126,18 @@ export class CompactCoordinator {
   pendingBoundaryCompleted = false;
 
   recordBoundaryCompleted(count: number, source?: TodoCompletionSource): void {
-    // Only count completed transitions originating from model tool calls
+    // Only model tool calls count, and the sample is the requests spent reaching this boundary.
     if (source !== 'tool' || count <= 0) return;
     this.pendingBoundaryCompleted = true;
-    if (this.state.currentBoundaryRequestCount > 0) {
-      this.state.completedBoundaryRequestCounts.push(this.state.currentBoundaryRequestCount);
-      if (this.state.completedBoundaryRequestCounts.length > MAX_BOUNDARY_SAMPLES) {
-        this.state.completedBoundaryRequestCounts.splice(
-          0,
-          this.state.completedBoundaryRequestCounts.length - MAX_BOUNDARY_SAMPLES,
-        );
-      }
-      this.state.currentBoundaryRequestCount = 0;
+    if (this.state.currentBoundaryRequestCount <= 0) return;
+    this.state.completedBoundaryRequestCounts.push(this.state.currentBoundaryRequestCount);
+    if (this.state.completedBoundaryRequestCounts.length > MAX_BOUNDARY_SAMPLES) {
+      this.state.completedBoundaryRequestCounts.splice(
+        0,
+        this.state.completedBoundaryRequestCounts.length - MAX_BOUNDARY_SAMPLES,
+      );
     }
+    this.state.currentBoundaryRequestCount = 0;
   }
 
   onBeforeProviderRequest(contextTokens: number): void {
@@ -137,9 +147,7 @@ export class CompactCoordinator {
         0,
         this.state.carriedDebtTokens - this.state.cacheDebtRepaymentTokens,
       );
-      if (this.state.carriedDebtTokens === 0) {
-        this.state.cacheDebtRepaymentTokens = 0;
-      }
+      if (this.state.carriedDebtTokens === 0) this.state.cacheDebtRepaymentTokens = 0;
     }
     if (this.state.lastContextTokens !== null && contextTokens > this.state.lastContextTokens) {
       this.state.positiveContextDeltaTotal += contextTokens - this.state.lastContextTokens;
@@ -149,29 +157,25 @@ export class CompactCoordinator {
   }
 
   onInput(event: { text?: string; source?: string; streamingBehavior?: string }): void {
-    // Ignore internal messages dispatched by extensions (D96 reminders, pipe injections, followUps)
-    if (event.source === 'extension' || event.text?.startsWith('CORRECTION:')) {
-      return;
-    }
+    // Ignore messages dispatched by extensions (D96 reminders, pipe injections, followUps).
+    if (event.source === 'extension' || event.text?.startsWith('CORRECTION:')) return;
 
     const fromHuman =
       event.source === 'interactive' ||
       event.source === 'rpc' ||
       event.source === undefined;
+    if (!fromHuman) return;
 
-    // If human typed a new prompt or steer directive, reset expectations (correction)
-    if (fromHuman) {
-      this.selectedCompaction = null;
-      this.intentionalAbort = false;
-      this.pendingBoundaryCompleted = false;
-      // completedBoundaryRequestCounts deliberately survives: it measures
-      // requests-per-boundary pacing, which holds across human turns. Clearing it
-      // zeroed the mean and pinned expectedRemainingRequests at 1 after every
-      // prompt, so OCC never saw a horizon worth compacting under (2026-09-17
-      // review: compact.jsonl epoch kept climbing 1→9 with zero compactions).
-      this.state.carriedDebtTokens = 0;
-      this.state.epoch++;
-    }
+    // A fresh human prompt is a correction: drop the pending plan.
+    this.selectedCompaction = null;
+    this.intentionalAbort = false;
+    this.pendingBoundaryCompleted = false;
+    // completedBoundaryRequestCounts deliberately survives: it measures requests-per-boundary
+    // pacing, which holds across human turns. Clearing it zeroed the mean and pinned
+    // expectedRemainingRequests at 1 after every prompt, so OCC never saw a horizon worth
+    // compacting under.
+    this.state.carriedDebtTokens = 0;
+    this.state.epoch++;
   }
 
   onTurnEnd(opts: {
@@ -185,8 +189,7 @@ export class CompactCoordinator {
 
     if (!boundary || this.selectedCompaction) return;
     if (!opts.config.enabled) return;
-
-    // Safety guard: if user typed something that is queued, don't abort!
+    // Safety guard: never abort while the user has a queued message.
     if (opts.ctx.hasPendingMessages?.()) return;
 
     const usage = opts.ctx.getContextUsage?.();
@@ -195,22 +198,10 @@ export class CompactCoordinator {
         ? usage.tokens
         : this.state.lastContextTokens ?? 0;
     const contextWindowTokens = usage?.contextWindow ?? opts.ctx.model?.contextWindow ?? null;
+    // System prompt is re-sent verbatim, so it is never part of the compressible archive; ~4 chars/token.
     const fixedTokens = Math.ceil(Buffer.byteLength(opts.ctx.getSystemPrompt?.() ?? '') / 4);
     const keepRecentTokens = opts.config.keepRecentTokens ?? DEFAULT_KEEP_RECENT_TOKENS;
     const archiveTokens = Math.max(0, contextTokens - fixedTokens - keepRecentTokens);
-    const remainingBoundaries = opts.todos.filter(
-      (it) => it.status !== 'completed' && it.status !== 'abandoned',
-    ).length;
-
-    const averageContextTokenIncrement =
-      this.state.positiveContextDeltaCount > 0
-        ? this.state.positiveContextDeltaTotal / this.state.positiveContextDeltaCount
-        : null;
-    const cacheRatio = resolveCacheRatioFromCost(
-      opts.config.cacheWriteReadRatio,
-      opts.ctx.model?.cost,
-      { provider: opts.ctx.model?.provider, modelId: opts.ctx.model?.id },
-    );
 
     const decision = decideCompaction({
       writeTokens: contextTokens,
@@ -218,13 +209,17 @@ export class CompactCoordinator {
       memoTokens: DEFAULT_MEMO_TOKENS,
       contextTokens,
       completedBoundaryRequestCounts: this.state.completedBoundaryRequestCounts,
-      remainingBoundaries,
-      averageContextTokenIncrement,
+      remainingBoundaries: remainingTodos(opts.todos).length,
+      averageContextTokenIncrement: averageContextIncrement(this.state),
       contextWindowTokens,
       priorCompactionCount: this.state.priorCompactionCount,
       carriedDebtTokens: this.state.carriedDebtTokens,
       cacheDebtRepaymentTokens: this.state.cacheDebtRepaymentTokens,
-      cacheWriteReadRatio: cacheRatio,
+      cacheWriteReadRatio: resolveCacheRatioFromCost(
+        opts.config.cacheWriteReadRatio,
+        opts.ctx.model?.cost,
+        { provider: opts.ctx.model?.provider, modelId: opts.ctx.model?.id },
+      ),
       economics: {
         ...DEFAULT_COMPACTION_ECONOMICS,
         firstCompactionRequestScale: opts.config.firstCompactionRequestScale,
@@ -232,34 +227,33 @@ export class CompactCoordinator {
       },
     });
 
-    if (decision.compact) {
-      // P1-3: after a failed summarization (token-cap class), skip compact decisions for
-      // a bounded backoff window — each attempt aborts an in-flight turn, so retrying a
-      // doomed compaction burns turns for nothing (observed 05:47:03→05:48:37, 01a0bd3a).
-      if (this.state.compactBackoffTurnEnds > 0) {
-        this.state.compactBackoffTurnEnds--;
-        if (opts.config.logEnabled) {
-          this.logDecision(opts.ctx, { ...decision, compact: false, reason: 'failure_backoff' });
-        }
-        return;
-      }
-      const branch = opts.ctx.sessionManager?.getBranch?.() ?? [];
-      const keepRecentTokens = opts.config.keepRecentTokens ?? DEFAULT_KEEP_RECENT_TOKENS;
-      const feasible = nativeCompactionFeasible(branch, keepRecentTokens);
-      if (!feasible) {
-        if (opts.config.logEnabled) {
-          this.logDecision(opts.ctx, { ...decision, compact: false, reason: 'native_not_compactable' });
-        }
-        return;
-      }
-
-      this.selectedCompaction = decision;
-      this.intentionalAbort = true;
-      opts.cancelReminder?.();
-      opts.ctx.abort();
-    } else if (opts.config.logEnabled) {
-      this.logDecision(opts.ctx, decision);
+    if (!decision.compact) {
+      if (opts.config.logEnabled) this.logDecision(opts.ctx, decision);
+      return;
     }
+
+    // P1-3 backoff: after a failed summarization (token-cap class), skip compact decisions for a
+    // bounded window — each attempt aborts an in-flight turn, so a doomed retry burns turns.
+    if (this.state.compactBackoffTurnEnds > 0) {
+      this.state.compactBackoffTurnEnds--;
+      if (opts.config.logEnabled) {
+        this.logDecision(opts.ctx, { ...decision, compact: false, reason: 'failure_backoff' });
+      }
+      return;
+    }
+
+    const branch = opts.ctx.sessionManager?.getBranch?.() ?? [];
+    if (!nativeCompactionFeasible(branch, keepRecentTokens)) {
+      if (opts.config.logEnabled) {
+        this.logDecision(opts.ctx, { ...decision, compact: false, reason: 'native_not_compactable' });
+      }
+      return;
+    }
+
+    this.selectedCompaction = decision;
+    this.intentionalAbort = true;
+    opts.cancelReminder?.();
+    opts.ctx.abort();
   }
 
   async onAgentSettled(opts: {
@@ -272,9 +266,8 @@ export class CompactCoordinator {
   }): Promise<void> {
     if (!this.selectedCompaction || !opts.ctx.isIdle()) return;
 
-    // Announce the compaction window in the transcript before the summary request
-    // starts: the supervising master polls this file, and its 30s observation window
-    // is shorter than a large-context compaction (52s observed on 01a0be37).
+    // Announce the compaction window before the summary request starts: the supervising master
+    // polls this file, and its observation window is shorter than a large-context compaction.
     this.appendMarker(opts.pi, COMPACTION_INFLIGHT_TYPE, { at: Date.now() });
     const decision = this.selectedCompaction;
     this.selectedCompaction = null;
@@ -282,191 +275,151 @@ export class CompactCoordinator {
     opts.cancelReminder?.();
     this.compactionInFlight = true;
 
-    const sessionDir = opts.ctx.sessionManager?.getSessionDir?.();
-    const sessionId = opts.ctx.sessionManager?.getSessionId?.();
-    const sessionRoot = resolveSessionRoot(sessionDir, sessionId);
-
+    const sessionRoot = resolveSessionRoot(
+      opts.ctx.sessionManager?.getSessionDir?.(),
+      opts.ctx.sessionManager?.getSessionId?.(),
+    );
     if (sessionRoot && opts.onBeforeCompact) {
       try {
         await opts.onBeforeCompact(sessionRoot, opts.ctx);
       } catch {
-        /* ignore batch packing errors before compaction */
+        /* Batch packing errors must not block compaction. */
       }
     }
 
-    const remaining = opts.todos.filter(
-      (it) => it.status !== 'completed' && it.status !== 'abandoned',
-    );
-    // P1-3: bound the instruction payload — a huge open-task list inflates the summary
-    // request itself (token-cap failures were observed with a 10M-token debt session).
-    const taskLines = remaining
-      .slice(0, 25)
-      .map((it) => `- [${it.status}] ${it.content.slice(0, 160)}${it.blocker ? ` (waiting on: ${it.blocker.slice(0, 80)})` : ''}`)
-      .join('\n');
-    const elided = remaining.length > 25 ? `\n… (+${remaining.length - 25} more, elided)` : '';
-
-    const customInstructions = [
-      'Preserve completed work, verification results, important decisions, and remaining work.',
-      remaining.length > 0 ? `Active/remaining tasks to preserve:\n${taskLines}${elided}` : 'All listed tasks are completed.',
-    ].join('\n\n');
-
     const startMs = Date.now();
-    await new Promise<void>((resolve) => {
-      let settled = false;
-      const finish = () => {
-        if (!settled) {
-          settled = true;
-          resolve();
+    const settled = Promise.withResolvers<void>();
+    opts.ctx.compact({
+      customInstructions: compactionInstructions(opts.todos),
+      onComplete: (compaction) => {
+        try {
+          this.finishCompaction(opts, decision, startMs, compaction);
+        } finally {
+          settled.resolve();
         }
-      };
-
-      opts.ctx.compact({
-        customInstructions,
-        onComplete: (compaction) => {
-          try {
-            this.state.priorCompactionCount++;
-            const incrementalRatio = decision.incrementalCacheCostRatio ?? 0;
-            this.state.carriedDebtTokens = decision.writeTokens * incrementalRatio;
-            this.state.cacheDebtRepaymentTokens = Math.max(0, decision.archiveTokens - decision.memoTokens);
-            this.state.epoch++;
-            this.state.consecutiveCompactionFailures = 0;
-            this.state.compactBackoffTurnEnds = 0;
-
-            this.appendMarker(opts.pi, COMPACT_STATE_CUSTOM_TYPE, this.state);
-
-            if (opts.config.logEnabled) {
-              const sessionDir = opts.ctx.sessionManager?.getSessionDir?.();
-              const sessionId = opts.ctx.sessionManager?.getSessionId?.();
-              const root = resolveSessionRoot(sessionDir, sessionId);
-              if (root) {
-                const logPath = efficiencyLogPath(root, 'compact');
-                void appendEfficiencyLog(logPath, {
-                  schema: 'pier-efficiency/1',
-                  mechanism: 'onlineContextCompact',
-                  ts: new Date().toISOString(),
-                  sessionId: sessionId ?? 'unknown',
-                  epoch: this.state.epoch,
-                  decision: decision.reason,
-                  writeTokens: decision.writeTokens,
-                  archiveTokens: decision.archiveTokens,
-                  savedTokens: Math.max(0, decision.archiveTokens - decision.memoTokens),
-                  breakevenRequests: decision.breakevenRequests,
-                  expectedRemainingRequests: decision.expectedRemainingRequests,
-                  carriedDebtTokens: this.state.carriedDebtTokens,
-                  summaryTokens: typeof compaction?.summary === 'string' ? Math.ceil(compaction.summary.length / 4) : 0,
-                  priorCompactionCount: this.state.priorCompactionCount,
-                  durationMs: Date.now() - startMs,
-                }).catch(() => {});
-              }
-            }
-
-            try {
-              opts.pi.sendMessage(
-                {
-                  customType: COMPACTION_CONTINUE_TYPE,
-                  content: 'Online context compaction finished. Active tasks preserved. Continue working on remaining tasks.',
-                  display: false,
-                },
-                { triggerTurn: true },
-              );
-            } catch {
-              /* ignore continuation failure */
-            }
-          } finally {
-            this.appendMarker(opts.pi, COMPACTION_SETTLED_TYPE, { outcome: 'completed', at: Date.now() });
-            this.compactionInFlight = false;
-            this.intentionalAbort = false;
-            finish();
-          }
-        },
-        onError: (error) => {
-          this.compactionInFlight = false;
-          this.intentionalAbort = false;
-          // `Compaction cancelled` / AbortError mean the user (or pi) cancelled on purpose.
-          // Telemetry must keep those apart from real failures, and a cancelled compaction
-          // must NOT be answered with a turn-triggering continuation.
-          const cancelled =
-            error instanceof Error &&
-            (error.name === 'AbortError' || error.message === 'Compaction cancelled');
-
-          // Release the cross-session hold in every outcome — a cancelled compaction
-          // early-returns below, so the marker cannot wait for the continuation.
-          this.appendMarker(opts.pi, COMPACTION_SETTLED_TYPE, {
-            outcome: cancelled ? 'cancelled' : 'failed',
-            at: Date.now(),
-          });
-
-          if (opts.config.logEnabled) {
-            const sessionDir = opts.ctx.sessionManager?.getSessionDir?.();
-            const sessionId = opts.ctx.sessionManager?.getSessionId?.();
-            const root = resolveSessionRoot(sessionDir, sessionId);
-            if (root) {
-              const logPath = efficiencyLogPath(root, 'compact');
-              void appendEfficiencyLog(logPath, {
-                schema: 'pier-efficiency/1',
-                mechanism: 'onlineContextCompact',
-                event: 'compaction-failed',
-                ts: new Date().toISOString(),
-                sessionId: sessionId ?? 'unknown',
-                epoch: this.state.epoch,
-                decision: decision.reason,
-                cancelled,
-                error: error instanceof Error ? error.message : String(error),
-                consecutiveCompactionFailures: this.state.consecutiveCompactionFailures,
-                durationMs: Date.now() - startMs,
-              }).catch(() => {});
-            }
-          }
-
-          if (cancelled) {
-            finish();
-            return;
-          }
-
-          // P1-3: record the failure and back off exponentially (cap 4 skipped decisions)
-          // so a token-cap-sized context does not buy repeated abort-then-fail cycles.
-          this.state.consecutiveCompactionFailures++;
-          this.state.compactBackoffTurnEnds = Math.min(2 ** this.state.consecutiveCompactionFailures, 4);
-
-          // Resume the task: OCC aborted the turn on purpose, so a failed compaction would
-          // otherwise leave the session parked on an aborted assistant message. Pi's own
-          // threshold compaction stays available as the safety net. Visible (display: true):
-          // a silent failure left a 209K-token session running unaware (01a0bd3a).
-          const approxTokens = this.state.lastContextTokens;
-          try {
-            opts.pi.sendMessage(
-              {
-                customType: COMPACTION_CONTINUE_TYPE,
-                content: `Context compaction FAILED (${error instanceof Error ? error.message : String(error)}). `
-                  + `Context ≈ ${approxTokens != null ? `${Math.round(approxTokens / 1000)}K tokens` : 'near the window limit'}; `
-                  + `OCC backs off for the next ${this.state.compactBackoffTurnEnds} opportunities. `
-                  + 'If this repeats, run /compact manually, prune large outputs, or restart the session.',
-                display: true,
-              },
-              { triggerTurn: true },
-            );
-          } catch {
-            /* ignore continuation failure */
-          }
-
-          finish();
-        },
-      });
+      },
+      onError: (error) => {
+        try {
+          this.failCompaction(opts, decision, startMs, error);
+        } finally {
+          settled.resolve();
+        }
+      },
     });
+    await settled.promise;
+  }
+
+  /** Successful compaction: fold it into the state, persist the markers in poller order, resume. */
+  private finishCompaction(
+    opts: { ctx: ExtensionContext; pi: ExtensionAPI; config: OnlineContextCompactConfig },
+    decision: CompactionDecision,
+    startMs: number,
+    compaction: { summary?: string } | undefined,
+  ): void {
+    this.state.priorCompactionCount++;
+    this.state.carriedDebtTokens = decision.writeTokens * (decision.incrementalCacheCostRatio ?? 0);
+    this.state.cacheDebtRepaymentTokens = Math.max(0, decision.archiveTokens - decision.memoTokens);
+    this.state.epoch++;
+    this.state.consecutiveCompactionFailures = 0;
+    this.state.compactBackoffTurnEnds = 0;
+    this.appendMarker(opts.pi, COMPACT_STATE_CUSTOM_TYPE, this.state);
+
+    if (opts.config.logEnabled) {
+      this.logCompact(opts.ctx, {
+        decision: decision.reason,
+        writeTokens: decision.writeTokens,
+        archiveTokens: decision.archiveTokens,
+        savedTokens: Math.max(0, decision.archiveTokens - decision.memoTokens),
+        breakevenRequests: decision.breakevenRequests,
+        expectedRemainingRequests: decision.expectedRemainingRequests,
+        carriedDebtTokens: this.state.carriedDebtTokens,
+        summaryTokens: typeof compaction?.summary === 'string' ? Math.ceil(compaction.summary.length / 4) : 0,
+        priorCompactionCount: this.state.priorCompactionCount,
+        durationMs: Date.now() - startMs,
+      });
+    }
+
+    this.sendContinuation(
+      opts.pi,
+      'Online context compaction finished. Active tasks preserved. Continue working on remaining tasks.',
+      false,
+    );
+    // Settled marker last: the master's poller releases its hold as soon as it appears.
+    this.appendMarker(opts.pi, COMPACTION_SETTLED_TYPE, { outcome: 'completed', at: Date.now() });
+    this.compactionInFlight = false;
+    this.intentionalAbort = false;
+  }
+
+  /** Failed or cancelled compaction: release the inflight hold, then resume or stay stopped. */
+  private failCompaction(
+    opts: { ctx: ExtensionContext; pi: ExtensionAPI; config: OnlineContextCompactConfig },
+    decision: CompactionDecision,
+    startMs: number,
+    error: unknown,
+  ): void {
+    this.compactionInFlight = false;
+    this.intentionalAbort = false;
+    const message = error instanceof Error ? error.message : String(error);
+    // 'Compaction cancelled' / AbortError mean the user (or pi) cancelled on purpose: telemetry keeps
+    // that apart from real failures, and a cancel must NOT trigger a continuation turn.
+    const cancelled =
+      error instanceof Error &&
+      (error.name === 'AbortError' || error.message === 'Compaction cancelled');
+
+    // Release the cross-session hold in every outcome — the cancel path returns before continuing.
+    this.appendMarker(opts.pi, COMPACTION_SETTLED_TYPE, {
+      outcome: cancelled ? 'cancelled' : 'failed',
+      at: Date.now(),
+    });
+    if (opts.config.logEnabled) {
+      this.logCompact(opts.ctx, {
+        event: 'compaction-failed',
+        decision: decision.reason,
+        cancelled,
+        error: message,
+        consecutiveCompactionFailures: this.state.consecutiveCompactionFailures,
+        durationMs: Date.now() - startMs,
+      });
+    }
+    if (cancelled) return;
+
+    // P1-3: record the failure and back off exponentially (cap 4 skipped decisions).
+    this.state.consecutiveCompactionFailures++;
+    this.state.compactBackoffTurnEnds = Math.min(2 ** this.state.consecutiveCompactionFailures, 4);
+
+    // OCC aborted the turn on purpose, so a failed compaction would leave the session parked on an
+    // aborted message; the notice is visible because a silent failure left a 209K-token session
+    // running unaware (01a0bd3a).
+    const approxTokens = this.state.lastContextTokens;
+    this.sendContinuation(
+      opts.pi,
+      `Context compaction FAILED (${message}). `
+        + `Context ≈ ${approxTokens != null ? `${Math.round(approxTokens / 1000)}K tokens` : 'near the window limit'}; `
+        + `OCC backs off for the next ${this.state.compactBackoffTurnEnds} opportunities. `
+        + 'If this repeats, run /compact manually, prune large outputs, or restart the session.',
+      true,
+    );
   }
 
   /**
-   * Best-effort session entry write. onAgentSettled runs detached (`void`), and
-   * appendEntry bottoms out in a synchronous file append — a full disk or a
-   * session being torn down must not turn into an unhandled rejection that
-   * kills the worker process (same convention as subagent-registry.persist).
-   * A missing marker only costs the master a delayed settlement, never a crash.
+   * Best-effort session entry write: onAgentSettled runs detached, and appendEntry bottoms out in a
+   * synchronous file append — a full disk or a torn-down session must not become an unhandled
+   * rejection. A missing marker only costs the master a delayed settlement, never a crash.
    */
   private appendMarker(pi: ExtensionAPI, customType: string, data: unknown): void {
     try {
       pi.appendEntry(customType, data);
     } catch (err) {
       swallow(`compact.append-${customType}`, err);
+    }
+  }
+
+  /** Resume the task after compaction; must never throw into the detached settled handler. */
+  private sendContinuation(pi: ExtensionAPI, content: string, display: boolean): void {
+    try {
+      pi.sendMessage({ customType: COMPACTION_CONTINUE_TYPE, content, display }, { triggerTurn: true });
+    } catch {
+      /* Ignore continuation failure. */
     }
   }
 
@@ -480,49 +433,49 @@ export class CompactCoordinator {
 
   getRemainingHorizon(remainingBoundaries = 3, contextWindowTokens: number | null = null): number {
     const counts = this.state.completedBoundaryRequestCounts;
-    if (counts.length === 0) return 4;
-
+    if (counts.length === 0) return 4; // No samples yet: conservative default horizon.
     const est = estimateRemainingRequests({
       completedBoundaryRequestCounts: counts,
       remainingBoundaries,
-      scale: 1.0,
-      standardDeviationK: 0.0,
+      scale: DEFAULT_COMPACTION_ECONOMICS.remainingRequestScale,
+      standardDeviationK: DEFAULT_COMPACTION_ECONOMICS.remainingRequestStddevK,
       contextTokens: this.state.lastContextTokens ?? 0,
       contextWindowTokens,
-      averageContextTokenIncrement:
-        this.state.positiveContextDeltaCount > 0
-          ? this.state.positiveContextDeltaTotal / this.state.positiveContextDeltaCount
-          : null,
+      averageContextTokenIncrement: averageContextIncrement(this.state),
     });
     return Math.max(1, est.expectedRemainingRequests);
   }
 
-  private logDecision(ctx: ExtensionContext, decision: CompactionDecision): void {
-    const sessionDir = ctx.sessionManager?.getSessionDir?.();
+  /** Append one compact.jsonl record (shared envelope); logging is always best-effort. */
+  private logCompact(ctx: ExtensionContext, fields: Record<string, unknown>): void {
     const sessionId = ctx.sessionManager?.getSessionId?.();
-    const root = resolveSessionRoot(sessionDir, sessionId);
+    const root = resolveSessionRoot(ctx.sessionManager?.getSessionDir?.(), sessionId);
     if (!root) return;
-    const logPath = efficiencyLogPath(root, 'compact');
-    void appendEfficiencyLog(logPath, {
+    void appendEfficiencyLog(efficiencyLogPath(root, 'compact'), {
       schema: 'pier-efficiency/1',
       mechanism: 'onlineContextCompact',
-      event: 'decision',
       ts: new Date().toISOString(),
       sessionId: sessionId ?? 'unknown',
       epoch: this.state.epoch,
+      ...fields,
+    }).catch(() => {});
+  }
+
+  private logDecision(ctx: ExtensionContext, decision: CompactionDecision): void {
+    this.logCompact(ctx, {
+      event: 'decision',
       decision: decision.reason,
       compact: decision.compact,
       writeTokens: decision.writeTokens,
       archiveTokens: decision.archiveTokens,
       breakevenRequests: decision.breakevenRequests,
       expectedRemainingRequests: decision.expectedRemainingRequests,
-      // 2026-09-17: without resolvedRatio/model the 61x cache_ratio_unavailable
-      // run was un-diagnosable from logs alone (which price table? which family?).
+      // Without resolvedRatio/model a cache_ratio_unavailable run is undiagnosable from logs alone.
       resolvedRatio: decision.cacheWriteReadRatio,
       incrementalCacheCostRatio: decision.incrementalCacheCostRatio,
       remainingBoundaries: decision.remainingBoundaries,
       model: ctx.model?.id ?? undefined,
       provider: ctx.model?.provider ?? undefined,
-    }).catch(() => {});
+    });
   }
 }
