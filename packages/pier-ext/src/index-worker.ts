@@ -7,9 +7,9 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Context } from '@deepseek-ai/cordis';
 import { PiSurface } from './pi-surface.ts';
-import todoPlugin from './core/todo.ts';
+import todoPlugin from './plugins/todo.ts';
 import type { TodosService } from './todos-service.ts';
-import type { TodoUiSlot } from './core/todo.ts';
+import type { TodoUiSlot } from './plugins/todo.ts';
 
 export interface TodoOnlyMount {
   pi: ExtensionAPI;

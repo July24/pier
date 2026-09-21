@@ -11,7 +11,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
-import subagentPlugin from '../src/core/subagent.ts';
+import subagentPlugin from '../src/plugins/subagent.ts';
 import { PiSurface } from '../src/pi-surface.ts';
 import type { HerdrClientLike } from '../src/herdr-client.ts';
 import { SUBS_CUSTOM_TYPE, type SubEntry } from '../src/subagent-core.ts';

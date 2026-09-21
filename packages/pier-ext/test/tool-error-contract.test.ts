@@ -13,10 +13,10 @@ import { readFileSync } from 'node:fs';
 import { ToolError, toolError } from '../src/tool-error.ts';
 
 const TOOL_MODULES = [
-  'src/core/subagent.ts',
-  'src/core/terminal.ts',
-  'src/core/todo.ts',
-  'src/core/observation.ts',
+  'src/plugins/subagent.ts',
+  'src/plugins/terminal.ts',
+  'src/plugins/todo.ts',
+  'src/plugins/observation.ts',
 ];
 
 test('A1 源码护栏：工具模块不再用文本返回真失败（必须 throw）', () => {

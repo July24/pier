@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Context } from '@deepseek-ai/cordis';
-import terminalPlugin from '../src/core/terminal.ts';
+import terminalPlugin from '../src/plugins/terminal.ts';
 import {
   foldTerminalsRegistry,
   makeTerminalsRegistry,
@@ -120,7 +120,7 @@ test('core/terminal：ledger.disposeKey(本文件) → 工具墓碑 inert（hmr 
   await ctx.plugin(terminalPlugin);
 
   // hmr/reload 会报插件文件路径——账本规范化后命中模块 key
-  const n = ledger.disposeKey(new URL('../src/core/terminal.ts', import.meta.url).href);
+  const n = ledger.disposeKey(new URL('../src/plugins/terminal.ts', import.meta.url).href);
   assert.equal(n, 1, '账本命中 terminal 模块登记');
   const r = await pi.tools.get(TOOL_NAME)?.execute?.(null, { action: 'list' }) as { content: Array<{ text: string }> };
   assert.match(r.content[0].text, /disposed/, '墓碑后工具 inert');

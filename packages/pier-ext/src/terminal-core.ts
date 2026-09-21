@@ -403,7 +403,7 @@ export function foldTerminalsRegistry(entries: readonly BranchEntryLike3[]): Ter
  * Observed (wF:p7 orphan): a master opened a resident terminal for a one-shot background
  * compile, the job finished, and nothing ever closed the pane — terminals are persistent by
  * design, so the shell lingered as a dead split in the main tab. Decision core mirrors the
- * todo stop-reminder: pure plan here, delivery wiring in core/terminal. */
+ * todo stop-reminder: pure plan here, delivery wiring in plugins/terminal. */
 
 /** Cap idle-terminal nudges for the lifetime of the process (same shape as TODO_REMINDERS_MAX). */
 export const TERM_REMINDERS_MAX = 2;

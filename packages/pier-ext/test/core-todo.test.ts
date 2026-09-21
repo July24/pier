@@ -5,7 +5,7 @@
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { Context } from '@deepseek-ai/cordis';
-import todoPlugin from '../src/core/todo.ts';
+import todoPlugin from '../src/plugins/todo.ts';
 import { PiSurface } from '../src/pi-surface.ts';
 import { DisposeLedger } from '../src/ledger.ts';
 import { TodosService } from '../src/todos-service.ts';
@@ -119,7 +119,7 @@ test('core/todo：墓碑（ledger.disposeKey 本文件）→ 工具 inert + 读�
   const pi = fakePi();
   const ledger = new DisposeLedger();
   const { ctx } = await mount(pi, ledger);
-  const n = ledger.disposeKey(new URL('../src/core/todo.ts', import.meta.url).href);
+  const n = ledger.disposeKey(new URL('../src/plugins/todo.ts', import.meta.url).href);
   assert.equal(n, 1);
   const r = await pi.tools.get('todo_write')?.execute?.(null, { todos: [] }, undefined, undefined, {}) as { content: Array<{ text: string }> };
   assert.match(r.content[0].text, /disposed/);

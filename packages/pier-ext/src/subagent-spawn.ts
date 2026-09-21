@@ -24,8 +24,8 @@ import {
   type TabPlacementPlan,
   type WorktreeZone,
 } from './subagent-core.ts';
-import { parseShapeTree, pickGridSplit, type PaneCell } from './core/grid-shape.ts';
-import { fromShapeTree, planSpawnSplitRatio, type LayoutNode } from './core/heat-plan.ts';
+import { parseShapeTree, pickGridSplit, type PaneCell } from './plugins/grid-shape.ts';
+import { fromShapeTree, planSpawnSplitRatio, type LayoutNode } from './plugins/heat-plan.ts';
 import type { GitIo } from './subagent-git-io.ts';
 
 export interface SpawnEnv {

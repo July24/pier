@@ -14,7 +14,7 @@ import { planIsolateSweep, isPathInside } from './gc-core.ts';
 
 interface Cand { branch: string; wtPath: string; entry: SubEntry | null }
 import type { GitIo } from './subagent-git-io.ts';
-import type { TerminalStateSlot } from './core/terminal.ts';
+import type { TerminalStateSlot } from './plugins/terminal.ts';
 
 function sleep(ms: number): Promise<void> {
   const wait = Promise.withResolvers<void>();

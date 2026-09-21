@@ -19,7 +19,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Context } from '@deepseek-ai/cordis';
-import subagentPlugin from '../src/core/subagent.ts';
+import subagentPlugin from '../src/plugins/subagent.ts';
 import { PiSurface } from '../src/pi-surface.ts';
 import { HerdrClient, NoopHerdrClient, herdrSocketTarget, type HerdrClientLike, type AgentInfo } from '../src/herdr-client.ts';
 import { emptySubagentPortBox } from '../src/subagent-port.ts';

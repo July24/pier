@@ -1,7 +1,7 @@
 /**
  * Git/worktree I/O used by spawn, isolate, GC, and settlement stat lines.
  *
- * Why: core/subagent mixed adapter calls with tool registration. Centralizing
+ * Why: core/subagent mixed adapter calls with tool registration (plugins/subagent). Centralizing
  * git behind one cache/timeout policy keeps placement and isolate GC consistent.
  */
 import { defaultGitAdapter, type GitAdapter } from './git-adapter.ts';

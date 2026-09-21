@@ -9,7 +9,7 @@
  * 12 seconds without authorization.
  *
  * Revision 3 keeps the decision and wording here while the timing grace period is wired in
- * core/subagent:
+ * plugins/subagent:
  *  - use sendMessage(custom), not the user role, so the reminder source is identifiable rather than impersonating the user;
  *  - replace “keep working” with a reconciliation request, making human-blocked items a first-class
  *    outcome alongside continuing authorized work and deleting obsolete entries;

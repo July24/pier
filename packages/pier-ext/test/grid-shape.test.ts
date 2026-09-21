@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { paneCells, parseShapeTree, pickGridSplit, type ShapeNode } from '../src/core/grid-shape.ts';
+import { paneCells, parseShapeTree, pickGridSplit, type ShapeNode } from '../src/plugins/grid-shape.ts';
 
 const P = (id: string): ShapeNode => ({ type: 'pane', paneId: id });
 const S = (direction: string, first: ShapeNode, second: ShapeNode, ratio = 0.5): ShapeNode =>

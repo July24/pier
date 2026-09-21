@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { WIDGET_MAX_LINES, widgetLines } from '../src/core/todo.ts';
+import { WIDGET_MAX_LINES, widgetLines } from '../src/plugins/todo.ts';
 import type { TodoItem } from '../src/vocab.ts';
 
 const it = (content: string, status: TodoItem['status'], phase?: string): TodoItem =>

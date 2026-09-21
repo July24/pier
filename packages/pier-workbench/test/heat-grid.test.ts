@@ -20,7 +20,7 @@ import {
   type HeatOp,
   type LayoutNode,
 } from '../src/heat-layout.ts';
-import { planSpawnSplitRatio, simulateSplit, SPAWN_PLACEHOLDER_ID } from '../../pier-ext/src/core/heat-plan.ts';
+import { planSpawnSplitRatio, simulateSplit, SPAWN_PLACEHOLDER_ID } from '../../pier-ext/src/plugins/heat-plan.ts';
 
 const R2 = Math.sqrt(FOCUS_SHARE); // 0.72^(1/2)
 const RB2 = Math.sqrt(FOCUS_SHARE_BLOCKED); // 0.60^(1/2)

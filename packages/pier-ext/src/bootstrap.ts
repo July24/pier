@@ -45,7 +45,7 @@ export async function createCordisApp(hooks: BootstrapHooks = {}): Promise<Cordi
   if (hooks.onDispose) {
     root.effect(() => () => { hooks.onDispose?.(); }, 'session-root');
   }
-  // Resolve relative entry names (./core/...) from this module's directory.
+  // Resolve relative entry names (./plugins/...) from this module's directory.
   root.baseUrl = pathToFileURL(path.dirname(fileURLToPath(import.meta.url))).href + '/';
 
   let loaderReady = false;

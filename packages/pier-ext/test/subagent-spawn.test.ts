@@ -14,7 +14,7 @@ import { mkdirSync, mkdtempSync, writeFileSync, unlinkSync, existsSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
-import subagentPlugin from '../src/core/subagent.ts';
+import subagentPlugin from '../src/plugins/subagent.ts';
 import { PiSurface } from '../src/pi-surface.ts';
 import { pipeNameFor, pipePathFor, type PipeRequest } from '../src/pipe-channel.ts';
 import type { HerdrClientLike } from '../src/herdr-client.ts';

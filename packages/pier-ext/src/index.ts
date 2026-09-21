@@ -34,7 +34,7 @@ import {
 
 import { APPROVAL_NEEDED_CUSTOM_TYPE, ROLE_MANIFEST_CUSTOM_TYPE, installRenderers } from './renderers.ts';
 import { createHerdrClient } from './herdr-client.ts';
-// The subagent family moved to core/subagent.ts (loader entry, D78/D81); its history-store,
+// The subagent family moved to plugins/subagent.ts (loader entry, D78/D81); its history-store,
 // session-tail, and gc-core imports moved with it, leaving index.ts only the common readers.
 import { bareSessionId, lastAssistantText, readSessionFile, sessionFileById } from './session-tail.ts';
 import { join } from 'node:path';
@@ -42,7 +42,7 @@ import { platformPaths } from './platform-paths.ts';
 import { fileURLToPath } from 'node:url';
 import { TodosService } from './todos-service.ts';
 import { reconcileTodos } from './reconcile-core.ts';
-import type { TodoUiSlot } from './core/todo.ts';
+import type { TodoUiSlot } from './plugins/todo.ts';
 import {
   estimateEta,
   formatProgressSuffix,
@@ -73,7 +73,7 @@ import { createNoticeBuffer } from './index-notices.ts';
 import { handlePipeRequest } from './index-pipe.ts';
 import { installWriteLocks } from './index-locks.ts';
 import { installDashboardCommand } from './dashboard-command.ts';
-import { registerObservationPack, createCompactionBatchPackHook, type PickMiddleExcerpt } from './core/observation.ts';
+import { registerObservationPack, createCompactionBatchPackHook, type PickMiddleExcerpt } from './plugins/observation.ts';
 import { createJevRuntime } from './jev-client.ts';
 import {
   NOTICE_RANK_MIN_CONFIDENCE,
@@ -153,7 +153,7 @@ function composeMasterRuntime(): RuntimeRoleManifest | null {
 }
 // C3: cordis belongs only in the master process; subagent-scope includes @deepseek-ai/cordis.
 // Dynamically import it on the master branch so worker processes never load the module.
-// Subagent constants/helpers moved with the family to core/subagent.ts.
+// Subagent constants/helpers moved with the family to plugins/subagent.ts.
 
 export default async function (pi: ExtensionAPI) {
   const mode = planIndexMode();
@@ -385,7 +385,7 @@ export default async function (pi: ExtensionAPI) {
     });
   }
 
-  /* ── todo family slot (core/todo.ts fills the plugin hook; widget rendering moved with the family) ── */
+  /* ── todo family slot (plugins/todo.ts fills the plugin hook; widget rendering moved with the family) ── */
   const todoUi: TodoUiSlot = {
     renderWidget: () => { /* No-op before plugin mounting; filled after mounting. */ },
   };

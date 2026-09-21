@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Context } from '@deepseek-ai/cordis';
-import subagentPlugin from '../src/core/subagent.ts';
+import subagentPlugin from '../src/plugins/subagent.ts';
 import { resolveTaskIdPrefix } from '../src/subagent-resolution.ts';
 import { PiSurface } from '../src/pi-surface.ts';
 import { DisposeLedger } from '../src/ledger.ts';
@@ -99,7 +99,7 @@ test('core/subagent：墓碑（ledger.disposeKey 本文件）→ 工具 inert + 
   const pi = fakePi();
   const ledger = new DisposeLedger();
   const { root, port } = await mount(pi, ledger);
-  const n = ledger.disposeKey(new URL('../src/core/subagent.ts', import.meta.url).href);
+  const n = ledger.disposeKey(new URL('../src/plugins/subagent.ts', import.meta.url).href);
   assert.equal(n, 1);
   const r = await pi.tools.get('subagent')?.execute?.(null, { action: 'list' }) as { content: Array<{ text: string }> };
   assert.match(r.content[0].text, /disposed/);

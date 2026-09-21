@@ -98,7 +98,7 @@ test('surface：hmr 真实时序——后置 disposeKey 不得杀死新世代（
   const pi = fakePi();
   const ledger = new DisposeLedger();
   const s = new PiSurface(pi, ledger);
-  const KEY = 'file:///F:/repo/src/core/demo.ts';
+  const KEY = 'file:///F:/repo/src/plugins/demo.ts';
 
   // v1 挂载（工具 + 监听）
   const s1 = s.forModule(KEY);

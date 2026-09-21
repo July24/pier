@@ -9,7 +9,7 @@ import {
   planSpawnSplitRatio,
   simulateSplit,
   type LayoutNode,
-} from '../src/core/heat-plan.ts';
+} from '../src/plugins/heat-plan.ts';
 
 function pane(id: string): LayoutNode {
   return { type: 'pane', pane_id: id };

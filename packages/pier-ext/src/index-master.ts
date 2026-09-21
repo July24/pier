@@ -10,14 +10,14 @@ import type { Server } from 'node:net';
 import { PiSurface } from './pi-surface.ts';
 import { createCordisApp } from './bootstrap.ts';
 import { disposeSessionRoot } from './subagent-scope.ts';
-import terminalPlugin from './core/terminal.ts';
-import todoPlugin from './core/todo.ts';
-import subagentPlugin from './core/subagent.ts';
+import terminalPlugin from './plugins/terminal.ts';
+import todoPlugin from './plugins/todo.ts';
+import subagentPlugin from './plugins/subagent.ts';
 import type { HerdrClientLike, HerdrEnv } from './herdr-client.ts';
 import type { JevRuntime } from './jev-client.ts';
 import type { RoutingTelemetryRecord } from './routing-telemetry.ts';
 import type { TodosService } from './todos-service.ts';
-import type { TodoUiSlot } from './core/todo.ts';
+import type { TodoUiSlot } from './plugins/todo.ts';
 import type { SubagentPortBox } from './subagent-port.ts';
 
 export interface MasterPluginMount {
@@ -87,7 +87,7 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
   };
   sessionRoot.provide('pi-herdr.terminal-deps', terminalDeps);
 
-  await loadEntry(sessionRoot, useLoader, './core/terminal.ts', terminalPlugin);
+  await loadEntry(sessionRoot, useLoader, './plugins/terminal.ts', terminalPlugin);
 
   sessionRoot.provide('pi-herdr.todo-deps', {
     todos: m.todos,
@@ -106,7 +106,7 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
       isIntentionalAbort: m.isIntentionalAbort,
     },
   });
-  await loadEntry(sessionRoot, useLoader, './core/todo.ts', todoPlugin);
+  await loadEntry(sessionRoot, useLoader, './plugins/todo.ts', todoPlugin);
 
   sessionRoot.provide('pi-herdr.subagent-deps', {
     client: m.client,
@@ -124,7 +124,7 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
     ...(m.jev ? { jev: m.jev } : {}),
     ...(m.appendRoutingLog ? { logRouting: m.appendRoutingLog } : {}),
   });
-  await loadEntry(sessionRoot, useLoader, './core/subagent.ts', subagentPlugin);
+  await loadEntry(sessionRoot, useLoader, './plugins/subagent.ts', subagentPlugin);
 
   m.pi.on('session_shutdown', () => {
     void disposeSessionRoot(sessionRoot);

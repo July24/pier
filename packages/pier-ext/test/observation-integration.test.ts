@@ -13,7 +13,7 @@ import {
   createCompactionBatchPackHook,
   registerObservationPack,
   RECALL_TOOL_NAME,
-} from '../src/core/observation.ts';
+} from '../src/plugins/observation.ts';
 import { DEFAULT_EFFICIENCY_CONFIG, type EfficiencyConfig } from '../src/efficiency-config-core.ts';
 import { REDUCER_RECEIPT_PREFIX } from '../src/observation-core.ts';
 import type { RuntimeRoleManifest } from '../src/tool-gate.ts';
