@@ -19,4 +19,6 @@ docs/rfc-*.md
 docs/pier-config-command.md
 docs/adr/
 docs/history/
+docs/efficiency-review-*.md
+docs/herdr-0.9.1-optimization-design.md
 spike/
