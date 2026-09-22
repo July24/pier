@@ -52,6 +52,23 @@ export function formatTodoConfirmation(items: readonly TodoItem[]): string {
   return c.blocked > 0 ? `${base.slice(0, -1)}, ${c.blocked} blocked.` : base;
 }
 
+/** Every status the todo model knows; anything else in a snapshot is corrupt data (D34). */
+const STATUS_LOOKUP: Readonly<Record<TodoStatus, true>> = {
+  pending: true,
+  in_progress: true,
+  completed: true,
+  blocked: true,
+  abandoned: true,
+};
+
+/**
+ * Corrupt snapshots carry arbitrary JSON as `status` (`extractSnapshotFromDetails` does not validate),
+ * so every table lookup keyed by status must pass through this first — `TODO_MARKS['constructor']`
+ * would otherwise render a function, and `groups['constructor'].push` would throw.
+ */
+export const isTodoStatus = (value: unknown): value is TodoStatus =>
+  typeof value === 'string' && Object.hasOwn(STATUS_LOOKUP, value);
+
 const COUNTED_STATUSES = {
   pending: 'pending',
   in_progress: 'inProgress',
@@ -59,17 +76,15 @@ const COUNTED_STATUSES = {
   blocked: 'blocked',
 } as const satisfies Partial<Record<TodoStatus, keyof TodoCounts>>;
 
-/** Corrupt snapshots carry arbitrary JSON as `status`; only the four counted states may pass. */
-const isCountedStatus = (status: string): status is keyof typeof COUNTED_STATUSES =>
+/** The four states that occupy a count column (`abandoned` is terminal and deliberately uncounted). */
+const isCountedStatus = (status: TodoStatus): status is keyof typeof COUNTED_STATUSES =>
   Object.hasOwn(COUNTED_STATUSES, status);
 
 export function countTodos(items: readonly TodoItem[]): TodoCounts {
   const counts: TodoCounts = { pending: 0, inProgress: 0, completed: 0, blocked: 0 };
   for (const it of items) {
-    // hasOwn + string check: Object.prototype keys would count as NaN and a non-primitive
-    // status would throw; an unknown/broken status is simply not counted.
-    const status = typeof it?.status === 'string' ? it.status : '';
-    if (isCountedStatus(status)) counts[COUNTED_STATUSES[status]] += 1;
+    const status = it?.status;
+    if (isTodoStatus(status) && isCountedStatus(status)) counts[COUNTED_STATUSES[status]] += 1;
   }
   return counts;
 }

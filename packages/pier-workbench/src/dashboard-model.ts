@@ -149,7 +149,8 @@ export function composeDashboardLines(
     const status = p.agent_status ?? 'unknown';
     if (p.agent === 'pi' || p.tokens?.['pi-todo']) {
       pierCount += 1;
-      if (status in counts) counts[status] += 1;
+      // Own keys only: `status in counts` also matches Object.prototype members from a stray status.
+      if (Object.hasOwn(counts, status)) counts[status] += 1;
     }
     // pi-todo wins; else the Herdr 0.9.1 stripped OSC title (the raw title may still carry a spinner).
     let desc = p.tokens?.['pi-todo'] ?? p.terminal_title_stripped ?? p.title ?? p.terminal_title ?? '';

@@ -1,5 +1,5 @@
 import type { HerdrClientLike, HerdrEnv } from './herdr-client.ts';
-import type { TodoItem, TodoStatus } from './vocab.ts';
+import { isTodoStatus, type TodoItem, type TodoStatus } from './vocab.ts';
 
 export interface DashboardCommandDeps {
   pi: {
@@ -47,10 +47,12 @@ export function formatStandaloneDashboard(opts: {
     const groups: Record<TodoStatus, TodoItem[]> = {
       pending: [], in_progress: [], completed: [], blocked: [], abandoned: [],
     };
-    for (const todo of opts.todos) groups[todo.status].push(todo);
+    // Corrupt snapshots can carry any status; a prototype key would make `groups[...].push` throw.
+    const todos = opts.todos.filter((todo) => isTodoStatus(todo.status));
+    for (const todo of todos) groups[todo.status].push(todo);
 
     lines.push(
-      `Todos: ${opts.todos.length} total (${SUMMARY_ORDER.map((row) => `${groups[row.status].length} ${row.label}`).join(', ')})`,
+      `Todos: ${todos.length} total (${SUMMARY_ORDER.map((row) => `${groups[row.status].length} ${row.label}`).join(', ')})`,
     );
     for (const row of LIVE_ROWS) {
       const items = groups[row.status];

@@ -2,7 +2,7 @@
  * Activity-anchored todo window for the pi widget and the slim overlay: the widget passes a budget of
  * unwrapped render lines, the overlay supplies its own `fits`; the in-progress row stays visible.
  */
-import { countTodos, type TodoItem, type TodoStatus } from './vocab.ts';
+import { countTodos, isTodoStatus, type TodoItem, type TodoStatus } from './vocab.ts';
 
 export const TODO_MARKS: Record<TodoStatus, string> = {
   pending: '○',
@@ -11,6 +11,9 @@ export const TODO_MARKS: Record<TodoStatus, string> = {
   blocked: '■',
   abandoned: '✗',
 };
+
+/** Mark for a snapshot's status, tolerating corrupt data (`?` instead of a prototype member). */
+export const todoMark = (status: unknown): string => (isTodoStatus(status) ? TODO_MARKS[status] : '?');
 
 export function formatTodoSummary(items: readonly TodoItem[]): string {
   const c = countTodos(items);
@@ -31,7 +34,7 @@ export function renderTodoGroups(items: readonly TodoItem[]): string[] {
     if (phase) lines.push(`  [${phase}]`);
     for (const it of list) {
       const suffix = it.status === 'blocked' && it.blocker ? ` — ${it.blocker}` : '';
-      lines.push(`  ${TODO_MARKS[it.status]} ${it.content}${suffix}`);
+      lines.push(`  ${todoMark(it.status)} ${it.content}${suffix}`);
     }
   }
   return lines;

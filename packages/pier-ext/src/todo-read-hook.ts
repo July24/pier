@@ -7,7 +7,7 @@
 import { boundedView, currentActivity, type TodoItem } from './todo-core.ts';
 import { countTodos } from './vocab.ts';
 import { STALE_NOTICE_MAX, evaluateStaleness, formatAge } from './stale-core.ts';
-import { TODO_MARKS } from './todo-window.ts';
+import { todoMark } from './todo-window.ts';
 
 /** Cadence shared by empty-list guards, stale warnings, and archive notices. */
 const EMPTY_GUARD_EVERY_N = 4;
@@ -81,7 +81,7 @@ export function planTodoReadHook(opts: {
     // Idle periods do not consume turns, so give one rewrite window with the old entries as reference
     // before the terminal notice.
     if (opts.staleNotices === 0 && guardDue) {
-      const lines = opts.items.map((it) => `  ${TODO_MARKS[it.status]} ${it.content}`);
+      const lines = opts.items.map((it) => `  ${todoMark(it.status)} ${it.content}`);
       const head = `todos ✓${c.completed} (all completed, last updated${age}) — about to be archived`;
       const warn = 'One rewrite window before archiving: if the work you are doing now is multi-step, rewrite the full list with todo_write to track it (old entries below as reference — reuse what still applies). Single-step Q&A may skip tracking. If the list stays untouched, it will be archived and cleared on the next reminder.';
       return {
@@ -116,7 +116,7 @@ export function planTodoReadHook(opts: {
     const c = countTodos(opts.items);
     const head = `todos ▶${c.inProgress} ○${c.pending} ■${c.blocked} ✓${c.completed}`
       + ` · unchanged for ${opts.turnsSinceWrite} turns, nothing open`;
-    const lines = opts.items.map((it) => `  ${TODO_MARKS[it.status]} ${it.content}`);
+    const lines = opts.items.map((it) => `  ${todoMark(it.status)} ${it.content}`);
     const warn = 'This list no longer reflects the work you are doing. Rewrite the full list with todo_write to match current work, or send [] to clear it.';
     return {
       inject: true,
@@ -130,7 +130,7 @@ export function planTodoReadHook(opts: {
   // Fresh lists are recited every turn to keep current work visible.
   const c = countTodos(opts.items);
   const view = boundedView(opts.items, 6);
-  const lines = view.visible.map((it) => `${TODO_MARKS[it.status]} ${it.content}`);
+  const lines = view.visible.map((it) => `${todoMark(it.status)} ${it.content}`);
   const activity = currentActivity(opts.items);
   const head = `todos ▶${c.inProgress} ○${c.pending} ■${c.blocked} ✓${c.completed}`
     + (activity ? ` · ${activity}` : '');
