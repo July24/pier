@@ -198,7 +198,7 @@ export default function todoPlugin(ctx: Context): void {
       sendMessage?: (
         message: { customType: string; content: string; display?: boolean; details?: Record<string, unknown> },
         opts?: { deliverAs?: string; triggerTurn?: boolean },
-      ) => Promise<void>;
+      ) => void;
     };
     let todoReminders = 0;
     let lastAssistantStopReason: string | null = null;
@@ -236,10 +236,14 @@ export default function todoPlugin(ctx: Context): void {
         const send = pi.sendMessage;
         if (typeof send !== 'function') return;
         try {
-          void send(
+          // pi's sendMessage is fire-and-forget (it returns void), so the cap counter must advance
+          // synchronously: `send(...).then(...)` threw, got swallowed here, and every settle re-sent
+          // "Reminder 1/3" forever.
+          send(
             { customType: TODO_REMINDER_CUSTOM_TYPE, content, display: true },
             { deliverAs: 'followUp', triggerTurn: true },
-          ).then(() => { todoReminders += 1; }, () => {});
+          );
+          todoReminders += 1;
         } catch {
           /* A synchronous send failure must not escape the timer callback. */
         }

@@ -108,7 +108,8 @@ export default function subagentPlugin(ctx: Context): void {
   const { client, env, sessionRoot, port, terminalState } = d;
   const pi = surface.raw as {
     appendEntry?: (customType: string, data: unknown) => void;
-    sendUserMessage?: (content: string, opts?: { deliverAs?: string }) => Promise<void>;
+    /** Fire-and-forget in pi: the method returns void, not a promise. */
+    sendUserMessage?: (content: string, opts?: { deliverAs?: string }) => void;
   };
   const scoped = surface.forModule(import.meta.url);
 
@@ -195,9 +196,11 @@ export default function subagentPlugin(ctx: Context): void {
     if (port.current === boundPort) port.current = null;
   }, 'subagent-port');
 
-  const injectNotice = (content: string): Promise<void> =>
-    d.deliverNotice ? d.deliverNotice(content)
-      : (pi.sendUserMessage?.(content, { deliverAs: 'followUp' }) ?? Promise.resolve());
+  const injectNotice = (content: string): Promise<void> => {
+    if (d.deliverNotice) return d.deliverNotice(content);
+    pi.sendUserMessage?.(content, { deliverAs: 'followUp' });
+    return Promise.resolve();
+  };
 
   const session = createSessionIo({ client, getSessionId: d.getSessionId, sessionsDir: defaultAgentSessionsDir });
   const spawn = createSpawner({ client, env, runtime, git });

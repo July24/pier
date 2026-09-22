@@ -146,6 +146,36 @@ test('D41 stop 提醒：custom 通道 + 宽限窗 + 唤醒取消（决策矩阵�
     await ctx.fiber.dispose();
   }
 });
+test('D41 stop 提醒：投递即计数，封顶 3 次后不再注入（pi.sendMessage 返回 void）', async () => {
+  const pi = fakePi();
+  const { ctx, todos } = await mount(pi, { stopReminder: { getBlockedDepth: () => 0, getRunningSubs: () => 0 } });
+  const flush = async (): Promise<void> => { for (let i = 0; i < 4; i++) await Promise.resolve(); };
+  todos.replace([{ content: 'push special-fix to repo', status: 'pending' }]);
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    // The counter has to advance on delivery: it used to ride `send(...).then(...)`, and pi's
+    // fire-and-forget sendMessage returns void — the throw was swallowed, so every settle sent
+    // "Reminder 1/3" again and the cap never engaged.
+    for (let round = 1; round <= 3; round += 1) {
+      await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'end_turn' } });
+      await fire(pi, 'agent_settled');
+      mock.timers.tick(30_001);
+      await flush();
+      assert.equal(pi.sent.length, round, `round ${round}: exactly one reminder is delivered`);
+      assert.match(String(pi.sent[round - 1]!.msg.content ?? ''), new RegExp(`Reminder ${round}/3`));
+    }
+    // Capped: a further settle must stay silent even after a full grace window.
+    await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'end_turn' } });
+    await fire(pi, 'agent_settled');
+    mock.timers.tick(60_000);
+    await flush();
+    assert.equal(pi.sent.length, 3, 'the third reminder is the last one');
+  } finally {
+    mock.timers.reset();
+    await ctx.fiber.dispose();
+  }
+});
+
 test('D41 stop 提醒：未配置 stopReminder 时不注册催办钩子', async () => {
   const pi = fakePi();
   const { ctx } = await mount(pi);

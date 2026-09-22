@@ -268,9 +268,12 @@ export default async function (pi: ExtensionAPI) {
     locksHandle = installWriteLocks(pi, { client, env, hard: process.env[WRITE_LOCK_ENV] === '1' });
   }
 
-  const sendUserMessageAs = (content: string, mode: 'steer' | 'followUp'): Promise<void> =>
-    (pi as unknown as { sendUserMessage?: (content: string, opts?: { deliverAs?: string; triggerTurn?: boolean }) => Promise<void> })
-      .sendUserMessage?.(content, { deliverAs: mode, triggerTurn: true }) ?? Promise.resolve();
+  /** pi's sendUserMessage is fire-and-forget (void); callers of this wrapper still get a promise. */
+  const sendUserMessageAs = (content: string, mode: 'steer' | 'followUp'): Promise<void> => {
+    (pi as unknown as { sendUserMessage?: (content: string, opts?: { deliverAs?: string; triggerTurn?: boolean }) => void })
+      .sendUserMessage?.(content, { deliverAs: mode, triggerTurn: true });
+    return Promise.resolve();
+  };
   const notices = createNoticeBuffer({
     isBusy: () => agentActive || lastStopReason === ABORT_STOP_REASON,
     send: sendUserMessageAs,

@@ -112,8 +112,9 @@ export interface FakePi {
   registerCommand(name: string, def: CommandDef): void;
   on(event: string, handler: PiHandler): void;
   appendEntry(customType: string, data: unknown): void;
-  sendMessage(msg: SentMessage['msg'], opts?: Record<string, unknown>): Promise<void>;
-  sendUserMessage(content: unknown, opts?: unknown): Promise<void>;
+  /** pi's API is fire-and-forget: both return void, so a `.then`/`await` on them is a bug, not a no-op. */
+  sendMessage(msg: SentMessage['msg'], opts?: Record<string, unknown>): void;
+  sendUserMessage(content: unknown, opts?: unknown): void;
   getActiveTools(): string[];
   setActiveTools(names: string[]): void;
   /** Registration surface consumed by the role runtime's switch path (`planSwitchActiveTools`). */
@@ -167,11 +168,9 @@ export function fakePi(): FakePi {
     },
     sendMessage(msg, opts) {
       sent.push({ msg, opts });
-      return Promise.resolve();
     },
     sendUserMessage(content, opts) {
       userSent.push({ content: String(content ?? ''), opts });
-      return Promise.resolve();
     },
     getActiveTools: () => [...tools.keys()],
     setActiveTools: () => undefined,

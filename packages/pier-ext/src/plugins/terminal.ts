@@ -130,7 +130,7 @@ export default function terminalPlugin(ctx: Context): void {
     sendMessage?: (
       message: { customType: string; content: string; display?: boolean },
       opts?: { deliverAs?: string; triggerTurn?: boolean },
-    ) => Promise<void>;
+    ) => void;
   };
   let idleReminders = 0;
   let idleReminderTimer: NodeJS.Timeout | null = null;
@@ -161,17 +161,16 @@ export default function terminalPlugin(ctx: Context): void {
     const content = plan.content;
     idleReminderTimer = setTimeout(() => {
       idleReminderTimer = null;
-      void (async () => {
-        const send = piSend.sendMessage;
-        if (typeof send !== 'function') return;
-        try {
-          await send(
-            { customType: TERM_REMINDER_CUSTOM_TYPE, content, display: true },
-            { deliverAs: 'followUp' },
-          );
-        } catch {
-        }
-      })();
+      const send = piSend.sendMessage;
+      if (typeof send !== 'function') return;
+      try {
+        // Fire-and-forget in pi (void); a synchronous throw is still swallowed here.
+        send(
+          { customType: TERM_REMINDER_CUSTOM_TYPE, content, display: true },
+          { deliverAs: 'followUp' },
+        );
+      } catch {
+      }
     }, terminalReminderGraceMs());
     idleReminderTimer.unref?.();
   });
