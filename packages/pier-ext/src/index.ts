@@ -103,7 +103,7 @@ export default async function (pi: ExtensionAPI) {
     void appendEfficiencyLog(efficiencyLogPath(root, 'routing'), stamped).catch(() => {});
   };
 
-  const roles = createRoleRuntime({ pi, roleBase, initialManifest, isSubagent, todos, appendRoutingLog });
+  const roles = createRoleRuntime({ pi, client, roleBase, initialManifest, isSubagent, todos, appendRoutingLog });
 
   /* ── Jev decision layer (RFC docs/rfc-jev-integration.md): direct HTTP, total-budget
    * abort, fail-open at every site. Disabled or keyless → behavior identical to before. ── */
@@ -459,22 +459,22 @@ export default async function (pi: ExtensionAPI) {
   pi.on('session_before_tree', () => (coordinator.compactionInFlight ? { cancel: true } : undefined));
 
   pi.on('turn_end', async (event: unknown, ctx) => {
-    if (event !== null && typeof event === 'object' && 'message' in event) {
-      const msg = (event as { message: unknown }).message;
-      if (msg !== null && typeof msg === 'object') {
-        const { role, stopReason } = msg as { role?: unknown; stopReason?: unknown };
-        if (role === 'assistant' && typeof stopReason === 'string') {
-          lastStopReason = stopReason;
-        }
+    // Master registered this twice: the lifecycle handler skipped malformed events, the notice
+    // flush ran regardless. The merged handler keeps both semantics.
+    const msg = event !== null && typeof event === 'object' && 'message' in event ? (event as { message: unknown }).message : null;
+    if (msg !== null && typeof msg === 'object') {
+      const { role, stopReason } = msg as { role?: unknown; stopReason?: unknown };
+      if (role === 'assistant' && typeof stopReason === 'string') {
+        lastStopReason = stopReason;
       }
-    }
-    if (ctx && typeof ctx === 'object') {
-      coordinator.onTurnEnd({
-        ctx,
-        todos: todos.items,
-        config: effConfig.onlineContextCompact,
-        cancelReminder: todoUi.cancelReminder,
-      });
+      if (ctx && typeof ctx === 'object') {
+        coordinator.onTurnEnd({
+          ctx,
+          todos: todos.items,
+          config: effConfig.onlineContextCompact,
+          cancelReminder: todoUi.cancelReminder,
+        });
+      }
     }
     void notices.flush('steer');
   });

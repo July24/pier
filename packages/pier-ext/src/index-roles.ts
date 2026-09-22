@@ -20,15 +20,7 @@ import { RESERVED_ROLE_NAMES, listRoleNames, roleLayers } from './role-loader.ts
 import { TodosService } from './todos-service.ts';
 import { APPROVAL_NEEDED_CUSTOM_TYPE, ROLE_MANIFEST_CUSTOM_TYPE } from './renderers.ts';
 import { planDenyHitRow, scanRoleAxisUsage, type RoutingTelemetryRecord } from './routing-telemetry.ts';
-
-/** pi surface pieces the role runtime touches (some postdate the pinned devDependency). */
-type RolePi = ExtensionAPI & {
-  reportDisplayAgent?: (name: string | null) => Promise<unknown>;
-};
-
-function reportDisplayAgent(pi: RolePi, name: string): void {
-  void pi.reportDisplayAgent?.(name).catch(() => {});
-}
+import type { HerdrClientLike } from './herdr-client.ts';
 
 /**
  * WS-D7: the master pane applies its own manifest through the same mandatory chain as
@@ -46,6 +38,8 @@ export function composeMasterRuntime(): RuntimeRoleManifest | null {
 
 export interface RoleRuntimeDeps {
   pi: ExtensionAPI;
+  /** D93 sidebar identity (`display_agent`) is a herdr RPC — pi's ExtensionAPI has no such method. */
+  client: HerdrClientLike;
   /** Role-resolution base dir carried by the master at spawn (an isolate worker's own cwd resolves a different checkout). */
   roleBase: string;
   initialManifest: RuntimeRoleManifest | null;
@@ -67,10 +61,14 @@ export interface RoleRuntime {
 }
 
 export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
-  const { pi, todos, roleBase, appendRoutingLog } = d;
-  const rolePi = pi as RolePi;
+  const { pi, client, todos, roleBase, appendRoutingLog } = d;
   const roleState = initialRoleState(d.initialManifest);
   let roleBadge: string | null = null;
+
+  /** D93: sidebar identity is the role name; null clears it. Best effort — herdr may be absent. */
+  const reportSidebarIdentity = (role: string): void => {
+    void client.reportDisplayAgent(role === 'worker-default' ? 'worker' : role).catch(() => {});
+  };
 
   const setBadge = (m: RuntimeRoleManifest): string =>
     (roleBadge = `role ${m.role} v${m.version ?? '?'} (${m.tools.length} tools)`);
@@ -113,8 +111,7 @@ export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
     } catch {
       /* Best effort recording; the mandatory layer does not depend on the session log. */
     }
-    // Sidebar identity is the role name (display_agent wins over the detected agent).
-    reportDisplayAgent(rolePi, roleState.manifest.role === 'worker-default' ? 'worker' : roleState.manifest.role);
+    reportSidebarIdentity(roleState.manifest.role);
     setBadge(roleState.manifest);
     // D77 visible layer: hide tools outside the manifest AFTER all plugins load.
     // Intersection semantics prevent clearing everything; master without a
@@ -207,7 +204,7 @@ export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
       });
     } catch {
     }
-    reportDisplayAgent(rolePi, next.role === 'worker-default' ? 'worker' : next.role);
+    reportSidebarIdentity(next.role);
     const diff = [
       plan.added.length ? `+${plan.added.join(', ')}` : null,
       plan.removed.length ? `-${plan.removed.join(', ')}` : null,
