@@ -52,18 +52,24 @@ export function formatTodoConfirmation(items: readonly TodoItem[]): string {
   return c.blocked > 0 ? `${base.slice(0, -1)}, ${c.blocked} blocked.` : base;
 }
 
-const COUNTED_STATUSES: Partial<Record<TodoStatus, keyof TodoCounts>> = {
+const COUNTED_STATUSES = {
   pending: 'pending',
   in_progress: 'inProgress',
   completed: 'completed',
   blocked: 'blocked',
-};
+} as const satisfies Partial<Record<TodoStatus, keyof TodoCounts>>;
+
+/** Corrupt snapshots carry arbitrary JSON as `status`; only the four counted states may pass. */
+const isCountedStatus = (status: string): status is keyof typeof COUNTED_STATUSES =>
+  Object.hasOwn(COUNTED_STATUSES, status);
 
 export function countTodos(items: readonly TodoItem[]): TodoCounts {
   const counts: TodoCounts = { pending: 0, inProgress: 0, completed: 0, blocked: 0 };
   for (const it of items) {
-    const key = COUNTED_STATUSES[it.status];
-    if (key) counts[key] += 1;
+    // hasOwn + string check: Object.prototype keys would count as NaN and a non-primitive
+    // status would throw; an unknown/broken status is simply not counted.
+    const status = typeof it?.status === 'string' ? it.status : '';
+    if (isCountedStatus(status)) counts[COUNTED_STATUSES[status]] += 1;
   }
   return counts;
 }
