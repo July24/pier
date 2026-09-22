@@ -35,11 +35,6 @@ export class TodosService extends EventEmitter {
     };
   }
 
-  /** Defensive copy for callers that must not mutate service state. */
-  getSnapshot(): TodoItem[] {
-    return this._items.map((it) => ({ ...it }));
-  }
-
   replace(items: readonly TodoItem[], opts?: { source?: TodoCompletionSource }): { changed: boolean } {
     const next = items.map((it) => ({ ...it }));
     if (listsEqual(this._items, next)) return { changed: false };

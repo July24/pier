@@ -15,6 +15,7 @@ import type { RoutingTelemetryRecord } from './routing-telemetry.ts';
 import type { TodosService } from './todos-service.ts';
 import type { TodoUiSlot } from './plugins/todo.ts';
 import type { SubagentPortBox } from './subagent-core.ts';
+import type { SubagentDeps } from './plugins/subagent.ts';
 
 export interface MasterPluginMount {
   pi: ExtensionAPI;
@@ -102,6 +103,8 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
   });
   await loadEntry(sessionRoot, useLoader, './plugins/todo.ts', todoPlugin);
 
+  // D98 regression guard: `satisfies` makes tsc reject a missing/mistyped key here — the bag is
+  // consumed untyped by plugins/subagent.ts, and the fe99252 crash was exactly a dropped key.
   sessionRoot.provide('pi-herdr.subagent-deps', {
     client: m.client,
     env: m.env,
@@ -117,7 +120,7 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
     terminalState: terminalDeps.state,
     ...(m.jev ? { jev: m.jev } : {}),
     ...(m.appendRoutingLog ? { logRouting: m.appendRoutingLog } : {}),
-  });
+  } satisfies SubagentDeps);
   await loadEntry(sessionRoot, useLoader, './plugins/subagent.ts', subagentPlugin);
 
   m.pi.on('session_shutdown', () => {

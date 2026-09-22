@@ -53,7 +53,7 @@ interface SubagentEnv {
   workspaceId: string;
 }
 
-interface SubagentDeps {
+export interface SubagentDeps {
   client: HerdrClientLike;
   env: SubagentEnv | null;
   /** Extension entry (index.ts) path — launchLine `-e`. */
