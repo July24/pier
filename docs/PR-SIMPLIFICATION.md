@@ -1,12 +1,12 @@
-## Massive simplification: −30.4% tracked LOC, god files broken up, one convention everywhere
+## Massive simplification: −30.1% tracked LOC, god files broken up, one convention everywhere
 
-**40,376 → 28,118 tracked LOC** (src+scripts+tests, measured identically on master and this branch). **726/726 tests green**, typecheck clean, comment-language hook clean, suite runtime **44s → ~18s** (`node --test` on an M1 Pro; the full `npm test` incl. typecheck is ~35s). File count: src `.ts` 94 → 77 (plus the workbench scripts 6 → 7: the new shared `herdr-rpc.mjs`), test files 91 → 36 (+2 shared fixture helpers).
+**40,376 → 28,207 tracked LOC** (src+scripts+tests, measured identically on master and this branch). **727/727 tests green**, typecheck clean, comment-language hook clean, suite runtime **44s → ~18s** (`node --test` on an M1 Pro; the full `npm test` incl. typecheck is ~35s). File count: src `.ts` 94 → 77 (plus the workbench scripts 6 → 7: the new shared `herdr-rpc.mjs`), test files 91 → 37 (+2 shared fixture helpers).
 
 | Area | Before | After | Δ |
 |---|---:|---:|---:|
-| src + workbench scripts | 21,202 | 17,999 | **−15.1%** |
-| tests (incl. helpers) | 19,174 | 10,119 | **−47.2%** |
-| **Total** | **40,376** | **28,118** | **−30.4%** |
+| src + workbench scripts | 21,202 | 18,029 | **−15.0%** |
+| tests (incl. helpers) | 19,174 | 10,178 | **−46.9%** |
+| **Total** | **40,376** | **28,207** | **−30.1%** |
 
 ### Structure (legibility & interpretability)
 - **`src/core/` → `src/plugins/`**: the old layout inverted the naming (Cordis plugin *entries* lived in `core/` while the actual pure cores were top-level `*-core.ts`). One directory now means one thing; `index.ts` carries a layout map header.
@@ -17,7 +17,10 @@
 ### Behavior changes beyond the mechanical rewrite (review-verified)
 The pass was *not* behavior-neutral. Listed here instead of being left to the commit messages:
 - **Fixes carried in this branch** (`fix(todo,observation,compact)`): `/todos` verb lookup is prototype-safe (`Object.hasOwn`), a synchronous `sendMessage` throw inside the reminder timer is swallowed, `restoreCoordinatorState` skips an invalid newest marker instead of dropping older pacing samples/debt, `buildPlaceholder` returns the content hash it already computed.
-- **Fixes found in review and applied**: `countTodos` is prototype-safe again (`vocab.ts`); `reportDisplayAgent` (D93) went back to the herdr client — the pinned `ExtensionAPI` (0.86) has no such method, so the split had silently disabled sidebar identity; the merged `turn_end` handler restores the malformed-event early return.
+- **Fixes found in review and applied**: the stop-reminder cap counter advances on delivery again (pi's
+  `sendMessage` returns void, so the old `send(...).then(...)` threw and was swallowed — every settle
+  re-sent "Reminder 1/3" and the 3-reminder cap never engaged); every status-keyed table lookup goes
+  through the new `isTodoStatus`/`todoMark` guards (`countTodos`, todo window/read hook, dashboard); `reportDisplayAgent` (D93) went back to the herdr client — the pinned `ExtensionAPI` (0.86) has no such method, so the split had silently disabled sidebar identity; the merged `turn_end` handler restores the malformed-event early return.
 - **Widened on purpose**: workbench event routing also matches the underscored `pane_agent_status_changed` (master's regex missed it); empty env values (`PI_HERDR_CACHE_RATIO=""`, `PIER_JEV_MIN_CONFIDENCE=""`) now count as unset instead of coercing through `Number('') === 0`.
 - **Changed on purpose, accepted**: `tool_call` handlers now run role-gate before write-locks (a denied call no longer acquires locks; a call that is both lock-conflicting and out-of-manifest now reports the deny reason with `terminate`); `slim-frame` inherits `ansi-text` width/wrap semantics, which fixes emoji/combining-mark widths but also changes wrapping of runs of spaces and ZWJ sequences.
 - **Not changed** (verified equivalent): the merged `pollLoop` observation window, the efficiency FIELD/ENV tables (byte-identical except the empty-env case above), the subagent helper unification, and the workbench reflow/heat math (differential-tested).
@@ -31,7 +34,7 @@ The pass was *not* behavior-neutral. Listed here instead of being left to the co
 - Declarative FIELD/ENV tables replace ~320 lines of hand-written validation in `efficiency-config-core` (same defaults, same issue strings, same fail-open rule; one deliberate divergence: an *empty* env value now counts as unset instead of being coerced by `Number('')`).
 - Action dispatch maps in `plugins/subagent` and `plugins/terminal`; STATUS_RULES table for output classification; table-driven `countTodos`, `nullClosingSentence`, `/todos` verbs, dashboard grouping, prompt strategies, workbench event routing; the 320-line `handleReducerToolResult` god function is now named stages; the 9-way compaction-reason ternary is an ordered guard list.
 
-### Tests (−47.2% with every behavioral contract re-owned)
+### Tests (−46.9% with every behavioral contract re-owned)
 - Shared fixture library (`test-utils.ts`: `fakePi`, `fakeHerdr`, `mountSubagent`, builders) replaced 9 hand-rolled fake variants; case tables replace N near-identical tests; 55 test files folded into domain files.
 - `subagent-spawn.test.ts` 33s → 1.3s — root-caused (uncancellable poller timers left ticking per test, not socket I/O); one real-socket test keeps the wire protocol pinned.
 - Deleted: implementation-pinning tests (source-text regex locks, mock call ordering, dead-constant assertions, re-export identity). Each deletion must name a surviving behavioral owner; review found eight contracts that had none and they are restored — installer dev-only `EXT_PATH` + update-not-uninstall guards, notice-buffer rank hook (≤cap not consulted / `null` fail-open / rank feeds the collapse), loop-level user-takeover + machine-inject-reset flips, `getRemainingHorizon` sample tiers, three negative ask-gate cases (invalid ask must not open a herdr gate), `PIER_FOCUS_POLL_MS=0` end-to-end, `HerdrClient.readAgent` in the A6 wire-contract guard, and the D98 `subagent-deps` bag (now `satisfies SubagentDeps`, so tsc rejects a dropped key).
