@@ -145,6 +145,8 @@ test('NoopHerdrClient: queries empty; split/createTab throw', async () => {
   assert.deepEqual(await c.tabList(), []);
   assert.equal(await c.waitAgent(), null);
   assert.deepEqual(await c.readPane(), { text: '', revision: 0, truncated: false });
+  // herdr absent: the model sees an empty agent buffer, not a throw.
+  assert.deepEqual(await c.readAgent(), { text: '', revision: 0, truncated: false });
   await assert.rejects(() => c.splitPane(), /herdr-managed pane/);
   await assert.rejects(() => c.createTab(), /herdr-managed pane/);
 });
@@ -293,6 +295,19 @@ rpcTest('HerdrClient: readPane unwraps read envelope; waitForOutput on a match',
   assert.deepEqual(await client.waitForOutput('p2', { type: 'substring', value: 'x' }, 50), { matched: true });
 });
 
+rpcTest('HerdrClient: readAgent sends agent.read and unwraps the read envelope', {
+  'agent.read': { read: { text: 'agent output text line 1\n', revision: 42, truncated: false } },
+}, async (client, server) => {
+  const read = await client.readAgent('w1:p2', { source: 'recent', lines: 100, stripAnsi: true });
+  assert.deepEqual(read, { text: 'agent output text line 1\n', revision: 42, truncated: false });
+  assert.equal(server.received[0]?.method, 'agent.read');
+  assert.deepEqual(server.received[0]?.params, { target: 'w1:p2', source: 'recent', format: 'text', strip_ansi: true, lines: 100 });
+
+  // agent output is ANSI-stripped by default (pane.read is the one that keeps it), and `lines` stays off the wire when unset.
+  await client.readAgent('w1:p3');
+  assert.deepEqual(server.received[1]?.params, { target: 'w1:p3', source: 'recent', format: 'text', strip_ansi: true });
+});
+
 rpcTest('HerdrClient: waitForOutput degrades to a discriminated timeout', {}, async (client) => {
   assert.deepEqual(await client.waitForOutput('p2', { type: 'substring', value: 'x' }, 50), { matched: false, reason: 'timeout' });
 }, (server) => { server.error = { code: 'timeout', message: 'wait timeout' }; });
@@ -375,6 +390,8 @@ function respond(method: string): Record<string, unknown> {
     'agent.list': () => ({ type: 'agent_list', agents: [] }),
     'agent.wait': () => ({ type: 'agent_status', agent: { agent_status: 'idle' } }),
     'pane.read': () => ({ type: 'pane_read', text: '', revision: 0, truncated: false }),
+    // Observed herdr envelope: the payload is nested under `read`.
+    'agent.read': () => ({ type: 'agent_read', read: { text: '', revision: 0, truncated: false } }),
     'layout.export': () => ({ type: 'layout_export', layout: { workspace_id: 'w1', tab_id: 'w1:t1', zoomed: false, focused_pane_id: 'w1:p1', root: { type: 'pane', pane_id: 'w1:p1' } } }),
   };
   return (answers[method] ?? (() => ({ type: 'ok' })))();
@@ -390,6 +407,8 @@ rpcTest('A6 contract: every request pier sends stays inside the herdr schema', r
   await client.paneLayout({ paneId: 'w1:p1' });
   await client.createTab({ workspaceId: 'w1', label: 'task' });
   await client.readPane('w1:p2', { stripAnsi: true });
+  const agentRead = await client.readAgent('w1:p2', { stripAnsi: true });
+  assert.deepEqual(agentRead, { text: '', revision: 0, truncated: false }, 'agent.read unwraps its `read` envelope');
   await client.sendPaneText('w1:p2', 'echo hi');
   await client.sendPaneKeys('w1:p2', ['ctrl+c']);
   await client.closePane('w1:p2');
@@ -402,6 +421,8 @@ rpcTest('A6 contract: every request pier sends stays inside the herdr schema', r
   await client.agentExplain('w1:p1');
 
   assert.ok(server.received.length >= 10, `expected several kinds of request, recorded ${server.received.length}`);
+  // The loop below only checks what was actually sent: a renamed/dropped readAgent call would skip its schema check.
+  assert.ok(server.received.some((r) => r.method === 'agent.read'), 'agent.read reached the wire');
   const problems: string[] = [];
   for (const { method, params } of server.received) {
     const spec = contract.methods[method];

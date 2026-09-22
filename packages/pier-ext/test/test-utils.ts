@@ -116,6 +116,8 @@ export interface FakePi {
   sendUserMessage(content: unknown, opts?: unknown): Promise<void>;
   getActiveTools(): string[];
   setActiveTools(names: string[]): void;
+  /** Registration surface consumed by the role runtime's switch path (`planSwitchActiveTools`). */
+  getAllTools(): Array<{ name: string }>;
 }
 
 /**
@@ -173,6 +175,7 @@ export function fakePi(): FakePi {
     },
     getActiveTools: () => [...tools.keys()],
     setActiveTools: () => undefined,
+    getAllTools: () => [...tools.keys()].map((name) => ({ name })),
   };
 }
 

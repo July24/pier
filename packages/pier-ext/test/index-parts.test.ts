@@ -1,9 +1,15 @@
 /**
- * index.ts satellite parts: pipe dispatch, the D92 settlement-notice buffer, the process-mode
- * planner, cross-pane write locks, and the pi-surface proxy with its tombstone compensation.
+ * index.ts satellite parts: pipe dispatch, the D92 settlement-notice buffer with its rank hook, the
+ * process-mode planner, cross-pane write locks, the pi-surface proxy with its tombstone compensation,
+ * and two composition-root seams (the D-4 focus-poller kill switch, D93 sidebar identity transport).
  */
+import * as fs from 'node:fs';
+import * as net from 'node:net';
+import * as path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import pier from '../src/index.ts';
 import { handlePipeRequest, type MachineRequest, type PipeHandlerSession } from '../src/index-pipe.ts';
 import { emptySubagentPortBox } from '../src/subagent-core.ts';
 import { collapseNotices, createNoticeBuffer } from '../src/index-notices.ts';
@@ -12,8 +18,11 @@ import { installWriteLocks } from '../src/index-locks.ts';
 import { lockTokenKey, lockTokenValue } from '../src/lock-core.ts';
 import { PiSurface } from '../src/pi-surface.ts';
 import { DisposeLedger } from '../src/ledger.ts';
-import type { AgentInfo, HerdrEnv } from '../src/herdr-client.ts';
-import { fakeHerdr, fakePi, fire, type FakePi } from './test-utils.ts';
+import { createRoleRuntime } from '../src/index-roles.ts';
+import { TodosService } from '../src/todos-service.ts';
+import type { RuntimeRoleManifest } from '../src/tool-gate.ts';
+import { herdrSocketTarget, type AgentInfo, type HerdrEnv, type HerdrClientLike } from '../src/herdr-client.ts';
+import { fakeHerdr, fakePi, fire, withCleanup, type CleanupContext, type FakePi } from './test-utils.ts';
 
 /* ── index-pipe: common-segment pipe dispatch ───────────────────── */
 
@@ -174,6 +183,49 @@ test('collapseNotices: empty → null; ≤3 verbatim; >3 → first three + count
   assert.match(tail, /history 台账/);
   assert.match(tail, /subagent list 查看/);
   assert.ok(!over.includes('\n\nn4') && !over.includes('\n\nn5'));
+});
+
+/** Busy buffer with a scripted rank hook: the batch is observable only through the collapsed send. */
+const rankedNotices = (rank?: (contents: readonly string[]) => Promise<readonly string[] | null>) => {
+  const sent: string[] = [];
+  const buf = createNoticeBuffer({ isBusy: () => true, send: async (content) => { sent.push(content); }, rank });
+  return { buf, sent };
+};
+
+test('createNoticeBuffer rank hook: at or below the cap the arrival order reaches the model', async () => {
+  let ranked = 0;
+  const { buf, sent } = rankedNotices(async (contents) => {
+    ranked += 1;
+    return [...contents].reverse();
+  });
+  for (const n of ['a', 'b', 'c']) await buf.deliverNotice(n);
+  await buf.flush('steer');
+  assert.equal(sent[0], 'a\n\nb\n\nc', 'a small batch is injected verbatim in arrival order');
+  assert.equal(ranked, 0, 'supporting: there is nothing to rank below the cap, so the hook is not consulted');
+});
+
+test('createNoticeBuffer rank hook: above the cap the shown three are the rank order', async () => {
+  const { buf, sent } = rankedNotices(async (contents) => [...contents].reverse());
+  for (const n of ['a', 'b', 'c', 'd']) await buf.deliverNotice(n);
+  await buf.flush('steer');
+
+  const out = sent[0]!;
+  assert.ok(out.startsWith('d\n\nc\n\nb\n\n'), `the collapse step must be fed the rank result, got ${JSON.stringify(out)}`);
+  assert.match(out, /另有 1 条结算未逐条展示/);
+  assert.ok(!out.includes('\n\na'), 'the dropped notice is the one rank pushed past the cap, not the last arrival');
+  // A second flush has nothing left: the ranked batch was drained, not re-injected.
+  assert.equal(buf.noticePending().size, 0);
+  await buf.flush('steer');
+  assert.equal(sent.length, 1);
+});
+
+test('createNoticeBuffer rank hook: null falls back to arrival order (fail-open)', async () => {
+  const { buf, sent } = rankedNotices(async () => null);
+  for (const n of ['a', 'b', 'c', 'd']) await buf.deliverNotice(n);
+  await buf.flush('steer');
+  const out = sent[0]!;
+  assert.ok(out.startsWith('a\n\nb\n\nc\n\n'), `a refusing ranker must not eat the batch, got ${JSON.stringify(out)}`);
+  assert.match(out, /另有 1 条结算未逐条展示/, 'the tail still accounts for the batch above the cap');
 });
 
 /* ── index-runtime: process-mode planner ────────────────────────── */
@@ -349,3 +401,171 @@ test('surface: pi 0.86 unsubscribe — retirement removes the listener instead o
   assert.deepEqual(pi.listeners.get('turn_start') ?? [], [], 'the dispatch list really shrinks');
   assert.match(((await callTool(pi, 't1')) as { content: Array<{ text: string }> }).content[0]!.text, /disposed/, 'tools still tombstone: pi has no unregisterTool');
 });
+
+/* ── index.ts composition root: the D-4 focus-poller kill switch ── */
+
+const FOCUS_WS = 'wP';
+const FOCUS_PANE = `${FOCUS_WS}:pMe`;
+
+/** Minimal herdr server for the real composition root: records every method, answers `layout.export`
+ *  with the scripted focus sequence. index.ts builds its client from the environment, so the socket is
+ *  the only seam — the client under test is the production one. */
+function scriptedHerdr(socketPath: string, focuses: readonly (string | null)[]): Promise<{ calls: string[]; close(): Promise<void> }> {
+  const calls: string[] = [];
+  let index = 0;
+  const server = net.createServer((sock) => {
+    let buf = '';
+    sock.setEncoding('utf8');
+    sock.on('data', (chunk) => {
+      buf += chunk;
+      const nl = buf.indexOf('\n');
+      if (nl < 0) return;
+      let req: { id?: string; method?: string };
+      try { req = JSON.parse(buf.slice(0, nl)); } catch { sock.destroy(); return; }
+      const method = String(req.method ?? '');
+      calls.push(method);
+      let result: unknown = { type: 'ok' };
+      if (method === 'layout.export') {
+        const focused = focuses[Math.min(index, focuses.length - 1)] ?? null;
+        index += 1;
+        // Both panes always exist and this pane is focused from the start: the first tick only records
+        // the baseline, so sampling never spawns a reflow child here.
+        result = {
+          type: 'layout_export',
+          layout: {
+            workspace_id: FOCUS_WS,
+            tab_id: `${FOCUS_WS}:t1`,
+            zoomed: false,
+            focused_pane_id: focused,
+            root: { type: 'split', first: { type: 'pane', pane_id: `${FOCUS_WS}:pOther` }, second: { type: 'pane', pane_id: FOCUS_PANE } },
+          },
+        };
+      }
+      sock.end(JSON.stringify({ id: req.id ?? '1', result }) + '\n');
+    });
+  });
+
+  const close = (): Promise<void> => {
+    const closed = Promise.withResolvers<void>();
+    // closeAllConnections exists at runtime (Node ≥18.2) but is missing from these @types/node.
+    const closable = server as unknown as { closeAllConnections?(): void };
+    closable.closeAllConnections?.();
+    server.close(() => closed.resolve());
+    return closed.promise;
+  };
+
+  const listening = Promise.withResolvers<{ calls: string[]; close(): Promise<void> }>();
+  server.listen(herdrSocketTarget(socketPath), () => listening.resolve({ calls, close }));
+  return listening.promise;
+}
+
+/** Boots the real composition root as a herdr pane over the scripted socket above. */
+async function mountHerdrIndex(cleanup: CleanupContext, pollMs: string) {
+  const env = cleanup.env();
+  for (const key of ['PI_HERDR_SUBAGENT', 'PI_HERDR_ROLE_MANIFEST']) env.delete(key);
+  const tmp = cleanup.tempDir('parts-focus').path;
+  const socketPath = path.join(tmp, 'herdr.sock');
+  for (const [key, value] of Object.entries({
+    HERDR_ENV: '1', HERDR_PANE_ID: FOCUS_PANE, HERDR_TAB_ID: `${FOCUS_WS}:t1`, HERDR_WORKSPACE_ID: FOCUS_WS,
+    HERDR_SOCKET_PATH: socketPath, PIER_FOCUS_POLL_MS: pollMs,
+  })) env.set(key, value);
+
+  const server = await scriptedHerdr(socketPath, [FOCUS_PANE]);
+  const pi = fakePi();
+  const cwd = path.join(tmp, 'ws');
+  fs.mkdirSync(cwd, { recursive: true });
+  try {
+    await pier(pi as never);
+    await fire(pi, 'session_start', { reason: 'new' }, { cwd, sessionManager: { getBranch: () => [] } });
+  } catch (err) {
+    await server.close();
+    throw err;
+  }
+  return { pi, server, calls: server.calls, samples: () => server.calls.filter((m) => m === 'layout.export').length };
+}
+
+test('index D-4: PIER_FOCUS_POLL_MS=0 关闭焦点采样（非零值仍采样）', withCleanup(async (cleanup) => {
+  // Off: bounded wait long enough for ~10 ticks of the control interval below.
+  const off = await mountHerdrIndex(cleanup, '0');
+  try {
+    // `ping` is awaited inside session_start, so this distinguishes the live production client from
+    // the Noop stand-in — without it the absence of layout.export below could pass vacuously.
+    assert.ok(off.calls.includes('ping'), 'the real client is wired to the scripted socket');
+    await delay(200);
+    assert.equal(off.samples(), 0, 'PIER_FOCUS_POLL_MS=0 must not sample the layout at all');
+  } finally {
+    await fire(off.pi, 'session_shutdown');
+    await off.server.close();
+  }
+
+  // On: the same mount with a small non-zero interval proves the poller path is otherwise live.
+  const on = await mountHerdrIndex(cleanup, '20');
+  try {
+    const deadline = Date.now() + 250;
+    while (on.samples() === 0 && Date.now() < deadline) await delay(20);
+    assert.ok(on.samples() > 0, 'a non-zero interval keeps sampling: 0 is a kill switch, not a broken mount');
+  } finally {
+    await fire(on.pi, 'session_shutdown');
+    await on.server.close();
+  }
+}));
+
+/* ── index-roles: D93 sidebar identity rides the herdr client ───── */
+
+const roleManifest = (role: string): RuntimeRoleManifest =>
+  ({ role, version: 'v1', tools: ['read'], permissions: {}, unknownTools: 'deny' });
+
+/** A role runtime whose only observable side effect is what it reports to the herdr client. */
+function roleRuntimeFor(manifest: RuntimeRoleManifest, client: HerdrClientLike, roleBase: string) {
+  return createRoleRuntime({
+    pi: fakePi() as never,
+    client,
+    roleBase,
+    initialManifest: manifest,
+    isSubagent: false,
+    todos: new TodosService(TodosService.configFromRuntime(manifest, false)),
+    appendRoutingLog: () => {},
+  });
+}
+
+test('role runtime: D93 sidebar identity is reported through the herdr client', withCleanup(async (cleanup) => {
+  const tmp = cleanup.tempDir('parts-roles').path;
+  const env = cleanup.env();
+  // The role loader's user layer hangs off os.homedir(); pinning it to the temp dir keeps the builtin
+  // switch below hermetic (a stray ~/.pi/agent/herdr-pi/roles/master.json would fail its reserved-name check).
+  env.set('HOME', tmp);
+  env.set('USERPROFILE', tmp);
+
+  // worker-default is the one name the sidebar must never show verbatim (the D93 mapping).
+  const mapped: Array<string | null> = [];
+  roleRuntimeFor(roleManifest('worker-default'), fakeHerdr({ reportDisplayAgent: async (name) => { mapped.push(name); } }), tmp)
+    .syncFromBranch({ sessionManager: { getBranch: () => [] } });
+  assert.deepEqual(mapped, ['worker'], 'the herdr client carries the mapped identity, not the manifest name');
+
+  // Any other role is transported verbatim.
+  const plain: Array<string | null> = [];
+  roleRuntimeFor(roleManifest('reviewer'), fakeHerdr({ reportDisplayAgent: async (name) => { plain.push(name); } }), tmp)
+    .syncFromBranch({ sessionManager: { getBranch: () => [] } });
+  assert.deepEqual(plain, ['reviewer']);
+
+  // Resume/branch replay decides which role the identity follows (the anchor entry is written first).
+  const replayed: Array<string | null> = [];
+  // Spelled out on purpose: this is the persisted custom-entry name an existing session file carries,
+  // so the replay fixture must keep matching it even if the constant's value is ever renamed.
+  const branchRecord = {
+    type: 'custom',
+    customType: 'pi-herdr.role-manifest',
+    data: { version: 1, role: 'observer', manifestVersion: 'v2', tools: ['read'], permissions: {}, unknownTools: 'deny' },
+  };
+  roleRuntimeFor(roleManifest('worker-default'), fakeHerdr({ reportDisplayAgent: async (name) => { replayed.push(name); } }), tmp)
+    .syncFromBranch({ sessionManager: { getBranch: () => [branchRecord] } });
+  assert.deepEqual(replayed, ['observer'], 'the replayed role is what the sidebar is told');
+
+  // A mid-session switch (builtin master resolves without a role file) re-reports through the client.
+  const switchedTo: Array<string | null> = [];
+  const runtime = roleRuntimeFor(roleManifest('worker-default'), fakeHerdr({ reportDisplayAgent: async (name) => { switchedTo.push(name); } }), tmp);
+  runtime.syncFromBranch({ sessionManager: { getBranch: () => [] } });
+  const result = await runtime.applyRoleSwitch('master', 'human');
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(switchedTo, ['worker', 'master'], 'the switch reports the new role through the same transport');
+}));

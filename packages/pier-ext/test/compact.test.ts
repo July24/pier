@@ -151,6 +151,33 @@ test('CompactCoordinator: only tool-sourced boundaries are sampled, extension in
   assert.equal(coordinator.pendingBoundaryCompleted, false);
 });
 
+test('CompactCoordinator.getRemainingHorizon: empty fallback, sample-derived mean, and the window cap', () => {
+  // 1. No samples yet: the conservative default keeps the decision off a zero horizon.
+  const coordinator = new CompactCoordinator();
+  assert.equal(coordinator.getRemainingHorizon(), 4, 'no samples → fallback 4');
+
+  // 2. Two tool boundaries that each took 5 requests: mean 5 → 1 + floor(5 × 2) = 11.
+  for (const _boundary of [0, 1]) {
+    for (let i = 0; i < 5; i++) coordinator.onBeforeProviderRequest(1000 + i);
+    coordinator.recordBoundaryCompleted(1, 'tool');
+  }
+  assert.deepEqual(coordinator.state.completedBoundaryRequestCounts, [5, 5]);
+  assert.equal(coordinator.getRemainingHorizon(2), 11, 'mean 5 over 2 boundaries');
+
+  // 3. A nearly full window caps the same state: samples still say 11, the window says
+  //    floor((100000 - 90000) / 2000) = 5, so the smaller bound wins.
+  const tight = new CompactCoordinator();
+  tight.onBeforeProviderRequest(88000);
+  tight.onBeforeProviderRequest(90000); // the only growth: avg increment = 2000
+  for (let i = 0; i < 3; i++) tight.onBeforeProviderRequest(90000); // boundary 1 = 5 requests
+  tight.recordBoundaryCompleted(1, 'tool');
+  for (let i = 0; i < 5; i++) tight.onBeforeProviderRequest(90000); // boundary 2 = 5 requests
+  tight.recordBoundaryCompleted(1, 'tool');
+  assert.deepEqual(tight.state.completedBoundaryRequestCounts, [5, 5]);
+  assert.equal(tight.getRemainingHorizon(2), 11, 'without a window the sample bound stands');
+  assert.equal(tight.getRemainingHorizon(2, 100000), 5, 'the window bound wins');
+});
+
 test('CompactCoordinator: turn_end does not abort when disabled, with a queued message, or without usage', () => {
   const todos: TodoItem[] = [{ content: 'Task 1', status: 'pending' }];
   const coordinator = new CompactCoordinator();

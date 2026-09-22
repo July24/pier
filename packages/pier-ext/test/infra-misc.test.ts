@@ -3,8 +3,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createCordisApp, detectExposeInternals } from '../src/bootstrap.ts';
 import { DisposeLedger } from '../src/ledger.ts';
@@ -341,3 +341,112 @@ test('installer CLI: version --json and --help', () => {
   assert.equal(data.installer.name, 'pier-setup'); assert.ok(data.installer.version);
   assert.ok('piExt' in data && 'herdr' in data && 'latest' in data);
 });
+
+/* The npx cache `npx pier-setup` runs from holds install.mjs + package.json and never
+ * packages/pier-ext. The guards below replay a real CLI run against exactly that layout with
+ * pi / herdr / npm faked at the process boundary, so the contract is observed through the
+ * installer's effects (exit code, the commands it shells out to, boot-config.json) instead of
+ * being locked to the installer's source text. */
+
+/** Fake CLI on PATH: records its argv in the call log, then decides its own stdout / exit code. */
+function fakeCli(name: string, dirs: { bin: string; fake: string; log: string }, decide: string): void {
+  const script = join(dirs.fake, `${name}.cjs`);
+  writeFileSync(script, [
+    "const { appendFileSync } = require('node:fs');",
+    'const args = process.argv.slice(2);',
+    `appendFileSync(${JSON.stringify(dirs.log)}, JSON.stringify([${JSON.stringify(name)}, ...args]) + '\\n');`,
+    decide,
+  ].join('\n') + '\n');
+  if (process.platform === 'win32') {
+    // npm global bins are .cmd shims on win32; the installer already spawns them through cmd.exe.
+    writeFileSync(join(dirs.bin, `${name}.cmd`), `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
+  } else {
+    const shim = join(dirs.bin, name);
+    writeFileSync(shim, `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`);
+    chmodSync(shim, 0o755);
+  }
+}
+
+interface NpxLayoutProbe {
+  /** Copy of install.mjs, alone in a cache-shaped dir (install.mjs + package.json, no packages/). */
+  installerDir: string;
+  /** The pi-installed pi-pier entry user mode must resolve — never the cache path above. */
+  extEntry: string;
+  /** Where `herdr plugin config-dir` points, i.e. the user-mode boot-config destination. */
+  bootConfig: string;
+  /** Every command the installer shelled out to, in order. */
+  calls(): string[][];
+  run(...argv: string[]): { status: number | null; stdout: string; stderr: string };
+}
+
+/** PI_CODING_AGENT_DIR keeps the real ~/.pi out of the run; fakes keep networks out of it. */
+function npxLayoutProbe(cleanup: CleanupContext): NpxLayoutProbe {
+  const dir = cleanup.tempDir('pier-npx-').path;
+  const installerDir = join(dir, 'installer');
+  const agentDir = join(dir, 'pi-agent');
+  const binDir = join(dir, 'bin');
+  const fakeDir = join(dir, 'fakes');
+  const logFile = join(dir, 'calls.jsonl');
+  const configDir = join(dir, 'herdr-config');
+  const globalModules = join(dir, 'global-node-modules');
+  const piCli = join(globalModules, '@earendil-works', 'pi-coding-agent', 'dist', 'cli.js');
+  const extPkg = join(agentDir, 'npm', 'node_modules', 'pi-pier');
+  const extEntry = join(extPkg, 'src', 'index.ts');
+
+  for (const d of [installerDir, binDir, fakeDir, configDir, dirname(piCli), dirname(extEntry)]) mkdirSync(d, { recursive: true });
+  copyFileSync(join(root, 'install.mjs'), join(installerDir, 'install.mjs'));
+  writeFileSync(join(installerDir, 'package.json'), JSON.stringify({ name: 'pier-setup', version: '1.0.0' }));
+  writeFileSync(join(extPkg, 'package.json'), JSON.stringify({ name: 'pi-pier', version: '1.0.0' }));
+  writeFileSync(extEntry, 'export default {};\n');
+  writeFileSync(piCli, ''); // the `npm root -g` fallback probePiRuntime needs to write any boot-config
+
+  fakeCli('pi', { bin: binDir, fake: fakeDir, log: logFile }, "if (args[0] === '--version') console.log('0.90.1');");
+  fakeCli('herdr', { bin: binDir, fake: fakeDir, log: logFile }, "if (args[0] === '--version') console.log('0.9.1');\n"
+    + `if (args[0] === 'plugin' && args[1] === 'config-dir') console.log(${JSON.stringify(configDir)});`);
+  fakeCli('npm', { bin: binDir, fake: fakeDir, log: logFile }, `console.log(args[0] === 'root' ? ${JSON.stringify(globalModules)} : '1.0.0');`);
+
+  const env: NodeJS.ProcessEnv = { ...process.env, PI_CODING_AGENT_DIR: agentDir };
+  const pathKey = Object.keys(env).find((k) => k.toLowerCase() === 'path') ?? 'PATH'; // win32 spells it Path
+  env[pathKey] = `${binDir}${delimiter}${env[pathKey] ?? ''}`;
+  const cli = join(installerDir, 'install.mjs');
+
+  return {
+    installerDir, extEntry, bootConfig: join(configDir, 'boot-config.json'),
+    calls: () => (existsSync(logFile) ? readFileSync(logFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as string[]) : []),
+    run: (...argv) => spawnSync(process.execPath, [cli, ...argv], { encoding: 'utf8', env }),
+  };
+}
+
+test('npx user-mode install never needs the repo layout: install.mjs alone resolves the pi-installed pi-pier', withCleanup((cleanup) => {
+  const probe = npxLayoutProbe(cleanup);
+  const r = probe.run('install');
+  assert.equal(r.status, 0, r.stderr + r.stdout);
+  assert.doesNotMatch(r.stderr, /pier-ext entry missing/, 'the repo-layout EXT_PATH check must fire for --dev only');
+  const config = JSON.parse(readFileSync(probe.bootConfig, 'utf8')) as { extPath: string; mainTabLabel: string; hmrDev: boolean };
+  assert.equal(config.extPath, probe.extEntry, 'boot-config points at the pi-installed pi-pier');
+  assert.equal(config.mainTabLabel, 'main'); assert.equal(config.hmrDev, false);
+  const calls = probe.calls();
+  assert.ok(calls.some((c) => c.join(' ') === 'pi install npm:pi-pier'), `expected \`pi install npm:pi-pier\`, got ${JSON.stringify(calls)}`);
+  assert.deepEqual(calls.filter((c) => c.some((a) => a.includes(probe.installerDir))), [], 'the npx cache path must never reach pi');
+}));
+
+test('dev-mode install still dies on a missing repo-layout EXT_PATH (the guard stays scoped to --dev)', withCleanup((cleanup) => {
+  const probe = npxLayoutProbe(cleanup);
+  const r = probe.run('install', '--dev');
+  assert.equal(r.status, 1, r.stderr + r.stdout);
+  assert.match(r.stderr, /pier-ext entry missing: .+ \(repo layout broken\?\)/);
+}));
+
+test('update refreshes the install in place: `pi update` runs and nothing is removed first', withCleanup((cleanup) => {
+  const probe = npxLayoutProbe(cleanup);
+  // Stale config from the previous release: update must rewrite it, not start from a clean slate.
+  writeFileSync(probe.bootConfig, JSON.stringify({ mainTabLabel: 'stale', extPath: join(probe.installerDir, 'gone', 'index.ts') }));
+  const r = probe.run('update');
+  assert.equal(r.status, 0, r.stderr + r.stdout);
+  const calls = probe.calls();
+  assert.ok(calls.some((c) => c.join(' ') === 'pi update npm:pi-pier'), `expected \`pi update npm:pi-pier\`, got ${JSON.stringify(calls)}`);
+  assert.deepEqual(calls.filter((c) => c.some((a) => a === 'remove' || a === 'uninstall')), [], 'update must not uninstall before updating');
+  const config = JSON.parse(readFileSync(probe.bootConfig, 'utf8')) as { extPath: string; mainTabLabel: string };
+  assert.equal(config.mainTabLabel, 'main', 'the stale boot-config was rewritten in place');
+  assert.equal(config.extPath, probe.extEntry);
+}));

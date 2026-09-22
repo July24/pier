@@ -117,8 +117,11 @@ function fixture(entry: SubEntry | null, initialTime = 13_000) {
   const notices: string[] = [];
   const reconciled: Reconcile[] = [];
   const claimKeys: string[] = [];
+  /** Registry snapshots taken at each persistSubs — the row a restarting process reads back. */
+  const persisted: SubEntry[] = [];
   const panes: string[] = entry ? [entry.paneId] : [];
   let waitState: HerdrAgentState | null = 'idle';
+  let agentState: HerdrAgentState = 'idle';
   let state: SubSessionState = { text: 'finished', pendingTool: false, activity: true, turnEnded: true, compacting: false };
   let reattributed: string | null = null;
   let claimResult = true;
@@ -126,7 +129,7 @@ function fixture(entry: SubEntry | null, initialTime = 13_000) {
   const client = {
     available: true,
     listPanes: async () => panes.map((paneId) => ({ paneId, tabId: 't0', workspaceId: 'w1', agentStatus: 'idle' })),
-    listAgents: async () => (entry ? [{ paneId: entry.paneId, status: 'idle' }] : []),
+    listAgents: async () => (entry ? [{ paneId: entry.paneId, status: agentState }] : []),
     waitAgent: async () => waitState,
     getAgentSessionPath: async () => null,
     closePane: async () => undefined,
@@ -148,7 +151,7 @@ function fixture(entry: SubEntry | null, initialTime = 13_000) {
     client,
     sessionRoot: new Context(),
     subs,
-    persistSubs: () => undefined,
+    persistSubs: () => { for (const row of subs.values()) persisted.push({ ...row }); },
     writeHistory: (e, patch, via) => { writes.push({ entry: { ...e }, patch, via }); },
     blockedGateNotified: new Set<string>(),
     lastMachineInjectAt: new Map<string, number>(),
@@ -172,9 +175,10 @@ function fixture(entry: SubEntry | null, initialTime = 13_000) {
   };
 
   return {
-    host, entry, writes, notices, reconciled, claimKeys, virtual, panes,
+    host, entry, writes, notices, reconciled, claimKeys, persisted, virtual, panes,
     state: (s: Partial<SubSessionState>) => { state = { ...state, ...s }; },
     waitState: (s: HerdrAgentState | null) => { waitState = s; },
+    agentStatus: (s: HerdrAgentState) => { agentState = s; },
     reattribute: (f: string | null) => { reattributed = f; },
     setClaim: (v: boolean) => { claimResult = v; },
   };
@@ -228,6 +232,48 @@ test('pollLoop: sustained idle during a user takeover hands control back and set
   await start(f);
   assert.equal(f.entry!.userTakeover, false);
   assert.equal(f.entry!.status, 'consumed');
+});
+
+test('pollLoop: observation detects user takeover when agent is working after grace period', async () => {
+  // Timer already running since 10_000 and no machine inject for far more than the 4_000ms grace:
+  // a working pane here is a human at the keyboard, not our own child.
+  const f = fixture(makeEntry('p-obs-takeover', { observationStartedAt: 10_000 }), 11_000);
+  f.agentStatus('working');
+  const sleep = f.host.sleep!;
+  let ticks = 0;
+  f.host.sleep = async (ms) => { if (++ticks === 1) f.entry!.status = 'settled'; await sleep(ms); };
+
+  await start(f);
+
+  assert.equal(f.entry!.userTakeover, true);
+  assert.equal(f.entry!.lastAgentStatus, 'working');
+  assert.ok(
+    f.persisted.some((row) => row.userTakeover === true && row.lastAgentStatus === 'working'),
+    'the takeover must reach the registry, or a restart resumes supervising a human-driven pane',
+  );
+  assert.equal(f.writes.length, 0, 'a taken-over pane is not settled');
+  assert.equal(f.entry!.consumedAt, null);
+});
+
+test('pollLoop: observation resets timer on machine-inject-reset', async () => {
+  // Machine inject 500ms ago, inside the 4_000ms grace: the child is still working OUR prompt, so
+  // the observation window restarts instead of settling or declaring a human takeover.
+  const f = fixture(makeEntry('p-obs-reset', { observationStartedAt: 10_000 }), 11_000);
+  f.host.lastMachineInjectAt.set('p-obs-reset', 10_500);
+  f.agentStatus('working');
+  const sleep = f.host.sleep!;
+  let ticks = 0;
+  f.host.sleep = async (ms) => { if (++ticks === 1) f.entry!.status = 'settled'; await sleep(ms); };
+
+  await start(f);
+
+  assert.equal(f.entry!.userTakeover, undefined, 'our own work is not a human takeover');
+  assert.equal(f.entry!.observationStartedAt, 11_000, 'the window restarts from now');
+  assert.ok(
+    f.persisted.some((row) => row.observationStartedAt === 11_000),
+    'the restarted window must be persisted, or a restart replays the pre-inject deadline',
+  );
+  assert.equal(f.writes.length, 0, 'a fresh machine inject must not settle the row');
 });
 
 test('pollLoop: the blocked gate notifies once with the human question, then clears', async () => {

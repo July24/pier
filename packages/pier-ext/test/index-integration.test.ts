@@ -58,6 +58,22 @@ async function workerAsk(cleanup: CleanupContext) {
   return { pi, exec };
 }
 
+/**
+ * Control for the negative ask cases: on the *same* mounted index a valid ask must open the gate
+ * for the whole wait and close it afterwards. Without it a mount whose gate is dead would make
+ * every "no herdr:blocked edge" assertion below pass vacuously.
+ */
+async function expectGateOpensAndCloses(pi: FakePi, exec: (...a: unknown[]) => unknown): Promise<void> {
+  let release: ((value: string) => void) | undefined;
+  const held = new Promise<string>((resolve) => { release = resolve; });
+  const running = exec({}, { question: 'deploy staging?' }, undefined, undefined, { ui: { input: () => held } });
+  assert.deepEqual(blockedEdges(pi), [{ active: true, label: 'deploy staging?' }], 'a valid ask opens the gate while the human is asked');
+  release!('ok');
+  const result = await running as { content: Array<{ text: string }> };
+  assert.match(result.content[0]?.text ?? '', /"deploy staging\?"="ok"/);
+  assert.deepEqual(blockedEdges(pi), [{ active: true, label: 'deploy staging?' }, { active: false }]);
+}
+
 /* ── mount surface per process mode ─────────────────────────────── */
 
 test('index mount surface: worker and bare pi stay todo-only', async (t) => {
@@ -113,6 +129,35 @@ test('ask_user_question emits herdr:blocked once around ui.input (official herdr
   assert.equal(officialDepth, 0);
 }));
 
+test('ask_user_question empty question does not emit herdr:blocked', withCleanup(async (cleanup) => {
+  const { pi, exec } = await workerAsk(cleanup);
+  // Whitespace is not a question: the prepare rejection must land before the gate is published,
+  // so a model that fumbles the argument never leaves the pane reporting blocked.
+  const result = await exec!({}, { question: '   ' }, undefined, undefined, {
+    ui: { input: async () => 'nope' },
+  }) as { content: Array<{ text: string }>; details: { error?: string } };
+  assert.equal(result.details.error, 'empty_question');
+  assert.match(result.content[0]?.text ?? '', /must be a non-empty string/);
+  assert.deepEqual(blockedEdges(pi), [], 'a rejected ask must not publish a herdr:blocked edge');
+
+  await expectGateOpensAndCloses(pi, exec!);
+}));
+
+test('ask_user_question reserved Other does not emit herdr:blocked', withCleanup(async (cleanup) => {
+  const { pi, exec } = await workerAsk(cleanup);
+  const result = await exec!({}, {
+    question: 'Which database?',
+    options: [{ label: 'Redis', description: 'mem' }, { label: 'Other', description: 'typed' }],
+  }, undefined, undefined, {
+    ui: { input: async () => 'nope' },
+  }) as { content: Array<{ text: string }>; details: { error?: string } };
+  assert.equal(result.details.error, 'reserved_label');
+  assert.match(result.content[0]?.text ?? '', /is reserved/);
+  assert.deepEqual(blockedEdges(pi), [], 'an unusable pick must not publish a herdr:blocked edge');
+
+  await expectGateOpensAndCloses(pi, exec!);
+}));
+
 test('ask_user_question options path emits herdr:blocked once around select', withCleanup(async (cleanup) => {
   const { pi, exec } = await workerAsk(cleanup);
   let resolveSelect: (() => void) | undefined;
@@ -145,6 +190,20 @@ test('ask_user_question questions batch keeps one herdr:blocked around both sele
   assert.match(result.content[0]?.text ?? '', /"Cache\?"="Redis"/);
   assert.match(result.content[0]?.text ?? '', /"SQL\?"="Postgres"/);
   assert.equal(blockedEdges(pi).length, 2);
+}));
+
+test('ask_user_question without ui does not emit herdr:blocked', withCleanup(async (cleanup) => {
+  const { pi, exec } = await workerAsk(cleanup);
+  // No ui at all: the tool bails out before publishing, so a headless run never reports blocked.
+  const result = await exec!({}, { question: 'deploy staging?' }, undefined, undefined, {}) as {
+    content: Array<{ text: string }>;
+    details: { error?: string };
+  };
+  assert.equal(result.details.error, 'no_ui');
+  assert.match(result.content[0]?.text ?? '', /UI not available/);
+  assert.deepEqual(blockedEdges(pi), [], 'a missing ui must not publish a herdr:blocked edge');
+
+  await expectGateOpensAndCloses(pi, exec!);
 }));
 
 test('ui_prompt_start opens the gate and emits one herdr:blocked edge', withCleanup(async (cleanup) => {
