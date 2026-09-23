@@ -272,6 +272,12 @@ export function createPoller(h: PollerHost): Poller {
           }
         }
 
+        const tickStartedAt = now();
+        /** waitAgent returns at once for a pane already idle/done/blocked; never re-poll faster than the interval. */
+        const pace = async (): Promise<void> => {
+          const left = pollIntervalMs - (now() - tickStartedAt);
+          if (left > 0) await doSleep(left);
+        };
         let state: HerdrAgentState | null;
         try {
           state = await h.client.waitAgent(paneId, ['idle', 'done', 'blocked'], pollIntervalMs);
@@ -289,6 +295,7 @@ export function createPoller(h: PollerHost): Poller {
               /* list_agents can recover a missed notice */
             }
           }
+          await pace();
           continue;
         }
         if (gate.kind === 'clear-gate') h.blockedGateNotified.delete(paneId);
@@ -436,6 +443,7 @@ export function createPoller(h: PollerHost): Poller {
           } catch { /* non-fatal */ }
           return;
         }
+        await pace();
       }
     } finally {
       pollers.delete(paneId);

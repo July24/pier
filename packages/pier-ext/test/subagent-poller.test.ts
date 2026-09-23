@@ -287,6 +287,53 @@ test('pollLoop: the blocked gate notifies once with the human question, then cle
   assert.equal(f.entry!.status, 'consumed', 'the loop resumes after the gate clears');
 });
 
+test('pollLoop: a pane that stays blocked is re-polled at the poll interval, not in a hot loop', async () => {
+  const f = fixture(makeEntry('p-blocked-long'));
+  let waits = 0;
+  // herdr answers at once for a pane already in a wanted state; the virtual clock does not move.
+  f.host.client.waitAgent = async () => {
+    if (++waits >= 5) f.entry!.status = 'settled';
+    return 'blocked';
+  };
+  const slept: number[] = [];
+  const sleep = f.host.sleep!;
+  f.host.sleep = async (ms) => { slept.push(ms); await sleep(ms); };
+  await start(f);
+  assert.equal(waits, 5);
+  assert.deepEqual(slept, [500, 500, 500, 500, 500], 'every blocked tick waits out the 500ms interval');
+});
+
+test('pollLoop: an idle pane that is not yet settleable is paced too', async () => {
+  const f = fixture(makeEntry('p-idle-busy'));
+  f.state({ text: null, pendingTool: false, activity: false, turnEnded: false });
+  let waits = 0;
+  f.host.client.waitAgent = async () => {
+    if (++waits >= 4) f.entry!.status = 'settled';
+    return 'idle';
+  };
+  const slept: number[] = [];
+  const sleep = f.host.sleep!;
+  f.host.sleep = async (ms) => { slept.push(ms); await sleep(ms); };
+  await start(f);
+  assert.deepEqual(slept, [500, 500, 500, 500]);
+});
+
+test('pollLoop: a slow wait already spent the interval, so no extra sleep follows', async () => {
+  const f = fixture(makeEntry('p-slow-wait'));
+  f.state({ text: null, pendingTool: false, activity: false, turnEnded: false });
+  let waits = 0;
+  f.host.client.waitAgent = async () => {
+    f.virtual.now += 500;
+    if (++waits >= 3) f.entry!.status = 'settled';
+    return null;
+  };
+  const slept: number[] = [];
+  const sleep = f.host.sleep!;
+  f.host.sleep = async (ms) => { slept.push(ms); await sleep(ms); };
+  await start(f);
+  assert.deepEqual(slept, []);
+});
+
 test('pollLoop: a vanished pane consumes the row as failed without waiting for the timeout', async () => {
   const f = fixture(makeEntry('p-gone'));
   f.panes.length = 0;
