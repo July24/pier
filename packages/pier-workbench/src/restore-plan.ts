@@ -37,3 +37,29 @@ export function latestBootRecordPerWorkspace(records: readonly BootRecord[]): Bo
   for (const rec of records) byWorkspace.set(rec.workspace_id, rec);
   return [...byWorkspace.values()];
 }
+
+/** The pane fields the master check reads from herdr's pane.list. */
+export interface PaneLike {
+  pane_id: string;
+  agent?: unknown;
+  title?: unknown;
+}
+
+/** D91 icon transition: ▶ prefixes new sessions, ⏳ legacy ones — both mark a live pi master. */
+export function isMasterPane(pane: PaneLike): boolean {
+  return pane.agent === 'pi' || (typeof pane.title === 'string' && /⏳|▶/.test(pane.title));
+}
+
+/**
+ * The record to append after restore rebuilt (or found) the main pane: the newest record must name
+ * the live ids, or the next startup finds the dead ones again and rebuilds another master. Null when
+ * herdr's reply carried no pane id — there is nothing trustworthy to record.
+ */
+export function rebuiltBootRecord(
+  rec: BootRecord,
+  ids: { tabId?: string | null; paneId?: string | null },
+  ts: number,
+): BootRecord | null {
+  if (!ids.paneId) return null;
+  return { ...rec, tab_id: ids.tabId || rec.tab_id, pane_id: ids.paneId, ts };
+}
