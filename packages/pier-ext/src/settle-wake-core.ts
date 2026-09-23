@@ -24,6 +24,11 @@ export interface SettleWakeInput {
 export interface SettleWakePlan {
   /** false means this settlement stays silent and emits no wake-up message. */
   wake: boolean;
+  /**
+   * Hand the settlement to the compaction coordinator. An OCC abort is silent (no wake) yet is the
+   * very settlement the selected compaction waits for; only a foreign (ESC) abort skips it.
+   */
+  compact: boolean;
   notice: boolean;
   /** New set key; empty running set → null. */
   noticeKey: string | null;
@@ -32,14 +37,20 @@ export interface SettleWakePlan {
 
 export function planSettleWake(input: SettleWakeInput): SettleWakePlan {
   if (input.intentionalAbort || input.lastStopReason === ABORT_STOP_REASON) {
-    return { wake: false, notice: false, noticeKey: input.lastNoticeKey, noticeAt: input.lastNoticeAt };
+    return {
+      wake: false,
+      compact: input.intentionalAbort === true,
+      notice: false,
+      noticeKey: input.lastNoticeKey,
+      noticeAt: input.lastNoticeAt,
+    };
   }
   const key = input.running.length === 0 ? null : input.running.map((s) => s.paneId).sort().join(',');
   if (key === null) {
-    return { wake: true, notice: false, noticeKey: null, noticeAt: input.lastNoticeAt };
+    return { wake: true, compact: true, notice: false, noticeKey: null, noticeAt: input.lastNoticeAt };
   }
   const newSet = key !== input.lastNoticeKey;
   const cooled = input.now - input.lastNoticeAt >= D96_REPEAT_NOTICE_MS;
   const notice = newSet || cooled;
-  return { wake: true, notice, noticeKey: key, noticeAt: notice ? input.now : input.lastNoticeAt };
+  return { wake: true, compact: true, notice, noticeKey: key, noticeAt: notice ? input.now : input.lastNoticeAt };
 }

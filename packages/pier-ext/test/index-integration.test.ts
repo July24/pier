@@ -399,3 +399,43 @@ test('P2-5: resume (session_start) folds todos from branch — kill+resume no lo
 
   await fire(pi, 'session_shutdown');
 }));
+
+test('OCC end-to-end: the intentional abort settles into ctx.compact (not swallowed by the abort gate)', withCleanup(async (cleanup) => {
+  const pi = await mountIndex(cleanup, 'bare', { HOME: cleanup.tempDir('pier-occ-home').path });
+  const cwd = cleanup.tempDir('pier-occ-ws').path;
+  await mkdir(join(cwd, '.pi-herdr'), { recursive: true });
+  await writeFile(join(cwd, '.pi-herdr', 'config.json'), JSON.stringify({ version: 1, onlineContextCompact: { enabled: true } }));
+
+  // 25 long messages: enough history for pi's native compaction to cut (nativeCompactionFeasible).
+  const branch = Array.from({ length: 25 }, (_, i) => ({
+    type: 'message', id: `m${i}`, parentId: i > 0 ? `m${i - 1}` : null,
+    message: { role: i % 2 === 0 ? 'user' : 'assistant', content: [{ type: 'text', text: 'log line\n'.repeat(2000) }] },
+  }));
+  let aborts = 0;
+  const compacts: unknown[] = [];
+  const ctx = {
+    cwd,
+    isProjectTrusted: () => true,
+    // Near the window: window protection selects a compaction regardless of pacing samples.
+    getContextUsage: () => ({ tokens: 125_000, contextWindow: 128_000 }),
+    getSystemPrompt: () => '',
+    hasPendingMessages: () => false,
+    isIdle: () => true,
+    sessionManager: { getBranch: () => branch, getSessionDir: () => undefined, getSessionId: () => 'occ' },
+    abort: () => { aborts++; },
+    compact: (opts: unknown) => { compacts.push(opts); },
+  };
+  await fire(pi, 'session_start', { reason: 'new' }, ctx);
+  await fire(pi, 'turn_start');
+  await fire(pi, 'before_provider_request', {}, ctx);
+  const todoWrite = pi.tools.get('todo_write')!.execute!;
+  await todoWrite('c1', { todos: [{ content: 'a', status: 'in_progress' }, { content: 'b', status: 'pending' }] }, undefined, undefined, ctx);
+  await todoWrite('c2', { todos: [{ content: 'a', status: 'completed' }, { content: 'b', status: 'in_progress' }] }, undefined, undefined, ctx);
+  await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'toolUse' } }, ctx);
+  assert.equal(aborts, 1, 'the boundary turn is aborted on purpose');
+  await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'aborted' } }, ctx);
+  await fire(pi, 'agent_settled', {}, ctx);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(compacts.length, 1, 'the settled OCC abort must reach ctx.compact');
+  await fire(pi, 'session_shutdown');
+}));

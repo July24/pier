@@ -502,7 +502,7 @@ export default async function (pi: ExtensionAPI) {
       const notice = `注意：仍有 ${running.length} 个后台 subagent 在运行：${brief}。若你的任务依赖它们，请等待其结算（subagent list 查看状态）；若不等待，请说明放弃原因。`;
       void sendUserMessageAs(notice, 'followUp');
     }
-    if (plan.wake && ctx && typeof ctx === 'object') {
+    if (plan.compact && ctx && typeof ctx === 'object') {
       void coordinator.onAgentSettled({
         ctx,
         todos: todos.items,

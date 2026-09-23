@@ -186,6 +186,15 @@ test('abort suppression: a settled turn after ESC wakes nothing and keeps the de
   assert.equal(plan.notice, false);
   assert.equal(plan.noticeKey, null);
   assert.equal(plan.noticeAt, 0);
+  assert.equal(plan.compact, false, 'a foreign (ESC) abort never starts a compaction');
+});
+
+test('OCC abort: silent settle that still hands off to the compaction coordinator', () => {
+  const plan = planSettleWake({ lastStopReason: 'aborted', intentionalAbort: true, running: SUBS, lastNoticeKey: null, lastNoticeAt: 0, now: T0 });
+  assert.equal(plan.wake, false);
+  assert.equal(plan.notice, false);
+  assert.equal(plan.compact, true, 'the intentional abort is the settlement the selected compaction waits for');
+  assert.equal(planSettleWake({ lastStopReason: 'stop', running: [], lastNoticeKey: null, lastNoticeAt: 0, now: T0 }).compact, true);
 });
 
 test('natural settle with a new running set → one notice carrying the set key', () => {
