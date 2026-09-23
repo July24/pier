@@ -68,13 +68,12 @@ export class TodosService extends EventEmitter {
     if (count > 0) this.emit('todo.completed', { count, at: Date.now(), source });
   }
 
-  /** Branch replay: fold the JSONL to the authoritative list, or keep current state when absent. */
+  /** Branch replay: fold the JSONL to the authoritative list. A branch with no snapshot (/new, or /tree
+   *  back before the first todo_write) has no list, so the previous session's items must not survive. */
   rebuild(entries: readonly unknown[]): void {
     const folded = foldLatestTodosMeta(entries as Parameters<typeof foldLatestTodosMeta>[0]);
-    if (folded) {
-      this._items = folded.items;
-      this.lastWriteAt = folded.writtenAt;
-    }
+    this._items = folded ? folded.items : [];
+    this.lastWriteAt = folded ? folded.writtenAt : null;
     this.emit('todo.updated', { items: this._items, reason: 'rebuild' });
   }
 }

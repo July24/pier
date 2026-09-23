@@ -439,3 +439,16 @@ test('OCC end-to-end: the intentional abort settles into ctx.compact (not swallo
   assert.equal(compacts.length, 1, 'the settled OCC abort must reach ctx.compact');
   await fire(pi, 'session_shutdown');
 }));
+
+test('/new: a fresh session does not inherit the previous session\'s todos', withCleanup(async (cleanup) => {
+  const pi = await mountIndex(cleanup, 'bare');
+  const items = [{ content: 'Old session task', status: 'pending' }];
+  const branch = [{ type: 'message', message: { role: 'toolResult', toolName: 'todo_write', details: { 'pi-herdr.todo': { version: 1, items } } } }];
+  await fire(pi, 'session_start', { reason: 'resume' }, { sessionManager: { getBranch: () => branch } });
+  await fire(pi, 'session_start', { reason: 'new' }, { sessionManager: { getBranch: () => [] } });
+
+  const notified: string[] = [];
+  await pi.commands.get('todos')!.handler!([], { ui: { notify: (t: string) => { notified.push(t); } } });
+  assert.doesNotMatch(notified.join('\n'), /Old session task/);
+  await fire(pi, 'session_shutdown');
+}));

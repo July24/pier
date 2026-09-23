@@ -402,6 +402,10 @@ describe('todos-service', () => {
       { type: 'custom', customType: 'pi-herdr.todo-edit', data: { version: 1, edits: [{ op: 'done', content: 'D' }], ts: 1234 } },
     ]);
     assert.equal(svc.lastWriteAt, 1234);
+    // A branch without any snapshot (/new, /tree before the first write) empties the list.
+    svc.rebuild([{ type: 'message', message: { role: 'user', content: 'hi' } }]);
+    assert.deepEqual(svc.items, []);
+    assert.equal(svc.lastWriteAt, null);
   });
 });
 
