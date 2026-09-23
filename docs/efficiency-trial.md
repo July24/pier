@@ -120,9 +120,9 @@ PI_HERDR_COMPACT_ENABLE=1 PI_HERDR_COMPACT_LOG=1 PI_HERDR_CACHE_RATIO=auto pi
 ## 3. 看什么（观测入口）
 
 ```bash
-/pier-config                 # 5 平面索引（含 OCC/OBS/EPR 的一行状态）
+/pier-config                 # 4 平面索引（含 OCC/OBS/EPR 的一行状态）
 /pier-config show efficiency # 三个机制全部键的 生效值 / 来源 / 影响
-/pier-config check           # 校验（含 boot-config 路径、env 越界）
+/pier-config check           # 校验（env 越界、JSON 损坏等）
 ```
 
 日志与对象都在 pi 会话目录下（`ctx.sessionManager.getSessionDir()`，通常形如

@@ -1,7 +1,6 @@
 node_modules/
 # macOS Finder artifacts（本机全局 ignore 已覆盖；入库此规则保证 CI/新克隆干净）
 .DS_Store
-packages/pier-workbench/scripts/boot-config.json
 # 本仓库的 CI workflow 需要入库（全局 gitignore 忽略了 .github/，此处显式例外）
 !.github/
 !.github/**

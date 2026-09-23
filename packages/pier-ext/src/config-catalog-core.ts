@@ -1,7 +1,7 @@
 /**
  * D104 config catalog core (pure).
  *
- * Single source of truth for the five pier configuration planes: knob descriptors, effective-value
+ * Single source of truth for the four pier configuration planes: knob descriptors, effective-value
  * provenance (env > workspace > user > default) and rendering for `/pier-config show|check|doc`. The
  * `env` plane derives from the `PIER_OPTIONS` registry, so it cannot disagree with the runtime readers;
  * no I/O here (config-command.ts does the reading) and test/config-catalog.test.ts guards the mirror.
@@ -9,7 +9,7 @@
 
 import { PIER_OPTIONS } from './pier-options.ts';
 
-export type ConfigPlaneId = 'efficiency' | 'roles' | 'pi' | 'boot' | 'env';
+export type ConfigPlaneId = 'efficiency' | 'roles' | 'pi' | 'env';
 
 export type ConfigKind = 'boolean' | 'number' | 'string' | 'enum';
 
@@ -34,7 +34,7 @@ export interface ConfigKnob {
 export interface ConfigPlane {
   readonly id: ConfigPlaneId;
   readonly title: string;
-  readonly owner: 'pier' | 'pi' | 'workbench';
+  readonly owner: 'pier' | 'pi';
   /** Human-facing path templates, in precedence order. */
   readonly files: readonly string[];
   readonly editHint: string;
@@ -61,13 +61,6 @@ export const CONFIG_PLANES: readonly ConfigPlane[] = Object.freeze([
     owner: 'pi',
     files: ['~/.pi/agent/settings.json', '<trusted-project>/.pi/settings.json'],
     editHint: 'Use pi\'s /settings for everything except the OCC-relevant compaction.* keys',
-  },
-  {
-    id: 'boot',
-    title: 'Workbench boot-config',
-    owner: 'workbench',
-    files: ['$HERDR_PLUGIN_CONFIG_DIR/boot-config.json', 'packages/pier-workbench/scripts/boot-config.json'],
-    editHint: 'Prefer `npx pier-setup@latest update --force` over hand-editing paths',
   },
   {
     id: 'env',
@@ -128,7 +121,7 @@ const ENV_KNOBS: readonly ConfigKnob[] = PIER_OPTIONS.map((option) => ({
   impact: option.description,
 }));
 
-/** Every knob the catalog can resolve (roles/boot are per-file planes: their schemas are the reference). */
+/** Every knob the catalog can resolve (roles is a per-file plane: its schema is the reference). */
 export const CONFIG_KNOBS: readonly ConfigKnob[] = Object.freeze([...EFFICIENCY_KNOBS, ...PI_KNOBS, ...ENV_KNOBS]);
 
 export function readDotted(obj: unknown, dotted: string): unknown {
@@ -268,18 +261,16 @@ export function renderIndex(lines: {
   pi: readonly ResolvedKnob[];
   env: readonly ResolvedKnob[];
   roleSummary: string;
-  bootSummary: string;
 }): string[] {
   const mechanism = (prefix: string): string =>
     lines.efficiency.some((e) => e.knob.key === `${prefix}.enabled` && e.value === 'true') ? 'on' : 'off';
   return [
-    'pier config — 5 planes, env > workspace > user > default',
+    'pier config — 4 planes, env > workspace > user > default',
     `  efficiency  ${summarizePlane(lines.efficiency)} — OCC ${mechanism('onlineContextCompact')} / OBS ${mechanism('observationPack')} / EPR ${mechanism('evidencePreservingReducer')}`,
     `  roles       ${lines.roleSummary}`,
     `  pi          ${summarizePlane(lines.pi)} — OCC reads compaction.* only`,
-    `  boot        ${lines.bootSummary}`,
     `  env         ${summarizePlane(lines.env)}`,
-    '  show: /pier-config show <efficiency|roles|pi|boot|env|all>   check: /pier-config check   report: /pier-config doc',
+    '  show: /pier-config show <efficiency|roles|pi|env|all>   check: /pier-config check   report: /pier-config doc',
   ];
 }
 

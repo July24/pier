@@ -12,7 +12,7 @@ import {
 } from '../src/config-catalog-core.ts';
 import { PIER_OPTIONS } from '../src/pier-options.ts';
 import {
-  CONFIG_GUIDANCE_PROMPT, collectConfigSnapshot, defaultHerdrPluginConfigDirs, guideReportMarkdown,
+  CONFIG_GUIDANCE_PROMPT, collectConfigSnapshot, guideReportMarkdown,
   renderGuide, type ConfigGuideDeps, type ConfigGuideSnapshot,
 } from '../src/config-command.ts';
 import { withCleanup, type CleanupContext } from './test-utils.ts';
@@ -143,14 +143,14 @@ test('secret-shaped keys are redacted and never rendered verbatim', () => {
   assert.match(report, /# pier config report/); assert.match(report, /Precedence: env > workspace \(trusted\) > user > default\./); assert.ok(!report.includes('sk-live'), 'the key never reaches the report');
 });
 
-test('renderers cover the five planes and stay compact', () => {
+test('renderers cover the four planes and stay compact', () => {
   const resolved = [...resolveConfigKnobs({ env: {}, user: { observationPack: { enabled: true } }, workspaceTrusted: false }), ...resolveEnvKnobs({})];
   const planeEntries = (id: string) => resolved.filter((r) => r.knob.plane === id);
   const index = renderIndex({
     efficiency: planeEntries('efficiency'), pi: planeEntries('pi'), env: planeEntries('env'),
-    roleSummary: '2 role(s)', bootSummary: 'missing',
+    roleSummary: '2 role(s)',
   });
-  assert.match(index[0]!, /5 planes/); assert.ok(index.length <= 8, 'index stays a short summary');
+  assert.match(index[0]!, /4 planes/); assert.ok(index.length <= 8, 'index stays a short summary');
   assert.ok(index.some((l) => l.includes('OCC off / OBS on / EPR off')));
 
   assert.ok(renderPlane(planeEntries('efficiency')).some((l) => l.includes('observationPack.enabled = true'))); assert.deepEqual(renderPlane([]), []);
@@ -164,31 +164,26 @@ test('renderers cover the five planes and stay compact', () => {
 
 interface Fixture {
   base: string; deps: ConfigGuideDeps;
-  paths: { cwd: string; agentDir: string; userConfigPath: string; workspaceConfigPath: string; herdrDir: string };
+  paths: { cwd: string; agentDir: string; userConfigPath: string; workspaceConfigPath: string };
 }
 
 function makeFixture(cleanup: CleanupContext, opts: { brokenRole?: boolean; reservedRole?: boolean; trustWorkspace?: boolean } = {}): Fixture {
   const base = cleanup.tempDir('cfg-guide').path;
   const cwd = join(base, 'repo');
   const agentDir = join(base, 'agent');
-  const herdrDir = join(base, 'herdr-plugin');
   const rolesDir = join(cwd, '.pi-herdr', 'roles');
   const userRolesDir = join(base, 'user-roles');
   const userConfigPath = join(base, 'user-efficiency.json');
   const workspaceConfigPath = join(cwd, '.pi-herdr', 'config.json');
-  for (const dir of [userRolesDir, agentDir, herdrDir, rolesDir, join(cwd, '.pi')]) mkdirSync(dir, { recursive: true });
+  for (const dir of [userRolesDir, agentDir, rolesDir, join(cwd, '.pi')]) mkdirSync(dir, { recursive: true });
 
   // pi owns settings.json; OCC reads compaction.* only. The user config enables OCC (pi's
   // compaction.enabled=false wins unless env forces it); the workspace config enables OBS at 4096.
   const role = (role: string, version: string) => JSON.stringify({ role, version, manifest: { tools: ['read', 'todo_write', 'ask_user_question'], rules: {}, unknownTools: 'allow' } });
-  // The boot plane verifies piNode/piCli/extPath exist, so those are real files on disk.
-  const bootPaths = { piNode: join(base, 'node'), piCli: join(base, 'cli.js'), extPath: join(base, 'ext.ts') };
   const files: Array<[string, string]> = [
-    ...Object.values(bootPaths).map((path): [string, string] => [path, '']),
     [join(agentDir, 'settings.json'), JSON.stringify({ compaction: { enabled: false, keepRecentTokens: 35000 } })],
     [userConfigPath, JSON.stringify({ version: 1, onlineContextCompact: { enabled: true } })],
     [workspaceConfigPath, JSON.stringify({ version: 1, observationPack: { enabled: true, thresholdBytes: 4096 } })],
-    [join(herdrDir, 'boot-config.json'), JSON.stringify({ mainTabLabel: 'main', ...bootPaths })],
     [join(rolesDir, 'auditor.json'), role('auditor', '1.0.0')],
     ...(opts.brokenRole ? [[join(rolesDir, 'broken.json'), JSON.stringify({ role: 'broken' })]] as Array<[string, string]> : []),
     ...(opts.reservedRole ? [[join(rolesDir, 'master.json'), role('master', '9.9.9')]] as Array<[string, string]> : []),
@@ -197,10 +192,10 @@ function makeFixture(cleanup: CleanupContext, opts: { brokenRole?: boolean; rese
 
   return {
     base,
-    paths: { cwd, agentDir, userConfigPath, workspaceConfigPath, herdrDir },
+    paths: { cwd, agentDir, userConfigPath, workspaceConfigPath },
     deps: {
-      rolesUserDir: userRolesDir, cwd, env: { HERDR_PLUGIN_CONFIG_DIR: herdrDir },
-      isProjectTrusted: opts.trustWorkspace ?? true, agentDir, userConfigPath, herdrPluginConfigDir: herdrDir, repoRoot: base,
+      rolesUserDir: userRolesDir, cwd, env: {},
+      isProjectTrusted: opts.trustWorkspace ?? true, agentDir, userConfigPath,
     },
   };
 }
@@ -215,8 +210,7 @@ test('collectConfigSnapshot: reports effective values, sources and per-plane che
   assert.match(snapshot.entries.find((e) => e.knob.key === 'onlineContextCompact.enabled')!.note ?? '', /pi compaction\.enabled=false/);
   assert.equal(knobValue(snapshot, 'pi', 'compaction.keepRecentTokens'), '35000 [pi]');
 
-  for (const plane of ['efficiency', 'boot', 'roles', 'env'] as const) assert.equal(planeReport(snapshot, plane).ok, true, planeReport(snapshot, plane).issues.join(' | '));
-  assert.equal(snapshot.files.boot.find((f) => f.label === 'herdr plugin config-dir')!.exists, true); assert.equal(snapshot.bootSummary.includes('present'), true);
+  for (const plane of ['efficiency', 'roles', 'env'] as const) assert.equal(planeReport(snapshot, plane).ok, true, planeReport(snapshot, plane).issues.join(' | '));
   assert.equal(snapshot.roleSummary, '3 role(s): workspace 1 / user 0 / builtin 2');
 
   assert.ok(renderGuide(snapshot, 'index').some((l) => l.includes('/pier-config show')));
@@ -226,7 +220,7 @@ test('collectConfigSnapshot: reports effective values, sources and per-plane che
 
   const report = guideReportMarkdown(snapshot, { generatedAt: '2026-09-13T00:00:00Z', cwd: fx.paths.cwd, piVersion: 'test' });
   assert.match(report, /# pier config report/); assert.match(report, /## Files observed/);
-  assert.match(report, new RegExp(fx.paths.herdrDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(report, new RegExp(fx.paths.workspaceConfigPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 }));
 
 interface ProbeCase {
@@ -245,23 +239,10 @@ const PROBE_CASES: ProbeCase[] = [
   { name: 'broken workspace JSON is reported as invalid JSON', setup: (fx) => writeFileSync(fx.paths.workspaceConfigPath, '{ not json'), expect: [['efficiency', 'invalid JSON']] },
   { name: 'invalid and reserved roles are flagged', fixture: { brokenRole: true, reservedRole: true }, expect: [['roles', 'broken'], ['roles', 'master']] },
   {
-    name: 'a stale boot-config path is reported as an issue',
-    setup: (fx) => writeFileSync(
-      join(fx.paths.herdrDir, 'boot-config.json'),
-      JSON.stringify({ mainTabLabel: 'main', piNode: '/nonexistent/node', piCli: '/nonexistent/cli.js', extPath: '/nonexistent/ext.ts' }),
-    ),
-    expect: [['boot', 'does not exist'], ['boot', 'pier-setup']],
-    extra: (s) => assert.equal(planeReport(s, 'boot').issues.filter((i) => i.includes('does not exist')).length, 3),
-  },
-  {
-    name: 'missing boot-config and pi settings are reported, not thrown',
-    deps: (fx) => ({
-      ...fx.deps, env: {}, herdrPluginConfigDir: join(fx.base, 'nope'), repoRoot: join(fx.base, 'nope'), agentDir: join(fx.base, 'nope-agent'),
-    }),
-    expect: [['boot', 'not found'], ['pi', 'not found', true]],
-    extra: (s) => {
-      assert.equal(s.bootSummary, 'missing (run pier-setup)'); assert.ok(renderGuide(s, 'all').length > 5, 'a missing plane must not break rendering');
-    },
+    name: 'missing pi settings are reported, not thrown',
+    deps: (fx) => ({ ...fx.deps, agentDir: join(fx.base, 'nope-agent') }),
+    expect: [['pi', 'not found', true]],
+    extra: (s) => assert.ok(renderGuide(s, 'all').length > 5, 'a missing plane must not break rendering'),
   },
 ];
 
@@ -281,13 +262,7 @@ test('collectConfigSnapshot: every degraded input is reported on its plane', asy
   }
 });
 
-test('defaultHerdrPluginConfigDirs follows XDG and LOCALAPPDATA; the guidance prompt stays stable', () => {
-  assert.deepEqual(defaultHerdrPluginConfigDirs({ XDG_CONFIG_HOME: '/xdg' }), [join('/xdg', 'herdr', 'plugins', 'config', 'pier.workbench')]);
-  const win = defaultHerdrPluginConfigDirs({ XDG_CONFIG_HOME: '/xdg', LOCALAPPDATA: '/local' });
-  assert.equal(win.length, 2); assert.equal(win[1], join('/local', 'herdr', 'plugins', 'config', 'pier.workbench'));
-  const fallback = defaultHerdrPluginConfigDirs({});
-  assert.equal(fallback.length, 1); assert.match(fallback[0]!, /herdr[/\\]plugins[/\\]config[/\\]pier\.workbench$/);
-
+test('the guidance prompt stays stable', () => {
   assert.match(CONFIG_GUIDANCE_PROMPT, /^\[PIER-CONFIG\]/); assert.match(CONFIG_GUIDANCE_PROMPT, /\/pier-config show all/);
   assert.match(CONFIG_GUIDANCE_PROMPT, /Forbidden: dumping `process\.env`/); assert.match(CONFIG_GUIDANCE_PROMPT, /Change ONE plane at a time/);
 });

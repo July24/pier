@@ -19,7 +19,7 @@ pier 由**两个半区**组成，各装一处：
 | 半区 | 包 | 作用 |
 |---|---|---|
 | **pi 扩展** | `packages/pier-ext`（npm: [`pi-pier`](https://www.npmjs.com/package/pi-pier)，[pi.dev 市场](https://pi.dev/packages/pi-pier)） | 在 pi 会话里注入 `todo_write` / `subagent` / `terminal` / `ask_user_question` 工具 + 经 herdr socket API 上报 pane 状态 |
-| **herdr 插件** | `packages/pier-workbench`（`pier.workbench`） | 主 tab 引导、blocked 人类闸门通知、焦点热力布局（聚焦 pane 原地放大） |
+| **herdr 插件** | `packages/pier-workbench`（`pier.workbench`） | blocked 人类闸门通知、焦点热力布局（聚焦 pane 原地放大）、运维面板 + 侧边栏视图 |
 
 ### 核心能力
 
@@ -56,7 +56,7 @@ pier 由**两个半区**组成，各装一处：
 npx pier-setup@latest            # 用户模式：pi install npm:pi-pier + herdr plugin install
 npx pier-setup@latest version    # 本地 vs npm latest（installer / pi-pier / herdr 插件）
 npx pier-setup@latest update     # 原地刷新两半区（不先卸载）
-npx pier-setup@latest uninstall  # --purge 连 boot-config.json 一起删
+npx pier-setup@latest uninstall
 
 npm i -g pier-setup              # 或全局安装后：pier-setup / version / update
 ```
@@ -70,14 +70,13 @@ npm i -g pier-setup              # 或全局安装后：pier-setup / version / u
 git clone https://github.com/July24/pier && cd pier
 node install.mjs install --dev   # 本地路径 pi install + herdr plugin link，改码即生效
 node install.mjs version --dev
-node install.mjs update --dev    # 只重写 boot-config；代码请自己 git pull
+node install.mjs update --dev    # 仅重新校验环境与版本；代码请自己 git pull
 ```
 
-脚本自动校验环境（node / pi / herdr 版本）、探测 pi 的 node 与 cli.js 绝对路径、
-生成 boot-config.json（用户模式落 herdr 插件配置目录，重装不丢），并注册两半区。
+脚本自动校验环境（node / pi / herdr 版本）并注册两半区。
 
 `update` 会跑 `pi update npm:pi-pier`（失败则 `pi install`）和
-`herdr plugin install … --yes`，然后重写 boot-config。发行规格可用
+`herdr plugin install … --yes`。发行规格可用
 `--pi-spec=` / `--herdr-spec=` 覆盖。`pier-setup --help` 列出全部命令。
 
 ### 手动安装（等价步骤）
@@ -129,14 +128,7 @@ pi 对同名 tool/command **后写覆盖**，event listener **累加**。两套 
 **设计上可共存：** herdr 官方 `herdr:pi` 上报器。不要卸——pier 发 `herdr:blocked`，由它当生命周期权威。
 
 - **herdr 中用其他 agent（claude code / codex 等）**：不含 pi pane 的 tab 不参与
-  热力布局；blocked 通知只发给 pi；主 tab 自动引导可用 boot-config 的
-  `autoBootstrap: false` 关闭。
-
-### 引导配置（workbench 半区）
-
-master 主 tab 引导需要本机 node / pi 路径：`node install.mjs` 自动生成；手动可复制模板
-`packages/pier-workbench/scripts/boot-config.example.json`（含 macOS / Windows 双平台占位）。
-用户模式配置在 `herdr plugin config-dir pier.workbench`；开发模式在 `packages/pier-workbench/scripts/boot-config.json`。
+  热力布局；blocked 通知只发给 pi。
 
 ### 使用
 
@@ -150,7 +142,7 @@ master 主 tab 引导需要本机 node / pi 路径：`node install.mjs` 自动�
 ```
 packages/
   pier-ext/        # pi 扩展（npm: pi-pier）：todo/subagent 工具、herdr 客户端、vocab 权威、skill
-  pier-workbench/  # herdr 插件（pier.workbench）：主 tab 引导 + blocked 通知 + 热力布局
+  pier-workbench/  # herdr 插件（pier.workbench）：blocked 通知 + 热力布局 + 运维面板
 docs/              # 安装手册、role 档案说明、侧边栏 role 配置
 ```
 
@@ -158,7 +150,7 @@ docs/              # 安装手册、role 档案说明、侧边栏 role 配置
 
 ```sh
 npm install --ignore-scripts
-npm test          # node --test，809 项单测（规划器 / todo 重放 / 反冻结陈旧度 / 会话尾 / GC / 生命周期 / 渲染器 / 选择题选择器 / 子代理输出 / jev 决策层：诊断门·结算排序·摘录选窗）
+npm test          # node --test，733 项单测（规划器 / todo 重放 / 反冻结陈旧度 / 会话尾 / GC / 生命周期 / 渲染器 / 选择题选择器 / 子代理输出 / jev 决策层：诊断门·结算排序·摘录选窗）
 ```
 
 ## 配置与环境变量
@@ -196,7 +188,7 @@ npm test          # node --test，809 项单测（规划器 / todo 重放 / 反�
 
 **焦点热力**：herdr 0.9.0 把鼠标焦点放在客户端解析，插件收不到 `pane.focused`，因此每个 pane
 采样自己 tab 的 `layout.export → focused_pane_id` 再重放 workbench 事件。0.9.1+ 原生派发
-`pane.focused`，轮询默认关闭。`PIER_FOCUS_POLL_MS` 可覆盖；`PIER_WORKBENCH_ROOT` 指向迁移后的插件目录（未设置时使用 workbench 钩子记录在 `~/.pi/agent/herdr-pi/workbench-root` 的插件目录）。
+`pane.focused`，轮询默认关闭。`PIER_FOCUS_POLL_MS` 可覆盖；`PIER_WORKBENCH_ROOT` 指向迁移后的插件目录。
 
 ## 设计原则
 
@@ -211,6 +203,6 @@ MIT
 
 ---
 
-> 💡 **开发说明**：`.gitignore` 目前已入库跟踪。注意 `packages/pier-workbench/scripts/boot-config.json` 属于本机专属配置（模板见 `.example.json`）；`docs/research/` 内为本地调研文档，已被 `.gitignore` 忽略。
+> 💡 **开发说明**：`.gitignore` 目前已入库跟踪。`docs/research/` 内为本地调研文档，已被 `.gitignore` 忽略。
 >
 > **命名约定**：品牌名 **pier**（仓库/包/插件），运行时协议标识保留 **`pi-herdr`** 前缀（`.pi-herdr/roles/` 目录、`pi-herdr.subs` 等会话 custom 条目、`~/.pi/agent/herdr-pi/roles/` 用户目录）——它们随用户会话/配置文件持久化，改动会破坏既有数据，属兼容层。

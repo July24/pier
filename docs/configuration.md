@@ -1,4 +1,4 @@
-# pier 配置总览（5 个平面）
+# pier 配置总览（4 个平面）
 
 > **一句话**：`/pier-config` 会按平面列出**当前生效值 + 来源**（`env` > 工作区 > 用户 > 默认），无参调用则把"改配置"这件事交给 agent 引导完成。
 > 本文件讲**为什么这样分层**与**每层改哪里**；机器真值（当前值/来源/校验）请直接跑命令：`/pier-config show all`、`/pier-config check`、`/pier-config doc`。
@@ -9,9 +9,9 @@
 ## 0. 先跑这些
 
 ```text
-/pier-config                 # 5 平面索引（≤10 行）+ 把引导交给 agent
+/pier-config                 # 4 平面索引（≤10 行）+ 把引导交给 agent
 /pier-config show all        # 每个键的 生效值 / 来源 / 默认 / 影响一句话
-/pier-config check           # 未知键、类型越界、未受信被忽略、JSON 损坏、env 非法、boot-config 缺失
+/pier-config check           # 未知键、类型越界、未受信被忽略、JSON 损坏、env 非法
 /pier-config doc             # 生成机器真值报告 → <repo>/.pi-herdr/config-report.md（建议把该文件加进 .gitignore）
 ```
 
@@ -19,17 +19,16 @@
 
 ---
 
-## 1. 五个平面与优先级
+## 1. 四个平面与优先级
 
 | 平面 | 文件 / 来源 | 优先级 | 受信门控 | 谁拥有 |
 |---|---|---|---|---|
 | `efficiency` | `<repo>/.pi-herdr/config.json`、`~/.pi/agent/herdr-pi/config.json`、`PI_HERDR_*` env | env > 工作区 > 用户 > 默认 | ✅ 工作区需项目受信 | pier（D100–D103） |
 | `roles` | `<repo>/.pi-herdr/roles/<name>.json`、`~/.pi/agent/herdr-pi/roles/<name>.json`、内置 `src/roles/` | 工作区/用户层覆盖（内置名不可劫持，D11） | 加载期校验（schema） | pier（D82/D11） |
 | `pi` | `~/.pi/agent/settings.json`（+ 受信项目 `.pi/settings.json`） | 项目 > 全局 | ✅ | pi 本体 |
-| `boot` | `$HERDR_PLUGIN_CONFIG_DIR/boot-config.json`（缺省即 `~/.config/herdr/plugins/config/pier.workbench/boot-config.json`）、`packages/pier-workbench/scripts/boot-config.json` | 唯一 | — | workbench（`install.mjs` 写入） |
 | `env` | `PIER_*`（runtime policy）、`PI_HERDR_*`（终端/待办/诊断/能效覆盖） | env 唯一（无文件） | — | pier |
 
-**为什么这么分层**：能效与角色是 pier 的**行为策略**，所以放在 pier 自己的目录（用户级 + 工作区级），并用 env 提供最高优先级的临时覆盖；而 pi 的模型/压缩等属于**宿主设置**，pier 只读其中与 OCC 有关的 `compaction.*`，其余引导用户走 pi 的 `/settings`；boot-config 是**安装期产物**，手改路径容易与 `install.mjs` 打架。
+**为什么这么分层**：能效与角色是 pier 的**行为策略**，所以放在 pier 自己的目录（用户级 + 工作区级），并用 env 提供最高优先级的临时覆盖；而 pi 的模型/压缩等属于**宿主设置**，pier 只读其中与 OCC 有关的 `compaction.*`，其余引导用户走 pi 的 `/settings`。
 
 ### 优先级与覆盖语义（试用期最容易踩的四条）
 
@@ -54,7 +53,6 @@
 | 让 OCC 的保留窗口跟随 pi | `pi` / `efficiency` | 不在效率配置里写 `keepRecentTokens` 即继承 pi 的值；显式写了就以效率配置为准 | 新会话 |
 | 调子代理超时/GC/轮询 | `env` | `PIER_SUBAGENT_TIMEOUT_MS`、`PIER_GC_TICK_MS`、`PIER_POLL_INTERVAL_MS` … | 新进程 |
 | 终端读多少字符 | `env` | `PI_HERDR_TERM_READ_MAX`（默认 8000） | 新进程 |
-| 换 pi/node 路径、标签 | `boot` | 优先 `npx pier-setup@latest update --force`；仅路径需要手改时再编辑 JSON | 重启 workbench |
 
 ---
 

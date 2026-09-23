@@ -1,7 +1,7 @@
 # pi-pier
 
 > [!IMPORTANT]
-> **This npm package is only the pi-extension half of pier.** pier is a two-half system — this extension plus a **herdr plugin** (`pier.workbench`). Without the herdr side you still get `todo_write` / `ask_user_question`; `subagent` / `terminal` are not registered. Pane integration, notifications, and workspace bootstrap all require herdr. See [Install the herdr half](#install-the-herdr-half-companion-plugin) below.
+> **This npm package is only the pi-extension half of pier.** pier is a two-half system — this extension plus a **herdr plugin** (`pier.workbench`). Without the herdr side you still get `todo_write` / `ask_user_question`; `subagent` / `terminal` are not registered. Pane integration and notifications require herdr. See [Install the herdr half](#install-the-herdr-half-companion-plugin) below.
 
 **pier** = **pi** × h**erdr** — a [pi](https://pi.dev/) extension that fuses coding agent sessions with the [herdr](https://herdr.dev/) pane/tab orchestrator.
 
@@ -21,7 +21,7 @@ pi install git:github.com/July24/pier
 
 ## Install the herdr half (companion plugin)
 
-The herdr plugin `pier.workbench` provides the other half: main-tab bootstrap (auto-start a pi master session per workspace), blocked-gate notifications (system notifications when a subagent waits for a human), and the focus-heat layout (focused pane grows in place). Install it from the same repo:
+The herdr plugin `pier.workbench` provides the other half: blocked-gate notifications (system notifications when a subagent waits for a human), the focus-heat layout (focused pane grows in place), and the ops dashboard / sidebar agent view. Install it from the same repo:
 
 ```sh
 herdr plugin install July24/pier/packages/pier-workbench --yes
@@ -31,10 +31,10 @@ Or install **both halves at once** with the one-shot installer from the monorepo
 
 ```sh
 git clone https://github.com/July24/pier && cd pier
-node install.mjs        # user mode: installs both halves + generates local bootstrap config
+node install.mjs        # user mode: installs both halves
 ```
 
-The installer also verifies node / pi / herdr versions, probes local paths, and writes the workbench bootstrap config (`boot-config.json`) into herdr's plugin config dir.
+The installer also verifies node / pi / herdr versions.
 
 ## What you get
 
@@ -54,7 +54,7 @@ The installer also verifies node / pi / herdr versions, probes local paths, and 
 | `/todos` | Show the todo list, or edit it: `/todos done|drop|rm|unblock <fuzzy match>` |
 | `/locks` | Show write locks held by this pane and by live panes — the **human/operator view** of the write-lock beacons (herdr only). Agents see the holders inside their own write warnings; the raw tokens are readable via `herdr agent list` |
 | `/pier-role` | Show the current role + available role names, or switch mid-session: `/pier-role <name>` (pi ≥ 0.86; widening beyond the current toolset asks for confirmation; the switch lands as a transcript tool delta) |
-| `/pier-config` | Read-only configuration guide over five planes: bare call = index + hands a guided change to the agent; `show [plane\|all]` = effective value + source (`env > workspace > user > default`); `check` = validate all planes; `doc [path]` = write a report |
+| `/pier-config` | Read-only configuration guide over four planes: bare call = index + hands a guided change to the agent; `show [plane\|all]` = effective value + source (`env > workspace > user > default`); `check` = validate all planes; `doc [path]` = write a report |
 
 ### Behaviors
 
@@ -78,7 +78,7 @@ This extension mutates the pi session even outside herdr. After `pi install npm:
 | Hidden inject (`before_agent_start` todo-read; settle reminder) | live | live |
 | `subagent`, `terminal` | **not registered** | live |
 | `/locks`, write-lock on `write`/`edit` | not installed | live |
-| `/pier-config` (read-only config guide over 5 planes) | live | live |
+| `/pier-config` (read-only config guide over 4 planes) | live | live |
 | slim-frame overlay, pane title, pipe, isolate worktree | off | live |
 | `setActiveTools` role visible layer | off | on (herdr master) |
 

@@ -4,8 +4,6 @@
  * `PIER_FOCUS_POLL_MS` overrides either default, 0 disables.
  */
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -187,42 +185,12 @@ export function startFocusPoller(deps: FocusPollerDeps): FocusPoller {
   };
 }
 
-/** Where the workbench's hooks record their own checkout (they run from it; pi-pier may not sit beside it). */
-export function workbenchRootRecordFile(): string {
-  return join(homedir(), '.pi', 'agent', 'herdr-pi', 'workbench-root');
-}
-
-function readRecordedWorkbenchRoot(): string | null {
-  try {
-    return readFileSync(workbenchRootRecordFile(), 'utf8').trim() || null;
-  } catch {
-    return null;
-  }
-}
-
-export interface ReflowPathIo {
-  exists(file: string): boolean;
-  recordedRoot(): string | null;
-}
-
-/**
- * The workbench's reflow entry point: PIER_WORKBENCH_ROOT, else the monorepo sibling (dev/link), else
- * the checkout the workbench hooks recorded (an npm pi-pier install lives apart from herdr's managed
- * plugin checkout, so the sibling path does not exist there).
- */
-export function reflowScriptPath(
-  env: NodeJS.ProcessEnv = process.env,
-  io: ReflowPathIo = { exists: existsSync, recordedRoot: readRecordedWorkbenchRoot },
-): string {
-  const script = (root: string): string => join(root, 'scripts', 'heat-reflow.mjs');
+/** The workbench's reflow entry point; overridable for relocated checkouts. */
+export function reflowScriptPath(env: NodeJS.ProcessEnv = process.env): string {
   const root = env.PIER_WORKBENCH_ROOT?.trim();
-  if (root) return script(root);
+  if (root) return join(root, 'scripts', 'heat-reflow.mjs');
   // packages/pier-ext/src/focus-poller.ts -> packages/pier-workbench/scripts/heat-reflow.mjs
-  const sibling = script(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'pier-workbench'));
-  if (io.exists(sibling)) return sibling;
-  const recorded = io.recordedRoot();
-  if (recorded && io.exists(script(recorded))) return script(recorded);
-  return sibling;
+  return join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'pier-workbench', 'scripts', 'heat-reflow.mjs');
 }
 
 export interface SpawnReflowOpts {

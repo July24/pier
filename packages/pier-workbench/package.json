@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "pier: herdr plugin half — workspace bootstrap, blocked notifications, focus heat layout",
+  "description": "pier: herdr plugin half — blocked notifications, focus heat layout, ops dashboard",
   "scripts": {
     "test": "node --test \"test/*.test.ts\""
   }

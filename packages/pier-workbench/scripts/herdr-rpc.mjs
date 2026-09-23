@@ -1,11 +1,8 @@
 /**
- * Shared herdr glue for the workbench hook scripts (one-shot processes, no cordis): socket target,
- * NDJSON request exchange, boot-config/boot-record paths, envelope id lookup, launch command.
+ * Shared herdr glue for the workbench hook scripts (one-shot processes, no cordis): socket target
+ * and NDJSON request exchange.
  */
 import * as net from 'node:net';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import * as os from 'node:os';
 
 /** POSIX socket paths are used verbatim; on win32 a bare pipe name needs the \\.\pipe\ prefix. */
 export function socketTarget() {
@@ -48,61 +45,4 @@ export function request(method, params = {}, timeoutMs = 15000) {
     });
     sock.on('error', (err) => settle(reject, err));
   });
-}
-
-/**
- * boot-config.json (pi node/cli paths, tab label, hmr flag): HERDR_PLUGIN_CONFIG_DIR in user mode (the
- * managed checkout is replaced on reinstall), the script directory in dev/link mode; null if neither parses.
- */
-export function readBootConfig(scriptDir) {
-  const candidates = [
-    process.env.HERDR_PLUGIN_CONFIG_DIR ? path.join(process.env.HERDR_PLUGIN_CONFIG_DIR, 'boot-config.json') : null,
-    path.join(scriptDir, 'boot-config.json'),
-  ].filter(Boolean);
-  for (const file of candidates) {
-    try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
-  }
-  return null;
-}
-
-/** Boot record log: bootstrap.mjs appends, restore-layout.mjs replays (HERDR_PLUGIN_STATE_DIR is not injected). */
-export function bootFilePath() {
-  return path.join(os.homedir(), '.pi', 'agent', 'herdr-pi', 'boot.jsonl');
-}
-
-/**
- * Record this checkout for pi-pier: an npm install of the extension does not sit beside herdr's managed
- * plugin checkout, and its focus poller replays scripts/heat-reflow.mjs from here. Best effort.
- */
-export function recordWorkbenchRoot(scriptDir) {
-  try {
-    const file = path.join(path.dirname(bootFilePath()), 'workbench-root');
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, path.resolve(scriptDir, '..') + '\n');
-  } catch {}
-}
-
-/** First string field named `key` anywhere in a herdr envelope (id positions vary per event shape). */
-export function deepFind(obj, key, depth = 0) {
-  if (!obj || typeof obj !== 'object' || depth > 6) return null;
-  if (typeof obj[key] === 'string') return obj[key];
-  for (const value of Object.values(obj)) {
-    const found = deepFind(value, key, depth + 1);
-    if (found) return found;
-  }
-  return null;
-}
-
-/** Master pi launch argv (D97: fullscreen by default; PI_HERDR_TUI=regular is the escape hatch). */
-export function masterArgv(config) {
-  const argv = [config.piNode, config.piCli];
-  if (process.env.PI_HERDR_TUI !== 'regular') argv.push('--tui-mode', 'fullscreen');
-  argv.push('-e', config.extPath);
-  return argv;
-}
-
-/** Raw argv -> platform shell line: win32 PowerShell (`&` + '' doubling), POSIX sh (single quotes). */
-export function launchCommand(argv) {
-  const quote = (s) => (process.platform === 'win32' ? `'${s.replace(/'/g, "''")}'` : `'${s.replace(/'/g, `'\\''`)}'`);
-  return (process.platform === 'win32' ? '& ' : '') + argv.map(quote).join(' ');
 }

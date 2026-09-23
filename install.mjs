@@ -3,25 +3,23 @@
  * pier one-shot installer / uninstaller / updater / version inspector (cross-platform: macOS / Linux / Windows).
  *
  * Usage:
- *   node install.mjs install  [--dev] [--hmr-dev] [--force]   # Install (default command, 'install' can be omitted)
- *   node install.mjs update   [--dev] [--hmr-dev]             # Refresh both halves in place to latest release (no prior uninstall)
- *   node install.mjs version  [--json]                        # Local vs npm latest
- *   node install.mjs uninstall [--dev] [--purge]              # Uninstall; --purge deletes boot-config.json as well
+ *   node install.mjs install  [--dev]                        # Install (default command, 'install' can be omitted)
+ *   node install.mjs update   [--dev]                        # Refresh both halves in place to latest release (no prior uninstall)
+ *   node install.mjs version  [--json]                       # Local vs npm latest
+ *   node install.mjs uninstall [--dev]                       # Uninstall both halves
  *   node install.mjs --prepare                                # npm prepare: hooksPath + repo root bin link
  *   node install.mjs --help
  *
  * Modes:
  *   User mode (default): pi install npm:pi-pier
  *                   + herdr plugin install July24/pier/packages/pier-workbench --yes
- *                   boot-config.json written to herdr plugin config-dir; extPath points to pi-installed
- *                   pi-pier (~/.pi/agent/npm/...), not the repo path inside pier-setup package.
  *   --dev Development mode: pi install <repo>/packages/pier-ext + herdr plugin link <repo>/packages/pier-workbench
- *                   (linked directory is live; code edits take effect immediately; update only rewrites boot-config).
+ *                   (linked directory is live; code edits take effect immediately).
  * Distribution specs can be overridden via --pi-spec= / --herdr-spec= (for npm publish or fork scenarios).
  * Failure semantics: Each step provides manual equivalent command; step failure does not abort reporting (exitCode=1).
  */
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,7 +27,6 @@ import { fileURLToPath } from 'node:url';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)));
 const EXT_DIR = join(ROOT, 'packages', 'pier-ext');
 const WB_DIR = join(ROOT, 'packages', 'pier-workbench');
-const DEV_BOOT_CONFIG = join(WB_DIR, 'scripts', 'boot-config.json');
 const EXT_PATH = join(EXT_DIR, 'src', 'index.ts');
 const IS_WIN = process.platform === 'win32';
 const COMMANDS = ['install', 'uninstall', 'update', 'version', 'help'];
@@ -141,10 +138,6 @@ function npmLatest(name) {
   }
 }
 
-/** Herdr plugin config directory (boot-config destination in user mode; semantic path exists once plugin is registered). */
-function herdrConfigDir() {
-  try { return run('herdr', ['plugin', 'config-dir', 'pier.workbench']); } catch { return null; }
-}
 
 /* ── Environment check (pre-install) ────────────────────────────────── */
 function checkEnv() {
@@ -167,26 +160,6 @@ function checkEnv() {
 /** pi extension source: user mode uses git/npm spec, dev mode uses local directory. */
 const piSource = () => (dev ? EXT_DIR : PI_SPEC);
 
-/* ── boot-config detection and writing ────────────────────────────── */
-function probePiRuntime() {
-  const piBin = which('pi');
-  // bin is a node shim: realpath resolves to .../pi-coding-agent/dist/cli.js (npm layout, isomorphic win/posix)
-  if (piBin) {
-    try {
-      const real = realpathSync(piBin);
-      if (real.endsWith('cli.js') && existsSync(real)) {
-        return { piCli: real, piNode: process.execPath };
-      }
-    } catch { /* fall back to fallback */ }
-  }
-  // npm root -g fallback: when pi is not in PATH (e.g. nvm shim), construct from global npm layout
-  try {
-    const gRoot = run('npm', ['root', '-g']);
-    const cand = join(gRoot, '@earendil-works', 'pi-coding-agent', 'dist', 'cli.js');
-    if (existsSync(cand)) return { piCli: cand, piNode: process.execPath };
-  } catch { /* npm unavailable */ }
-  return null;
-}
 
 function piAgentDir() {
   return process.env.PI_CODING_AGENT_DIR || join(homedir(), '.pi', 'agent');
@@ -260,47 +233,6 @@ function resolveUserExtPath() {
   return extPathFromPiList();
 }
 
-function writeBootConfig(hmrDev, force) {
-  const probed = probePiRuntime();
-  if (!probed) die('cannot locate pi cli.js (tried: pi shim realpath, npm root -g). Fill boot-config.json manually.');
-  let extPath;
-  if (dev) {
-    if (!existsSync(EXT_PATH)) die(`pier-ext entry missing: ${EXT_PATH} (repo layout broken?)`);
-    extPath = EXT_PATH;
-  } else {
-    extPath = resolveUserExtPath();
-    if (!extPath) die(`cannot locate installed pier-ext (npm:pi-pier / git clone). Did \`pi install ${piSource()}\` succeed?`);
-  }
-
-  const config = {
-    mainTabLabel: 'main',
-    piNode: probed.piNode,
-    piCli: probed.piCli,
-    extPath,
-    workbenchPluginId: 'pier.workbench',
-    hmrDev,
-  };
-
-  const target = dev ? DEV_BOOT_CONFIG : join(herdrConfigDir() ?? die('cannot resolve herdr plugin config-dir (is pier.workbench installed?)'), 'boot-config.json');
-  if (existsSync(target) && !force) {
-    let existing = null;
-    try { existing = JSON.parse(readFileSync(target, 'utf8')); } catch { /* treated as corrupted */ }
-    if (existing) {
-      log(`• ${target} exists, diff (existing → new):`);
-      for (const k of Object.keys(config)) {
-        if (existing[k] !== config[k]) log(`    ${k}: ${JSON.stringify(existing[k])} → ${JSON.stringify(config[k])}`);
-      }
-      log('  kept existing (use --force to overwrite)');
-      return;
-    }
-  }
-  mkdirSync(dirname(target), { recursive: true });
-  writeFileSync(target, JSON.stringify(config, null, 2) + '\n');
-  log(`✓ boot-config.json ${force ? 'overwritten (--force)' : 'written'} → ${target}`);
-  log(`  piNode = ${config.piNode}`);
-  log(`  piCli  = ${config.piCli}`);
-  log(`  extPath = ${config.extPath}`);
-}
 
 function pkgDirFromExtPath(extPath) {
   let d = dirname(extPath);
@@ -344,17 +276,17 @@ function usage() {
   log(`pier-setup — install / update / inspect pier (pi-pier + pier.workbench)
 
 Usage:
-  pier-setup [install] [--dev] [--hmr-dev] [--force]
-  pier-setup update    [--dev] [--hmr-dev]
+  pier-setup [install] [--dev]
+  pier-setup update    [--dev]
   pier-setup version   [--json]
-  pier-setup uninstall [--dev] [--purge]
+  pier-setup uninstall [--dev]
 
   npx pier-setup@latest          # recommended user install
   npx pier-setup@latest update   # refresh both halves to newest release
   npx pier-setup@latest version  # local vs npm latest
 
   --pi-spec= / --herdr-spec= override distribution sources
-  --dev  local link (clone); update only rewrites boot-config`);
+  --dev  local link (clone); the linked directories are live`);
 }
 
 function version() {
@@ -390,25 +322,20 @@ function update() {
   if (latestSetup && me && cmpSemver(me, latestSetup) < 0) {
     log(`⚠ installer ${me} < latest ${latestSetup} — re-run: npx pier-setup@latest update`);
   }
-  const hmrDev = flags.has('--hmr-dev');
   if (dev) {
-    log('dev mode: local link is live; pull the repo yourself. Refreshing boot-config only.');
-    writeBootConfig(hmrDev, true);
+    log('dev mode: local link is live; pull the repo yourself (no installer-managed files to refresh).');
   } else {
     if (tryRun('pi', ['update', piSource()])) log(`✓ pi extension updated (${piSource()})`);
     else if (tryRun('pi', ['install', piSource()])) log(`✓ pi extension installed (${piSource()})`);
     else { console.error('✗ pi update/install failed'); log(`  manual: pi update ${piSource()}`); process.exitCode = 1; }
     if (tryRun('herdr', ['plugin', 'install', HERDR_SPEC, '--yes'])) log(`✓ herdr plugin updated (${HERDR_SPEC})`);
     else { console.error('✗ herdr plugin update failed'); log(`  manual: herdr plugin install ${HERDR_SPEC} --yes`); process.exitCode = 1; }
-    writeBootConfig(hmrDev, true);
   }
   log('');
   version();
 }
 
 function install() {
-  const hmrDev = flags.has('--hmr-dev');
-  const force = flags.has('--force');
   checkEnv();
   removeLegacyGitRegistration();
 
@@ -417,40 +344,31 @@ function install() {
     else { console.error('✗ pi install failed'); log(`  manual: pi install ${EXT_DIR}`); process.exitCode = 1; }
     if (tryRun('herdr', ['plugin', 'link', WB_DIR])) log('✓ herdr plugin linked (packages/pier-workbench, local)');
     else { console.error('✗ herdr plugin link failed'); log(`  manual: herdr plugin link ${WB_DIR}`); process.exitCode = 1; }
-    writeBootConfig(hmrDev, force);
   } else {
     if (tryRun('pi', ['install', piSource()])) log(`✓ pi extension installed (${PI_SPEC})`);
     else { console.error('✗ pi install failed'); log(`  manual: pi install ${PI_SPEC}`); process.exitCode = 1; }
     if (tryRun('herdr', ['plugin', 'install', HERDR_SPEC, '--yes'])) log(`✓ herdr plugin installed (${HERDR_SPEC})`);
     else { console.error('✗ herdr plugin install failed'); log(`  manual: herdr plugin install ${HERDR_SPEC}`); process.exitCode = 1; }
-    writeBootConfig(hmrDev, force);
   }
 
   log(`
 pier installed (${dev ? 'dev mode: local paths, code changes are live' : 'user mode: managed checkouts'}). Next:
-  1. start herdr, open/create a workspace — the main tab auto-bootstraps a pi session
+  1. start herdr, open/create a workspace and run \`pi\` inside a pane
   2. inside pi, ask the model to use todo_write / subagent tools`);
 }
 
 function uninstall() {
-  const purge = flags.has('--purge');
   if (tryRun('pi', ['remove', piSource()])) log('✓ pi extension removed');
   else { console.error('✗ pi remove failed'); log(`  manual: pi remove ${piSource()}`); process.exitCode = 1; }
 
   if (dev) {
     if (tryRun('herdr', ['plugin', 'unlink', 'pier.workbench'])) log('✓ herdr plugin unlinked (files kept)');
     else { console.error('✗ herdr plugin unlink failed'); log('  manual: herdr plugin unlink pier.workbench'); process.exitCode = 1; }
-    if (purge && existsSync(DEV_BOOT_CONFIG)) { rmSync(DEV_BOOT_CONFIG); log('✓ dev boot-config.json purged'); }
   } else {
     if (tryRun('herdr', ['plugin', 'uninstall', 'pier.workbench'])) log('✓ herdr plugin uninstalled (managed checkout removed)');
     else { console.error('✗ herdr plugin uninstall failed'); log('  manual: herdr plugin uninstall pier.workbench'); process.exitCode = 1; }
-    if (purge) {
-      const dir = herdrConfigDir();
-      const f = dir ? join(dir, 'boot-config.json') : null;
-      if (f && existsSync(f)) { rmSync(f); log('✓ boot-config.json purged'); }
-    }
   }
-  log(`\npier uninstalled.${purge ? '' : ' (boot-config.json kept; use --purge to remove)'}`);
+  log('\npier uninstalled.');
 }
 
 if (command === 'help' || flags.has('--help') || flags.has('-h')) usage();

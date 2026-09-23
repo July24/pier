@@ -1,4 +1,4 @@
-# pier-workbench: main tab bootstrap + blocked notification + M23 focus heat layout.
+# pier-workbench: blocked notification + M23 focus heat layout + sidebar agent view + ops dashboard.
 #
 # ⚠️ Herdr plugin v1 has no SDK / no runtime UI: "the entire herdr CLI is the plugin API".
 # This manifest declares entries only; logic is implemented with Node under scripts/.
@@ -13,7 +13,7 @@
 id = "pier.workbench"
 name = "pier-workbench"
 version = "0.1.0"
-description = "pier × herdr 工作台融合：主 tab 引导、blocked 通知、焦点热力布局"
+description = "pier × herdr 工作台融合：blocked 通知、焦点热力布局、运维面板与侧边栏视图"
 min_herdr_version = "0.9.0"
 platforms = ["linux", "macos", "windows"]
 
@@ -27,20 +27,6 @@ command = ["node", "scripts/notify-agent-state.mjs"]
 on = "pane.agent_status_changed"
 platforms = ["windows"]
 command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/notify-agent-state.mjs')"]
-
-# ── Event hook: workspace opened -> automatically bootstrap main tab (v1.3 M7, D28) ──
-# [[startup]] runs once on session restore + socket ready, not per-workspace (empirically confirmed);
-# The correct trigger for new workspaces is the workspace.created / worktree.opened event hook.
-# bootstrap.mjs is idempotent: skips if workspace already contains a pi master pane (agent=pi or title contains ⏳).
-[[events]]
-on = "workspace.created"
-platforms = ["linux", "macos"]
-command = ["node", "scripts/bootstrap.mjs"]
-
-[[events]]
-on = "workspace.created"
-platforms = ["windows"]
-command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/bootstrap.mjs')"]
 
 # ── Event hook: register Pier sidebar agent view (0.9.0) ─────────────
 [[events]]
@@ -62,17 +48,6 @@ command = ["node", "scripts/agent-view.mjs"]
 on = "pane.created"
 platforms = ["windows"]
 command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/agent-view.mjs')"]
-
-
-[[events]]
-on = "worktree.opened"
-platforms = ["linux", "macos"]
-command = ["node", "scripts/bootstrap.mjs"]
-
-[[events]]
-on = "worktree.opened"
-platforms = ["windows"]
-command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/bootstrap.mjs')"]
 
 # ── M23 Tier 1: expand focused pane to primary window on human focus (D67) ──
 # pane.created records pane age only, providing the 3s whitelist for F1 when cause is missing.
@@ -120,16 +95,6 @@ command = ["node", "scripts/heat-reflow.mjs"]
 on = "pane.closed"
 platforms = ["windows"]
 command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/heat-reflow.mjs')"]
-
-# ── Startup hook: replay last bootstrapped war-room layout after session restore (v1.3 M7, D28) ──
-# one-shot: reads HERDR_PLUGIN_STATE_DIR/boot.jsonl, rebuilding missing main tabs/panes.
-[[startup]]
-platforms = ["linux", "macos"]
-command = ["node", "scripts/restore-layout.mjs"]
-
-[[startup]]
-platforms = ["windows"]
-command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/restore-layout.mjs')"]
 
 # ── Plugin Panes: Pier Ops Dashboard (0.9.0) ────────────────────────
 # One entry only: a pane id is the entrypoint used by `herdr plugin pane open --entrypoint dashboard`,

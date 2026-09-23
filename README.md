@@ -19,7 +19,7 @@ pier ships as **two halves**, installed separately:
 | Half | Package | Role |
 |---|---|---|
 | **pi extension** | `packages/pier-ext` (npm: [`pi-pier`](https://www.npmjs.com/package/pi-pier), [pi.dev gallery](https://pi.dev/packages/pi-pier)) | Injects `todo_write` / `subagent` / `terminal` / `ask_user_question` tools into a pi session, and reports pane state over the herdr socket API |
-| **herdr plugin** | `packages/pier-workbench` (`pier.workbench`) | Workspace bootstrap, blocked human-gate notifications, focus heat layout (focused pane grows in place) |
+| **herdr plugin** | `packages/pier-workbench` (`pier.workbench`) | Blocked human-gate notifications, focus heat layout (focused pane grows in place), ops dashboard + sidebar agent view |
 
 ### Highlights
 
@@ -56,7 +56,7 @@ No clone needed — run the npm package directly:
 npx pier-setup@latest            # user mode: pi install npm:pi-pier + herdr plugin install
 npx pier-setup@latest version    # local vs npm latest (installer / pi-pier / herdr plugin)
 npx pier-setup@latest update     # refresh both halves in place (does not uninstall first)
-npx pier-setup@latest uninstall  # --purge also drops boot-config.json
+npx pier-setup@latest uninstall
 
 npm i -g pier-setup              # or install globally, then: pier-setup / version / update
 ```
@@ -70,15 +70,13 @@ Dev mode still requires cloning the repo:
 git clone https://github.com/July24/pier && cd pier
 node install.mjs install --dev   # local-path pi install + herdr plugin link; code changes are live
 node install.mjs version --dev
-node install.mjs update --dev    # rewrite boot-config only; pull the repo yourself
+node install.mjs update --dev    # re-check env + versions; pull the repo yourself
 ```
 
-The script verifies the environment (node / pi / herdr versions), probes pi's node
-and cli.js absolute paths, generates boot-config.json (user mode stores it in the
-herdr plugin config dir, so reinstalls don't lose it), and registers both halves.
+The script verifies the environment (node / pi / herdr versions) and registers both halves.
 
 `update` re-runs `pi update npm:pi-pier` (falls back to `pi install`) and
-`herdr plugin install … --yes`, then rewrites boot-config. Override sources with
+`herdr plugin install … --yes`. Override sources with
 `--pi-spec=` / `--herdr-spec=` (npm publishing or forks). `pier-setup --help`
 lists every command.
 
@@ -131,15 +129,7 @@ pi overwrites tools/commands by name; event listeners stack. Two todo or subagen
 **Designed coexistence:** herdr’s official `herdr:pi` reporter. Keep it. pier emits `herdr:blocked` so that plugin remains lifecycle authority.
 
 - **other agents inside herdr (claude code / codex etc.)**: tabs without a pi pane
-  are excluded from heat reflow; blocked notifications are pi-only; master-tab
-  auto-bootstrap can be disabled with `autoBootstrap: false` in boot-config.
-
-### Bootstrap config (workbench half)
-
-Master-tab bootstrap needs local node / pi paths: `pier-setup` generates
-them automatically; manually, copy `packages/pier-workbench/scripts/boot-config.example.json`
-(placeholders for both macOS and Windows). User mode reads it from
-`herdr plugin config-dir pier.workbench`; dev mode from `packages/pier-workbench/scripts/boot-config.json`.
+  are excluded from heat reflow; blocked notifications are pi-only.
 
 ### Usage
 
@@ -153,7 +143,7 @@ them automatically; manually, copy `packages/pier-workbench/scripts/boot-config.
 ```
 packages/
   pier-ext/        # pi extension (npm: pi-pier): todo/subagent tools, herdr client, vocab authority, skill
-  pier-workbench/  # herdr plugin (pier.workbench): workspace bootstrap + blocked notify + heat layout
+  pier-workbench/  # herdr plugin (pier.workbench): blocked notify + heat layout + ops dashboard
 docs/              # install guide, configuration overview, role profile docs, sidebar role config
 ```
 
@@ -161,7 +151,7 @@ docs/              # install guide, configuration overview, role profile docs, s
 
 ```sh
 npm install --ignore-scripts
-npm test          # node --test, 809 unit tests (planner / todo replay / anti-freeze staleness / session tail / GC / lifecycle / renderers / ask picker / subagent output / jev decision layer: diagnostic gate, notice ranking, excerpt windows)
+npm test          # node --test, 733 unit tests (planner / todo replay / anti-freeze staleness / session tail / GC / lifecycle / renderers / ask picker / subagent output / jev decision layer: diagnostic gate, notice ranking, excerpt windows)
 ```
 
 ## Configuration
@@ -202,8 +192,7 @@ errors pier deliberately swallowed this session.
 **Focus heat:** Herdr 0.9.0 resolved mouse focus in the client and did not deliver `pane.focused`
 to plugins, so each pane sampled `layout.export → focused_pane_id` and replayed the workbench
 event. Herdr 0.9.1+ delivers `pane.focused` natively, so the poller defaults off. Override with
-`PIER_FOCUS_POLL_MS`; `PIER_WORKBENCH_ROOT` points at a relocated plugin checkout (otherwise pier uses the
-checkout the workbench hooks record in `~/.pi/agent/herdr-pi/workbench-root`).
+`PIER_FOCUS_POLL_MS`; `PIER_WORKBENCH_ROOT` points at a relocated plugin checkout.
 
 ### Efficiency mechanisms (D100–D103, opt-in)
 
@@ -219,10 +208,10 @@ PI_HERDR_OBS_PACK_ENABLE=1 PI_HERDR_OBS_PACK_LOG=1 pi   # start here
 
 Full quick start, what to watch in `efficiency-logs/*.jsonl`, rollback steps and a feedback template: **[docs/efficiency-trial.md](docs/efficiency-trial.md)**.
 
-Everything above (plus roles, pi settings, boot-config and the `PIER_*`/`PI_HERDR_*` env knobs) is also inspectable in-session:
+Everything above (plus roles, pi settings and the `PIER_*`/`PI_HERDR_*` env knobs) is also inspectable in-session:
 
 ```text
-/pier-config            # 5-plane index; hands a guided change to the agent
+/pier-config            # 4-plane index; hands a guided change to the agent
 /pier-config show all   # effective value + source (env > workspace > user > default) per key
 /pier-config check      # validation across planes   ·   /pier-config doc → written report
 ```
@@ -242,6 +231,6 @@ MIT
 
 ---
 
-> 💡 **For contributors**: `.gitignore` is tracked in the repository. Note that `packages/pier-workbench/scripts/boot-config.json` is machine-local (see the `.example.json` template), and `docs/research/` contains local research notes ignored by `.gitignore`.
+> 💡 **For contributors**: `.gitignore` is tracked in the repository. `docs/research/` contains local research notes ignored by `.gitignore`.
 >
 > **Naming convention**: the brand is **pier** (repo/packages/plugin); runtime protocol identifiers keep the **`pi-herdr`** prefix (`.pi-herdr/roles/` dir, `pi-herdr.subs` session custom entries, `~/.pi/agent/herdr-pi/roles/` user dir) — they persist with user sessions/config files, renaming would break existing data, so they are the compatibility layer.

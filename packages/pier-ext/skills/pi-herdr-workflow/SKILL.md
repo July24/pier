@@ -92,13 +92,12 @@ Call: `subagent(action: "resume", taskId: "<uuid>")`
 
 When the user asks about pier/pi configuration (or asks to change it), start from the read-only
 guide instead of guessing: `/pier-config show all` reports every knob's **effective value and
-source** (`env > workspace > user > default`), `check` validates all five planes (efficiency
-D100–D103, roles, pi settings, boot-config, `PIER_*`/`PI_HERDR_*` env), and `doc` writes a report
+source** (`env > workspace > user > default`), `check` validates all four planes (efficiency
+D100–D103, roles, pi settings, `PIER_*`/`PI_HERDR_*` env), and `doc` writes a report
 into `<repo>/.pi-herdr/config-report.md`. Bare `/pier-config` injects the full guided-change
 workflow. Key rules: an untrusted project's workspace layer is ignored (report it, never edit
-blindly); pi-owned settings go through pi's own `/settings`; prefer
-`npx pier-setup@latest update --force` for boot-config; change one plane at a time and show a diff
-before writing. Overview: `docs/configuration.md`.
+blindly); pi-owned settings go through pi's own `/settings`; change one plane at a time and show a
+diff before writing. Overview: `docs/configuration.md`.
 
 ## 3. Human gate
 

@@ -1,5 +1,5 @@
 /**
- * D104 `/pier-config`: probes the five configuration planes (real files + process env), renders
+ * D104 `/pier-config`: probes the four configuration planes (real files + process env), renders
  * `show|check|doc|doctor`, and registers the command.
  *
  * Read-only by design: effective values are reported with their provenance and the actual edit goes
@@ -11,12 +11,10 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { VERSION as piVersion, type ExtensionAPI, type ExtensionContext } from '@earendil-works/pi-coding-agent';
 import {
   CONFIG_PLANES,
   checkEnvKnobs,
-  readDotted,
   renderCheck,
   renderIndex,
   renderPlane,
@@ -49,7 +47,6 @@ export const CONFIG_GUIDANCE_PROMPT = [
   '   - roles: read `docs/sidebar-role-config.md` and `schemas/role-manifest.schema.json`; builtin role names cannot be overridden.',
   "   - pi (settings.json): recommend pi's own `/settings`; the only OCC-relevant keys here are `compaction.enabled` and",
   '     `compaction.keepRecentTokens` (read-only from our side).',
-  '   - boot (boot-config.json): manual edits are risky; prefer `npx pier-setup@latest update --force`, and only patch paths when asked.',
   '   - env (PIER_* / PI_HERDR_*): affects new processes only; state that explicitly.',
   '3. Explain before changing: 2-3 sentences on what the knob controls, its cost/benefit (tokens, latency, safety, blast radius),',
   '   and 2-3 recommended values for common scenarios. Then ask what the user actually wants to achieve.',
@@ -77,10 +74,6 @@ export interface ConfigGuideDeps {
   agentDir?: string;
   /** User-level efficiency config path (defaults to ~/.pi/agent/herdr-pi/config.json). */
   userConfigPath?: string;
-  /** herdr plugin config dir holding the user-mode boot-config.json. */
-  herdrPluginConfigDir?: string;
-  /** Repository root used to probe the dev-mode boot-config.json. */
-  repoRoot?: string;
   /** User-level roles dir override (defaults to ~/.pi/agent/herdr-pi/roles). */
   rolesUserDir?: string;
 }
@@ -91,16 +84,8 @@ export interface ConfigGuideSnapshot {
   readonly files: Readonly<Record<ConfigPlaneId, readonly ConfigPlaneFile[]>>;
   readonly workspaceTrusted: boolean;
   readonly roleSummary: string;
-  readonly bootSummary: string;
 }
 
-/** Standard herdr plugin config dirs: XDG config on macOS/Linux, LOCALAPPDATA on Windows. */
-export function defaultHerdrPluginConfigDirs(env: Record<string, string | undefined> = process.env): string[] {
-  const xdg = env.XDG_CONFIG_HOME?.trim() || join(homedir(), '.config');
-  const dirs = [join(xdg, 'herdr', 'plugins', 'config', 'pier.workbench')];
-  if (env.LOCALAPPDATA?.trim()) dirs.push(join(env.LOCALAPPDATA, 'herdr', 'plugins', 'config', 'pier.workbench'));
-  return dirs;
-}
 
 function readJsonLayer(path: string): { value: unknown; issue?: string } {
   if (!existsSync(path)) return { value: undefined };
@@ -126,10 +111,9 @@ export function collectConfigSnapshot(deps: ConfigGuideDeps = {}): ConfigGuideSn
   const agentDir = deps.agentDir ?? env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent');
   const userConfigPath = deps.userConfigPath ?? defaultUserEfficiencyConfigFile();
   const workspaceConfigPath = defaultWorkspaceEfficiencyConfigFile(cwd);
-  const herdrPluginConfigDir = deps.herdrPluginConfigDir ?? env.HERDR_PLUGIN_CONFIG_DIR;
 
   const reports: CheckReport[] = [];
-  const files: Record<ConfigPlaneId, ConfigPlaneFile[]> = { efficiency: [], roles: [], pi: [], boot: [], env: [] };
+  const files: Record<ConfigPlaneId, ConfigPlaneFile[]> = { efficiency: [], roles: [], pi: [], env: [] };
 
   /* efficiency: workspace layer (trusted projects only) + user layer, JSON issues reported as-is */
   const workspaceLayer = readJsonLayer(workspaceConfigPath);
@@ -190,65 +174,20 @@ export function collectConfigSnapshot(deps: ConfigGuideDeps = {}): ConfigGuideSn
   }
   const roleSummary = `${roleNames.size} role(s): ${layerCounts.join(' / ')}`;
 
-  /* boot-config: herdr plugin config dir → standard plugin dirs → dev checkout */
-  const bootIssues: string[] = [];
-  const bootCandidates: Array<{ path: string; label: string }> = [];
-  if (herdrPluginConfigDir) bootCandidates.push({ path: join(herdrPluginConfigDir, 'boot-config.json'), label: 'herdr plugin config-dir' });
-  // herdr does not always export HERDR_PLUGIN_CONFIG_DIR into the pi process, so production also
-  // probes the standard plugin config locations. Tests inject env/herdrPluginConfigDir and stay hermetic.
-  if (deps.herdrPluginConfigDir === undefined && deps.env === undefined) {
-    for (const dir of defaultHerdrPluginConfigDirs(env)) {
-      bootCandidates.push({ path: join(dir, 'boot-config.json'), label: 'herdr plugin config (default)' });
-    }
-  }
-  bootCandidates.push({
-    path: join(deps.repoRoot ?? defaultRepoRoot(), 'packages', 'pier-workbench', 'scripts', 'boot-config.json'),
-    label: 'dev (repo)',
-  });
-  let bootFound: { path: string; label: string } | null = null;
-  for (const candidate of bootCandidates) {
-    const exists = existsSync(candidate.path);
-    files.boot.push({ path: candidate.path, label: candidate.label, exists });
-    if (exists && !bootFound) bootFound = candidate;
-  }
-  if (!bootFound) {
-    bootIssues.push(`boot-config.json not found in: ${bootCandidates.map((c) => c.path).join(' , ')} (run \`npx pier-setup@latest install\`)`);
-  } else {
-    const parsed = readJsonLayer(bootFound.path);
-    if (parsed.issue) {
-      bootIssues.push(parsed.issue);
-    } else {
-      for (const key of ['piNode', 'piCli', 'extPath'] as const) {
-        const value = readDotted(parsed.value, key);
-        if (typeof value !== 'string' || value === '') {
-          bootIssues.push(`${bootFound.path}: missing required key "${key}"`);
-        } else if (!existsSync(value)) {
-          // A stale absolute path is the most common post-reinstall breakage.
-          bootIssues.push(`${bootFound.path}: "${key}" points to a path that does not exist: ${value} (stale after a reinstall? re-run \`npx pier-setup@latest update --force\`)`);
-        }
-      }
-    }
-  }
-  const bootSummary = bootFound ? `present (${bootFound.label})` : 'missing (run pier-setup)';
 
   reports.push(
     { plane: 'efficiency', ok: efficiencyIssues.length === 0, issues: efficiencyIssues },
     { plane: 'roles', ok: roleIssues.length === 0, issues: roleIssues },
     { plane: 'pi', ok: true, issues: piIssues },
-    { plane: 'boot', ok: bootIssues.length === 0, issues: bootIssues },
     { plane: 'env', ok: envIssues.length === 0, issues: envIssues },
   );
   const entries = [
     ...resolveConfigKnobs({ env, workspace: workspaceLayer.value, user: userLayer.value, workspaceTrusted, piSettings }),
     ...resolveEnvKnobs(env),
   ];
-  return { entries, reports, files, workspaceTrusted, roleSummary, bootSummary };
+  return { entries, reports, files, workspaceTrusted, roleSummary };
 }
 
-/** Repo root of this checkout (works in-repo; in node_modules the probe simply finds nothing). */
-function defaultRepoRoot(): string {
-  return resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
-}
 
 export type GuideView = 'index' | 'check' | ConfigPlaneId | 'all';
 
@@ -261,7 +200,6 @@ export function renderGuide(snapshot: ConfigGuideSnapshot, view: GuideView): str
       pi: plane('pi'),
       env: plane('env'),
       roleSummary: snapshot.roleSummary,
-      bootSummary: snapshot.bootSummary,
     });
   }
   if (view === 'check') {
@@ -346,7 +284,7 @@ export function installConfigCommand(deps: ConfigCommandDeps): void {
 
   pi.registerCommand('pier-config', {
     description:
-      'Show pier configuration (5 planes) with effective values and sources; `check` validates them; `doctor` lists option values and swallowed errors; no argument hands a guided change to the agent',
+      'Show pier configuration (4 planes) with effective values and sources; `check` validates them; `doctor` lists option values and swallowed errors; no argument hands a guided change to the agent',
     getArgumentCompletions: (prefix: string) => {
       const tokens = (prefix ?? '').split(/\s+/);
       const head = tokens[0] ?? '';

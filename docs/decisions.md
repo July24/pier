@@ -21,7 +21,7 @@
 | D11 | 内置角色（master / worker-default）直接读取内置档案，无视 workspace/user 目录诱饵以防角色劫持 | `packages/pier-ext/src/role-loader.ts:75` |
 | D25 | （推断，代码用法见 `packages/pier-ext/src/subagent-core.ts:158`）子代理任务 tab 放置决策纯逻辑规划 | `packages/pier-ext/src/subagent-core.ts:158` |
 | D26 | 子代理派发互斥锁（mutex），防止并发创建 tab 与 pane 时产生竞态 | `packages/pier-ext/src/subagent-spawn.ts:287` |
-| D28 | workspace 打开时主 tab 自动引导及会话恢复后布局重放（herdr 插件 `[[events]]` 与 `[[startup]]` 钩子） | `packages/pier-workbench/herdr-plugin.toml:29` |
+| D28 | （已废弃 → D110）workspace 打开时主 tab 自动引导及会话恢复后布局重放（herdr 插件 `[[events]]` 与 `[[startup]]` 钩子） | `packages/pier-workbench/herdr-plugin.toml` |
 | D29 | 任务 tab 垃圾回收（GC）纯判定矩阵（消费完成后关闭 pane，取消 resident 豁免） | `packages/pier-ext/src/gc-core.ts:2` |
 | D34 | Todo 五态模型（pending/in_progress/completed/blocked/abandoned，blocked 必须带原因且不计入 completed） | `packages/pier-ext/src/vocab.ts:8` |
 | D35 | Todo 列表内容未变化时跳过持久化与镜像同步，避免无谓 I/O | `packages/pier-ext/src/plugins/todo.ts:297` |
@@ -40,7 +40,7 @@
 | D50 | 追踪 pane 最新机器请求状态，用于打断认领、轮询去重与结算结果快路径推送 | `packages/pier-ext/src/index.ts:314` |
 | D62 | 将 pane 当前 todo 快照投影至 herdr 窗格标题栏与侧边栏 | `packages/pier-ext/src/pane-title.ts:2` |
 | D65 | （推断，代码用法见 `packages/pier-ext/src/todos-service.ts:1`）TodosService 服务化封装，承载 todo 运行时状态与事件生命周期 | `packages/pier-ext/src/todos-service.ts:1` |
-| D67 | 焦点热力布局档 1（历史方案：swap-to-first + 0.65 缩放，已被 D91 档 3 原地热力取代） | `packages/pier-workbench/herdr-plugin.toml:77` |
+| D67 | 焦点热力布局档 1（历史方案：swap-to-first + 0.65 缩放，已被 D91 档 3 原地热力取代） | `packages/pier-workbench/herdr-plugin.toml:52` |
 | D68 | 窗格标题看板化投影公式（统一渲染 `▶i ○p ■b ✓c (N/M)`） | `packages/pier-ext/src/pane-title.ts:2` |
 | D69 | 将 todo 阅读钩子挂载于 `before_agent_start` 事件（设置 `display: false` 静默注入） | `packages/pier-ext/src/todo-read-hook.ts:2` |
 | D71 | 常驻交互式终端工具族（open/send/read/signal/close/list），由 herdr pane 承载 | `packages/pier-ext/src/plugins/terminal.ts:57` |
@@ -69,9 +69,10 @@
 | D101 | 观察结果冷热分级（ObservationPack）：整行切片安全折叠长工具输出，受前缀缓存经济学与角色门禁约束 | `packages/pier-ext/src/observation-core.ts:192` |
 | D102 | 进程内测试日志保真提炼（EPR）：基于未截断输出逐字节引文验真，替换前强制归档原文且支持密钥过滤 | `packages/pier-ext/src/reducer-core.ts:117` |
 | D103 | 能效多级配置与独立遥测闭环：支持环境变量覆盖、项目信任安全门控与细粒度 JSONL 审计流水 | `packages/pier-ext/src/efficiency-config-core.ts:368` |
-| D104 | 配置说明只读命令与 agent 引导式改配置（5 平面目录、生效值+来源、schema 漂移守卫） | `packages/pier-ext/src/config-catalog-core.ts:1` |
+| D104 | 配置说明只读命令与 agent 引导式改配置（4 平面目录、生效值+来源、schema 漂移守卫；boot 平面随 D110 移除） | `packages/pier-ext/src/config-catalog-core.ts:1` |
 | D105 | Pier 侧边栏 agent 视图不设 harness 过滤（`filter: null`，任何 agent 都显示），只保留 attention-first 排序：`agent.view.set` 全局替换 herdr 内置 Agents 投影，任何过滤都会静默隐藏未列入的 harness | `packages/pier-workbench/src/agent-view.ts:48` |
 | D106 | pi 0.86 基线升级：动态工具集走 transcript 持久化（`setActiveTools` delta 存活于 resume/branch），删除 feature-detect 兼容层；`pi.on()` 原生 unsubscribe 真摘除退休世代监听（tombstone 保留给 tool/command） | `packages/pier-ext/src/pi-surface.ts:1` |
 | D107 | 会话中角色切换（P0）：roleState 可变状态 + `/pier-role`（人，放宽需 confirm）+ pipe `role` 请求（master 自由）；切换以注册全集为论域重算 active（可找回被 D77 裁掉的工具）；resume 从最后一条 role-manifest entry 重放 gate manifest（变更才写防覆盖）；per-role `guidelines` 作为 `pier-role` prompt section 幂等注入 | `packages/pier-ext/src/role-state.ts:1` |
 | D108 | Master 自身永不成为子代理目标（会话 01a0bd3a 自杀链）：sessionFile 归因同时排除自身会话与他人活 pane 占用（`bareSessionId` 统一比较，单一 `agent.list` 同时产出上报与占用集）；resume 命中 master pane 硬失败、revive 视中毒 sessionFile 为缺失；pane 级 GC 无条件跳过 `env.paneId`（D94 复用与 D86 主 tab 保护的补口） | `packages/pier-ext/src/subagent-session.ts:234` |
 | D109 | 报告必达与会话恢复（01a0bd3a 后续批次）：worker 经 pipe 自报的会话 id 为权威（裸 id 映射为路径后可覆盖中毒 sessionFile；worker settle push 同样按 id 解析自读 transcript）；结算文本候选以 entry.sessionFile 为 preferred；null 收尾文本经 jev 双 Noul（尾巴归属/最终答案）分类 attribution-suspect / extraction-failed / silent，jev 不可用回落旧措辞；master resume 后对存活 running 子代理重建 poller（requestId `recover-*`）并重放 branch fold（todos/OCC 债务）；OCC 压缩失败进入指数退避（封顶 4）+ 可见失败消息 + 指令限长 | `packages/pier-ext/src/subagent-session.ts:143` |
+| D110 | 移除 workspace 自动引导与重启重放（废弃 D28）：新 workspace 不再自动注入 pi 启动命令、herdr 重启不再重放主 tab，pi 一律由人手动在 pane 启动；连带删除 boot-config 生成/校验全链（install.mjs 探测写入、/pier-config boot 平面、herdr-rpc 启动命令拼装与 boot.jsonl） | `packages/pier-workbench/herdr-plugin.toml:1` |
