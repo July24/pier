@@ -7,7 +7,7 @@ import { mountSubagent, runSubagent, subEntry } from './test-utils.ts';
 import {
   FOREGROUND_POLL_MS, SUBS_CUSTOM_TYPE, TAB_NAME_MAX, Semaphore, agoText, buildAliveNotice, buildBlockedGateNotice,
   buildLaunchLine, buildLaunchParts, classifyWorktreeZone, foldSubsRegistry, formatSubagentResult, isAlive,
-  makeProgressUpdate, nextTaskTabName, planForegroundTick, planLaunchValidation, planTabPlacement, resolveTaskIdPrefix,
+  makeProgressUpdate, nextTaskTabName, rekeySub, planForegroundTick, planLaunchValidation, planTabPlacement, resolveTaskIdPrefix,
   tabNameForTask, type AliveProbe, type SubEntry,
 } from '../src/subagent-core.ts';
 import { planReadyAttempt, readyBackoffMs, readyFailureText } from '../src/subagent-spawn.ts';
@@ -33,6 +33,33 @@ test('buildLaunchParts: fullscreen TUI by default (static frames); PI_HERDR_TUI=
     '/usr/local/bin/node', '/opt/pi/dist/cli.js', '-a', '-e', '/ext/index.ts',
     '--tui-mode', 'fullscreen', '--provider', 'zai', '--model', 'glm-4.7', '--session', '/s.jsonl',
   ]);
+});
+
+test('buildLaunchParts: the provider is split off at the first "/" only', () => {
+  const modelArgs = (roleModel: string) => {
+    const parts = buildLaunchParts(RT, { roleModel }, { PI_HERDR_TUI: 'regular' });
+    return parts.slice(parts.indexOf('-e') + 2);
+  };
+  assert.deepEqual(modelArgs('openrouter/moonshotai/kimi-k2'), ['--provider', 'openrouter', '--model', 'moonshotai/kimi-k2']);
+  assert.deepEqual(modelArgs('glm-5.3'), ['--model', 'glm-5.3'], 'a bare model id is not also passed as the provider');
+  assert.deepEqual(modelArgs('/odd'), ['--model', '/odd']);
+});
+
+test('rekeySub: a revived entry drops its dead pane id so it is listed (and swept) once', () => {
+  const entry = subEntry({ paneId: 'w1:p3', status: 'closed' });
+  const other = subEntry({ paneId: 'w1:p4' });
+  const subs = new Map([['w1:p3', entry], ['w1:p4', other]]);
+  entry.paneId = 'w1:p9'; // what reviveEntry does in place
+  entry.status = 'running';
+  rekeySub(subs, 'w1:p3', entry);
+  assert.deepEqual([...subs.keys()].sort(), ['w1:p4', 'w1:p9']);
+  assert.equal(subs.get('w1:p9'), entry);
+  // A row that took over the old key in the meantime is not ours to delete.
+  const squatter = subEntry({ paneId: 'w1:p9' });
+  const map2 = new Map([['w1:p9', squatter]]);
+  const moved = subEntry({ paneId: 'w1:p10' });
+  rekeySub(map2, 'w1:p9', moved);
+  assert.deepEqual([...map2.keys()].sort(), ['w1:p10', 'w1:p9']);
 });
 
 const mkSub = (over: Record<string, unknown>) => ({

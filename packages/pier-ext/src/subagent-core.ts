@@ -241,6 +241,19 @@ export function newestPerTaskId(entries: Iterable<SubEntry>): Map<string, SubEnt
   return byTask;
 }
 
+/** Re-key a revived entry under its new pane id; the dead id must go, or a later zombie sweep closes the live row. */
+export function rekeySub(subs: Map<string, SubEntry>, previousPaneId: string, entry: SubEntry): void {
+  if (previousPaneId !== entry.paneId && subs.get(previousPaneId) === entry) subs.delete(previousPaneId);
+  subs.set(entry.paneId, entry);
+}
+
+/** Split `provider/model` on the first '/' only: model ids such as `moonshotai/kimi-k2` carry their own. */
+export function splitRoleModel(roleModel: string): { provider: string | null; model: string } {
+  const slash = roleModel.indexOf('/');
+  if (slash <= 0 || slash === roleModel.length - 1) return { provider: null, model: roleModel };
+  return { provider: roleModel.slice(0, slash), model: roleModel.slice(slash + 1) };
+}
+
 /** pi's AgentToolResult shape — a bare string crashes the interactive TUI's getTextOutput. */
 export function makeProgressUpdate(msg: string) {
   return { content: [{ type: 'text' as const, text: msg }], details: {} as Record<string, never> };
@@ -352,7 +365,11 @@ export function buildLaunchParts(
   if (opts.approve) parts.push('-a');
   parts.push('-e', runtime.extPath);
   if (env.PI_HERDR_TUI !== 'regular') parts.push('--tui-mode', 'fullscreen');
-  if (opts.roleModel) parts.push('--provider', opts.roleModel.split('/')[0]!, '--model', opts.roleModel.split('/')[1] ?? opts.roleModel);
+  if (opts.roleModel) {
+    const { provider, model } = splitRoleModel(opts.roleModel);
+    if (provider) parts.push('--provider', provider);
+    parts.push('--model', model);
+  }
   if (opts.resumeFile) parts.push('--session', opts.resumeFile);
   return parts;
 }

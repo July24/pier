@@ -17,6 +17,7 @@ import {
   idParam,
   isAlive,
   newestPerTaskId,
+  rekeySub,
   resolveTaskIdPrefix,
   tabNameForTask,
   type AliveProbe,
@@ -398,8 +399,9 @@ export default function subagentPlugin(ctx: Context): void {
 
   async function ensureLive(entry: SubEntry): Promise<void> {
     if (entry.status !== 'closed') return;
+    const previousPaneId = entry.paneId;
     await reviveEntry(entry);
-    subs.set(entry.paneId, entry);
+    rekeySub(subs, previousPaneId, entry);
     persistSubs();
   }
 
