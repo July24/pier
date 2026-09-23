@@ -542,6 +542,40 @@ export function createSpawnAction(h: SpawnActionHost) {
     const { spec, background, isolate, cwdParam, roleKind: kind, suggested, manifestRole, tab } = launch;
     const masterCwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
     const taskId = randomUUID();
+    // Validate the role before any isolate worktree exists: this early return has no cleanup path.
+    let roleManifestEnv: Record<string, string> = {};
+    let roleModel: string | null = null;
+    try {
+      const { role, manifest } = composeForRole(manifestRole ?? 'worker-default', suggested, { loadRoleOpts: { baseDir: masterCwd } });
+      roleManifestEnv = {
+        PI_HERDR_ROLE_MANIFEST: JSON.stringify({
+          role: role.role,
+          version: role.version,
+          tools: manifest.tools,
+          permissions: manifest.permissions,
+          unknownTools: manifest.unknownTools,
+          services: role.services ?? {},
+          // Without guidelines parseRuntimeManifest yields none and the pier-role prompt section silently no-ops.
+          ...(role.guidelines?.length ? { guidelines: role.guidelines } : {}),
+        }),
+        // Role base: /pier-role and the pipe switch resolve .pi-herdr/roles/ against the MASTER's checkout.
+        PI_HERDR_ROLE_BASE: masterCwd,
+      };
+      if (typeof role.model === 'string' && role.model.trim()) roleModel = role.model.trim();
+      h.logRouting?.(
+        planSpawnProfileRow({
+          now: Date.now(),
+          roleExplicit: typeof manifestRole === 'string' && manifestRole.trim() !== '',
+          role: role.role,
+          allowedTools: suggested,
+          manifestTools: manifest.tools,
+          task: spec.prompt,
+        }),
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return toolError(`Error: role "${manifestRole}" manifest invalid — ${msg}`);
+    }
     // D98: create the isolate through pier's execFile git path, not herdr's socket worktree.create
     // (bootstrap races, missing root-pane env, linked_worktree_source rejection).
     let isolateMeta: SubEntry['isolate'] | null = null;
@@ -589,39 +623,6 @@ export function createSpawnAction(h: SpawnActionHost) {
     const zone = classifyWorktreeZone({ cwd, masterCwd, worktrees: await git.listWorktrees(masterCwd) });
     // D86 trust: pass -a only for the master's checkout/worktrees; external dirs stay behind pi's Trust dialog.
     const approve = isPathUnder(cwd, masterCwd) || zone.zone === 'worktree';
-    let roleManifestEnv: Record<string, string> = {};
-    let roleModel: string | null = null;
-    try {
-      const { role, manifest } = composeForRole(manifestRole ?? 'worker-default', suggested, { loadRoleOpts: { baseDir: masterCwd } });
-      roleManifestEnv = {
-        PI_HERDR_ROLE_MANIFEST: JSON.stringify({
-          role: role.role,
-          version: role.version,
-          tools: manifest.tools,
-          permissions: manifest.permissions,
-          unknownTools: manifest.unknownTools,
-          services: role.services ?? {},
-          // Without guidelines parseRuntimeManifest yields none and the pier-role prompt section silently no-ops.
-          ...(role.guidelines?.length ? { guidelines: role.guidelines } : {}),
-        }),
-        // Role base: /pier-role and the pipe switch resolve .pi-herdr/roles/ against the MASTER's checkout.
-        PI_HERDR_ROLE_BASE: masterCwd,
-      };
-      if (typeof role.model === 'string' && role.model.trim()) roleModel = role.model.trim();
-      h.logRouting?.(
-        planSpawnProfileRow({
-          now: Date.now(),
-          roleExplicit: typeof manifestRole === 'string' && manifestRole.trim() !== '',
-          role: role.role,
-          allowedTools: suggested,
-          manifestTools: manifest.tools,
-          task: spec.prompt,
-        }),
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return toolError(`Error: role "${manifestRole}" manifest invalid — ${msg}`);
-    }
 
     const release = await h.subSemaphore.acquire();
     let paneId = '';

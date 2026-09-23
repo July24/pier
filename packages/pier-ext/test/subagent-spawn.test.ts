@@ -2,7 +2,8 @@
  * injection, foreground/background settlement, rollback) and the injectable git adapter. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import type { Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -350,6 +351,25 @@ test('isolate: mutually exclusive with cwd, and outside a git repo it fails inst
     );
   } finally {
     await root.fiber.dispose();
+  }
+});
+
+test('isolate: an invalid role fails before any worktree or pier/ branch is created', async () => {
+  const repo = mkdtempSync(join(tmpdir(), 'd98-badrole-'));
+  const git = (...args: string[]) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+  git('init', '-q');
+  git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'init');
+  const { root, pi } = await mountSubagent({ client: { available: true } });
+  try {
+    assert.match(
+      await runSubagentRejects(pi, { description: 'x', prompt: 'do x', isolate: true, role: 'no-such-role' }, repo),
+      /role "no-such-role" manifest invalid/,
+    );
+    assert.equal(git('worktree', 'list', '--porcelain').match(/^worktree /gm)?.length, 1, 'no isolate worktree was added');
+    assert.equal(git('for-each-ref', 'refs/heads/pier/').trim(), '', 'no pier/ branch was left behind');
+  } finally {
+    await root.fiber.dispose();
+    rmSync(repo, { recursive: true, force: true });
   }
 });
 
