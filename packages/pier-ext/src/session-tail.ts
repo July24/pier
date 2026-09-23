@@ -142,7 +142,7 @@ export interface SubSessionState {
  * Whether the transcript currently sits inside an OCC compaction cycle. Last marker wins: inflight
  * last means the summary request is running; settled last means the cycle is over — unless no
  * assistant message follows it yet, in which case the worker is still machine-paused (not settled,
- * not a user takeover).
+ * not a user takeover). A cancelled cycle sends no continuation, so it is over at the marker.
  */
 export function compactionBusy(entries: readonly SessionEntryLike[]): boolean {
   for (let i = entries.length - 1; i >= 0; i--) {
@@ -151,6 +151,8 @@ export function compactionBusy(entries: readonly SessionEntryLike[]): boolean {
     const customType = entry.customType;
     if (customType === COMPACTION_INFLIGHT_TYPE) return true;
     if (customType === COMPACTION_SETTLED_TYPE) {
+      // A cancel sends no continuation turn, so waiting for one would pin the worker as busy forever.
+      if ((entry.data as { outcome?: unknown } | undefined)?.outcome === 'cancelled') return false;
       for (let j = i + 1; j < entries.length; j++) {
         if (messageOf(entries[j])?.role === 'assistant') return false;
       }

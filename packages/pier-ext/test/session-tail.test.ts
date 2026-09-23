@@ -15,7 +15,7 @@ import { jsonl, transcriptMessage, withCleanup } from './test-utils.ts';
 
 const msg = (role: string, text: string, ts: number, stopReason = 'stop') =>
   transcriptMessage(role, text, ts, stopReason) as SessionEntryLike;
-const custom = (customType: string): SessionEntryLike => ({ type: 'custom', customType, data: {}, timestamp: 0 });
+const custom = (customType: string, data: Record<string, unknown> = {}): SessionEntryLike => ({ type: 'custom', customType, data, timestamp: 0 });
 const toolCall = (ts: number, n = 1): SessionEntryLike => ({
   type: 'message',
   message: { role: 'assistant', content: Array.from({ length: n }, () => ({ type: 'toolCall' })), timestamp: ts, stopReason: 'toolUse' },
@@ -67,6 +67,8 @@ test('deriveSubSessionState/compactionBusy: no settlement inside an OCC marker c
   const cases: Array<[name: string, entries: SessionEntryLike[], text: string | null, turnEnded: boolean, compacting: boolean]> = [
     ['inflight marker last → the summary request is running', closed, null, true, true],
     ['settled marker without a continuation turn yet → still machine-paused', [...closed, custom(COMPACTION_SETTLED_TYPE)], null, true, true],
+    ['cancelled compaction sends no continuation → released at the marker', [...closed, custom(COMPACTION_SETTLED_TYPE, { outcome: 'cancelled' })], null, true, false],
+    ['failed compaction still waits for its continuation turn', [...closed, custom(COMPACTION_SETTLED_TYPE, { outcome: 'failed' })], null, true, true],
     ['continuation assistant after settled → released', [...closed, custom(COMPACTION_SETTLED_TYPE), continuation], null, false, false],
     ['no markers (older pi / OCC off) → behaviour unchanged', [task, abortedTurn], null, true, false],
     ['closing text written before the cycle is not a settlement while compacting', [task, msg('assistant', 'all tests pass, committed', 5), custom(COMPACTION_INFLIGHT_TYPE)], 'all tests pass, committed', true, true],
