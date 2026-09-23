@@ -34,13 +34,13 @@ export function createNoticeBuffer(opts: {
    * Implementations must not throw. */
   rank?: (contents: readonly string[]) => Promise<readonly string[] | null>;
 }): NoticeBuffer {
-  const pending: string[] = [];
+  const pending: Array<{ content: string; paneId?: string }> = [];
   const pendingPaneIds = new Set<string>();
   return {
     async deliverNotice(content, paneId) {
       if (content !== '' && paneId !== undefined) pendingPaneIds.add(paneId);
       if (opts.isBusy()) {
-        pending.push(content);
+        pending.push({ content, paneId });
         return;
       }
       await opts.send(content, 'followUp');
@@ -49,12 +49,17 @@ export function createNoticeBuffer(opts: {
     noticePending: () => pendingPaneIds,
     async flush(mode) {
       if (pending.length === 0) return;
-      const batch = pending.splice(0);
+      const flushed = pending.splice(0);
+      const batch = flushed.map((n) => n.content);
       let ordered: readonly string[] = batch;
       if (opts.rank && batch.length > NOTICE_MAX_SHOWN) {
         ordered = (await opts.rank(batch)) ?? batch;
       }
-      pendingPaneIds.clear();
+      // Release only this batch's panes: a notice buffered during the rank await is still undelivered,
+      // and GC must keep its pane until it is.
+      for (const { paneId } of flushed) {
+        if (paneId !== undefined && !pending.some((n) => n.paneId === paneId)) pendingPaneIds.delete(paneId);
+      }
       const collapsed = collapseNotices(ordered);
       if (collapsed) await opts.send(collapsed, mode);
     },

@@ -228,6 +228,21 @@ test('createNoticeBuffer rank hook: null falls back to arrival order (fail-open)
   assert.match(out, /另有 1 条结算未逐条展示/, 'the tail still accounts for the batch above the cap');
 });
 
+test('createNoticeBuffer: a notice buffered while rank is pending keeps its pane exempt from GC', async () => {
+  const gate = Promise.withResolvers<void>();
+  const { buf, sent } = rankedNotices(async (contents) => { await gate.promise; return contents; });
+  for (const [n, pane] of [['a', 'p1'], ['b', 'p2'], ['c', 'p3'], ['d', 'p4']] as const) await buf.deliverNotice(n, pane);
+  const flushing = buf.flush('steer');
+  await buf.deliverNotice('late', 'p7'); // settles during the rank await; the agent is still busy
+  gate.resolve();
+  await flushing;
+  assert.equal(sent.length, 1);
+  assert.deepEqual([...buf.noticePending()], ['p7'], 'only the flushed batch releases its panes');
+  await buf.flush('followUp');
+  assert.equal(sent[1], 'late');
+  assert.equal(buf.noticePending().size, 0);
+});
+
 /* ── index-runtime: process-mode planner ────────────────────────── */
 
 test('planIndexMode: worker flag wins inside herdr; herdr pane → master; no herdr → neither', () => {
