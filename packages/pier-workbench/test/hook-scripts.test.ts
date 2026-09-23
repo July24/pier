@@ -147,6 +147,8 @@ test('restore-layout: a rebuilt main tab is recorded, so the next startup does n
     const newest = latestBootRecordPerWorkspace(parseBootRecords(readFileSync(bootFile, 'utf8')))[0];
     assert.equal(newest?.tab_id, 'w1:t9');
     assert.equal(newest?.pane_id, 'w1:p9');
+    // pi-pier's focus poller finds heat-reflow.mjs through this record when it is installed from npm.
+    assert.equal(readFileSync(join(home, '.pi', 'agent', 'herdr-pi', 'workbench-root'), 'utf8').trim(), fileURLToPath(new URL('..', import.meta.url)).replace(/[\\/]$/, ''));
   } finally {
     server.close();
     rmSync(dir, { recursive: true, force: true });

@@ -70,6 +70,18 @@ export function bootFilePath() {
   return path.join(os.homedir(), '.pi', 'agent', 'herdr-pi', 'boot.jsonl');
 }
 
+/**
+ * Record this checkout for pi-pier: an npm install of the extension does not sit beside herdr's managed
+ * plugin checkout, and its focus poller replays scripts/heat-reflow.mjs from here. Best effort.
+ */
+export function recordWorkbenchRoot(scriptDir) {
+  try {
+    const file = path.join(path.dirname(bootFilePath()), 'workbench-root');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, path.resolve(scriptDir, '..') + '\n');
+  } catch {}
+}
+
 /** First string field named `key` anywhere in a herdr envelope (id positions vary per event shape). */
 export function deepFind(obj, key, depth = 0) {
   if (!obj || typeof obj !== 'object' || depth > 6) return null;

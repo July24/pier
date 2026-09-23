@@ -117,6 +117,12 @@ test('spawnReflow: 事件载荷/脚本路径正确，spawn 抛错或子进程 er
   const def = reflowScriptPath({});
   assert.ok(def.replaceAll('\\', '/').endsWith('packages/pier-workbench/scripts/heat-reflow.mjs'), def);
   assert.equal(reflowScriptPath({ PIER_WORKBENCH_ROOT: '/opt/wb' }), path.join('/opt/wb', 'scripts', 'heat-reflow.mjs'));
+  // An npm pi-pier install has no sibling workbench: the checkout recorded by the workbench hooks is used.
+  const recordedScript = path.join('/herdr/plugins/pier.workbench', 'scripts', 'heat-reflow.mjs');
+  const npmIo = (recorded: string | null) => ({ exists: (f: string) => f === recordedScript, recordedRoot: () => recorded });
+  assert.equal(reflowScriptPath({}, npmIo('/herdr/plugins/pier.workbench')), recordedScript);
+  assert.ok(reflowScriptPath({}, npmIo(null)).replaceAll('\\', '/').endsWith('packages/pier-workbench/scripts/heat-reflow.mjs'), 'nothing recorded → the sibling default');
+  assert.ok(reflowScriptPath({}, { exists: () => true, recordedRoot: () => '/elsewhere' }).replaceAll('\\', '/').endsWith('packages/pier-workbench/scripts/heat-reflow.mjs'), 'an existing sibling wins over the record');
 
   // focus heat is a comfort feature: neither a throwing spawn nor a child `error` event may escape
   const throwing = (() => { throw new Error('ENOENT'); }) as unknown as SpawnFn;

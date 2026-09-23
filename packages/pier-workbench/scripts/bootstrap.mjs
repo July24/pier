@@ -10,10 +10,11 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { bootFilePath, deepFind, launchCommand, masterArgv, readBootConfig, request } from './herdr-rpc.mjs';
+import { bootFilePath, deepFind, launchCommand, masterArgv, readBootConfig, recordWorkbenchRoot, request } from './herdr-rpc.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const BOOT_FILE = bootFilePath();
+recordWorkbenchRoot(here);
 
 const config = readBootConfig(here);
 if (!config) {

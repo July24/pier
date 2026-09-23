@@ -202,7 +202,8 @@ errors pier deliberately swallowed this session.
 **Focus heat:** Herdr 0.9.0 resolved mouse focus in the client and did not deliver `pane.focused`
 to plugins, so each pane sampled `layout.export → focused_pane_id` and replayed the workbench
 event. Herdr 0.9.1+ delivers `pane.focused` natively, so the poller defaults off. Override with
-`PIER_FOCUS_POLL_MS`; `PIER_WORKBENCH_ROOT` points at a relocated plugin checkout.
+`PIER_FOCUS_POLL_MS`; `PIER_WORKBENCH_ROOT` points at a relocated plugin checkout (otherwise pier uses the
+checkout the workbench hooks record in `~/.pi/agent/herdr-pi/workbench-root`).
 
 ### Efficiency mechanisms (D100–D103, opt-in)
 

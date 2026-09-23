@@ -196,7 +196,7 @@ npm test          # node --test，809 项单测（规划器 / todo 重放 / 反�
 
 **焦点热力**：herdr 0.9.0 把鼠标焦点放在客户端解析，插件收不到 `pane.focused`，因此每个 pane
 采样自己 tab 的 `layout.export → focused_pane_id` 再重放 workbench 事件。0.9.1+ 原生派发
-`pane.focused`，轮询默认关闭。`PIER_FOCUS_POLL_MS` 可覆盖；`PIER_WORKBENCH_ROOT` 指向迁移后的插件目录。
+`pane.focused`，轮询默认关闭。`PIER_FOCUS_POLL_MS` 可覆盖；`PIER_WORKBENCH_ROOT` 指向迁移后的插件目录（未设置时使用 workbench 钩子记录在 `~/.pi/agent/herdr-pi/workbench-root` 的插件目录）。
 
 ## 设计原则
 
