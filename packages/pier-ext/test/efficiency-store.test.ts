@@ -39,6 +39,22 @@ test('storeContentAddressedObject & readStoredObjectChunk: round-trip, idempoten
   await assert.rejects(() => storeContentAddressedObject(filePath, content), /hash mismatch/);
 }));
 
+test('readStoredObjectChunk: next_offset is an absolute file offset, not the window length', withCleanup(async (cleanup) => {
+  const filePath = join(cleanup.tempDir('page').path, 'objects', 'paged.txt');
+  const content = 'a'.repeat(100) + 'TAIL';
+  await storeContentAddressedObject(filePath, content);
+  const first = await readStoredObjectChunk(filePath, 0, { maxBytes: 40, maxLines: 10 });
+  assert.equal(first.eof, false);
+  assert.equal(first.nextOffset, first.bytes);
+  const second = await readStoredObjectChunk(filePath, first.nextOffset, { maxBytes: 40, maxLines: 10 });
+  assert.equal(second.nextOffset, first.nextOffset + second.bytes);
+  assert.ok(second.nextOffset > first.nextOffset, 'paging must advance past the first window');
+  const last = await readStoredObjectChunk(filePath, content.length - 4, { maxBytes: 40, maxLines: 10 });
+  assert.equal(last.text, 'TAIL');
+  assert.equal(last.nextOffset, content.length);
+  assert.equal(last.eof, true);
+}));
+
 test('appendEfficiencyLog: appends newline-delimited JSON', withCleanup(async (cleanup) => {
   const logPath = join(cleanup.tempDir('log').path, 'logs', 'test.jsonl');
   await appendEfficiencyLog(logPath, { event: 'step_1', val: 100 }); await appendEfficiencyLog(logPath, { event: 'step_2', val: 200 });

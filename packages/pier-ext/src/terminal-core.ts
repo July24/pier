@@ -101,6 +101,8 @@ export function registerTerminal(
     tabId: string;
     cwd: string;
     label?: string | null;
+    /** Caller-requested id; when omitted (or unusable per validateTerminalId) a term-N id is assigned. */
+    terminalId?: string | null;
     createdAt: number;
   },
 ): { ok: true; entries: TerminalEntry[]; entry: TerminalEntry } | { ok: false; error: string } {
@@ -111,8 +113,10 @@ export function registerTerminal(
       error: `terminal limit reached (max ${MAX_TERMINALS} open terminals); close one with terminal(action: "close") before opening another`,
     };
   }
+  const requested = validateTerminalId(opts.terminalId, entries.map((e) => e.terminalId));
+  if (requested != null && !requested.ok) return { ok: false, error: requested.error };
   const entry: TerminalEntry = {
-    terminalId: nextTerminalId(entries.map((e) => e.terminalId)),
+    terminalId: requested != null && requested.ok ? requested.id : nextTerminalId(entries.map((e) => e.terminalId)),
     paneId: opts.paneId,
     tabId: opts.tabId,
     cwd: opts.cwd,
@@ -128,6 +132,24 @@ export function registerTerminal(
     readEoTail: '',
   };
   return { ok: true, entries: [...entries, entry], entry };
+}
+
+/** A requested terminal id must be a short single-token string that no existing terminal (open or
+ *  closed) already uses — ids stay addressable after close for `close`/`list`, so reuse would
+ *  retarget actions at the wrong pane. Returns null when no id was requested. */
+export function validateTerminalId(
+  id: string | null | undefined,
+  existingIds: readonly string[],
+): { ok: true; id: string } | { ok: false; error: string } | null {
+  const trimmed = (id ?? '').trim();
+  if (trimmed.length === 0) return null; // blank means "not provided" → auto-assigned term-N
+  if (trimmed.length > 64 || /\s/.test(trimmed)) {
+    return { ok: false, error: `invalid terminal_id "${trimmed.slice(0, 40)}": use 1-64 characters without whitespace, or omit it to get an auto-assigned term-N id` };
+  }
+  if (existingIds.includes(trimmed)) {
+    return { ok: false, error: `terminal_id "${trimmed}" is already used (open or closed); ids stay reserved for addressing — pick another or omit it` };
+  }
+  return { ok: true, id: trimmed };
 }
 
 export function closeTerminal(
@@ -176,6 +198,30 @@ export function validateSignal(key: string): { ok: true; key: SignalKey } | { ok
     };
   }
   return { ok: true, key: k };
+}
+
+/**
+ * Whether a wait pattern would match the terminal's own echoed input: the shell echoes typed
+ * commands into the pane, so a pattern contained in the last sent text (`…; echo TERM_DONE_$?`
+ * waited on as literal `TERM_DONE_`) matches its own echo and returns "matched" before the job
+ * has produced anything. Detection is per terminal and best-effort: no send in this process
+ * lifetime → no hazard known → the wait proceeds unchanged.
+ */
+export function sentinelEchoHazard(opts: {
+  pattern: string;
+  regex?: boolean;
+  lastSentText?: string | null;
+}): boolean {
+  const sent = opts.lastSentText;
+  if (!sent) return false;
+  if (opts.regex) {
+    try {
+      return new RegExp(opts.pattern).test(sent);
+    } catch {
+      return false; // invalid regex is rejected by the caller before this runs
+    }
+  }
+  return sent.includes(opts.pattern);
 }
 
 export function detectFullscreenTUI(raw: string): { detected: boolean; sequence: string | null } {
@@ -237,6 +283,41 @@ export function computeIncrement(
   const bounded = boundText(next.text, maxChars);
   const text = prev ? `${RESET_MARKER}\n${bounded.text}` : bounded.text;
   return { mode: 'reset', text, cursor, hardCapped: bounded.capped };
+}
+
+/** Window around the first hit so a later capped read cannot hide the match behind earlier lines. */
+export function excerptAroundMatch(text: string, pattern: string, regex: boolean, radius = 1500): string {
+  let index = -1;
+  let hitLen = pattern.length;
+  if (regex) {
+    const found = new RegExp(pattern).exec(text);
+    index = found?.index ?? -1;
+    hitLen = found?.[0].length ?? pattern.length;
+  } else {
+    index = text.indexOf(pattern);
+  }
+  if (index < 0) return text.slice(-radius);
+  const start = Math.max(0, index - radius);
+  const end = Math.min(text.length, index + hitLen + radius);
+  return `${start > 0 ? '…' : ''}${text.slice(start, end)}${end < text.length ? '…' : ''}`;
+}
+
+/**
+ * herdr waitForOutput matches the whole pane, including text a prior read already returned.
+ * A hit is fresh only when it sits in the unread increment; a hit only in consumed text is stale.
+ */
+export function classifyWaitMatch(
+  prev: ReadCursor | null,
+  paneText: string,
+  pattern: string,
+  regex: boolean,
+): { kind: 'fresh'; excerpt: string } | { kind: 'stale' } | { kind: 'absent' } {
+  const match = (text: string) => regex ? new RegExp(pattern).test(text) : text.includes(pattern);
+  const inc = computeIncrement(prev, { text: paneText, revision: prev?.revision ?? 0 }, paneText.length + 1);
+  const unread = inc.mode === 'append' ? inc.text : inc.mode === 'reset' ? paneText : '';
+  if (match(unread)) return { kind: 'fresh', excerpt: excerptAroundMatch(unread, pattern, regex) };
+  if (inc.mode !== 'reset' && match(paneText)) return { kind: 'stale' };
+  return { kind: 'absent' };
 }
 
 function boundText(text: string, maxChars: number): { text: string; capped: boolean } {

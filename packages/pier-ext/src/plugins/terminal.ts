@@ -19,6 +19,7 @@ import {
   classifyReadiness,
   closeTerminal,
   computeIncrement,
+  classifyWaitMatch,
   detectFullscreenTUI,
   foldTerminalsRegistry,
   makeTerminalsRegistry,
@@ -26,6 +27,7 @@ import {
   planShellInit,
   promptStrategyFor,
   registerTerminal,
+  sentinelEchoHazard,
   stripAnsi,
   summarizeSessions,
   terminalReminderGraceMs,
@@ -69,6 +71,9 @@ export default function terminalPlugin(ctx: Context): void {
    * and active terminal panes remain exempt from index GC. Workers omit this master-side entry. */
 
   let terminals: TerminalEntry[] = [];
+
+  /** Last text sent per terminal (in-memory): lets `wait` refuse patterns that match their own echo. */
+  const lastSentText = new Map<string, string>();
 
   function persistTerminals(): void {
     try {
@@ -203,7 +208,7 @@ export default function terminalPlugin(ctx: Context): void {
       'Manage persistent interactive terminals (resident shells in dedicated herdr panes).',
       'Operations: open (create session), send (type commands), wait (block until output matches a pattern), read (capture output), signal (ctrl+c/ctrl+d/ctrl+z/esc/enter), close (kill shell), list (show all).',
       'The shell keeps cwd, environment variables, and background processes across calls.',
-      'Long job pattern: send "cmd; echo TERM_DONE_$?" then wait with pattern "TERM_DONE_" — the sentinel also carries the exit code; redirect verbose output to a log file and read the file, because output between two reads is lost.',
+      'Long job pattern: send "cmd; echo TERM_DONE_$?" then wait with regex "^TERM_DONE_[0-9]" — the shell echoes the typed command, so a literal wait on "TERM_DONE_" would match its own echo instantly; keep the sentinel distinguishable from its echo. Redirect verbose output to a log file and read the file, because output between two reads is lost.',
     ].join(' '),
     promptSnippet: 'terminal: a persistent shell in its own pane — use for dev servers, REPLs, and multi-step shell work that must keep state between calls.',
     promptGuidelines: [
@@ -216,10 +221,10 @@ export default function terminalPlugin(ctx: Context): void {
     parameters: Type.Object({
       action: Type.Union(TERMINAL_ACTIONS.map((name) => Type.Literal(name)), { description: 'Terminal operation to perform' }),
       cwd: Type.Optional(Type.String({ description: '[open] Working directory for the shell (defaults to session cwd)' })),
-      terminal_id: Type.Optional(Type.String({ description: '[send|wait|read|signal|close] Terminal id returned by open action' })),
+      terminal_id: Type.Optional(Type.String({ description: '[open] optional requested id for the new terminal (defaults to auto-assigned term-N); [send|wait|read|signal|close] terminal id returned by open' })),
       text: Type.Optional(Type.String({ description: '[send] Command text to type and run (Enter appended automatically)' })),
       wait_prompt: Type.Optional(Type.Boolean({ description: '[send] Verify the shell is back at a prompt before sending; refuses with the detected readiness instead of queueing text behind a running command' })),
-      pattern: Type.Optional(Type.String({ description: '[wait] Literal text or regular expression to wait for in pane output' })),
+      pattern: Type.Optional(Type.String({ description: '[wait] Literal text or regular expression to wait for in pane output (must not occur in the command text you sent — echoed input matches too)' })),
       regex: Type.Optional(Type.Boolean({ description: '[wait] Treat pattern as a regular expression (default: literal substring)' })),
       timeout_ms: Type.Optional(Type.Number({ description: '[wait] Give up after this many ms (default 120000, max 600000)' })),
       pane_id: Type.Optional(Type.String({ description: '[read] Direct pane read (limited to own tab panes only)' })),
@@ -273,6 +278,9 @@ export default function terminalPlugin(ctx: Context): void {
       paneId: env.paneId, // Reserve a valid id until split returns the terminal pane.
       tabId: env.tabId,
       cwd,
+      // Adopt the caller-requested id so `open {terminal_id}` + `send {terminal_id}` agree;
+      // silently ignoring it made the follow-up send fail on an unknown terminal.
+      terminalId: typeof params?.terminal_id === 'string' ? params.terminal_id : null,
       createdAt: Date.now(),
     });
     if (!r.ok) return fail(r.error);
@@ -327,6 +335,9 @@ export default function terminalPlugin(ctx: Context): void {
       // model hunting for a pane that is fine. Prefer the actionable transport sentence.
       return fail(herdrUnavailableHint(e) ?? `send failed (pane may be closed): ${(e as Error).message}`);
     }
+    // In-memory only (never persisted): the wait echo-hazard check needs the text this pane last
+    // received, because the shell echoes typed commands back into the pane.
+    lastSentText.set(entry.terminalId, v.text);
     touchTerminal(entry);
     return { content: [{ type: 'text', text: `sent to ${entry.terminalId} (${v.text.length} chars)` }], details: { terminal_id: entry.terminalId } };
   }
@@ -344,8 +355,23 @@ export default function terminalPlugin(ctx: Context): void {
         return fail(`invalid regex: ${(e as Error).message}`);
       }
     }
+    // The shell echoes typed commands into the pane, so a pattern contained in the last sent text
+    // matches its own echo and "succeeds" instantly, before the job finishes (observed: a
+    // minutes-long batch matched in 112ms on the echo of its own `echo SENTINEL`).
+    if (sentinelEchoHazard({ pattern: raw, regex: useRegex, lastSentText: lastSentText.get(entry.terminalId) })) {
+      const shown = raw.length > 80 ? `${raw.slice(0, 80)}…` : raw;
+      return fail(
+        `pattern "${shown}" also appears in the command text sent to ${entry.terminalId} — the shell echoes typed commands, `
+        + 'so the wait would match its own echo and return before the job finishes. '
+        + 'That command is still running: do NOT re-send it (text typed behind a running command just queues). '
+        + 'Watch progress with action read, or wait for a marker the running command itself prints that does not occur in the command text. '
+        + 'For future sends, use a sentinel distinguishable from its echo: send `cmd; echo DONE_$?` and wait with regex "^DONE_[0-9]" '
+        + '(the echo contains `DONE_$?`, which that regex cannot match).',
+      );
+    }
     const requested = typeof params?.timeout_ms === 'number' && params.timeout_ms > 0 ? params.timeout_ms : WAIT_DEFAULT_MS;
     const timeoutMs = Math.min(Math.max(requested, 1000), WAIT_MAX_MS);
+    const started = Date.now();
     const matcher = useRegex ? { type: 'regex' as const, value: raw } : { type: 'substring' as const, value: raw };
     let waitResult: { matched: boolean; reason?: 'timeout' | 'unavailable' };
     try {
@@ -367,10 +393,52 @@ export default function terminalPlugin(ctx: Context): void {
         details: { terminal_id: entry.terminalId, matched: false, pattern: raw, reason },
       };
     }
-    return {
-      content: [{ type: 'text', text: `matched in ${entry.terminalId} — output is ready, use action read to inspect it` }],
-      details: { terminal_id: entry.terminalId, matched: true, pattern: raw },
+    // herdr matches the whole pane, including text a prior read already returned, and a second
+    // waitForOutput on that same text returns immediately. After a stale hit, poll the unread
+    // increment until a new occurrence appears or the original budget is gone — do not re-enter
+    // waitForOutput (that busy-loops on the old match).
+    const deadline = started + timeoutMs;
+    const cursor: ReadCursor | null = entry.readRevision != null
+      ? { revision: entry.readRevision, len: entry.readLen ?? 0, tail: entry.readTail ?? '', eoTail: entry.readEoTail ?? '' }
+      : null;
+    const shown = raw.length > 80 ? `${raw.slice(0, 80)}…` : raw;
+    let sawStale = false;
+    const staleFailure = {
+      content: [{ type: 'text' as const, text: `pattern "${shown}" matched only in already-read output of ${entry.terminalId}; no new output contains it. This is not a new event — do not treat the job as finished. Wait for a marker that has not appeared yet, or use action read.` }],
+      details: { terminal_id: entry.terminalId, matched: false, stale: true, pattern: raw },
     };
+    while (true) {
+      let paneText = '';
+      try {
+        const read = await client.readPane(entry.paneId, { stripAnsi: false });
+        paneText = stripAnsi(read.text);
+      } catch {
+        if (sawStale) return staleFailure;
+        return {
+          content: [{ type: 'text', text: `matched in ${entry.terminalId} — output is ready, use action read to inspect it` }],
+          details: { terminal_id: entry.terminalId, matched: true, pattern: raw },
+        };
+      }
+      const classified = classifyWaitMatch(cursor, paneText, raw, useRegex);
+      if (classified.kind === 'fresh') {
+        return {
+          content: [{ type: 'text', text: `matched in ${entry.terminalId} — new output contains the pattern:\n${classified.excerpt}` }],
+          details: { terminal_id: entry.terminalId, matched: true, pattern: raw },
+        };
+      }
+      if (classified.kind !== 'stale') {
+        return {
+          content: [{ type: 'text', text: `matched in ${entry.terminalId} — output is ready, use action read to inspect it` }],
+          details: { terminal_id: entry.terminalId, matched: true, pattern: raw },
+        };
+      }
+      sawStale = true;
+      const left = deadline - Date.now();
+      if (left <= 0) return staleFailure;
+      const { promise, resolve } = Promise.withResolvers<void>();
+      setTimeout(resolve, Math.min(400, left));
+      await promise;
+    }
   }
 
   /** T5: a direct `pane_id` read is limited to panes in this session's own tab or to self-created terminal
@@ -475,6 +543,7 @@ export default function terminalPlugin(ctx: Context): void {
       }
     }
     terminals = closeTerminal(terminals, entry.terminalId, Date.now()).entries;
+    lastSentText.delete(entry.terminalId);
     persistTerminals();
     return { content: [{ type: 'text', text: `terminal ${entry.terminalId} closed` }], details: { terminal_id: entry.terminalId } };
   }

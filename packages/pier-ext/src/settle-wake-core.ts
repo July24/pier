@@ -19,6 +19,11 @@ export interface SettleWakeInput {
   lastNoticeKey: string | null;
   lastNoticeAt: number;
   now: number;
+  /**
+   * A compaction abort is already selected. turn_start clears intentionalAbort before agent_settled
+   * reads it, so this is the durable signal: do not inject a running-sub notice that compaction will abort.
+   */
+  compactionPending?: boolean;
 }
 
 export interface SettleWakePlan {
@@ -36,6 +41,15 @@ export interface SettleWakePlan {
 }
 
 export function planSettleWake(input: SettleWakeInput): SettleWakePlan {
+  if (input.compactionPending) {
+    return {
+      wake: false,
+      compact: true,
+      notice: false,
+      noticeKey: input.lastNoticeKey,
+      noticeAt: input.lastNoticeAt,
+    };
+  }
   if (input.intentionalAbort || input.lastStopReason === ABORT_STOP_REASON) {
     return {
       wake: false,
@@ -53,4 +67,22 @@ export function planSettleWake(input: SettleWakeInput): SettleWakePlan {
   const cooled = input.now - input.lastNoticeAt >= D96_REPEAT_NOTICE_MS;
   const notice = newSet || cooled;
   return { wake: true, compact: true, notice, noticeKey: key, noticeAt: notice ? input.now : input.lastNoticeAt };
+}
+
+/**
+ * Whether a just-settled run may answer its pending machine request (the pipe settle fast-path).
+ * An OCC intentional abort and a still-running compaction both mean the continuation turn is
+ * coming: answering now reports "finished, no closing message" for live work and — worse —
+ * consumes the one-shot request plus the parent's claim latch, so the real closing message can
+ * never be delivered (observed: a worker mid-compaction announced finished; its final report
+ * never reached the parent). A user abort ('aborted') likewise settles a run that may re-run.
+ */
+export function shouldPushSettleReply(input: {
+  intentionalAbort?: boolean;
+  compactionInFlight?: boolean;
+  lastStopReason: string | null;
+}): boolean {
+  return !input.intentionalAbort
+    && !input.compactionInFlight
+    && input.lastStopReason !== ABORT_STOP_REASON;
 }

@@ -34,7 +34,7 @@ import { reconcileTodos } from './reconcile-core.ts';
 import type { TodoUiSlot } from './plugins/todo.ts';
 import { estimateEta, formatProgressSuffix, planToolBadge, progressOf } from './progress-core.ts';
 import { WRITE_LOCK_ENV } from './lock-core.ts';
-import { ABORT_STOP_REASON, planSettleWake } from './settle-wake-core.ts';
+import { ABORT_STOP_REASON, planSettleWake, shouldPushSettleReply } from './settle-wake-core.ts';
 import { parseRuntimeManifest } from './tool-gate.ts';
 import { formatPaneTitle } from './pane-title.ts';
 import { registerSlimFrame, updateSlimFrame } from './slim-frame.ts';
@@ -107,7 +107,7 @@ export default async function (pi: ExtensionAPI) {
 
   /* ── Jev decision layer (RFC docs/rfc-jev-integration.md): direct HTTP, total-budget
    * abort, fail-open at every site. Disabled or keyless → behavior identical to before. ── */
-  const jevRuntime = createJevRuntime(() => effConfig.jev, { getSessionRoot: () => sessionRoot });
+  const jevRuntime = createJevRuntime(() => effConfig.jev, { getSessionRoot: () => sessionRoot, getSessionId: () => sessionId || null });
   /** P0-3: candidate windows are generated in code; jev only picks (rerank pattern). */
   const pickMiddleExcerpt: PickMiddleExcerpt = async (text, excerptBudgetBytes) => {
     if (!jevRuntime.available) return null;
@@ -350,6 +350,17 @@ export default async function (pi: ExtensionAPI) {
   async function pushSettleReply(): Promise<void> {
     const req = pendingMachineRequest;
     if (!req || !req.push || !req.from) return;
+    // An aborted settle is not a settlement: OCC's abort means the continuation turn is coming, and
+    // answering now would burn the one-shot request + the parent's claim latch on a null-text reply
+    // ("left no closing message") — the real closing message then never gets delivered. Keep the
+    // request armed; the post-compaction settle pushes it (settle-wake-core.ts).
+    if (!shouldPushSettleReply({
+      intentionalAbort: coordinator.intentionalAbort,
+      compactionInFlight: coordinator.compactionInFlight,
+      lastStopReason,
+    })) {
+      return;
+    }
     pendingMachineRequest = null;
     try {
       const ownFile = sessionId ? resolveSessionFileValue(process.cwd(), agentSessionsDir(), sessionId) : null;
@@ -488,6 +499,7 @@ export default async function (pi: ExtensionAPI) {
     const plan = planSettleWake({
       lastStopReason,
       intentionalAbort: coordinator.intentionalAbort,
+      compactionPending: coordinator.selectedCompaction !== null || coordinator.compactionInFlight,
       running: subagentPort.current?.listRunningSubs() ?? [],
       lastNoticeKey: d96NoticeKey,
       lastNoticeAt: d96NoticeAt,

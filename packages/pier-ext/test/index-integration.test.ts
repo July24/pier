@@ -8,8 +8,9 @@ import { existsSync } from 'node:fs';
 import { mkdir, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import pier from '../src/index.ts';
-import { pipeRequestTo } from '../src/pipe-channel.ts';
-import { fakePi, fire, withCleanup, type CleanupContext, type FakePi } from './test-utils.ts';
+import { pipeNameFor, pipeRequestTo, startPipeServer, type PipeRequest } from '../src/pipe-channel.ts';
+import { sessionDirName } from '../src/storage-layout.ts';
+import { fakePi, fire, jsonl, transcriptMessage, withCleanup, type CleanupContext, type FakePi } from './test-utils.ts';
 
 type IndexMode = 'worker' | 'bare' | 'master';
 
@@ -311,7 +312,7 @@ test('index session lifecycle: derives the session object root and prunes it on 
 }));
 
 test('index: /pier-config reports configuration and hands a guided change to the agent', withCleanup(async (cleanup) => {
-  const pi = await mountIndex(cleanup, 'worker', { HERDR_PLUGIN_CONFIG_DIR: undefined });
+  const pi = await mountIndex(cleanup, 'worker');
 
   assert.ok(pi.commands.has('pier-config'), 'D104 command is registered');
   assert.equal(pi.commands.has('efficiency'), false, '/efficiency was superseded by /pier-config (not yet released)');
@@ -374,6 +375,73 @@ test('index: turn_start resets lastStopReason (A11) so a stale abort cannot swal
     assert.deepEqual(pi.userSent[0]!.opts, { deliverAs: 'followUp', triggerTurn: true });
   } finally {
     await fire(pi, 'session_shutdown'); // close the pipe server even when an assertion fails
+  }
+}));
+
+test('settle fast-path (D49): an aborted settle keeps the machine request armed; the genuine settle pushes the reply', withCleanup(async (cleanup) => {
+  const childPane = 'p_settle_child';
+  // Own transcript under the temp agent home so the genuine settle finds its closing text.
+  const home = cleanup.tempDir('pier-settle-home').path;
+  const cwd = cleanup.tempDir('pier-settle-ws').path;
+  const parentCwd = cleanup.tempDir('pier-settle-parent').path;
+  const pi = await mountIndex(cleanup, 'master', {
+    HERDR_SOCKET_PATH: '/tmp/pier-test-sock-settle',
+    HERDR_PANE_ID: childPane,
+    PI_CODING_AGENT_DIR: home,
+    PI_SESSION_FILE: 'smoke-sess-0001',
+  });
+  const ctx = { cwd, sessionManager: { getBranch: () => [] }, isIdle: () => true };
+  const replies: PipeRequest[] = [];
+  const replyArrived = Promise.withResolvers<void>();
+  const parent = startPipeServer(pipeNameFor(parentCwd, 'p_settle_parent'), (req) => {
+    replies.push(req);
+    replyArrived.resolve();
+    return Promise.resolve({ type: 'ok', id: req.id });
+  });
+
+  try {
+    await fire(pi, 'session_start', { reason: 'new' }, ctx);
+    const prompted = await pipeRequestTo(cwd, childPane, {
+      type: 'prompt', id: 'prompt-smoke', text: 'go', from: pipeNameFor(parentCwd, 'p_settle_parent'), push: true,
+    });
+    assert.equal(prompted.type, 'ok');
+
+    // The run "settles" on an abort (user ESC here; OCC's abort lands on the same guard via
+    // intentionalAbort/compactionInFlight): pre-fix this consumed the request with a null-text
+    // reply, so the worker's real closing message could never be delivered.
+    await fire(pi, 'turn_start');
+    await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'aborted' } }, ctx);
+    await fire(pi, 'agent_settled', {}, ctx);
+    assert.equal(replies.length, 0, 'an aborted settle must not answer the machine request');
+
+    // The continuation run genuinely settles: the still-armed request now carries the real text.
+    await fire(pi, 'turn_start');
+    await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'stop' } }, ctx);
+    const sessDir = join(home, 'sessions', sessionDirName(process.cwd()));
+    await mkdir(sessDir, { recursive: true });
+    await writeFile(
+      join(sessDir, '2026-09-22T00-00-00-000Z_smoke-sess-0001.jsonl'),
+      jsonl(
+        { type: 'session', id: 'smoke-sess-0001' },
+        transcriptMessage('assistant', '服务已停、环境干净；报告全文写入 /tmp/report.md', Date.now() + 1000),
+      ),
+    );
+    await fire(pi, 'agent_settled', {}, ctx);
+    // pushSettleReply is fire-and-forget, and the reply crosses a real unix socket: await the
+    // arrival signal with a deadline (deterministic time control cannot cross a socket).
+    const deadline = setTimeout(() => replyArrived.reject(new Error('settle reply did not arrive within 2s')), 2000);
+    deadline.unref?.();
+    await replyArrived.promise;
+    clearTimeout(deadline);
+    assert.equal(replies.length, 1, 'exactly one settle reply, from the genuine settle');
+    const reply = replies[0]!;
+    assert.ok(reply.type === 'reply', `expected a reply, got ${reply.type}`);
+    assert.equal(reply.id, 'prompt-smoke');
+    assert.match(reply.text ?? '', /报告全文写入/);
+    assert.equal(reply.paneId, childPane);
+  } finally {
+    parent.close();
+    await fire(pi, 'session_shutdown'); // close the child's pipe server even when an assertion fails
   }
 }));
 

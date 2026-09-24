@@ -311,6 +311,24 @@ test('success path: parses answers; telemetry carries the state hash, never the 
   assert.ok(!log.includes('sk-test'));
 }));
 
+test('telemetry sessionId: meta wins, the runtime dep is the fallback (obs-excerpt rows)', withCleanup(async (cleanup) => {
+  const root = cleanup.tempDir('jev').path;
+  const mk = () => createJevRuntime(() => config(), {
+    fetchImpl: async () => new Response(JSON.stringify(okBody()), { status: 200 }),
+    getSessionRoot: () => root,
+    getSessionId: () => 'sess-dep',
+  });
+  await mk().ask({ state: 's', questions: QUESTIONS }, { questionId: 'obs-excerpt-window' });
+  await mk().ask({ state: 's', questions: QUESTIONS }, { questionId: 'epr-diagnostic-gate', sessionId: 'sess-meta' });
+  await createJevRuntime(() => config(), {
+    fetchImpl: async () => new Response(JSON.stringify(okBody()), { status: 200 }),
+    getSessionRoot: () => root,
+  }).ask({ state: 's', questions: QUESTIONS }, { questionId: 'q' });
+  const rows = (await readLog(root)).trim().split('\n').map((line) => JSON.parse(line) as { sessionId: string; mechanism: string });
+  assert.ok(rows.every((r) => r.mechanism === 'jev'), 'every row keeps its mechanism tag');
+  assert.deepEqual(rows.map((r) => r.sessionId), ['sess-dep', 'sess-meta', 'unknown']);
+}));
+
 /** [case, fetch impl, reason the ask fails open with] */
 const FAILURE_CASES: Array<[string, typeof fetch, string]> = [
   ['rate limited', async () => new Response('rate limited', { status: 429 }), 'rate-limited'],

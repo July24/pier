@@ -8,7 +8,7 @@ import {
   FOREGROUND_POLL_MS, SUBS_CUSTOM_TYPE, TAB_NAME_MAX, Semaphore, agoText, buildAliveNotice, buildBlockedGateNotice,
   buildLaunchLine, buildLaunchParts, classifyWorktreeZone, foldSubsRegistry, formatSubagentResult, isAlive,
   makeProgressUpdate, nextTaskTabName, rekeySub, planForegroundTick, planLaunchValidation, planTabPlacement, resolveTaskIdPrefix,
-  tabNameForTask, type AliveProbe, type SubEntry,
+  flattenToolParams, idParam, tabNameForTask, type AliveProbe, type SubEntry,
 } from '../src/subagent-core.ts';
 import { planReadyAttempt, readyBackoffMs, readyFailureText } from '../src/subagent-spawn.ts';
 
@@ -23,6 +23,15 @@ test('buildLaunchLine: win32 uses PowerShell & syntax, POSIX starts via sh', () 
   // A quoted path stays a single literal under both syntaxes.
   assert.equal(buildLaunchLine(["it's a path"], 'darwin'), `'it'\\''s a path'`);
   assert.equal(buildLaunchLine(["it's a path"], 'win32'), `& 'it''s a path'`);
+});
+
+test('flattenToolParams: nested parameters fill missing top-level ids and do not override them', () => {
+  const flat = flattenToolParams({ action: 'output', parameters: { agentId: 'wA:p3Z', max_chars: 5000 } });
+  assert.equal(flat?.agentId, 'wA:p3Z');
+  assert.equal(flat?.max_chars, 5000);
+  assert.equal(idParam(flat, 'agentId', 'taskId'), 'wA:p3Z');
+  assert.equal(idParam({ action: 'output', parameters: { agentId: 'wA:p3Z' } }, 'agentId'), 'wA:p3Z');
+  assert.equal(flattenToolParams({ agentId: 'top', parameters: { agentId: 'nested' } })?.agentId, 'top');
 });
 
 test('buildLaunchParts: fullscreen TUI by default (static frames); PI_HERDR_TUI=regular opts out', () => {

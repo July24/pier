@@ -8,7 +8,7 @@ import {
   MAX_TERMINALS, POSIX_PROMPT, POWERSHELL_PROMPT, PROMPT_TAIL_RE, SIGNAL_KEYS, TERMINALS_CUSTOM_TYPE, TERM_REMINDERS_MAX,
   TERM_REMINDER_CUSTOM_TYPE, classifyReadiness, closeTerminal, computeIncrement, detectFullscreenTUI, foldTerminalsRegistry,
   makeTerminalsRegistry, nextTerminalId, planIdleTerminalReminder, planShellInit, promptStrategyFor, registerTerminal,
-  stripAnsi, summarizeSessions, terminalIdleMs, validateSendText, validateSignal,
+  classifyWaitMatch, sentinelEchoHazard, stripAnsi, summarizeSessions, terminalIdleMs, validateSendText, validateSignal,
   type PromptStrategy, type ReadinessTier, type TerminalEntry,
 } from '../src/terminal-core.ts';
 import { PiSurface } from '../src/pi-surface.ts';
@@ -41,6 +41,36 @@ test('registry: 取最大号 +1、默认 label = cwd 尾段、到达上限拒绝
   assert.equal(once.entries[0].status, 'closed'); assert.equal(once.entries[0].closedAt, 2000);
   assert.equal(closeTerminal(once.entries, 'term-1', 3000).entries[0].closedAt, 2000, 'idempotent: an existing closedAt is kept');
   assert.equal(closeTerminal([], 'term-x', 1).entries.length, 0);
+});
+
+test('registry: 请求的 terminal_id 被采纳（trim），占用/非法 id 拒绝，省略时自动编号不受影响', () => {
+  const named = registerTerminal([mkEntry()], { ...base, terminalId: ' spike ' });
+  assert.equal(named.ok, true);
+  if (!named.ok) return;
+  assert.equal(named.entry.terminalId, 'spike', 'requested id wins after trim');
+  // 自动编号以最大 term-N 为基准，自定义 id 不挤压后续默认 id
+  assert.equal(nextTerminalId(named.entries.map((e) => e.terminalId)), 'term-2');
+
+  const taken = registerTerminal(named.entries, { ...base, terminalId: 'term-1' });
+  assert.equal(taken.ok, false);
+  if (taken.ok) return;
+  assert.match(taken.error, /already used/);
+
+  const stale = registerTerminal([mkEntry({ status: 'closed' })], { ...base, terminalId: 'term-1' });
+  assert.equal(stale.ok, false, 'closed ids stay reserved: close/list still address them');
+
+  // 空/纯空白 id 视同未提供（自动编号）；带内部空白或超长的 id 拒绝
+  for (const omitted of ['', '   ']) {
+    const res = registerTerminal([], { ...base, terminalId: omitted });
+    assert.equal(res.ok, true, JSON.stringify(omitted));
+    if (res.ok) assert.equal(res.entry.terminalId, 'term-1');
+  }
+  for (const bad of ['a b', 'x'.repeat(65)]) {
+    const res = registerTerminal([], { ...base, terminalId: bad });
+    assert.equal(res.ok, false, JSON.stringify(bad));
+    if (!res.ok) assert.match(res.error, /invalid terminal_id/);
+  }
+  assert.equal(registerTerminal([], { ...base, terminalId: null }).ok, true, 'null → auto id');
 });
 
 test('validateSendText/validateSignal：拒 ANSI 与控制字符、剥尾部换行；信号白名单原样通过', () => {
@@ -247,6 +277,19 @@ test('plugins/terminal：wait/send/read 的动作契约（就绪校验、超时�
   assert.equal(hit.details.matched, true, 'a hit → matched'); assert.equal(calls.waitForOutput.at(-1)?.paneId, 'pane-2');
   assert.deepEqual(calls.waitForOutput.at(-1)?.match, { type: 'substring', value: 'TERM_DONE_' });
 
+  client.readPane = async () => ({ text: 'bug=19820 terminal_result=ok\n$ ', revision: 3, truncated: false });
+  await run(pi, { action: 'read', terminal_id: 'term-1', max_chars: 7000 });
+  const waitsBeforeStale = calls.waitForOutput.length;
+  const stale = await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: 'terminal_result=', timeout_ms: 1000 });
+  assert.equal(stale.details.matched, false);
+  assert.equal(stale.details.stale, true);
+  assert.match(stale.content[0].text, /already-read output/);
+  assert.equal(calls.waitForOutput.length, waitsBeforeStale + 1, 'a stale hit must not re-enter waitForOutput');
+  client.readPane = async () => ({ text: 'bug=19820 terminal_result=ok\nsubmitted bug=19816\n$ ', revision: 4, truncated: false });
+  const freshWait = await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: 'submitted bug=19816', timeout_ms: 2000 });
+  assert.equal(freshWait.details.matched, true);
+  assert.match(freshWait.content[0].text, /submitted bug=19816/);
+
   client.waitForOutput = async (paneId, match, timeoutMs) => {
     calls.waitForOutput.push({ paneId, match, timeoutMs });
     return { matched: false, reason: 'timeout' };
@@ -281,6 +324,70 @@ test('plugins/terminal：wait/send/read 的动作契约（就绪校验、超时�
   client.listPanes = async () => [{ paneId: 'pane-9', tabId: 'other', workspaceId: 'w1', agentStatus: 'idle' }];
   await assert.rejects(async () => { await run(pi, { action: 'read', pane_id: 'pane-9' }); }, /limited to panes in this session's own tab/);
 });
+
+test('wait 哨兵自匹配：命中自己回显的 pattern 直接拒绝，可区分的 sentinel 照常等待', async (t) => {
+  // 纯函数：literal/regex 是否会命中发送文本本身
+  const sent = 'for r in 1 2 3; do pi -p "$(cat in_$r.txt)" > out_$r.json; done; echo G3FP_ALL_DONE';
+  assert.equal(sentinelEchoHazard({ pattern: 'G3FP_ALL_DONE', lastSentText: sent }), true, 'literal sentinel ⊆ echo');
+  assert.equal(sentinelEchoHazard({ pattern: 'G3FP_ALL_DONE', regex: true, lastSentText: sent }), true, 'regex 不锚定也会命中 echo');
+  assert.equal(sentinelEchoHazard({ pattern: '^G3FP_ALL_DONE', regex: true, lastSentText: sent }), false, '行首锚定不命中 `echo G3FP…` 回显');
+  assert.equal(sentinelEchoHazard({ pattern: 'BUILD SUCCESS', lastSentText: sent }), false, '与命令无关的 pattern 无风险');
+  assert.equal(sentinelEchoHazard({ pattern: 'x', lastSentText: null }), false, '本进程没发送过 → 无法判定，放行');
+
+  // 契约：发送过含哨兵的命令后，wait 该哨兵必须拒绝且不发起 herdr 等待
+  const { pi, calls } = await mountTerminal(t, { open: true });
+  calls.waitForOutput.length = 0;
+  await run(pi, { action: 'send', terminal_id: 'term-1', text: sent });
+  await assert.rejects(
+    async () => { await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: 'G3FP_ALL_DONE', timeout_ms: 5000 }); },
+    /matches its own echo|also appears in the command text/,
+  );
+  await assert.rejects(
+    async () => { await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: 'G3FP_ALL_DONE', timeout_ms: 5000 }); },
+    /do NOT re-send/,
+  );
+  assert.equal(calls.waitForOutput.length, 0, 'an echo self-match never reaches herdr');
+
+  // 可区分的 pattern（锚定正则）照常走等待
+  const hit = await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: '^G3FP_ALL_DONE', regex: true, timeout_ms: 5000 });
+  assert.equal(hit.details.matched, true);
+  assert.deepEqual(calls.waitForOutput.at(-1)?.match, { type: 'regex', value: '^G3FP_ALL_DONE' });
+
+  // close 清掉发送记录后，同 pattern 的 wait 不再被拒（终端已关闭则按未知终端报错）
+  await run(pi, { action: 'close', terminal_id: 'term-1' });
+  await assert.rejects(
+    async () => { await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: 'G3FP_ALL_DONE' }); },
+    /unknown or closed terminal/,
+  );
+});
+
+test('classifyWaitMatch: a pattern only in already-read text is stale; new text is fresh', () => {
+  const first = computeIncrement(null, { text: 'bug=19820 terminal_result=ok\n', revision: 1 }, 10_000);
+  assert.equal(classifyWaitMatch(first.cursor, 'bug=19820 terminal_result=ok\n', 'terminal_result=', false).kind, 'stale');
+  const grown = 'bug=19820 terminal_result=ok\nsubmitted bug=19816\n';
+  const fresh = classifyWaitMatch(first.cursor, grown, 'submitted bug=19816', false);
+  assert.equal(fresh.kind, 'fresh');
+  if (fresh.kind === 'fresh') assert.match(fresh.excerpt, /submitted bug=19816/);
+  assert.equal(classifyWaitMatch(null, '$ ', 'TERM_DONE_', false).kind, 'absent');
+});
+
+test('open 采纳请求的 terminal_id：open/send 用同名 id 直达，不再静默改号', async (t) => {
+  const { pi } = await mountTerminal(t);
+  const open = await run(pi, { action: 'open', cwd: '/tmp/spike', terminal_id: 'spike' });
+  assert.match(open.content[0].text, /terminal spike open/);
+  assert.equal(open.details.terminal_id, 'spike');
+  const sent = await run(pi, { action: 'send', terminal_id: 'spike', text: 'echo hi' });
+  assert.match(sent.content[0].text, /sent to spike/);
+  // 占用过的 id 再开 → 明确报错而不是静默换号
+  await assert.rejects(
+    async () => { await run(pi, { action: 'open', terminal_id: 'spike' }, { cwd: '/tmp/spike' }); },
+    /already used/,
+  );
+  // 未请求 id 时保持原自动编号行为
+  const auto = await run(pi, { action: 'open' }, { cwd: '/tmp/spike' });
+  assert.match(auto.content[0].text, /terminal term-1 open/);
+});
+
 
 test('plugins/terminal：会话生命周期——shutdown 关停全部 open pane，ledger 墓碑让工具 inert', async (t) => {
   const { pi, deps, ledger, calls } = await mountTerminal(t, { open: true });

@@ -238,7 +238,7 @@ export function createPoller(h: PollerHost): Poller {
       while (true) {
         const current = requestByPane.get(paneId) ?? { injectTs, description, requestId };
         const entry = h.subs.get(paneId);
-        if (!entry || entry.status === 'settled') return;
+        if (!entry || entry.status === 'settled' || entry.status === 'consumed' || entry.status === 'closed') return;
 
         if (entry.userTakeover) {
           try {

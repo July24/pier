@@ -1,6 +1,6 @@
 {
   "name": "pier-setup",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "One-shot installer for pier: install / update / version / uninstall for pi-pier + pier.workbench",
   "license": "MIT",
   "type": "module",

@@ -15,6 +15,7 @@ import {
   ambiguousIdError,
   buildAliveNotice,
   idParam,
+  flattenToolParams,
   isAlive,
   newestPerTaskId,
   rekeySub,
@@ -32,6 +33,7 @@ import {
   latestGeneration,
   preferredHistoryFile,
   readHistory,
+  readHistoryTree,
   type HistoryEntry,
 } from '../history-store.ts';
 import { platformPaths } from '../platform-paths.ts';
@@ -88,7 +90,7 @@ const SUBAGENT_DESCRIPTION = [
   '[spawn] `tab` (optional): name of a task tab to place the subagent into (join if a tab with this name exists, otherwise create it). Overrides the default placement. Default placement groups by git worktree: a subagent working in your checkout shares your tab; one working in a separate worktree (pass its path via `cwd`; create worktrees with `git worktree add`) gets its own tab named after the worktree directory.',
   '[spawn] `role` + `allowed_tools`: when role matches a profile (searched: workspace .pi-herdr/roles/ → user-global ~/.pi/agent/herdr-pi/roles/ → builtin), the worker toolset becomes the composed manifest — baseline ∪ allowed_tools minus role-deny tools (deny always wins). Custom roles: drop a JSON profile into .pi-herdr/roles/ (master/worker-default reserved). Unknown role names remain display labels only.',
   '[spawn] `isolate` (default false): creates a FRESH git worktree for this subagent and runs it there (branch pier/<slug> from your HEAD under ~/.herdr/worktrees/<repo>/). Three-way choice: heavy independent writing in parallel with your own edits or other workers, or work needing its own clean reviewable diff → isolate; read-mostly or sequential helper work → omit (shared checkout, writes guarded by the write-lock); targeting an existing directory/worktree → cwd. In isolate mode the subagent\'s writes cannot conflict with your checkout; its panes group into a tab named after the worktree; its prompt is prefixed with commit discipline (commit to its own branch, NEVER push); when it settles you get a diff summary (commits since base, files changed, uncommitted count). Review with git log/diff HEAD..<branch>, merge with git merge --no-ff <branch>; once merged and clean the worktree auto-removes (branch kept). Mutually exclusive with cwd.',
-  '[resume] `taskId`: revive a finished (collected) subagent from the delegation ledger — opens its saved conversation in a new pane (pi --session), then use action send to give it new work. The ledger is an append-only JSONL file, one row per status change (same taskId rows = generations, latest row is current): fields taskId, description, status (running|settled|consumed|closed), outcome (closing text), paneId, sessionFile, launchCommand, createdAt. It is per-checkout at ~/.pi/agent/herdr-pi/history/<flattened-cwd>/history.jsonl. Use action list for live panes from this session; for earlier sessions or closed panes, grep the ledger for the taskId.',
+  '[resume] `taskId`: revive a finished (collected) subagent from the delegation ledger — opens its saved conversation in a new pane (pi --session), then use action send to give it new work. The ledger is an append-only JSONL file, one row per status change (same taskId rows = generations, latest row is current): fields taskId, description, status (running|settled|consumed|closed), outcome (closing text), paneId, sessionFile, launchCommand, createdAt. Ledgers are per-checkout at ~/.pi/agent/herdr-pi/history/<flattened-cwd>/history.jsonl, but resume searches every checkout this master has spawned into, not only the current cwd. A still-running task is not resumed — use action send or output. Use action list for live panes.',
   '[list] no extra parameters: list background subagents with live state (running / idle), pane ids, last activity, role, and descriptions. Foreground one-shot panes are not listed.',
   '[output] `agentId` (required, the subagent pane id): view incremental output of a running or background subagent since the last output call. Text returned to the model is bounded (default 6000 chars) with status metadata (running/idle/blocked/settled), revision, and a truncated flag. When the delta cannot be computed the full text is returned with a "buffer scrolled or reset" note — that is normal for fullscreen TUI panes, not a crash indicator. Use this to observe subagent progress before settlement.',
   '[interrupt] `agentId`: abort the current turn (fire-and-return). The pane stays; you can send again.',
@@ -190,6 +192,14 @@ export default function subagentPlugin(ctx: Context): void {
     async settleStatLine(paneId) {
       const entry = subs.get(paneId);
       return entry ? await git.worktreeStatLine(entry) : null;
+    },
+    consumeReply(paneId, outcome) {
+      const entry = subs.get(paneId);
+      if (!entry || entry.status === 'consumed' || entry.status === 'closed') return;
+      entry.status = 'consumed';
+      entry.consumedAt = Date.now();
+      persistSubs();
+      writeHistory(entry, { outcome: outcome ?? null, status: 'consumed' }, 'pipe-reply');
     },
   };
   port.current = boundPort;
@@ -407,19 +417,33 @@ export default function subagentPlugin(ctx: Context): void {
 
   async function executeSubagentResume(params: ToolParams, toolCtx: unknown) {
     if (!client.available) return toolError('requires a herdr-managed pane.');
-    const cwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
     const rawTaskId = idParam(params, 'taskId', 'agentId');
     if (!rawTaskId) return toolError('missing taskId for resume (see action list or delegation ledger).');
-    const history = readHistory(histFile(cwd));
+    const running = newestPerTaskId([...subs.values()].filter((s) => s.background && s.status === 'running'));
+    const live = resolveTaskIdPrefix(rawTaskId, running.keys());
+    if (live.kind === 'too_short') {
+      return toolError(`Error: task id prefix "${rawTaskId}" is too short (minimum 4 characters).`);
+    }
+    if (live.kind === 'ambiguous') return toolError(ambiguousIdError('task id', rawTaskId, live.candidates));
+    if (live.kind === 'resolved') {
+      const entry = running.get(live.taskId)!;
+      return {
+        content: [{ type: 'text', text: `task ${entry.taskId} is already running as pane ${entry.paneId}. Use action send or output; resume is only for a collected task whose pane is gone.` }],
+        details: { paneId: entry.paneId, taskId: entry.taskId, alreadyRunning: true },
+      };
+    }
+    const history = readHistoryTree(dirname(defaultAgentSessionsDir()));
     const resolution = resolveTaskIdPrefix(rawTaskId, history.map((e) => e.taskId));
     if (resolution.kind === 'too_short') {
       return toolError(`Error: task id prefix "${rawTaskId}" is too short (minimum 4 characters).`);
     }
     if (resolution.kind === 'ambiguous') return toolError(ambiguousIdError('task id', rawTaskId, resolution.candidates));
-    if (resolution.kind === 'not_found') return toolError(`Error: no history for task "${rawTaskId}" in this workspace.`);
+    if (resolution.kind === 'not_found') {
+      return toolError(`Error: no history for task "${rawTaskId}" in this workspace or its spawned checkouts.`);
+    }
     const taskId = resolution.taskId;
     const latest = latestGeneration(history, taskId);
-    if (!latest) return toolError(`Error: no history for task "${taskId}" in this workspace.`);
+    if (!latest) return toolError(`Error: no history for task "${taskId}" in this workspace or its spawned checkouts.`);
 
     const release = await subSemaphore.acquire();
     try {
@@ -436,7 +460,6 @@ export default function subagentPlugin(ctx: Context): void {
         paneId: existing?.paneId ?? '',
         tabId: existing?.tabId ?? '',
         tabName: latest.tabName ?? tabNameForTask(latest.description),
-        cwd,
         status: 'running',
         createdAt: Date.now(),
         consumedAt: null,
@@ -584,7 +607,11 @@ export default function subagentPlugin(ctx: Context): void {
         lines.push(`${sub.taskId.slice(0, 8)} [idle] (${sub.kind}, closed; action send revives)${tabTag}${wtTag} ${sub.description}`);
         continue;
       }
-      const state = sub.status === 'settled' ? 'idle' : 'running';
+      if (sub.status === 'consumed' || sub.status === 'settled') {
+        lines.push(`${sub.paneId} [idle] (${sub.kind}, settled; action send revives)${tabTag}${wtTag} ${sub.description}`);
+        continue;
+      }
+      const state = 'running';
       const takeoverMark = sub.userTakeover ? ', user-controlled' : '';
       const probe = probes.get(sub.paneId);
       const statusTag = probe?.agentStatus ? ` ${probe.agentStatus}` : '';
@@ -653,6 +680,7 @@ export default function subagentPlugin(ctx: Context): void {
       'Keep the prompt complete and self-contained: the worker does not see this conversation, so include paths, acceptance criteria, the test command, and what to report back.',
       'Do not poll with action: "output" in a tight loop: the pane pushes a settlement notice when it finishes. Check once, then continue other work.',
       'Send follow-up instructions with action: "send" (delivered as a steer between tool calls) instead of spawning a second worker for the same task.',
+      'Pass agentId, taskId, message, and max_chars as top-level arguments. Do not wrap them in a parameters object.',
     ],
     description: SUBAGENT_DESCRIPTION,
     parameters: Type.Object({
@@ -681,19 +709,20 @@ export default function subagentPlugin(ctx: Context): void {
     // B2: `action` is optional in the schema; normalize it so the validated arguments and the
     // code path never disagree and `spawn` is explicit in logs.
     prepareArguments: (args: unknown) => {
-      const rec = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>;
+      const rec = flattenToolParams(args && typeof args === 'object' ? args as Record<string, unknown> : {}) ?? {};
       const hasAction = typeof rec.action === 'string' && rec.action.trim() !== '';
       return hasAction ? rec : { ...rec, action: 'spawn' };
     },
     async execute(toolCallId: string, params: ToolParams, signal: AbortSignal | undefined, onUpdate: ((update: unknown) => void) | undefined, toolCtx: unknown) {
       void toolCallId;
       void signal;
-      const action = typeof params?.action === 'string' && params.action.trim() ? params.action.trim() : 'spawn';
+      const flat = flattenToolParams(params);
+      const action = typeof flat?.action === 'string' && flat.action.trim() ? flat.action.trim() : 'spawn';
       const handler = ACTIONS[action];
       if (!handler) {
         return toolError(`Error: unknown action "${action}" (valid: ${Object.keys(ACTIONS).join(', ')})`);
       }
-      return handler(params, toolCtx, onUpdate);
+      return handler(flat, toolCtx, onUpdate);
     },
   });
 }

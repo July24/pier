@@ -259,9 +259,28 @@ export function makeProgressUpdate(msg: string) {
   return { content: [{ type: 'text' as const, text: msg }], details: {} as Record<string, never> };
 }
 
+/**
+ * Models sometimes wrap fields in a `parameters` object (JSON-schema habit). Top-level wins;
+ * only missing keys are filled from the nested bag so a real field is never overwritten.
+ */
+export function flattenToolParams(params: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!params) return params;
+  const nested = params.parameters;
+  if (nested === null || typeof nested !== 'object' || Array.isArray(nested)) return params;
+  const out: Record<string, unknown> = { ...params };
+  for (const [key, value] of Object.entries(nested as Record<string, unknown>)) {
+    if (key === 'parameters') continue;
+    const current = out[key];
+    if (current == null || current === '') out[key] = value;
+  }
+  return out;
+}
+
+
 export function idParam(params: Record<string, unknown> | undefined, ...keys: string[]): string {
+  const flat = flattenToolParams(params);
   for (const key of keys) {
-    const v = params?.[key];
+    const v = flat?.[key];
     if (v != null && String(v).trim() !== '') return String(v).trim();
   }
   return '';
@@ -572,6 +591,8 @@ export interface SubagentPort {
   reconcileOnReply(paneId: string): string[];
   listRunningSubs(): Array<{ paneId: string; description: string }>;
   settleStatLine(paneId: string): Promise<string | null>;
+  /** Pipe settlement: drop the row out of listRunningSubs before the finish notice wakes the master. */
+  consumeReply(paneId: string, outcome: string | null): void;
 }
 
 export interface SubagentPortBox {

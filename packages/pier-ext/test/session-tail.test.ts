@@ -9,7 +9,7 @@ import {
 } from '../src/session-tail.ts';
 import { COMPACTION_INFLIGHT_TYPE, COMPACTION_SETTLED_TYPE } from '../src/compact-coordinator.ts';
 import { STALE_CLOCK_MS, STALE_TURNS, evaluateStaleness, formatAge, isArchived, openTodos } from '../src/stale-core.ts';
-import { planSettleWake } from '../src/settle-wake-core.ts';
+import { planSettleWake, shouldPushSettleReply } from '../src/settle-wake-core.ts';
 import type { TodoItem } from '../src/vocab.ts';
 import { jsonl, transcriptMessage, withCleanup } from './test-utils.ts';
 
@@ -199,6 +199,16 @@ test('OCC abort: silent settle that still hands off to the compaction coordinato
   assert.equal(planSettleWake({ lastStopReason: 'stop', running: [], lastNoticeKey: null, lastNoticeAt: 0, now: T0 }).compact, true);
 });
 
+test('compaction already selected: no running-sub notice, compaction still proceeds', () => {
+  const plan = planSettleWake({
+    lastStopReason: 'stop', compactionPending: true, running: SUBS, lastNoticeKey: null, lastNoticeAt: 0, now: T0,
+  });
+  assert.equal(plan.notice, false, 'a notice here would wake a turn that OCC immediately aborts');
+  assert.equal(plan.wake, false);
+  assert.equal(plan.compact, true);
+  assert.equal(plan.noticeKey, null, 'the anchor is unchanged so the set can still notify after compaction');
+});
+
 test('natural settle with a new running set → one notice carrying the set key', () => {
   const plan = planSettleWake({ lastStopReason: 'stop', running: SUBS, lastNoticeKey: null, lastNoticeAt: 0, now: T0 });
   assert.equal(plan.wake, true);
@@ -231,4 +241,17 @@ test('unknown stopReason (null, older pi) counts as a natural end: no notice is 
   const plan = planSettleWake({ lastStopReason: null, running: SUBS, lastNoticeKey: null, lastNoticeAt: 0, now: T0 });
   assert.equal(plan.wake, true);
   assert.equal(plan.notice, true);
+});
+
+/* ── settle fast-path: an aborted settle must not answer the machine request ── */
+
+test('settle reply guard: OCC abort / in-flight compaction / user abort keep the request armed', () => {
+  const natural = { lastStopReason: 'stop' as const };
+  assert.equal(shouldPushSettleReply(natural), true, 'a genuine settle answers the pending machine request');
+  // A worker whose turn OCC aborted reads stopReason 'error'; only the flags distinguish it.
+  assert.equal(shouldPushSettleReply({ ...natural, intentionalAbort: true }), false, 'OCC abort → continuation is coming');
+  assert.equal(shouldPushSettleReply({ ...natural, compactionInFlight: true }), false, 'compaction summary still running');
+  assert.equal(shouldPushSettleReply({ lastStopReason: 'error' }), true, 'a plain provider-error settle still replies');
+  assert.equal(shouldPushSettleReply({ lastStopReason: 'aborted' }), false, 'a user-aborted run may re-run');
+  assert.equal(shouldPushSettleReply({ lastStopReason: null }), true, 'an unknown stopReason (older pi) still replies');
 });

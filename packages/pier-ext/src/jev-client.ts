@@ -37,6 +37,8 @@ export interface JevRuntimeDeps {
   now?: () => number;
   /** Session root for jev.jsonl; telemetry is skipped when absent. */
   getSessionRoot?: () => string | null;
+  /** Session id fallback for telemetry rows; sites that know it pass meta.sessionId instead. */
+  getSessionId?: () => string | null | undefined;
 }
 
 export interface JevRuntime {
@@ -63,8 +65,8 @@ export function createJevRuntime(getConfig: () => JevConfig, deps: JevRuntimeDep
     const record: Record<string, unknown> = {
       schema: 'pier-efficiency/1',
       mechanism: 'jev',
+      sessionId: meta.sessionId ?? deps.getSessionId?.() ?? 'unknown',
       ts: new Date(now()).toISOString(),
-      sessionId: meta.sessionId ?? 'unknown',
       questionId: meta.questionId,
       model: outcome.ok ? outcome.model : config.model,
       latencyMs,

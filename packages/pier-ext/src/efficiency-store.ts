@@ -221,7 +221,11 @@ export async function readStoredObjectChunk(
     const available = Math.max(0, fileStat.size - offset);
     const buffer = Buffer.alloc(Math.min(available, limits.maxBytes + 4));
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
-    return sliceBufferChunk(buffer.subarray(0, bytesRead), 0, limits);
+    const sliced = sliceBufferChunk(buffer.subarray(0, bytesRead), 0, limits);
+    // sliceBufferChunk's nextOffset is relative to the window it was given (offset 0). Callers page
+    // with the absolute file offset from the header, so add the seek back.
+    const nextOffset = offset + sliced.nextOffset;
+    return { ...sliced, nextOffset, eof: nextOffset >= fileStat.size };
   } finally {
     await handle?.close();
   }

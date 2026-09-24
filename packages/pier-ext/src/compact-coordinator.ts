@@ -14,6 +14,9 @@ import { swallow } from './swallow.ts';
 
 export const COMPACT_STATE_CUSTOM_TYPE = 'pi-herdr.efficiency-state';
 export const COMPACTION_CONTINUE_TYPE = 'pi-herdr.compaction-continue';
+/** Shown to the model after a successful OCC. Names the abort so it is not retried as a failure. */
+export const COMPACTION_CONTINUE_TEXT =
+  'Online context compaction finished. The preceding abort ("This operation was aborted" / "Operation aborted") was this compaction aborting the in-flight turn on purpose — not a model failure, not a user cancel, and not a reason to retry that call. Active tasks are preserved. Continue the remaining work.';
 /**
  * Cross-session compaction markers: OCC's abort lands in the child transcript as an assistant
  * message with stopReason 'error', which a master's poller would read as a settled turn. The
@@ -331,7 +334,7 @@ export class CompactCoordinator {
 
     this.sendContinuation(
       opts.pi,
-      'Online context compaction finished. Active tasks preserved. Continue working on remaining tasks.',
+      COMPACTION_CONTINUE_TEXT,
       false,
     );
     // Settled marker last: the master's poller releases its hold as soon as it appears.
@@ -375,6 +378,9 @@ export class CompactCoordinator {
     // P1-3: record the failure and back off exponentially (cap 4 skipped decisions).
     this.state.consecutiveCompactionFailures++;
     this.state.compactBackoffTurnEnds = Math.min(2 ** this.state.consecutiveCompactionFailures, 4);
+    // Persist the bumped counters: state is restored from this marker, so a restart without it
+    // would reset the P1-3 backoff window and retry the doomed compaction immediately.
+    this.appendMarker(opts.pi, COMPACT_STATE_CUSTOM_TYPE, this.state);
 
     // OCC aborted the turn on purpose, so a failed compaction would leave the session parked on an
     // aborted message; the notice must be visible rather than a silent failure.

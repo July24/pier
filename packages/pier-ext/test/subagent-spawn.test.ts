@@ -315,6 +315,10 @@ test('send/resume: short prefixes resolve at four characters and report ambiguit
     assert.match(await runSubagentRejects(env.pi, { action: 'send', agentId: fullTaskId.slice(0, 3), message: 'x' }, env.cwd), /too short \(minimum 4 characters\)/);
     assert.match(await runSubagentRejects(env.pi, { action: 'send', agentId: '00000000', message: 'x' }, env.cwd), /unknown subagent id "00000000"/);
 
+    const live = await runSubagent(env.pi, { action: 'resume', taskId: short8 }, env.cwd);
+    assert.match(live.content[0]!.text, /already running as pane/);
+    assert.equal(live.details?.taskId, fullTaskId);
+    env.port.current?.consumeReply('p2', 'done');
     const resumed = await runSubagent(env.pi, { action: 'resume', taskId: short8 }, env.cwd);
     assert.match(resumed.content[0]!.text, /resumed subagent/);
     assert.equal(resumed.details?.taskId, fullTaskId, 'resume reports the full taskId');
@@ -328,11 +332,31 @@ test('send/resume: short prefixes resolve at four characters and report ambiguit
       description: '歧义冲突任务', sessionFile: null, launchCommand: ['node', 'cli.js'],
       status: 'settled', createdAt: Date.now() + 10,
     });
+    env.port.current?.consumeReply(String(resumed.details?.paneId), 'done');
     const ambiguous = await runSubagentRejects(env.pi, { action: 'resume', taskId: short4 }, env.cwd);
     assert.match(ambiguous, /ambiguous task id/);
     assert.match(ambiguous, new RegExp(fullTaskId));
     assert.match(ambiguous, new RegExp(ambiguousTaskId));
   });
+});
+
+test('resume: a task spawned into another checkout is found after it is consumed', async () => {
+  const other = mkdtempSync(join(tmpdir(), 'pier-resume-other-'));
+  await withPipeEnv(async (env) => {
+    env.parkPollers();
+    const spawned = await runSubagent(env.pi, {
+      description: '跨仓库任务', prompt: PROMPT, run_in_background: true, cwd: other,
+    }, env.cwd);
+    const taskId = spawned.details?.taskId as string;
+    const paneId = spawned.details?.paneId as string;
+    assert.match(await runSubagent(env.pi, { action: 'resume', taskId }, env.cwd).then((r) => r.content[0]!.text), /already running as pane/);
+    env.port.current?.consumeReply(paneId, 'done');
+    const resumed = await runSubagent(env.pi, { action: 'resume', taskId }, env.cwd);
+    assert.match(resumed.content[0]!.text, /resumed subagent/);
+    assert.equal(resumed.details?.taskId, taskId);
+    const row = subsSnapshot(env.pi)?.subs.find((s) => s.taskId === taskId);
+    assert.equal(row?.cwd, other, 'revive keeps the checkout the task was spawned into');
+  }, { childCwd: other });
 });
 
 /* ── isolate at the tool surface ────────────────────────────────── */

@@ -70,11 +70,13 @@ test('handlePipeRequest: ping / prompt / steer follow_up / interrupt', async () 
 
 test('handlePipeRequest: reply binds port, claims once, delivers notice', async () => {
   const applied: Array<[string, string | null]> = [];
+  const consumed: Array<[string, string | null]> = [];
   const notices: string[] = [];
   const claimed: string[] = [];
   const port = emptySubagentPortBox();
   port.current = {
     applyReplySession(paneId, sessionFile) { applied.push([paneId, sessionFile]); },
+    consumeReply(paneId, outcome) { consumed.push([paneId, outcome]); },
     reconcileOnReply() { return ['Reconciled: x']; },
     async settleStatLine() { return 'stat: clean'; },
     listRunningSubs() { return []; },
@@ -94,9 +96,9 @@ test('handlePipeRequest: reply binds port, claims once, delivers notice', async 
   const req = { type: 'reply' as const, id: 'r1', paneId: 'p2', text: 'done', sessionFile: '/tmp/s.jsonl' };
   assert.equal((await handlePipeRequest(req, session)).type, 'ok');
   assert.deepEqual(applied, [['p2', '/tmp/s.jsonl']]);
+  assert.deepEqual(consumed, [['p2', 'done']], 'a finish notice must drop the pane from the running set first');
   // the notice names the pane, the text, the session path, the stat line and the reconciliations
-  for (const frag of [/p2/, /done/, /Session: \/tmp\/s\.jsonl/, /stat: clean/, /Reconciled: x/]) assert.match(notices[0], frag);
-
+  for (const frag of [/p2/, /done/, /Session: \/tmp\/s\.jsonl/, /stat: clean/, /Reconciled: x/]) assert.match(notices[0]!, frag);
   await handlePipeRequest(req, session);
   assert.equal(notices.length, 1, 'a duplicate claim must not re-deliver');
   assert.deepEqual(claimed, ['p2:r1', 'p2:r1']);

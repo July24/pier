@@ -152,7 +152,7 @@ async function isDiagnosticCandidate(
   if (!gate || containsLikelySecret(command)) return regexHit;
   const result = await gate.ask(diagnosticGateRequest(command), {
     questionId: 'epr-diagnostic-gate',
-    timeoutMs: 1500, // cold TLS handshake hit 1002ms and timed out at 1s, warm calls run 250-770ms
+    timeoutMs: 2500, // cold TLS hit 1002ms at 1s; at 1500ms a real session still saw 14/73 calls (19%) time out — 2.5s keeps the gate decisive without stalling reducers
     sessionId,
     // regex_hit makes the flip observable: how often and in which direction jev overrides the regex list (jev.jsonl).
     extra: { site: 'epr-gate', commandSha256: sha256Hex(command), regexHit },

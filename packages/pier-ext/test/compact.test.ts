@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from '@earendil-works/pi-coding-agent';
 import { decideCompaction, estimateRemainingRequests, nativeCompactionFeasible, resolveCacheRatioFromCost, type CompactionDecision } from '../src/compact-economics-core.ts';
 import {
-  CompactCoordinator, COMPACT_STATE_CUSTOM_TYPE, COMPACTION_CONTINUE_TYPE, COMPACTION_INFLIGHT_TYPE,
+  CompactCoordinator, COMPACT_STATE_CUSTOM_TYPE, COMPACTION_CONTINUE_TEXT, COMPACTION_CONTINUE_TYPE, COMPACTION_INFLIGHT_TYPE,
   COMPACTION_SETTLED_TYPE, restoreCoordinatorState,
 } from '../src/compact-coordinator.ts';
 import type { TodoItem } from '../src/todo-core.ts';
@@ -230,6 +230,8 @@ test('CompactCoordinator: abort → compact → markers → silent continuation'
   assert.deepEqual(markers, [COMPACTION_INFLIGHT_TYPE, COMPACT_STATE_CUSTOM_TYPE, COMPACTION_SETTLED_TYPE], 'write order is the protocol the poller depends on');
   assert.equal((pi.entries[2]?.[1] as { outcome?: string })?.outcome, 'completed');
   assert.equal(pi.sent.length, 1); assert.equal(pi.sent[0]!.msg.customType, COMPACTION_CONTINUE_TYPE); assert.equal(pi.sent[0]!.opts!.triggerTurn, true);
+  assert.equal(pi.sent[0]!.msg.content, COMPACTION_CONTINUE_TEXT);
+  assert.match(COMPACTION_CONTINUE_TEXT, /not a model failure/);
 });
 
 test('CompactCoordinator: a cancelled compaction stays cancelled, a failed one wakes the task', async () => {
@@ -313,6 +315,12 @@ test('P1-3: a failed compaction backs off, pays no abort during the window, and 
   compactCalls[0]!.onError(new Error('Summarization failed: generation hit the token cap and the summary is incomplete'));
   await settled;
   assert.ok(coordinator.state.compactBackoffTurnEnds >= 2, 'backoff window ≥2');
+  // The failure must persist the bumped counters (restore reads the last state marker), or a
+  // restart inside the window would retry the doomed compaction immediately.
+  const asBranch = pi.entries.map(([customType, data]) => ({ type: 'custom', customType, data })) as never[];
+  const restored = restoreCoordinatorState(asBranch);
+  assert.equal(restored.consecutiveCompactionFailures, 1);
+  assert.equal(restored.compactBackoffTurnEnds, coordinator.state.compactBackoffTurnEnds);
   assert.equal(pi.sent[0]!.msg.display, true, 'the failure notice must be visible'); assert.match(String(pi.sent[0]!.msg.content), /FAILED/);
   rearm();
   coordinator.onTurnEnd({ ctx, todos, config: CONFIG });

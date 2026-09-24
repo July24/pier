@@ -443,7 +443,7 @@ export async function executeSubagentOutput(
   },
 ) {
   const rawId = idParam(params, 'agentId', 'taskId');
-  if (!rawId) return toolError('Error: missing agentId for output (see action list)');
+  if (!rawId) return toolError('Error: missing agentId for output. Pass it as a top-level argument {"action":"output","agentId":"<pane id>"}, not nested under parameters.');
 
   const cwd = deps.getCwd(toolCtx);
   const resolved = deps.resolveEntry(rawId, cwd);

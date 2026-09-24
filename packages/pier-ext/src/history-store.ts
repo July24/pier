@@ -115,6 +115,29 @@ export function readHistory(file: string): HistoryEntry[] {
   return r.status === 'ok' ? r.entries : [];
 }
 
+/** Every ledger under `<agentRoot>/herdr-pi/history`. Resume must see tasks spawned into another checkout. */
+export function readHistoryTree(agentRoot: string): HistoryEntry[] {
+  const root = path.join(agentRoot, 'herdr-pi', 'history');
+  let names: string[];
+  try {
+    names = fs.readdirSync(root);
+  } catch {
+    return [];
+  }
+  const all: HistoryEntry[] = [];
+  for (const name of names) {
+    let isDir = false;
+    try {
+      isDir = fs.statSync(path.join(root, name)).isDirectory();
+    } catch {
+      continue;
+    }
+    if (!isDir) continue;
+    all.push(...readHistory(path.join(root, name, 'history.jsonl')));
+  }
+  return all;
+}
+
 export type HistoryWriteResult = { ok: true } | { ok: false; error: Error };
 
 /** Failures are logged and returned so the ledger is not silently lost. */
