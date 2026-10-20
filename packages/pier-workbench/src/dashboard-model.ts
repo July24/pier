@@ -152,6 +152,20 @@ export function composeDashboardLines(
       // Own keys only: `status in counts` also matches Object.prototype members from a stray status.
       if (Object.hasOwn(counts, status)) counts[status] += 1;
     }
+  }
+
+  // Delegation tree (RFC rfc-delegation-identity §2.3): a worker carries tokens['pi-parent'];
+  // it renders indented right under its parent when the parent pane is in this workspace.
+  const paneIds = new Set(wsPanes.map((p) => p.pane_id));
+  const delegatedChildren = (parent: SnapshotPane): SnapshotPane[] =>
+    wsPanes.filter((p) => p.tokens?.['pi-parent'] === parent.pane_id);
+  const isDelegated = (p: SnapshotPane): boolean =>
+    typeof p.tokens?.['pi-parent'] === 'string'
+    && p.tokens['pi-parent'] !== ''
+    && paneIds.has(p.tokens['pi-parent']);
+
+  const pushPaneRow = (p: SnapshotPane, indent: boolean): void => {
+    const status = p.agent_status ?? 'unknown';
     // pi-todo wins; else the Herdr 0.9.1 stripped OSC title (the raw title may still carry a spinner).
     let desc = p.tokens?.['pi-todo'] ?? p.terminal_title_stripped ?? p.title ?? p.terminal_title ?? '';
     const locks = Object.keys(p.tokens ?? {}).filter((k) => k.startsWith('lock-')).length;
@@ -161,19 +175,29 @@ export function composeDashboardLines(
       desc = `cwd: ${cwd.split('/').pop() || cwd}`;
     }
     lines.push([
-      pad(p.pane_id, 10),
+      pad(indent ? `↳ ${p.pane_id}` : p.pane_id, 10),
       pad(p.display_agent ?? (p.agent || '-'), 8),
       pad(status === 'blocked' ? '! BLOCKED' : status, 10),
       p.focused || p.pane_id === data.focused_pane_id ? ' *  ' : '    ',
       pad(desc, 44),
     ].join(' '));
+  };
+  for (const p of wsPanes) {
+    if (isDelegated(p)) continue; // rendered under its parent
+    pushPaneRow(p, false);
+    for (const child of delegatedChildren(p)) pushPaneRow(child, true);
   }
 
   if (wsPanes.length === 0) lines.push('  (No panes in this workspace)');
   lines.push(RULE);
 
   if (counts.blocked > 0) {
-    lines.push(`⚠️  ALERT: ${counts.blocked} SUBAGENT(S) BLOCKED — WAITING ON HUMAN DECISION`);
+    // Attribution answers "who is waiting on whom": worker ← delegating master pane.
+    const attributed = wsPanes
+      .filter((p) => (p.agent_status ?? 'unknown') === 'blocked' && p.tokens?.['pi-parent'])
+      .map((p) => `${p.pane_id} ← ${p.tokens?.['pi-parent']}`);
+    const suffix = attributed.length > 0 ? ` [${attributed.join(', ')}]` : '';
+    lines.push(`⚠️  ALERT: ${counts.blocked} SUBAGENT(S) BLOCKED — WAITING ON HUMAN DECISION${suffix}`);
   }
   lines.push(
     `Summary: ${wsPanes.length} pane(s) | Pier agents: ${pierCount} (${counts.working} working, ${counts.blocked} blocked, ${counts.idle} idle)`,

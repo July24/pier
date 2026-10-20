@@ -1,9 +1,11 @@
 /**
  * Minimal herdr socket API client used inside the pi extension.
  *
- * Validated against herdr 0.9.1 (protocol 22; see WIRE.md). The request shapes pier builds are pinned
- * to herdr's own `api schema` by test/herdr-client.test.ts — regenerate test/fixtures/herdr-contract.json
- * and bump HERDR_PROTOCOL_EXPECTED when the server moves on:
+ * Validated against herdr 0.9.5 (protocol 22; see WIRE.md — unchanged since 0.9.1; 0.9.2 removed only the
+ * pane.graphics.* API, which pier never used). The request shapes pier builds are pinned to the
+ * 0.9.5 methods snapshot in test/fixtures/herdr-contract.json (recent `api schema` releases no longer
+ * emit a methods map) — after a herdr upgrade, re-verify the protocol number and the method set, then
+ * regenerate the fixture and bump HERDR_PROTOCOL_EXPECTED when the server moves on:
  *  - Transport is NDJSON: request {id, method, params} → response {id, result} | {id, error:{code,message}};
  *  - **Control requests use one connection per request**; the server closes it after replying;
  *  - Windows targets are named pipes whose name is the complete socket_path with a \\.\pipe\ prefix;
@@ -18,6 +20,7 @@
  */
 import { REPORT_AGENT_SOURCE, type TodoItem } from './vocab.ts';
 import { BLOCKED_LABEL_KEY, SIDEBAR_ASK_TOKEN, formatBlockedLabel, formatPaneTitle, sidebarTodoTokens, staleTokenClearance } from './pane-title.ts';
+import { applyWorkerTag, delegationSidebarTokens, type DelegationContext } from './delegation-core.ts';
 import { LOCK_BATCH_LIMIT, LOCK_TTL_MS } from './lock-core.ts';
 import * as net from 'node:net';
 
@@ -55,6 +58,18 @@ export interface PaneListItem {
   foregroundCwd?: string | null;
   terminalTitle?: string | null;
   terminalTitleStripped?: string | null;
+}
+
+/** pane.process_info: the processes currently holding the pane's PTY foreground. */
+export interface PaneProcessInfo {
+  paneId: string;
+  shellPid: number | null;
+  foreground: ReadonlyArray<{
+    name: string | null;
+    argv0: string | null;
+    pid: number | null;
+    cwd: string | null;
+  }>;
 }
 
 export interface PaneLayoutCell {
@@ -151,8 +166,7 @@ export interface ReadBuffer {
 export interface HerdrClientLike {
   readonly available: boolean;
   reportAgent(state: PaneAgentState, message: string | null): Promise<void>;
-  reportMetadata(meta: { session: string; items: readonly TodoItem[]; progressSuffix?: string | null; lastWriteAt?: number | null }): Promise<void>;
-  /** M18: report write-lock tokens (lock-<hash> → paneId|path); null releases, and batches stay within 16 keys. */
+  reportMetadata(meta: { session: string; items: readonly TodoItem[]; progressSuffix?: string | null; lastWriteAt?: number | null; workerTag?: string | null }): Promise<void>;
   reportLockTokens(tokens: Record<string, string | null>): Promise<void>;
   /** D93: sidebar agent display name (display_agent is the role name); null clears it. Persists, no TTL. */
   reportDisplayAgent(name: string | null): Promise<void>;
@@ -161,6 +175,14 @@ export interface HerdrClientLike {
    * grade blocked + pi-ask as the ask level, distinct from plain block.
    */
   reportAskFlag(text: string | null): Promise<void>;
+  /** Delegation identity tokens (pi-parent/pi-task): who delegated this pane and for what task. */
+  reportDelegationTokens(d: DelegationContext | null): Promise<void>;
+  /**
+   * herdr 0.9.2+ self-reported restore: register the command that reopens this exact session after
+   * a server restart. Worker panes only; masters stay with herdr's native pi integration.
+   * Silently no-ops on older servers and on any error — resume is always best-effort.
+   */
+  reportAgentSessionResume(sessionId: string, resumeArgv: readonly string[]): Promise<void>;
   listAgents(): Promise<AgentInfo[]>;
   /** Inject text into a pane terminal (pi editor input + Enter); the PTY channel is used only to start launchLine. */
   sendPaneText(paneId: string, text: string): Promise<void>;
@@ -173,6 +195,8 @@ export interface HerdrClientLike {
   closePane(paneId: string): Promise<void>;
   createTab(opts: { workspaceId: string; label?: string; cwd?: string; env?: Record<string, string> }): Promise<{ tabId: string; paneId: string }>;
   listPanes(): Promise<PaneListItem[]>;
+  /** Foreground process snapshot; null when the server predates the method or the pane is gone. */
+  processInfo(paneId: string): Promise<PaneProcessInfo | null>;
   /** D91: layout tree by paneId or tabId; null on failure. */
   exportLayout(opts?: { paneId?: string; tabId?: string }): Promise<{ tabId: string | null; zoomed: boolean; root: unknown; focusedPaneId: string | null } | null>;
   /** 0.9.1: live pane rects for the tab containing paneId. Best effort returns null. */
@@ -212,8 +236,10 @@ function findIdIn(obj: unknown, key: string, depth = 0): string | null {
 export class NoopHerdrClient implements HerdrClientLike {
   readonly available = false;
   async reportAgent(): Promise<void> {}
+  async reportAgentSessionResume(): Promise<void> {}
   async reportMetadata(): Promise<void> {}
   async reportLockTokens(): Promise<void> {}
+  async reportDelegationTokens(): Promise<void> {}
   async reportDisplayAgent(): Promise<void> {}
   async reportAskFlag(): Promise<void> {}
   async sendPaneText(): Promise<void> {}
@@ -223,6 +249,7 @@ export class NoopHerdrClient implements HerdrClientLike {
   close(): void {}
   async listAgents(): Promise<AgentInfo[]> { return []; }
   async listPanes(): Promise<PaneListItem[]> { return []; }
+  async processInfo(): Promise<PaneProcessInfo | null> { return null; }
   async tabList(): Promise<TabInfo[]> { return []; }
   async waitAgent(): Promise<null> { return null; }
   async getAgentSessionPath(): Promise<null> { return null; }
@@ -312,6 +339,13 @@ export class HerdrClient implements HerdrClientLike {
 
   /* ── Reporting (silent best effort: the workbench mirror must never affect pi's main flow) ── */
 
+  /**
+   * D-2 (verified 2026-10-20): herdr's native `herdr:pi` integration owns `agent_status`
+   * (`screen_detection_skip_reason: full_lifecycle_hook_authority`), but it never reports the
+   * activity text. `pane.report_agent` is still the only carrier for the tool badge, so pier keeps
+   * sending state with the message; removing it requires migrating the badge to
+   * `report_metadata.state_labels` first.
+   */
   async reportAgent(state: PaneAgentState, message: string | null): Promise<void> {
     try {
       await this.request('pane.report_agent', {
@@ -325,16 +359,47 @@ export class HerdrClient implements HerdrClientLike {
     }
   }
 
-  // Single writer: herdr's native pi integration owns the session path, so pier never sends
-  // pane.report_agent_session; the activity badge stays on report_agent.
+  /**
+   * Master panes stay with herdr's native pi integration (it owns the session path); workers
+   * self-report so a restart replays pier's own launch line — extension loaded, role model, approve,
+   * fullscreen frame — instead of a bare `pi --resume` without `-e`. herdr requires the source to
+   * hold the pane before accepting a resume command (resume_not_accepted), so an idle state report
+   * goes first, with one retry to tolerate a lost race with the session_start gate report.
+   */
+  async reportAgentSessionResume(sessionId: string, resumeArgv: readonly string[]): Promise<void> {
+    if (!this.env) return;
+    try {
+      await this.reportAgent('idle', null);
+      const params = {
+        pane_id: this.env.paneId,
+        source: REPORT_AGENT_SOURCE,
+        agent: 'pi',
+        agent_session_id: sessionId,
+        resume_argv: [...resumeArgv],
+      };
+      try {
+        await this.request('pane.report_agent_session', params);
+      } catch {
+        const { promise: retryDelay, resolve: retryNow } = Promise.withResolvers<void>();
+        setTimeout(retryNow, 250);
+        await retryDelay;
+        await this.request('pane.report_agent_session', params);
+      }
+    } catch {
+      /* best effort: live sessions never depend on restore metadata */
+    }
+  }
 
-  async reportMetadata(meta: { session: string; items: readonly TodoItem[]; progressSuffix?: string | null; lastWriteAt?: number | null }): Promise<void> {
+  async reportMetadata(meta: { session: string; items: readonly TodoItem[]; progressSuffix?: string | null; lastWriteAt?: number | null; workerTag?: string | null }): Promise<void> {
     try {
       void meta.session;
-      const title = formatPaneTitle(meta.items, null, {
-        progressSuffix: meta.progressSuffix,
-        lastWriteAt: meta.lastWriteAt,
-      });
+      const title = applyWorkerTag(
+        formatPaneTitle(meta.items, null, {
+          progressSuffix: meta.progressSuffix,
+          lastWriteAt: meta.lastWriteAt,
+        }),
+        meta.workerTag ?? null,
+      );
       const blocked = formatBlockedLabel(meta.items);
       // D96: stale cleanup needs its own batch — stale(16) + pi-todo(1) exceeds herdr's 16-token
       // limit, and the rejected request would drop both the title and the tokens.
@@ -356,6 +421,22 @@ export class HerdrClient implements HerdrClientLike {
           : { clear_state_labels: true }),
         // D93: the todo summary is a custom token; an empty string clears the key instead of leaving a stale summary.
         tokens: sidebarTodoTokens(title),
+        ttl_ms: 86400000,
+      });
+    } catch {
+    }
+  }
+
+  /** RFC rfc-delegation-identity §2.3: separate batch — tokens patches never merge with the stale
+   * cleanup or the todo title (D96 discipline); an unknown parent pane skips the report. */
+  async reportDelegationTokens(d: DelegationContext | null): Promise<void> {
+    const tokens = d ? delegationSidebarTokens(d) : {};
+    if (Object.keys(tokens).length === 0) return;
+    try {
+      await this.request('pane.report_metadata', {
+        pane_id: this.env.paneId,
+        source: REPORT_AGENT_SOURCE,
+        tokens,
         ttl_ms: 86400000,
       });
     } catch {
@@ -511,6 +592,29 @@ export class HerdrClient implements HerdrClientLike {
       ...(p.terminal_title ? { terminalTitle: String(p.terminal_title) } : {}),
       ...(p.terminal_title_stripped ? { terminalTitleStripped: String(p.terminal_title_stripped) } : {}),
     }));
+  }
+
+  async processInfo(paneId: string): Promise<PaneProcessInfo | null> {
+    try {
+      const result = (await this.request('pane.process_info', { pane_id: paneId })) as Record<string, unknown> | null;
+      const info = (result?.process_info ?? result) as Record<string, unknown> | null | undefined;
+      if (!info || typeof info !== 'object') return null;
+      const raw = Array.isArray(info.foreground_processes) ? info.foreground_processes : [];
+      return {
+        paneId: typeof info.pane_id === 'string' ? info.pane_id : paneId,
+        shellPid: typeof info.shell_pid === 'number' ? info.shell_pid : null,
+        foreground: raw
+          .filter((p): p is Record<string, unknown> => p !== null && typeof p === 'object')
+          .map((p) => ({
+            name: typeof p.name === 'string' ? p.name : null,
+            argv0: typeof p.argv0 === 'string' ? p.argv0 : null,
+            pid: typeof p.pid === 'number' ? p.pid : null,
+            cwd: typeof p.cwd === 'string' ? p.cwd : null,
+          })),
+      };
+    } catch {
+      return null;
+    }
   }
 
   async exportLayout(opts: { paneId?: string; tabId?: string } = {}): Promise<{ tabId: string | null; zoomed: boolean; root: unknown; focusedPaneId: string | null } | null> {

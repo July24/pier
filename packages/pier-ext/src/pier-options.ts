@@ -47,7 +47,6 @@ export const PIER_OPTIONS: readonly OptionSpec[] = [
   { name: 'PIER_SETTLEMENT_WINDOW_MS', legacy: 'PI_HERDR_SETTLEMENT_WINDOW_MS', fallback: '60000', min: 0, policy: 'settlementWindowMs', description: 'settlement notice window / machine-inject grace / takeover idle' },
   { name: 'PIER_FOREGROUND_PATIENCE_MS', legacy: 'PI_HERDR_FOREGROUND_PATIENCE_MS', fallback: '300000', min: 0, policy: 'foregroundPatienceMs', description: 'foreground patience before demoting a subagent to background' },
   { name: 'PIER_SESSION_TTL_SECONDS', legacy: 'PI_HERDR_SESSION_TTL_SECONDS', fallback: '600', min: 0, policy: 'sessionTtlSeconds', description: 'session retention after a subagent exits, before GC' },
-  { name: 'PIER_FOCUS_POLL_MS', fallback: '1500', min: 0, description: 'pane-focus sampling cadence for the heat layout (0 disables; event-first on herdr 0.9.1+)' },
   { name: 'PIER_TERMINAL_PROMPT', legacy: 'PI_HERDR_TERMINAL_PROMPT', fallback: '(auto from $SHELL)', description: 'prompt strategy for terminal readiness: bash|zsh|powershell|pwsh' },
   { name: 'PIER_SLIM_FRAME', legacy: 'PI_HERDR_SLIM_FRAME', fallback: '1', description: 'mutation frame around todo-tool cards (0 disables)' },
   { name: 'PIER_TRACE', legacy: 'PI_HERDR_TRACE', fallback: '', description: 'write diagnostics (renderers, swallowed errors) to stderr (or to this file when it is a path)' },

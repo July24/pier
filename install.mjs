@@ -100,6 +100,11 @@ function tryRun(cmd, args) {
   try { run(cmd, args); return true; } catch (e) { log(`  (${e.message.split('\n')[0]})`); return false; }
 }
 
+/** Same as tryRun without the diagnostic line, for feature probes whose failure is expected. */
+function tryRunQuiet(cmd, args) {
+  try { run(cmd, args); return true; } catch { return false; }
+}
+
 function parseVersion(s) {
   const m = String(s).match(/(\d+)\.(\d+)\.(\d+)/);
   return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
@@ -145,13 +150,13 @@ function checkEnv() {
   if (major < 22) die(`node ≥ 22 required, found ${process.versions.node}`);
   log(`✓ node ${process.versions.node}`);
   const piVersion = (() => { try { return parseVersion(run('pi', ['--version'])); } catch { return null; } })();
-  if (!piVersion || !geVersion(piVersion, [0, 86, 0])) {
-    die(`pi ≥ 0.86.0 required${piVersion ? `, found ${piVersion.join('.')}` : ' (pi not found or not runnable)'}. Install: npm i -g @earendil-works/pi-coding-agent`);
+  if (!piVersion || !geVersion(piVersion, [1, 3, 0])) {
+    die(`pi ≥ 1.3.0 required${piVersion ? `, found ${piVersion.join('.')}` : ' (pi not found or not runnable)'}. Install: npm i -g @earendil-works/pi-coding-agent`);
   }
   log(`✓ pi ${piVersion.join('.')}`);
   const herdrVersion = (() => { try { return parseVersion(run('herdr', ['--version'])); } catch { return null; } })();
-  if (!herdrVersion || !geVersion(herdrVersion, [0, 9, 0])) {
-    die(`herdr ≥ 0.9.0 required${herdrVersion ? `, found ${herdrVersion.join('.')}` : ' (herdr not found)'}. Install: https://herdr.dev/`);
+  if (!herdrVersion || !geVersion(herdrVersion, [0, 9, 5])) {
+    die(`herdr ≥ 0.9.5 required${herdrVersion ? `, found ${herdrVersion.join('.')}` : ' (herdr not found)'}. Install: https://herdr.dev/`);
   }
   log(`✓ herdr ${herdrVersion.join('.')}`);
   return { piVersion, herdrVersion };
@@ -245,16 +250,57 @@ function pkgDirFromExtPath(extPath) {
   return null;
 }
 
-function herdrPluginInfo() {
-  let out;
-  try { out = run('herdr', ['plugin', 'list']); } catch { return { installed: false, spec: null, sha: null }; }
-  const line = out.split(/\r?\n/).find((l) => l.includes('pier.workbench'));
-  if (!line) return { installed: false, spec: null, sha: null };
+const HERDR_PLUGIN_ID = 'pier.workbench';
+const HERDR_PLUGIN_NAME = 'pier-workbench';
+const NOT_INSTALLED = Object.freeze({ installed: false, spec: null, sha: null, version: null, source: null, enabled: false });
+
+/** `plugin list --json` (herdr 0.9.5+): returns undefined for a malformed payload, null when the
+ *  plugin is absent, so the caller can fall back to the text listing on older binaries. */
+function parseHerdrPluginJson(out) {
+  let parsed;
+  try { parsed = JSON.parse(out); } catch { return undefined; }
+  const plugins = parsed?.result?.plugins ?? parsed?.plugins;
+  if (!Array.isArray(plugins)) return undefined;
+  const p = plugins.find((x) => x && (x.plugin_id === HERDR_PLUGIN_ID || x.name === HERDR_PLUGIN_NAME));
+  if (!p) return null;
+  const source = p.source && typeof p.source === 'object' ? p.source : {};
+  const kind = typeof source.kind === 'string' ? source.kind : null;
+  const root = typeof p.plugin_root === 'string' ? p.plugin_root : null;
+  const commit = typeof source.commit === 'string' ? source.commit : null;
+  const spec = kind === 'local'
+    ? `local:${root ?? p.manifest_path ?? ''}`
+    : (typeof p.version === 'string' ? `v${p.version}` : (kind ?? 'installed'));
+  return {
+    installed: true,
+    spec,
+    sha: commit ? commit.slice(0, 7) : null,
+    version: typeof p.version === 'string' ? p.version : null,
+    source: kind,
+    enabled: p.enabled === true,
+  };
+}
+
+function parseHerdrPluginText(out) {
+  const line = out.split(/\r?\n/).find((l) => l.includes(HERDR_PLUGIN_ID));
+  if (!line) return NOT_INSTALLED;
   const bracket = line.match(/\[([^\]]+)\]/);
   const spec = bracket ? bracket[1] : line.trim();
   const at = spec.lastIndexOf('@');
   const fullSha = at >= 0 && !spec.startsWith('local:') ? spec.slice(at + 1) : null;
-  return { installed: true, spec, sha: fullSha ? fullSha.slice(0, 7) : null };
+  return { installed: true, spec, sha: fullSha ? fullSha.slice(0, 7) : null, version: null, source: spec.startsWith('local:') ? 'local' : null, enabled: false };
+}
+
+function herdrPluginInfo() {
+  try {
+    const out = run('herdr', ['plugin', 'list', '--json']);
+    const parsed = parseHerdrPluginJson(out);
+    if (parsed !== undefined) return parsed ?? NOT_INSTALLED;
+  } catch { /* older herdr or no server; fall through to the text listing */ }
+  try {
+    return parseHerdrPluginText(run('herdr', ['plugin', 'list']));
+  } catch {
+    return NOT_INSTALLED;
+  }
 }
 
 function collectStatus() {
@@ -328,7 +374,13 @@ function update() {
     if (tryRun('pi', ['update', piSource()])) log(`✓ pi extension updated (${piSource()})`);
     else if (tryRun('pi', ['install', piSource()])) log(`✓ pi extension installed (${piSource()})`);
     else { console.error('✗ pi update/install failed'); log(`  manual: pi update ${piSource()}`); process.exitCode = 1; }
-    if (tryRun('herdr', ['plugin', 'install', HERDR_SPEC, '--yes'])) log(`✓ herdr plugin updated (${HERDR_SPEC})`);
+    // 0.9.4+ updates the GitHub checkout in place without disturbing running plugin panes.
+    // Only try it for an installed, non-local plugin; otherwise install from the configured spec.
+    const existing = herdrPluginInfo();
+    const updated = (existing.installed && existing.source !== 'local'
+      && tryRunQuiet('herdr', ['plugin', 'update', HERDR_PLUGIN_ID, '--yes']))
+      || tryRunQuiet('herdr', ['plugin', 'install', HERDR_SPEC, '--yes']);
+    if (updated) log(`✓ herdr plugin updated (${HERDR_SPEC})`);
     else { console.error('✗ herdr plugin update failed'); log(`  manual: herdr plugin install ${HERDR_SPEC} --yes`); process.exitCode = 1; }
   }
   log('');

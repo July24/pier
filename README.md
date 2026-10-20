@@ -23,9 +23,12 @@ pier ships as **two halves**, installed separately:
 
 ### Highlights
 
-- **Todo loop**: `todo_write` with full-replace semantics, session JSONL as source of truth, correct branch rollback; live pane-title projection `▶i ○p ■b ✓c (N/M) · current task`; TUI widget is an activity-anchored window (the in_progress entry and its surrounding context stay visible as work moves down the list); `/todos` command (including unblock)
+- **Todo loop**: `todo_write` with full-replace semantics, session JSONL as source of truth, correct branch rollback; live pane-title projection `▶i ○p ■b ✓c (N/M) · current task`; `/todos` command (including unblock)
 - **Todo anti-freeze**: an all-completed list unchanged for ≥6 turns flips the read hook from recitation to a rewrite warning; after ≥1h it archives — first offering one rewrite window with old entries as reference, then (if ignored) a final notice that clears the list (rm persisted to JSONL; the empty guard takes over — multi-step work must re-track); `/todos` still shows history, session JSONL untouched
 - **Interactive subagents**: every subagent = an isolated pi session in its own pane (separate context window); **a human can enter that pane and talk to it directly** (fix bugs, take over, answer ask_user_question)
+- **Delegation identity** (D111): spawn hands the worker a `PI_HERDR_DELEGATION` context (parent pane/session, taskId, task, role), replayed env > worker marker > branch fold; the worker's system prompt gains a `pier-delegation` section (identity + one stable delivery contract), its transcript opens with an "⟵ delegated by master …" card, and its pane title carries an `↳` prefix; `pi-parent`/`pi-task` herdr tokens ride their own report batch, the dashboard groups workers under their master, and blocked alerts name the edge (`worker ← master`)
+- **Task slugs + worker progress reports** (D112): spawn allocates a task slug (numbered on collision); tool outputs print `slug@paneId` and `agentId` accepts the bare slug, bare pane id, or the combined form (the slug part survives a revive that changed the pane); a worker-only `report_progress` tool pipes checkpoints into the master's context as a display-less custom message — no chat flood, no forced turn
+- **Unified TUI status strip** (D113): the resident widget is one line per agent — self as `▶ current item ✓done/total`, each running subagent as `↳ slug ▶ current item ✓d/n` (blocked shows the task + reason; settled rows never occupy the strip); workers push their full todo list over the pipe on every `todo_write` (event-driven, no polling), and `/pier-tree` opens the complete delegation tree (your todos + every worker's full list + settled nodes); `/dashboard` stays the ops panel
 - **Subagent output preview**: `subagent(action: "output", agentId)` returns what a running background subagent has printed since the previous call — an in-memory per-pane cursor computes the delta (`agent.read`, falling back to `pane.read` on older herdr), and the result carries status, revision, truncation and a `restart` flag for scrolled/cleared buffers, so the master can notice a stuck worker instead of waiting for settlement
 - **Soft write-locks**: per-pane lock beacons on `write`/`edit` paths; cross-pane conflicts warn (default) or block (`PI_HERDR_WRITE_LOCK=1`). The warning lists every holder; `/locks` is the human view of the same table (`herdr agent list` exposes the raw tokens to agents)
 - **Role profiles**: built-in `master` / `worker-default`; custom roles as `.pi-herdr/roles/<name>.json`; toolset converges per role (deny rules are not bypassable)
@@ -45,8 +48,8 @@ pier ships as **two halves**, installed separately:
 ### Requirements
 
 - Node ≥ 22
-- pi ≥ 0.86.0 (`@earendil-works/pi-coding-agent`) — dynamic toolset (transcript-backed `setActiveTools` deltas) and role switching require it
-- herdr ≥ 0.9.0 (macOS / Linux / Windows; Windows is preview beta)
+- pi ≥ 1.3.0 (`@earendil-works/pi-coding-agent`) — `before_agent_start.messageType` and resumed-session active tools
+- herdr ≥ 0.9.5 (macOS / Linux / Windows; Windows is preview beta) — native `pane.focused`, self-reported resume, and shutdown-safe session saves
 
 ### One-shot install (recommended)
 
@@ -169,7 +172,6 @@ Runtime policies and operational limits are centralized in `runtime-policy.ts` (
 | `PIER_READY_TIMEOUT_MS` | `90000` | ms | Subagent pane pipe readiness wait (exponential backoff; a pane that exited fails immediately with its last output attached) |
 | `PIER_SESSION_TTL_SECONDS` | `600` | s | Session retention TTL after subagent exit before GC cleanup |
 | `PIER_GIT_TIMEOUT_MS` | `10000` | ms | Execution timeout for git operations (worktree creation, diff summary, cleanup) |
-| `PIER_FOCUS_POLL_MS` | `1500` / `0` | ms | Focus sampling for heat layout (`0` disables). Default 1500ms on Herdr <0.9.1; 0 (event-first) on 0.9.1+ |
 | `PIER_TERM_READ_MAX` | `8000` | chars | Maximum terminal buffer characters read per operation |
 | `PIER_TERM_IDLE_MS` | `1800000` | ms | Idle time before pier nudges about an open terminal |
 | `PIER_TODO_GRACE_MS` | `30000` | ms | Settle grace before the unfinished-todo reminder |
@@ -189,10 +191,12 @@ processes stay as they are (`PI_HERDR_SUBAGENT`, `PI_HERDR_ROLE_MANIFEST`, `PI_H
 `/pier-config doctor` lists every option with its effective value and where it came from, plus the
 errors pier deliberately swallowed this session.
 
-**Focus heat:** Herdr 0.9.0 resolved mouse focus in the client and did not deliver `pane.focused`
-to plugins, so each pane sampled `layout.export → focused_pane_id` and replayed the workbench
-event. Herdr 0.9.1+ delivers `pane.focused` natively, so the poller defaults off. Override with
-`PIER_FOCUS_POLL_MS`; `PIER_WORKBENCH_ROOT` points at a relocated plugin checkout.
+**Focus heat:** Herdr 0.9.5 delivers `pane.focused` natively, so pier starts no per-pane sampler;
+the workbench receives the event directly. `PIER_WORKBENCH_ROOT` points at a relocated plugin checkout.
+
+**Upstream tracking:** pi 1.3 / herdr 0.9.5 impact, version-floor cleanup, and the next extension
+directions (remote machines, native worktrees, plugin actions):
+**[docs/rfc-upstream-absorption-2026-10.md](docs/rfc-upstream-absorption-2026-10.md)**.
 
 ### Efficiency mechanisms (D100–D103, opt-in)
 

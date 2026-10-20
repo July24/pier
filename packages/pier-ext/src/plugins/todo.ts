@@ -7,16 +7,17 @@
  */
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
-import type { PiSurface } from '../pi-surface.ts';
+import { cordisGet } from '../cordis-services.ts';
 import type { TodosService } from '../todos-service.ts';
-import { planTodoReadHook } from '../todo-read-hook.ts';
+import { planTodoReadHook, shouldRunTodoRead } from '../todo-read-hook.ts';
 import { TODO_REMINDER_CUSTOM_TYPE, planStopTodoReminder, todoReminderGraceMs } from '../todo-reminder-core.ts';
 import { makeProgressUpdate } from '../subagent-core.ts';
 import { TODO_DETAILS_KEY, TODO_STATUSES, TODO_TOOL_NAME, formatTodoConfirmation, type TodoItem } from '../vocab.ts';
 import { toolError } from '../tool-error.ts';
 import { formatAge, isArchived } from '../stale-core.ts';
 import { TODO_EDIT_CUSTOM_TYPE, completionTransitions, fuzzyFind, listsEqual, makeSnapshot, normalizeStrict, revertedCompleted, validateTodos, type TodoEditOp } from '../todo-core.ts';
-import { anchorTodoRange, formatTodoSummary, renderTodoGroups } from '../todo-window.ts';
+import { formatTodoSummary, renderTodoGroups } from '../todo-window.ts';
+import { unifiedWidgetLines, type WorkerWidgetRow } from '../tree-view.ts';
 import { swallow } from '../swallow.ts';
 
 type ToolParams = Record<string, unknown> | undefined;
@@ -29,7 +30,7 @@ export interface TodoUiSlot {
   cancelReminder?: () => void;
 }
 
-interface TodoDeps {
+export interface TodoDeps {
   todos: TodosService;
   allowParallelInProgress: boolean;
   /** Warn above this size without rejecting otherwise valid plans. */
@@ -39,6 +40,8 @@ interface TodoDeps {
   state: TodoUiSlot;
   /** Human-gate depth (ask_user_question / herdr:blocked); >0 collapses the widget to one line. */
   getBlockedDepth?: () => number;
+  /** D113: running subagent rows for the unified widget; master mounts only. */
+  getWorkers?: () => readonly WorkerWidgetRow[];
   /** Master-only unfinished-todo reminder; omitted on worker panes. */
   stopReminder?: {
     getBlockedDepth: () => number;
@@ -58,8 +61,6 @@ const TOOL_DESCRIPTION = [
   'Delegated work belongs on this list too. When you hand an entry to a subagent, append ` <sub>` to its content (the subagent is doing it, not you); when the subagent settles, a matching entry is auto-completed — you will see "Reconciled:" in the settlement note. If no auto-match fired, update the entry yourself.',
 ].join(' ');
 
-/** pi interactive mode renders at most ten widget lines. */
-const WIDGET_MAX_LINES = 10;
 
 /** `/todos <op> <query>` verbs; the value is the user-facing past-tense feedback. */
 const OP_VERBS: Record<TodoEditOp, string> = {
@@ -69,48 +70,21 @@ const OP_VERBS: Record<TodoEditOp, string> = {
   rm: 'removed',
 };
 
-/**
- * Keep the active task visible within WIDGET_MAX_LINES rather than truncating to a fixed head or tail:
- * the window anchors on the first in-progress item, then the last open item, then recent completions.
- */
+/** D113 unified resident widget (see tree-view.ts for the line rules). */
 export function widgetLines(
   items: readonly TodoItem[],
-  opts?: { archivedAgeMs?: number | null; blockedDepth?: number | null },
+  opts?: { archivedAgeMs?: number | null; blockedDepth?: number | null; workers?: readonly WorkerWidgetRow[] },
 ): string[] {
-  if (items.length === 0) return [];
-  // Human gate open (ask_user_question waiting): the question and editor own the fixed area, so the widget
-  // collapses to one summary line — a 10-line widget plus a multi-line question would leave no scrollable transcript.
-  if ((opts?.blockedDepth ?? 0) > 0) {
-    return [`${formatTodoSummary(items)} · /todos 全量`];
-  }
-  // Collapse archived plans to two lines so stale work cannot monopolize the widget.
-  if (opts?.archivedAgeMs != null) {
-    return [
-      `${formatTodoSummary(items)} · archived ${formatAge(opts.archivedAgeMs)}`,
-      '  archived — /todos 全量',
-    ];
-  }
-
-  // Reserve summary and overflow lines; phase headers consume the budget too, hence the shrink loop.
-  const renderBudget = WIDGET_MAX_LINES - 2;
-  const [start, end] = anchorTodoRange(
-    items,
-    (s, e) => renderTodoGroups(items.slice(s, e)).length <= renderBudget,
-  );
-  const kept = items.slice(start, end);
-  const hidden = items.filter((_, i) => i < start || i >= end);
-  const lines = [formatTodoSummary(items), ...renderTodoGroups(kept)];
-  if (hidden.length > 0) {
-    const hiddenCompleted = hidden.filter((it) => it.status === 'completed').length;
-    lines.push(`   +${hidden.length} hidden (${hiddenCompleted}✓) · /todos 全量`);
-  }
-  return lines;
+  return unifiedWidgetLines(items, opts?.workers ?? [], {
+    archivedAgeMs: opts?.archivedAgeMs,
+    blockedDepth: opts?.blockedDepth,
+  });
 }
 
 export default function todoPlugin(ctx: Context): void {
-  const surface = ctx.get('pi-herdr.surface') as PiSurface<object>;
-  const { todos, allowParallelInProgress, maxItems, mirrorTodos, appendEntry, state, stopReminder, getBlockedDepth } =
-    ctx.get('pi-herdr.todo-deps') as TodoDeps;
+  const surface = cordisGet(ctx, 'pi-herdr.surface');
+  const { todos, allowParallelInProgress, maxItems, mirrorTodos, appendEntry, state, stopReminder, getBlockedDepth, getWorkers } =
+    cordisGet(ctx, 'pi-herdr.todo-deps');
   const scoped = surface.forModule(import.meta.url);
 
   /** Share one archive-age decision between the widget and /todos. */
@@ -129,6 +103,7 @@ export default function todoPlugin(ctx: Context): void {
       ui?.setWidget?.('todos', widgetLines(todos.items, {
         archivedAgeMs: archivedAgeMs(),
         blockedDepth: getBlockedDepth?.() ?? 0,
+        workers: getWorkers?.() ?? [],
       }));
     } catch {
       /* Older pi versions may omit widget support without disabling todo tracking. */
@@ -152,6 +127,9 @@ export default function todoPlugin(ctx: Context): void {
   });
 
   scoped.on('before_agent_start', async (eventCtx?: unknown) => {
+    // pi 1.2+ also fires this for extension-triggered runs; skip the ones that would double-inject
+    // or consume the guard cadence (stop reminder, config guide, third-party custom runs).
+    if (!shouldRunTodoRead(eventCtx)) return;
     const plan = planTodoReadHook({
       items: todos.items,
       turn: todoReadTurn,

@@ -15,6 +15,11 @@ export interface SettleWakeInput {
   lastStopReason: string | null;
   /** True when abort was triggered intentionally by internal mechanisms like OCC. */
   intentionalAbort?: boolean;
+  /**
+   * pi ≥ 1.1 carries `aborted` on agent_settled itself: authoritative for runs cancelled without a
+   * final assistant message (ESC mid-tool), where stopReason tracking sees a stale natural reason.
+   */
+  aborted?: boolean;
   running: ReadonlyArray<{ paneId: string }>;
   lastNoticeKey: string | null;
   lastNoticeAt: number;
@@ -50,7 +55,7 @@ export function planSettleWake(input: SettleWakeInput): SettleWakePlan {
       noticeAt: input.lastNoticeAt,
     };
   }
-  if (input.intentionalAbort || input.lastStopReason === ABORT_STOP_REASON) {
+  if (input.aborted === true || input.intentionalAbort || input.lastStopReason === ABORT_STOP_REASON) {
     return {
       wake: false,
       compact: input.intentionalAbort === true,
@@ -79,10 +84,13 @@ export function planSettleWake(input: SettleWakeInput): SettleWakePlan {
  */
 export function shouldPushSettleReply(input: {
   intentionalAbort?: boolean;
+  /** pi ≥ 1.1 agent_settled.aborted: the run was cancelled — the closing message may still come after a re-run. */
+  aborted?: boolean;
   compactionInFlight?: boolean;
   lastStopReason: string | null;
 }): boolean {
   return !input.intentionalAbort
+    && input.aborted !== true
     && !input.compactionInFlight
     && input.lastStopReason !== ABORT_STOP_REASON;
 }

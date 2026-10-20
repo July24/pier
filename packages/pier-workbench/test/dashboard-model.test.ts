@@ -52,6 +52,27 @@ test('composeDashboardLines: targetWorkspaceId option overrides focused workspac
   assert.ok(text.includes('Summary: 1 pane(s) | Pier agents: 1 (0 working, 0 blocked, 1 idle)'));
 });
 
+test('composeDashboardLines: pi-parent tokens group workers under their delegating master; blocked alert attributes the source', () => {
+  const snapshot: SessionSnapshotData = {
+    version: '0.9.2', protocol: 22, focused_workspace_id: 'w1',
+    workspaces: [{ workspace_id: 'w1', label: 'pier' }],
+    tabs: [{ tab_id: 'w1:t1', workspace_id: 'w1', number: 1, label: 'main' }],
+    panes: [
+      { pane_id: 'w1:p1', workspace_id: 'w1', tab_id: 'w1:t1', agent: 'pi', display_agent: 'master', agent_status: 'working', focused: true, tokens: { 'pi-todo': '▶1 ○1 ✓0 · orchestrating' } },
+      { pane_id: 'w1:p3', workspace_id: 'w1', tab_id: 'w1:t1', agent: 'pi', display_agent: 'worker', agent_status: 'blocked', tokens: { 'pi-parent': 'w1:p1', 'pi-task': 'run migration tests' } },
+      { pane_id: 'w1:p2', workspace_id: 'w1', tab_id: 'w1:t1', agent: 'pi', display_agent: 'worker', agent_status: 'idle', tokens: { 'pi-parent': 'w1:p1' } },
+      { pane_id: 'w1:p4', workspace_id: 'w1', tab_id: 'w1:t1', agent: 'shell', agent_status: 'idle', tokens: { 'pi-parent': 'w1:pGone' } },
+    ],
+  };
+  const text = composeDashboardLines(snapshot, { now: 1700000000000 }).join('\n');
+  const rows = text.split('\n').filter((l) => /^w1:p\d|^↳ w1:p\d/.test(l));
+  assert.deepEqual(rows.map((r) => r.slice(0, 10).trimEnd()), ['w1:p1', '↳ w1:p3', '↳ w1:p2', 'w1:p4'], 'children follow their parent; an orphan parent stays flat');
+  // Worker desc falls back through pi-todo → title; the blocked worker carries its delegated task.
+  assert.ok(text.includes('↳ w1:p3'));
+  assert.ok(text.includes('! BLOCKED'));
+  assert.ok(text.includes('⚠️  ALERT: 1 SUBAGENT(S) BLOCKED — WAITING ON HUMAN DECISION [w1:p3 ← w1:p1]'), 'alert names the delegation edge');
+});
+
 test('composeDashboardLines: Herdr 0.9.1 terminal_title_stripped and foreground_cwd display', () => {
   const snapshot = {
     workspaces: [{ workspace_id: 'w1', label: 'test' }],

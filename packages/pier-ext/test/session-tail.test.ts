@@ -191,6 +191,18 @@ test('abort suppression: a settled turn after ESC wakes nothing and keeps the de
   assert.equal(plan.compact, false, 'a foreign (ESC) abort never starts a compaction');
 });
 
+test('agent_settled.aborted (pi ≥ 1.1): a cancelled run wakes nothing even when stopReason looks natural', () => {
+  const plan = planSettleWake({ lastStopReason: 'stop', aborted: true, running: SUBS, lastNoticeKey: null, lastNoticeAt: 0, now: T0 });
+  assert.equal(plan.wake, false, 'ESC mid-tool settles without a final assistant message — stopReason is stale');
+  assert.equal(plan.notice, false);
+  assert.equal(plan.compact, false, 'a user cancel is not the settlement a selected compaction waits for');
+});
+
+test('shouldPushSettleReply: an aborted settle keeps the machine request armed for the re-run', () => {
+  assert.equal(shouldPushSettleReply({ aborted: true, lastStopReason: 'stop' }), false);
+  assert.equal(shouldPushSettleReply({ lastStopReason: 'stop' }), true);
+});
+
 test('OCC abort: silent settle that still hands off to the compaction coordinator', () => {
   const plan = planSettleWake({ lastStopReason: 'aborted', intentionalAbort: true, running: SUBS, lastNoticeKey: null, lastNoticeAt: 0, now: T0 });
   assert.equal(plan.wake, false);

@@ -4,7 +4,8 @@
  * needed and older pi builds degrade to "no renderer".
  */
 import { TODO_EDIT_CUSTOM_TYPE, type TodoEditPayload } from './todo-core.ts';
-import { SUBS_CUSTOM_TYPE, type SubsRegistry } from './subagent-core.ts';
+import { SUBS_CUSTOM_TYPE, PROGRESS_CUSTOM_TYPE, subRef, type SubsRegistry } from './subagent-core.ts';
+import { DELEGATION_CUSTOM_TYPE } from './delegation-core.ts';
 import { TERMINALS_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE, type TerminalsRegistry } from './terminal-core.ts';
 import { TODO_REMINDER_CUSTOM_TYPE } from './todo-reminder-core.ts';
 
@@ -94,8 +95,29 @@ function subsLines(data: unknown, theme: RenderTheme, expanded: boolean): string
     label: 'subagents',
     unit: 'tracked',
     ...(running ? { badge: `${running} running` } : {}),
-    row: (sub) => `  ${sub.status === 'running' ? '●' : '○'} ${sub.paneId} · ${sub.status} · ${clip(String(sub.description ?? ''), 70)}`,
+    // Every registry row IS a delegated worker (↳ marks the delegation edge; status text carries state).
+    row: (sub) => `  ↳ ${subRef(sub)} · ${sub.status} · ${clip(String(sub.description ?? ''), 70)}`,
   });
+}
+
+/** First-frame delegation card in the worker's own transcript (RFC rfc-delegation-identity §2.3). */
+function delegationLines(data: unknown, theme: RenderTheme, expanded: boolean): string[] {
+  const rec = (data ?? {}) as {
+    parentPaneId?: unknown;
+    parentSessionId?: unknown;
+    taskId?: unknown;
+    description?: unknown;
+    role?: unknown;
+  };
+  const parent = typeof rec.parentPaneId === 'string' && rec.parentPaneId ? rec.parentPaneId : '?';
+  const head = `${theme.fg('accent', '⟵ delegated')} ${theme.fg('dim', `by master ${parent} · ${clip(String(rec.description ?? ''), 60)}`)}`;
+  if (!expanded) return [head];
+  const session = typeof rec.parentSessionId === 'string' && rec.parentSessionId ? rec.parentSessionId : '?';
+  const role = typeof rec.role === 'string' && rec.role ? rec.role : '?';
+  return [
+    head,
+    theme.fg('dim', `  task ${typeof rec.taskId === 'string' ? rec.taskId : '?'} · role ${role} · parent session ${session}`),
+  ];
 }
 
 function terminalsLines(data: unknown, theme: RenderTheme, expanded: boolean): string[] {
@@ -135,6 +157,17 @@ function approvalLines(data: unknown, theme: RenderTheme): string[] {
   const role = typeof rec.role === 'string' ? rec.role : '?';
   const tool = typeof rec.tool === 'string' ? rec.tool : '?';
   return [`${theme.fg('warning', '⚠ approval needed')} ${theme.fg('dim', `· ${tool} (${role})`)}`];
+}
+
+/** Phase 2: worker progress note (display-less custom message) as a one-line card — the sender
+ * pane rides `details.paneId`; keep it recognizable without flooding the transcript. */
+function progressLines(message: unknown, theme: RenderTheme, expanded: boolean): string[] {
+  const rec = (message ?? {}) as { content?: unknown; details?: { paneId?: unknown } };
+  const from = typeof rec.details?.paneId === 'string' && rec.details.paneId ? rec.details.paneId : '?';
+  const content = typeof rec.content === 'string' ? rec.content : '';
+  const head = `${theme.fg('accent', '⤴ progress')} ${theme.fg('dim', `· ${from}: ${clip(content, 100)}`)}`;
+  if (!expanded) return [head];
+  return [head, ...content.split('\n').map((line) => theme.fg('dim', line))];
 }
 
 /** Reminder custom messages carry the full injected text; restyle without altering it. */
@@ -179,8 +212,10 @@ export function installRenderers(pi: unknown): string[] {
   entry(TODO_EDIT_CUSTOM_TYPE, todoEditLines);
   entry(SUBS_CUSTOM_TYPE, subsLines);
   entry(TERMINALS_CUSTOM_TYPE, terminalsLines);
+  entry(DELEGATION_CUSTOM_TYPE, delegationLines);
   entry(ROLE_MANIFEST_CUSTOM_TYPE, (data, theme) => roleManifestLines(data, theme));
   entry(APPROVAL_NEEDED_CUSTOM_TYPE, (data, theme) => approvalLines(data, theme));
+  message(PROGRESS_CUSTOM_TYPE, progressLines);
   message(TODO_REMINDER_CUSTOM_TYPE, (msg, theme, expanded) => reminderLines(msg, theme, 'todo reminder', expanded));
   message(TERM_REMINDER_CUSTOM_TYPE, (msg, theme, expanded) => reminderLines(msg, theme, 'terminal nudge', expanded));
   return registered;

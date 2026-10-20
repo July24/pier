@@ -5,6 +5,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { Server } from 'node:net';
 import { PiSurface } from './pi-surface.ts';
 import { createCordisApp } from './bootstrap.ts';
+import { cordisProvide } from './cordis-services.ts';
 import { disposeSessionRoot } from './subagent-poller.ts';
 import terminalPlugin from './plugins/terminal.ts';
 import todoPlugin from './plugins/todo.ts';
@@ -15,7 +16,7 @@ import type { RoutingTelemetryRecord } from './routing-telemetry.ts';
 import type { TodosService } from './todos-service.ts';
 import type { TodoUiSlot } from './plugins/todo.ts';
 import type { SubagentPortBox } from './subagent-core.ts';
-import type { SubagentDeps } from './plugins/subagent.ts';
+import type { WorkerWidgetRow } from './tree-view.ts';
 
 export interface MasterPluginMount {
   pi: ExtensionAPI;
@@ -40,6 +41,8 @@ export interface MasterPluginMount {
   jev?: { ask: JevRuntime['ask']; getMinConfidence: () => number };
   /** Phase 0 routing telemetry append (RFC rfc-jev-role-routing §8); absent in tests. */
   appendRoutingLog?: (row: RoutingTelemetryRecord) => void;
+  /** D113: running subagent rows joined with their cached todos — feeds the unified widget. */
+  getWorkers?: () => readonly WorkerWidgetRow[];
 }
 
 async function loadEntry(
@@ -74,17 +77,17 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
   }, 'pipe-server');
 
   const surface = new PiSurface(m.pi as unknown as object, cordisApp.ledger);
-  sessionRoot.provide('pi-herdr.surface', surface);
+  cordisProvide(sessionRoot, 'pi-herdr.surface', surface);
   const terminalDeps = {
     client: m.client,
     env: m.env,
     state: { activePaneIds: (): Set<string> => new Set() },
   };
-  sessionRoot.provide('pi-herdr.terminal-deps', terminalDeps);
+  cordisProvide(sessionRoot, 'pi-herdr.terminal-deps', terminalDeps);
 
   await loadEntry(sessionRoot, useLoader, './plugins/terminal.ts', terminalPlugin);
 
-  sessionRoot.provide('pi-herdr.todo-deps', {
+  cordisProvide(sessionRoot, 'pi-herdr.todo-deps', {
     todos: m.todos,
     allowParallelInProgress: m.todos.config.allowParallelInProgress,
     maxItems: 15,
@@ -93,6 +96,7 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
       (m.pi as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.(customType, data);
     },
     state: m.todoUi,
+    ...(m.getWorkers ? { getWorkers: m.getWorkers } : {}),
     getBlockedDepth: m.getBlockedDepth,
     stopReminder: {
       getBlockedDepth: m.getBlockedDepth,
@@ -103,9 +107,8 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
   });
   await loadEntry(sessionRoot, useLoader, './plugins/todo.ts', todoPlugin);
 
-  // D98 regression guard: `satisfies` makes tsc reject a missing/mistyped key here — the bag is
-  // consumed untyped by plugins/subagent.ts, and the fe99252 crash was exactly a dropped key.
-  sessionRoot.provide('pi-herdr.subagent-deps', {
+  // Dropped keys fail here: cordisProvide checks the bag against PierCordisServices (fe99252).
+  cordisProvide(sessionRoot, 'pi-herdr.subagent-deps', {
     client: m.client,
     env: m.env,
     extPath: m.extPath,
@@ -120,7 +123,7 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
     terminalState: terminalDeps.state,
     ...(m.jev ? { jev: m.jev } : {}),
     ...(m.appendRoutingLog ? { logRouting: m.appendRoutingLog } : {}),
-  } satisfies SubagentDeps);
+  });
   await loadEntry(sessionRoot, useLoader, './plugins/subagent.ts', subagentPlugin);
 
   m.pi.on('session_shutdown', () => {

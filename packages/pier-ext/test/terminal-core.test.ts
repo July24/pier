@@ -3,6 +3,7 @@
 import { test, mock, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { Context } from '@deepseek-ai/cordis';
+import { cordisProvide } from '../src/cordis-services.ts';
 import terminalPlugin from '../src/plugins/terminal.ts';
 import {
   MAX_TERMINALS, POSIX_PROMPT, POWERSHELL_PROMPT, PROMPT_TAIL_RE, SIGNAL_KEYS, TERMINALS_CUSTOM_TYPE, TERM_REMINDERS_MAX,
@@ -237,8 +238,8 @@ async function mountTerminal(t: TestContext, opts: { client?: Partial<HerdrClien
   const ledger = new DisposeLedger();
   const deps = { client, env: { paneId: 'p1', tabId: 't1' }, state: { activePaneIds: (): Set<string> => new Set() } };
   const ctx = new Context();
-  ctx.provide('pi-herdr.surface', new PiSurface(pi as unknown as object, ledger));
-  ctx.provide('pi-herdr.terminal-deps', deps);
+  cordisProvide(ctx, 'pi-herdr.surface', new PiSurface(pi as unknown as object, ledger));
+  cordisProvide(ctx, 'pi-herdr.terminal-deps', deps);
   await ctx.plugin(terminalPlugin);
   t.after(() => ctx.fiber.dispose());
   if (opts.open) await run(pi, { action: 'open' }, { cwd: 'F:/w' });

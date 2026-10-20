@@ -58,7 +58,7 @@ export function reducerObjectPath(root: string, sha256: string): string {
 
 export function efficiencyLogPath(
   root: string,
-  mechanism: 'compact' | 'observation' | 'reducer' | 'jev' | 'routing',
+  mechanism: 'compact' | 'observation' | 'reducer' | 'jev' | 'routing' | 'tools',
   customPath?: string,
 ): string {
   if (customPath && typeof customPath === 'string') return resolve(customPath);

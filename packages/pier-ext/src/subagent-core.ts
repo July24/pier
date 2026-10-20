@@ -3,6 +3,7 @@
  * decisions, task-id resolution, and the outbound port types. Pure: planners decide, adapters do I/O.
  */
 import { normalizeEntryKind } from './history-store.ts';
+import { Type } from 'typebox';
 
 export function sleep(ms: number): Promise<void> {
   const { promise, resolve } = Promise.withResolvers<void>();
@@ -22,6 +23,113 @@ export function buildLaunchLine(parts: readonly string[], platform: NodeJS.Platf
     ? `'${String(s).replace(/'/g, "''")}'`
     : `'${String(s).replace(/'/g, `'\\''`)}'`));
   return (win ? '& ' : '') + quoted.join(' ');
+}
+
+/** Shells that mean a freshly split pane is at its prompt and can accept a launch line. */
+const SHELL_PROCESS_NAMES: ReadonlySet<string> = new Set([
+  'sh', 'bash', 'zsh', 'fish', 'dash', 'ksh', 'mksh', 'tcsh', 'csh', 'nu', 'login',
+  'pwsh', 'powershell', 'cmd',
+]);
+
+/** Normalize `name` / `argv0` (`/bin/zsh`, `C:\\Windows\\System32\\cmd.exe`, `-zsh`) to a shell key. */
+export function shellProcessName(value: string | null | undefined): string {
+  const base = String(value ?? '').replace(/\\/g, '/').split('/').pop()?.toLowerCase() ?? '';
+  const stripped = base.replace(/^-/, '').replace(/\.exe$/, '');
+  return stripped;
+}
+
+/**
+ * Decide whether a pane's foreground set means its shell is ready for input. `null`/`undefined`
+ * means the probe was unavailable: return ready so an older herdr never adds spawn latency.
+ * An empty set is not proof (the shell may still be starting), so callers wait for the timeout.
+ */
+export function planShellReady(
+  foreground: ReadonlyArray<{ name?: string | null; argv0?: string | null }> | null | undefined,
+): 'ready' | 'wait' {
+  if (foreground == null) return 'ready';
+  if (foreground.length === 0) return 'wait';
+  return foreground.some((p) => SHELL_PROCESS_NAMES.has(shellProcessName(p.name)) || SHELL_PROCESS_NAMES.has(shellProcessName(p.argv0)))
+    ? 'ready'
+    : 'wait';
+}
+
+/** Flags pier passes at spawn (buildLaunchParts) that a herdr 0.9.2+ resume command must replay. */
+const RESUME_FLAG_ARITY: Record<string, number> = {
+  '-a': 0,
+  '-e': 1,
+  '--extension': 1,
+  '--tui-mode': 1,
+  '--provider': 1,
+  '--model': 1,
+  '--session': 1,
+};
+
+const RESUME_MAX_ARGS = 64;
+const RESUME_MAX_BYTES = 8 * 1024;
+
+/**
+ * herdr 0.9.2 self-report (docs "Add Herdr support to your agent"): rebuild this worker's launch
+ * line as a `resume_argv` herdr runs after a server restart. The worker's own process.argv is the
+ * source of truth — interpreter and cli.js paths are dropped, whitelisted spawn flags are mirrored
+ * (`--flag=value` splits), argv[0] becomes a plain PATH command name. herdr rules: argv[0] plain,
+ * no apostrophes/control characters, ≤64 args, ≤8 KiB; violations (or a missing `-e`, which could
+ * not restore the extension) return null and the caller skips the report — restore stays best-effort.
+ */
+export function buildResumeArgv(workerArgv: readonly string[], piBin = 'pi'): string[] | null {
+  if (!/^[A-Za-z0-9._-]+$/.test(piBin)) return null;
+  const collected: string[] = [];
+  let index = 0;
+  // Skip interpreter + cli script (everything before the first flag).
+  while (index < workerArgv.length && !workerArgv[index]!.startsWith('-')) index++;
+  for (; index < workerArgv.length; index++) {
+    const raw = workerArgv[index]!;
+    if (!raw.startsWith('-')) continue; // positional (unknown flag's value) — not pier spawn shape
+    const eq = raw.indexOf('=');
+    const flag = eq > 0 ? raw.slice(0, eq) : raw;
+    const inlineValue = eq > 0 ? raw.slice(eq + 1) : null;
+    const arity = RESUME_FLAG_ARITY[flag];
+    if (arity === undefined) continue; // pi-internal flags are not replayed
+    if (arity === 0) {
+      collected.push(flag);
+    } else if (inlineValue !== null) {
+      collected.push(flag, inlineValue);
+    } else if (index + 1 < workerArgv.length) {
+      collected.push(flag, workerArgv[++index]!);
+    }
+  }
+  if (!collected.some((f, i) => (f === '-e' || f === '--extension') && i + 1 < collected.length)) return null;
+  const argv = [piBin, ...collected];
+  if (argv.length > RESUME_MAX_ARGS) return null;
+  if (argv.some((a) => /['\u0000-\u001f\u007f]/.test(a))) return null;
+  if (argv.reduce((sum, a) => sum + a.length + 1, 0) > RESUME_MAX_BYTES) return null;
+  return argv;
+}
+
+/**
+ * pi ≥ 0.99 outputSchema for the subagent tool: the `details` each action already produces, stamped
+ * with the normalized action. Codemode scripts (and any structured consumer) read this instead of
+ * parsing the prose reply; the text content stays authoritative for the transcript. Hard failures
+ * throw (toolError), so every returned value is a success and always carries structuredContent.
+ */
+export const SUBAGENT_OUTPUT_SCHEMA = Type.Object({
+  action: Type.Union([
+    Type.Literal('spawn'), Type.Literal('resume'), Type.Literal('list'),
+    Type.Literal('send'), Type.Literal('interrupt'), Type.Literal('output'), Type.Literal('role'),
+  ]),
+  paneId: Type.Optional(Type.String()),
+  taskId: Type.Optional(Type.String()),
+  role: Type.Optional(Type.String()),
+  background: Type.Optional(Type.Boolean()),
+  alreadyRunning: Type.Optional(Type.Boolean()),
+}, { additionalProperties: true });
+
+export function attachSubagentStructuredContent(action: string, result: unknown): unknown {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) return result;
+  const record = result as Record<string, unknown>;
+  const details = record.details !== null && typeof record.details === 'object' && !Array.isArray(record.details)
+    ? record.details as Record<string, unknown>
+    : {};
+  return { ...record, structuredContent: { action, ...details } };
 }
 
 /** Bounds concurrent delegation spawns (SUBAGENT_CONCURRENCY). */
@@ -147,6 +255,9 @@ export interface SubEntry {
   /** 'task' or a role name; only a display label for GC. */
   kind: string;
   paneId: string;
+  /** Phase 2 task slug (kebab-case of description; RFC rfc-delegation-identity §3.1): tool args
+   * accept `slug@paneId` or the bare slug; allocated once at spawn and stable across revives. */
+  slug?: string;
   tabId: string;
   tabName: string;
   cwd: string;
@@ -173,6 +284,41 @@ export interface SubEntry {
   };
 }
 
+/* ── task slugs (RFC rfc-delegation-identity §3.1) ───────────────── */
+
+/** Slug cap: short enough for tool args and list rows, long enough to stay distinctive. */
+const SLUG_MAX = 24;
+
+/** Kebab-case a task description; non-ASCII (CJK descriptions) sanitizes to '' — the allocator
+ * then falls back to a taskId-derived ascii slug, because tool args must stay typeable. */
+export function slugifyTask(description: string): string {
+  return description
+    .toLowerCase()
+    .replace(/[''']/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, SLUG_MAX)
+    .replace(/-+$/g, '');
+}
+
+/** Allocate a unique slug among live rows: base, then base-2, base-3, …; a description that
+ * sanitizes to nothing (CJK, emoji-only) falls back to `task-<taskId prefix>`. */
+export function allocateSubSlug(description: string, taskId: string, taken: ReadonlySet<string>): string {
+  const base = slugifyTask(description) || `task-${taskId.slice(0, 6)}`;
+  if (!taken.has(base)) return base;
+  for (let n = 2; ; n++) {
+    const next = `${base}-${n}`;
+    if (!taken.has(next)) return next;
+  }
+}
+
+/** Stable display/argument form for a subagent row: `slug@paneId` when a slug exists. */
+export function subRef(sub: { paneId: string; slug?: string }): string {
+  return sub.slug ? `${sub.slug}@${sub.paneId}` : sub.paneId;
+}
+
+export const PROGRESS_CUSTOM_TYPE = 'pi-herdr.progress';
+
 export interface SubsRegistry {
   version: 2;
   subs: SubEntry[];
@@ -198,6 +344,7 @@ export function foldSubsRegistry(entries: ReadonlyArray<{ type?: string; customT
         taskId: typeof s.taskId === 'string' ? s.taskId : s.paneId,
         kind: normalizeEntryKind(typeof s.kind === 'string' ? s.kind : undefined),
         paneId: s.paneId,
+        slug: typeof s.slug === 'string' && s.slug ? s.slug : undefined,
         tabId: typeof s.tabId === 'string' ? s.tabId : '',
         tabName: typeof s.tabName === 'string' ? s.tabName : '',
         cwd: typeof s.cwd === 'string' ? s.cwd : '',
@@ -395,6 +542,12 @@ export function buildLaunchParts(
 
 const ISOLATE_SLUG_MAX = 40;
 
+/**
+ * D-3 (verified 2026-10-20): herdr 0.9.5 `worktree create --workspace <parent>` still opens a new
+ * top-level workspace, not a tab inside the parent workspace, so it cannot replace pier's isolate
+ * placement. Keep `git worktree add` + the master-workspace tab; native worktree management remains
+ * an option only for workflows that accept a separate workspace.
+ */
 export function planIsolateWorktree(opts: {
   description: string;
   taskHex: string;
@@ -589,7 +742,9 @@ export function resolveTaskIdPrefix(
 export interface SubagentPort {
   applyReplySession(paneId: string, sessionFile: string | null): void;
   reconcileOnReply(paneId: string): string[];
-  listRunningSubs(): Array<{ paneId: string; description: string }>;
+  listRunningSubs(): Array<{ paneId: string; slug?: string; description: string; kind: string }>;
+  /** D113: non-closed rows for the /pier-tree view (settled nodes carry their settle time). */
+  listRows(): Array<{ paneId: string; slug?: string; description: string; kind: string; status: SubEntry['status']; settledAt: number | null }>;
   settleStatLine(paneId: string): Promise<string | null>;
   /** Pipe settlement: drop the row out of listRunningSubs before the finish notice wakes the master. */
   consumeReply(paneId: string, outcome: string | null): void;

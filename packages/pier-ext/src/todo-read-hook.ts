@@ -13,6 +13,29 @@ import { todoMark } from './todo-window.ts';
 const EMPTY_GUARD_EVERY_N = 4;
 const TODO_READ_CUSTOM_TYPE = 'pi-herdr.todo-read';
 
+/**
+ * pi 1.2 fires `before_agent_start` for runs started by `sendMessage(..., { triggerTurn: true })`
+ * too. The todo hook wants the plan in every *user* run and after a compaction continuation (the
+ * model needs the plan to resume), but not in its own stop reminder or the config guide: those
+ * already carry their own text, and counting them as turns would advance the guard cadence.
+ * Keep this list in sync with COMPACTION_CONTINUE_TYPE in compact-coordinator.ts.
+ */
+export const TODO_READ_CUSTOM_TYPES: readonly string[] = ['pi-herdr.compaction-continue'];
+
+/** Whether this run should receive the todo read hook. Missing `messageType` is pi < 1.2, where
+ *  only user runs fired `before_agent_start`; treat it as a user run for compatibility. */
+export function shouldRunTodoRead(event: unknown): boolean {
+  if (event === null || typeof event !== 'object' || !('messageType' in event)) return true;
+  const messageType = (event as { messageType?: unknown }).messageType;
+  if (messageType === 'user') return true;
+  if (messageType !== 'custom') return false;
+  const message = (event as { message?: unknown }).message;
+  const customType = message !== null && typeof message === 'object' && 'customType' in message
+    ? (message as { customType?: unknown }).customType
+    : undefined;
+  return typeof customType === 'string' && TODO_READ_CUSTOM_TYPES.includes(customType);
+}
+
 type TodoReadEffect =
   | 'recite' // Recite normally while the list is fresh.
   | 'empty-guard' // Guard against an empty list.

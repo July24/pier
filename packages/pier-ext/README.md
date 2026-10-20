@@ -43,8 +43,8 @@ The installer also verifies node / pi / herdr versions.
 | Tool | Purpose |
 |---|---|
 | `todo_write` | Full-replacement todo list. Session JSONL is the single source of truth; correct rollback on branch switches. Projected live onto the pane title (`▶i ○p ■b ✓c (N/M) · current task`). `/todos` command to view/edit/unblock |
-| `subagent` | Delegate self-contained subtasks to an isolated pi session in its own herdr pane. Actions: `spawn` (default; foreground / parallel / background), `list`, `send`, `interrupt`, `resume`, `output` (incremental preview of a running subagent's pane output), `role` (switch that worker's role profile mid-session — pi 0.86 records the toolset change as a transcript delta, so it applies on the worker's next request and survives resume) |
-| `ask_user_question` | Human gate: 2-5 authored options plus a trailing free-text row (`allowOther: false` for pure choice); multiple related questions per call. TUI renders single- and multi-select through one picker dialog (multi adds checkboxes: space toggles, `a` all, live count; `recommended` seeds the cursor and pre-checks in multi); pane shows blocked in herdr while waiting |
+| `subagent` | Delegate self-contained subtasks to an isolated pi session in its own herdr pane. Actions: `spawn` (default; foreground / parallel / background), `list`, `send`, `interrupt`, `resume`, `output` (incremental preview of a running subagent's pane output), `role` (switch that worker's role profile mid-session — pi records the toolset change as a transcript delta, so it applies on the worker's next request and survives resume). Every spawned task gets a stable slug: outputs print `slug@paneId`, and `agentId` accepts the slug, the pane id, or the combined form |
+| `report_progress` | Worker panes only: send the delegating master a short checkpoint update without ending the task. Arrives in the master's context as a display-less custom message (no turn, no chat flood), rendered as a `⤴ progress` card |
 | `terminal` | Persistent interactive shells in dedicated herdr panes. Actions: `open`, `send`, `read`, `signal`, `close`, `list` |
 
 ### Commands
@@ -52,13 +52,15 @@ The installer also verifies node / pi / herdr versions.
 | Command | Purpose |
 |---|---|
 | `/todos` | Show the todo list, or edit it: `/todos done|drop|rm|unblock <fuzzy match>` |
+| `/pier-tree` | Master only: the full delegation tree — your complete todo list plus every running subagent's full list (live-pushed over the pipe) and settled nodes with ages; the resident widget stays one line per agent (D113) |
 | `/locks` | Show write locks held by this pane and by live panes — the **human/operator view** of the write-lock beacons (herdr only). Agents see the holders inside their own write warnings; the raw tokens are readable via `herdr agent list` |
-| `/pier-role` | Show the current role + available role names, or switch mid-session: `/pier-role <name>` (pi ≥ 0.86; widening beyond the current toolset asks for confirmation; the switch lands as a transcript tool delta) |
+| `/pier-role` | Show the current role + available role names, or switch mid-session: `/pier-role <name>` (widening beyond the current toolset asks for confirmation; the switch lands as a transcript tool delta) |
 | `/pier-config` | Read-only configuration guide over four planes: bare call = index + hands a guided change to the agent; `show [plane\|all]` = effective value + source (`env > workspace > user > default`); `check` = validate all planes; `doc [path]` = write a report |
 
 ### Behaviors
 
 - **Human-in-the-loop**: every subagent is a visible, interactive TUI pane — step into it anytime to talk directly (fix bugs, take over, answer its `ask_user_question`). Blocked gates raise sidebar markers + notifications
+- **Delegation identity**: the worker knows who delegated it — spawn env (`PI_HERDR_DELEGATION`) replays through the worker marker and the session's own first-frame entry; its system prompt carries a `pier-delegation` section (identity + delivery contract), the transcript opens with an "⟵ delegated by master …" card, the pane title gets an `↳` prefix, and `pi-parent`/`pi-task` tokens feed the workbench dashboard tree and blocked-alert attribution
 - **Blocking dialogs block the pane**: pi's `ui_prompt_start` / `ui_prompt_end` events cover the inherently blocking `ctx.ui` dialogs (`select` / `confirm` / `input` / `editor`), so a dialog from any extension (not only pier's own ask tool) reports the pane as blocked and emits the `herdr:blocked` edge; nested gates are coalesced. `custom` is excluded because pi also routes resident overlays through it (pier's slim-frame overlay never calls `done()`, and a resident overlay keeps pi's prompt span open anyway)
 - **Role gate stops early**: a tool call denied by the role manifest returns `terminate`, so a batch whose results are all terminating ends without another model round trip
 - **Readable transcript**: pier's own session entries (todo edits, subagent/terminal registries, role manifests, soft approvals) and its reminder messages render as compact cards instead of raw JSON
@@ -105,8 +107,8 @@ pi overwrites tools/commands by name; event listeners stack.
 ## Requirements
 
 - Node ≥ 22
-- pi ≥ 0.86.0 (`@earendil-works/pi-coding-agent`) — dynamic toolset (transcript-backed `setActiveTools` deltas) and role switching require it
-- **herdr ≥ 0.9.0** — required for subagents / pane integration / notifications (see the IMPORTANT note above); without it only the todo loop and `ask_user_question` load
+- pi ≥ 1.3.0 (`@earendil-works/pi-coding-agent`) — `before_agent_start.messageType` and resumed-session active tools
+- **herdr ≥ 0.9.5** — required for subagents / pane integration / notifications (see the IMPORTANT note above); native `pane.focused`, self-reported resume, and shutdown-safe session saves restore subagent panes after a server restart
 
 ## Development
 

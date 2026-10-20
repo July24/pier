@@ -7,12 +7,14 @@
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
 import { basename, dirname, join } from 'node:path';
-import type { PiSurface } from '../pi-surface.ts';
+import { cordisGet } from '../cordis-services.ts';
 import type { HerdrClientLike } from '../herdr-client.ts';
 import {
   Semaphore,
+  SUBAGENT_OUTPUT_SCHEMA,
   agoText,
   ambiguousIdError,
+  attachSubagentStructuredContent,
   buildAliveNotice,
   idParam,
   flattenToolParams,
@@ -21,6 +23,7 @@ import {
   rekeySub,
   resolveTaskIdPrefix,
   tabNameForTask,
+  subRef,
   type AliveProbe,
   type SubEntry,
   type SubagentPort,
@@ -41,8 +44,9 @@ import { toolError, ToolError } from '../tool-error.ts';
 import { pipeNameFor, pipeRequestTo, type PipeRequest, type PipeResponse } from '../pipe-channel.ts';
 import type { TerminalStateSlot } from './terminal.ts';
 import { bareSessionId, resolveSessionFileValue } from '../session-tail.ts';
-import { createGitIo, createSpawnAction, createSpawner } from '../subagent-spawn.ts';
+import { DELEGATION_ENV, type DelegationContext } from '../delegation-core.ts';
 import type { JevRuntime } from '../jev-client.ts';
+import { createGitIo, createSpawnAction, createSpawner } from '../subagent-spawn.ts';
 import { createPoller } from '../subagent-poller.ts';
 import { createGcController, createSubagentRegistry } from '../subagent-gc.ts';
 import { createSessionIo, executeSubagentOutput, type SubagentOutputCursor } from '../subagent-session.ts';
@@ -106,8 +110,8 @@ function defaultAgentSessionsDir(): string {
 }
 
 export default function subagentPlugin(ctx: Context): void {
-  const surface = ctx.get('pi-herdr.surface') as PiSurface<object>;
-  const d = ctx.get('pi-herdr.subagent-deps') as SubagentDeps;
+  const surface = cordisGet(ctx, 'pi-herdr.surface');
+  const d = cordisGet(ctx, 'pi-herdr.subagent-deps');
   const { client, env, sessionRoot, port, terminalState } = d;
   const pi = surface.raw as {
     appendEntry?: (customType: string, data: unknown) => void;
@@ -141,6 +145,7 @@ export default function subagentPlugin(ctx: Context): void {
       taskId: e.taskId,
       kind: e.kind,
       paneId: e.paneId,
+      ...(e.slug ? { slug: e.slug } : {}),
       tabId: e.tabId,
       tabName: e.tabName,
       workspaceId: env?.workspaceId ?? '',
@@ -187,7 +192,19 @@ export default function subagentPlugin(ctx: Context): void {
     listRunningSubs() {
       return [...subs.values()]
         .filter((s) => s.background && s.status === 'running')
-        .map((s) => ({ paneId: s.paneId, description: s.description }));
+        .map((s) => ({ paneId: s.paneId, slug: s.slug, description: s.description, kind: s.kind }));
+    },
+    listRows() {
+      return [...subs.values()]
+        .filter((s) => s.status !== 'closed')
+        .map((s) => ({
+          paneId: s.paneId,
+          slug: s.slug,
+          description: s.description,
+          kind: s.kind,
+          status: s.status,
+          settledAt: s.consumedAt ?? null,
+        }));
     },
     async settleStatLine(paneId) {
       const entry = subs.get(paneId);
@@ -331,7 +348,18 @@ export default function subagentPlugin(ctx: Context): void {
     const spawned = await spawnPaneInTaskTab(
       { desiredTab: entry.tabName || latest.tabName || null, description: entry.description },
       entry.cwd,
-      { PI_HERDR_SUBAGENT: '1' },
+      {
+        PI_HERDR_SUBAGENT: '1',
+        [DELEGATION_ENV]: JSON.stringify({
+          parentPaneId: env?.paneId ?? '',
+          parentSessionId: bareSessionId(d.getSessionId()),
+          // Phase 2: report_progress needs the master's pipe; kind 'task' maps to the composed default.
+          parentPipe: pipeNameFor(process.cwd(), env?.paneId ?? ''),
+          taskId: entry.taskId,
+          description: entry.description,
+          role: entry.kind === 'task' ? 'worker-default' : entry.kind,
+        } satisfies DelegationContext),
+      },
       launchLine(resumeFile, null, approve),
     );
     const ready = await waitSubReady(entry.cwd, spawned.paneId);
@@ -358,6 +386,7 @@ export default function subagentPlugin(ctx: Context): void {
       taskId: h.taskId,
       kind: h.kind,
       paneId: h.paneId,
+      ...(h.slug ? { slug: h.slug } : {}),
       tabId: h.tabId,
       tabName: h.tabName ?? '',
       cwd: h.cwd,
@@ -377,6 +406,17 @@ export default function subagentPlugin(ctx: Context): void {
     if (!rawId) return { error: 'Error: unknown subagent id "" (see action list)' };
     const direct = subs.get(rawId);
     if (direct) return { entry: direct };
+    // Phase 2 slug reference: exact match against live rows (paneId stays first for back-compat).
+    // `slug@paneId` accepts both parts; a revived row changed its paneId, so the slug part wins then.
+    const at = rawId.indexOf('@');
+    const slugPart = at > 0 ? rawId.slice(0, at) : rawId;
+    const panePart = at > 0 ? rawId.slice(at + 1) : null;
+    const combined = panePart !== null
+      ? (subs.get(panePart) ?? [...subs.values()].find((s) => s.slug === slugPart && s.paneId === panePart) ?? null)
+      : null;
+    if (combined) return { entry: combined };
+    const bySlug = [...subs.values()].find((s) => s.slug === slugPart);
+    if (bySlug) return { entry: bySlug };
 
     const byTaskId = newestPerTaskId(subs.values());
     const res = resolveTaskIdPrefix(rawId, byTaskId.keys());
@@ -477,7 +517,7 @@ export default function subagentPlugin(ctx: Context): void {
         ? 'reused existing pane with same session; pi still running there'
         : entry.sessionFile ? 'session restored' : 'session file missing; fresh conversation';
       return {
-        content: [{ type: 'text', text: `resumed subagent ${entry.paneId} from task ${taskId} (${how}).` }],
+        content: [{ type: 'text', text: `resumed subagent ${subRef(entry)} from task ${taskId} (${how}).` }],
         details: { paneId: entry.paneId, taskId },
       };
     } catch (err) {
@@ -548,7 +588,7 @@ export default function subagentPlugin(ctx: Context): void {
           persistSubs();
           throw inner;
         }
-        return { content: [{ type: 'text', text: `Message sent to subagent ${entry.paneId}.` }], details: { paneId: entry.paneId } };
+        return { content: [{ type: 'text', text: `Message sent to subagent ${subRef(entry)}.` }], details: { paneId: entry.paneId } };
       },
     });
   }
@@ -556,7 +596,7 @@ export default function subagentPlugin(ctx: Context): void {
   async function executeSubagentInterrupt(params: ToolParams, toolCtx: unknown) {
     const { entry } = targetOf(params, toolCtx);
     if (entry.status === 'closed') {
-      return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (already idle/closed; no-op).` }], details: {} };
+      return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${subRef(entry)} (already idle/closed; no-op).` }], details: {} };
     }
     return pipeAction(entry, {
       ready: false,
@@ -565,7 +605,7 @@ export default function subagentPlugin(ctx: Context): void {
         // No settlement notice for an interrupted turn: the requester already knows.
         const lastId = lastRequestIdByPane.get(entry.paneId);
         if (lastId) d.claimSettleNotice(`${entry.paneId}:${lastId}`);
-        return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${entry.paneId} (fire-and-return).` }], details: { paneId: entry.paneId } };
+        return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${subRef(entry)} (fire-and-return).` }], details: { paneId: entry.paneId } };
       },
     });
   }
@@ -608,7 +648,7 @@ export default function subagentPlugin(ctx: Context): void {
         continue;
       }
       if (sub.status === 'consumed' || sub.status === 'settled') {
-        lines.push(`${sub.paneId} [idle] (${sub.kind}, settled; action send revives)${tabTag}${wtTag} ${sub.description}`);
+        lines.push(`${subRef(sub)} [idle] (${sub.kind}, settled; action send revives)${tabTag}${wtTag} ${sub.description}`);
         continue;
       }
       const state = 'running';
@@ -624,7 +664,7 @@ export default function subagentPlugin(ctx: Context): void {
       const cwdTag = probe?.foregroundCwd && probe.foregroundCwd !== sub.cwd
         ? ` [cwd: ${basename(probe.foregroundCwd) || probe.foregroundCwd}]`
         : '';
-      lines.push(`${sub.paneId} [${state}${takeoverMark}${statusTag}${activityTag}${gateTag}] (${sub.kind})${tabTag}${wtTag}${cwdTag} ${sub.description}`);
+      lines.push(`${subRef(sub)} [${state}${takeoverMark}${statusTag}${activityTag}${gateTag}] (${sub.kind})${tabTag}${wtTag}${cwdTag} ${sub.description}`);
     }
     return { content: [{ type: 'text', text: lines.join('\n') }], details: {} };
   }
@@ -643,6 +683,7 @@ export default function subagentPlugin(ctx: Context): void {
     session,
     spawn,
     poller,
+    getSessionId: d.getSessionId,
     ...(d.logRouting ? { logRouting: d.logRouting } : {}),
   });
 
@@ -702,10 +743,11 @@ export default function subagentPlugin(ctx: Context): void {
       tab: Type.Optional(Type.String({ description: '[spawn] Name of a task tab to place the subagent into (join if exists, otherwise create). Default placement groups by git worktree.' })),
       allowed_tools: Type.Optional(Type.Array(Type.String(), { description: '[spawn] Additional tools for role composition (union with role baseline)' })),
       taskId: Type.Optional(Type.String({ description: '[resume] The task id to revive from the delegation ledger' })),
-      agentId: Type.Optional(Type.String({ description: '[send|interrupt|output|role] The subagent id (herdr pane id)' })),
+      agentId: Type.Optional(Type.String({ description: '[send|interrupt|output|role] The subagent reference: task slug (e.g. "fix-auth"), herdr pane id, or "slug@paneId" as printed by spawn/list' })),
       message: Type.Optional(Type.String({ description: '[send] The follow-up message' })),
       max_chars: Type.Optional(Type.Integer({ description: '[output] Maximum characters of output delta to return (default 6000, 100-16000)' })),
     }),
+    outputSchema: SUBAGENT_OUTPUT_SCHEMA,
     // B2: `action` is optional in the schema; normalize it so the validated arguments and the
     // code path never disagree and `spawn` is explicit in logs.
     prepareArguments: (args: unknown) => {
@@ -722,7 +764,7 @@ export default function subagentPlugin(ctx: Context): void {
       if (!handler) {
         return toolError(`Error: unknown action "${action}" (valid: ${Object.keys(ACTIONS).join(', ')})`);
       }
-      return handler(flat, toolCtx, onUpdate);
+      return attachSubagentStructuredContent(action, await handler(flat, toolCtx, onUpdate));
     },
   });
 }

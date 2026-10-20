@@ -23,9 +23,12 @@ pier 由**两个半区**组成，各装一处：
 
 ### 核心能力
 
-- **todo 闭环**：`todo_write` 全量替换语义、会话 JSONL 权威、分支正确回滚；窗格标题实时投影 `▶i ○p ■b ✓c (N/M) · 当前任务`；TUI widget 为活动锚定窗口（in_progress 条目及其前后上下文随执行位置滚动可见）；`/todos` 命令（含 unblock）可查看/编辑
+- **todo 闭环**：`todo_write` 全量替换语义、会话 JSONL 权威、分支正确回滚；窗格标题实时投影 `▶i ○p ■b ✓c (N/M) · 当前任务`；`/todos` 命令（含 unblock）可查看/编辑
 - **todo 反冻结**：全完成列表 ≥6 轮未写 → 读钩复读改为改写警告；≥1h 未写 → 归档——先给一次带旧条目参照的重写窗口，无视后终态通知并清空列表（rm 落 JSONL，空守卫接管，多步工作必须重建清单）；`/todos` 永远可查历史，会话 JSONL 权威不动
 - **交互式子代理**：每个子代理 = 独立 pane 的隔离 pi 会话（独立上下文窗口）；**人类可随时进入该 pane 直接对话**（修 bug、接管、回答 ask_user_question）
+- **委托身份一等公民**（D111）：spawn 时经 `PI_HERDR_DELEGATION` 把委托上下文（父 pane/父会话/taskId/任务/角色）下发 worker，env > worker marker > branch fold 三级回放；worker 系统提示注入 `pier-delegation` 段（身份 + 统一交付契约），首帧渲染「⟵ delegated by master …」卡片，pane title 带 `↳` 前缀；herdr `pi-parent`/`pi-task` token 独立批上报，dashboard 按 parent 分组树化、blocked 告警带 `worker ← master` 归属
+- **任务 slug + 主动进度上报**（D112）：spawn 分配任务 slug（冲突加序号），工具输出一律 `slug@paneId`，`agentId` 接受 slug/paneId/组合形式（revive 换 pane 后按 slug 兜底）；worker 侧 `report_progress` 工具经 pipe 把检查点以 display-less custom message 送进 master 上下文——不刷屏、不强制 turn，master 从轮询猜状态升级为关键节点被动接收
+- **统一 TUI 状态条**（D113）：常驻 widget 一行一 agent——自己一行 `▶ 当前条 ✓d/n`，每个 running 子代理一行 `↳ slug ▶ 当前条 ✓d/n`（blocked 显示任务+原因，settled 不占行）；worker `todo_write` 经 pipe 实时推送全量清单（事件驱动零轮询），`/pier-tree` 弹完整委托树（自己 + 各 worker 全量 todo + settled 节点）；`/dashboard` 仍是 ops 面板
 - **子代理输出预览**：`subagent(action: "output", agentId)` 返回后台子代理自上次调用以来的新输出——内存中的 per-pane 游标计算增量（优先 `agent.read`，旧版 herdr 回退 `pane.read`），结果带状态、revision、截断与 `restart` 标记（缓冲回卷/清屏），master 不必等到结算就能发现卡住的 worker
 - **软锁防争抢**（写路径按 pane 粒度锁 token，冲突时警告/阻止）
 - **角色档案**：`master` / `worker-default` 内置，自定义 role 按 `.pi-herdr/roles/<name>.json` 挂载；工具集按角色收敛（deny 规则不可绕过）
@@ -45,8 +48,8 @@ pier 由**两个半区**组成，各装一处：
 ### 环境要求
 
 - Node ≥ 22
-- pi ≥ 0.86.0（`@earendil-works/pi-coding-agent`）——动态工具集（transcript 持久化的 `setActiveTools` delta）与角色切换依赖此版本
-- herdr ≥ 0.9.0（macOS / Linux / Windows；Windows 为 preview beta）
+- pi ≥ 1.3.0（`@earendil-works/pi-coding-agent`）——`before_agent_start.messageType` 与 resume active tools
+- herdr ≥ 0.9.5（macOS / Linux / Windows；Windows 为 preview beta）——原生 `pane.focused`、自报告 resume、关机安全保存
 
 ### 一键安装（推荐）
 
@@ -168,7 +171,6 @@ npm test          # node --test，733 项单测（规划器 / todo 重放 / 反�
 | `PIER_READY_TIMEOUT_MS` | `90000` | ms | 子代理 pane 管道就绪等待（指数退避；pane 已退出则立刻失败并附上它的最后输出） |
 | `PIER_SESSION_TTL_SECONDS` | `600` | 秒 | 子代理进程退出后会话保留 TTL（超时清理） |
 | `PIER_GIT_TIMEOUT_MS` | `10000` | ms | Git 命令超时（worktree 创建、diff 汇总、清理） |
-| `PIER_FOCUS_POLL_MS` | `1500` / `0` | ms | 焦点采样间隔（`0` 关闭）。Herdr <0.9.1 默认 1500ms；0.9.1+ 默认 0（事件驱动） |
 | `PIER_TERM_READ_MAX` | `8000` | 字符 | 终端单次读取缓冲区字符上限 |
 | `PIER_TERM_IDLE_MS` | `1800000` | ms | 终端闲置多久后提醒一次 |
 | `PIER_TODO_GRACE_MS` | `30000` | ms | 未完成 todo 提醒前的静默宽限 |
@@ -186,9 +188,11 @@ npm test          # node --test，733 项单测（规划器 / todo 重放 / 反�
 `PI_HERDR_META_KEY`）——改名会让正在运行的 worker 与父进程对不上。
 `/pier-config doctor` 会列出每个选项的生效值与来源，以及本会话被有意吞掉的异常。
 
-**焦点热力**：herdr 0.9.0 把鼠标焦点放在客户端解析，插件收不到 `pane.focused`，因此每个 pane
-采样自己 tab 的 `layout.export → focused_pane_id` 再重放 workbench 事件。0.9.1+ 原生派发
-`pane.focused`，轮询默认关闭。`PIER_FOCUS_POLL_MS` 可覆盖；`PIER_WORKBENCH_ROOT` 指向迁移后的插件目录。
+**焦点热力**：herdr 0.9.5 原生派发 `pane.focused`，pier 不再启动 per-pane 采样器，workbench 直接消费事件。`PIER_WORKBENCH_ROOT` 指向迁移后的插件目录。
+
+**上游跟进**：pi 1.3 / herdr 0.9.5 的影响、版本下限清理，以及下一批扩展方向
+（跨机器、原生 worktree、plugin actions）见
+**[docs/rfc-upstream-absorption-2026-10.md](docs/rfc-upstream-absorption-2026-10.md)**。
 
 ## 设计原则
 

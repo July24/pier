@@ -6,7 +6,7 @@
  */
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
-import type { PiSurface } from '../pi-surface.ts';
+import { cordisGet } from '../cordis-services.ts';
 import type { HerdrClientLike } from '../herdr-client.ts';
 import { herdrUnavailableHint } from '../herdr-client.ts';
 import { toolError } from '../tool-error.ts'
@@ -52,15 +52,15 @@ export interface TerminalStateSlot {
   activePaneIds: () => Set<string>;
 }
 
-interface TerminalDeps {
+export interface TerminalDeps {
   client: HerdrClientLike;
   env: { paneId: string; tabId: string } | null;
   state: TerminalStateSlot;
 }
 
 export default function terminalPlugin(ctx: Context): void {
-  const surface = ctx.get('pi-herdr.surface') as PiSurface<object>;
-  const { client, env, state } = ctx.get('pi-herdr.terminal-deps') as TerminalDeps;
+  const surface = cordisGet(ctx, 'pi-herdr.surface');
+  const { client, env, state } = cordisGet(ctx, 'pi-herdr.terminal-deps');
   const pi = surface.raw as {
     appendEntry?: (customType: string, data: unknown) => void;
   };

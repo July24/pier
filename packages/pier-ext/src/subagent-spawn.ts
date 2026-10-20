@@ -8,6 +8,8 @@ import { mkdirSync, stat as statCb } from 'node:fs';
 import { basename, dirname, join, resolve as pathResolve } from 'node:path';
 import { promisify } from 'node:util';
 import type { HerdrClientLike } from './herdr-client.ts';
+import { delegationEnv } from './delegation-core.ts';
+import { bareSessionId } from './session-tail.ts';
 import { pipeNameCandidates, pipeNameFor, pipeRequest, pipeRequestTo } from './pipe-channel.ts';
 import { composeForRole } from './manifest-compose.ts';
 import { platformPaths } from './platform-paths.ts';
@@ -18,6 +20,7 @@ import type { HistoryEntry } from './history-store.ts';
 import {
   FOREGROUND_POLL_MS,
   Semaphore,
+  allocateSubSlug,
   buildAliveNotice,
   buildBlockedGateNotice,
   buildIsolatePreamble,
@@ -32,8 +35,10 @@ import {
   planForegroundTick,
   planIsolateWorktree,
   planLaunchValidation,
+  planShellReady,
   planTabPlacement,
   sleep,
+  subRef,
   type SubEntry,
   type TabPlacementPlan,
   type WorktreeZone,
@@ -44,6 +49,11 @@ import type { Poller } from './subagent-poller.ts';
 import type { SessionIo } from './subagent-session.ts';
 
 const statAsync = promisify(statCb);
+
+/** Bound on waiting for a fresh pane's shell to reach its prompt. On timeout the launch line is sent
+ *  anyway: `waitSubReady` still diagnoses a failed boot, and an unsupported probe must not stall spawn. */
+export const SHELL_READY_TIMEOUT_MS = 2_000;
+const SHELL_READY_POLL_MS = 100;
 
 /* ── git adapter ────────────────────────────────────────────────── */
 
@@ -302,6 +312,18 @@ export function createSpawner(h: SpawnerHost): Spawner {
     return buildLaunchLine(buildLaunchParts(h.runtime, { resumeFile, roleModel, approve }));
   }
 
+  /** herdr 0.9.4 refuses over-long commands on a shell that is still starting; `pane.send_text`
+   *  has no such guard. Poll the foreground process until the shell owns the PTY (or give up). */
+  async function waitShellReady(paneId: string): Promise<void> {
+    const deadline = Date.now() + SHELL_READY_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      const info = await h.client.processInfo(paneId).catch(() => null);
+      if (info === null) return; // older server or pane already gone: keep the old best-effort path
+      if (planShellReady(info.foreground) === 'ready') return;
+      await sleep(SHELL_READY_POLL_MS);
+    }
+  }
+
   async function approveFor(cwd: string, masterCwd: string): Promise<boolean> {
     if (isPathUnder(cwd, masterCwd)) return true;
     const zone = classifyWorktreeZone({ cwd, masterCwd, worktrees: await h.git.listWorktrees(masterCwd) });
@@ -471,6 +493,7 @@ export function createSpawner(h: SpawnerHost): Spawner {
             focus: false,
             ...(ratio != null ? { ratio } : {}),
           });
+          await waitShellReady(paneId);
           await h.client.sendPaneText(paneId, launch);
           return { tabId: plan.tabId, paneId, tabName: plan.tabName };
         }
@@ -482,6 +505,7 @@ export function createSpawner(h: SpawnerHost): Spawner {
         cwd,
         env: envOver,
       });
+      await waitShellReady(created.paneId);
       await h.client.sendPaneText(created.paneId, launch);
       return { tabId: created.tabId, paneId: created.paneId, tabName: plan.tabName };
     } finally {
@@ -517,11 +541,13 @@ interface SpawnActionHost {
   writeHistory(entry: SubEntry, patch?: Partial<HistoryEntry>, via?: string): void;
   pendingIsolateBranches: Set<string>;
   lastMachineInjectAt: Map<string, number>;
-  lastRequestIdByPane: Map<string, string>;
+  lastRequestIdByPane: Map<string, number | string>;
   git: GitIo;
   session: SessionIo;
   spawn: Spawner;
   poller: Poller;
+  /** Master session id for the delegation identity handed to the worker. */
+  getSessionId: () => string;
   /** Phase 0 routing telemetry (RFC rfc-jev-role-routing §8): best-effort spawn profile; absent in tests. */
   logRouting?: (row: RoutingTelemetryRecord) => void;
 }
@@ -545,6 +571,8 @@ export function createSpawnAction(h: SpawnActionHost) {
     // Validate the role before any isolate worktree exists: this early return has no cleanup path.
     let roleManifestEnv: Record<string, string> = {};
     let roleModel: string | null = null;
+    // Delegation identity (RFC rfc-delegation-identity §2.1): the worker learns who delegated it.
+    let delegationEnvPatch: Record<string, string> = {};
     try {
       const { role, manifest } = composeForRole(manifestRole ?? 'worker-default', suggested, { loadRoleOpts: { baseDir: masterCwd } });
       roleManifestEnv = {
@@ -561,6 +589,15 @@ export function createSpawnAction(h: SpawnActionHost) {
         // Role base: /pier-role and the pipe switch resolve .pi-herdr/roles/ against the MASTER's checkout.
         PI_HERDR_ROLE_BASE: masterCwd,
       };
+      delegationEnvPatch = delegationEnv({
+        parentPaneId: env?.paneId ?? '',
+        parentSessionId: bareSessionId(h.getSessionId()),
+        // Phase 2: the master's own pipe so the worker's report_progress can dial home (D49).
+        parentPipe: pipeNameFor(masterCwd, env?.paneId ?? ''),
+        taskId,
+        description: spec.description,
+        role: role.role,
+      });
       if (typeof role.model === 'string' && role.model.trim()) roleModel = role.model.trim();
       h.logRouting?.(
         planSpawnProfileRow({
@@ -631,14 +668,24 @@ export function createSpawnAction(h: SpawnActionHost) {
       const spawned = await spawnPaneInTaskTab(
         { desiredTab: tab, description: spec.description, zone },
         cwd,
-        { PI_HERDR_SUBAGENT: '1', ...roleManifestEnv },
+        // pier owns worker state reporting (report_agent with todo/blocked badges); pi 1.1+'s own
+        // OSC 7501 program-status emission would become a second, competing source once a terminal
+        // or dashboard starts reading it. One reporter per pane.
+        { PI_HERDR_SUBAGENT: '1', PI_PROGRAM_STATUS: '0', ...roleManifestEnv, ...delegationEnvPatch },
         launchLine(null, roleModel, approve),
       );
       paneId = spawned.paneId;
+      // Phase 2: allocate once per spawn; revives/history keep the row's slug (stability beats beauty).
+      const slug = allocateSubSlug(
+        spec.description,
+        taskId,
+        new Set([...subs.values()].map((s) => s.slug ?? '').filter(Boolean)),
+      );
       const entry: SubEntry = {
         taskId,
         kind,
         paneId,
+        slug,
         tabId: spawned.tabId,
         tabName: spawned.tabName,
         cwd,
@@ -686,8 +733,8 @@ export function createSpawnAction(h: SpawnActionHost) {
       if (background) {
         handToPoller(`prompt-${taskId}`);
         return {
-          content: [{ type: 'text', text: `started subagent ${paneId} (task ${taskId})` }],
-          details: { paneId, taskId, background: true, role: kind },
+          content: [{ type: 'text', text: `started subagent ${subRef(entry)} (task ${taskId})` }],
+          details: { paneId, taskId, background: true, role: kind, slug },
         };
       }
 

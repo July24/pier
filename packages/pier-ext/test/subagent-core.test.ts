@@ -6,13 +6,25 @@ import { DisposeLedger } from '../src/ledger.ts';
 import { mountSubagent, runSubagent, subEntry } from './test-utils.ts';
 import {
   FOREGROUND_POLL_MS, SUBS_CUSTOM_TYPE, TAB_NAME_MAX, Semaphore, agoText, buildAliveNotice, buildBlockedGateNotice,
-  buildLaunchLine, buildLaunchParts, classifyWorktreeZone, foldSubsRegistry, formatSubagentResult, isAlive,
-  makeProgressUpdate, nextTaskTabName, rekeySub, planForegroundTick, planLaunchValidation, planTabPlacement, resolveTaskIdPrefix,
+  allocateSubSlug, slugifyTask, subRef,
+  attachSubagentStructuredContent, buildLaunchLine, buildLaunchParts, buildResumeArgv, classifyWorktreeZone, foldSubsRegistry, formatSubagentResult, isAlive,
+  makeProgressUpdate, nextTaskTabName, rekeySub, planForegroundTick, planLaunchValidation, planShellReady, planTabPlacement, resolveTaskIdPrefix, shellProcessName,
   flattenToolParams, idParam, tabNameForTask, type AliveProbe, type SubEntry,
 } from '../src/subagent-core.ts';
 import { planReadyAttempt, readyBackoffMs, readyFailureText } from '../src/subagent-spawn.ts';
 
 const RT = { nodePath: '/usr/local/bin/node', cliPath: '/opt/pi/dist/cli.js', extPath: '/ext/index.ts' };
+
+test('planShellReady: only a shell foreground means a fresh pane can take the launch line', () => {
+  assert.equal(shellProcessName('/bin/zsh'), 'zsh');
+  assert.equal(shellProcessName('C:\\Windows\\System32\\cmd.exe'), 'cmd');
+  assert.equal(shellProcessName('-bash'), 'bash');
+  assert.equal(planShellReady(null), 'ready', 'unsupported probe must not stall spawn');
+  assert.equal(planShellReady([]), 'wait', 'empty foreground is not proof of readiness');
+  assert.equal(planShellReady([{ name: 'zsh', argv0: '/bin/zsh' }]), 'ready');
+  assert.equal(planShellReady([{ name: 'node', argv0: 'pwsh.exe' }]), 'ready', 'either field may carry the shell');
+  assert.equal(planShellReady([{ name: 'pi', argv0: 'node' }]), 'wait', 'an already-running agent is not a shell prompt');
+});
 
 test('buildLaunchLine: win32 uses PowerShell & syntax, POSIX starts via sh', () => {
   const parts = ['/usr/local/bin/node', '/opt/pi/dist/cli.js', '-e', '/ext/index.ts'];
@@ -52,6 +64,47 @@ test('buildLaunchParts: the provider is split off at the first "/" only', () => 
   assert.deepEqual(modelArgs('openrouter/moonshotai/kimi-k2'), ['--provider', 'openrouter', '--model', 'moonshotai/kimi-k2']);
   assert.deepEqual(modelArgs('glm-5.3'), ['--model', 'glm-5.3'], 'a bare model id is not also passed as the provider');
   assert.deepEqual(modelArgs('/odd'), ['--model', '/odd']);
+});
+
+test('buildResumeArgv: mirrors the spawn flags onto a plain `pi`, dropping interpreter and cli.js', () => {
+  const workerArgv = [
+    '/usr/local/bin/node', '/opt/pi/dist/cli.js', '-a', '-e', '/ext/index.ts',
+    '--tui-mode', 'fullscreen', '--provider', 'zai', '--model', 'glm-4.7', '--session', '/s/2026-10-08T01-00-00Z_a1b2c3.jsonl',
+  ];
+  assert.deepEqual(buildResumeArgv(workerArgv), [
+    'pi', '-a', '-e', '/ext/index.ts', '--tui-mode', 'fullscreen',
+    '--provider', 'zai', '--model', 'glm-4.7', '--session', '/s/2026-10-08T01-00-00Z_a1b2c3.jsonl',
+  ]);
+  assert.deepEqual(buildResumeArgv(['/x/node', '/x/cli.js', '--extension=/ext/index.ts']), ['pi', '--extension', '/ext/index.ts'], '--flag=value splits');
+  assert.deepEqual(
+    buildResumeArgv(['/x/node', '/x/cli.js', '--print-mode', 'json', '-e', '/ext/index.ts']),
+    ['pi', '-e', '/ext/index.ts'],
+    'pi-internal flags are not replayed',
+  );
+});
+
+test('buildResumeArgv: herdr argv rules — plain bin, no quotes/control chars, ≤64 args, ≤8 KiB, must carry -e', () => {
+  assert.equal(buildResumeArgv(['/x/node', '/x/cli.js']), null, 'no extension flag → nothing pier-shaped to restore');
+  assert.equal(buildResumeArgv(['/x/node', '/x/cli.js', '-e', '/e.ts'], '/usr/local/bin/pi'), null, 'argv[0] must be a plain PATH name');
+  assert.equal(buildResumeArgv(['/x/node', '/x/cli.js', '-e', "/e'.ts"]), null, 'apostrophes are rejected by herdr');
+  assert.equal(buildResumeArgv(['/x/node', '/x/cli.js', '-e', '/e.ts', '--model', 'a\rb']), null, 'control characters are rejected');
+  const many = ['/x/node', '/x/cli.js', '-e', '/e.ts', ...Array.from({ length: 70 }, () => '-a')];
+  assert.equal(buildResumeArgv(many), null, 'over 64 args is rejected');
+  assert.equal(buildResumeArgv(['/x/node', '/x/cli.js', '-e', '/e.ts', '--model', 'x'.repeat(9_000)]), null, 'over 8 KiB total is rejected');
+});
+
+test('attachSubagentStructuredContent: stamps the action onto details; non-objects pass through', () => {
+  const result = attachSubagentStructuredContent('spawn', {
+    content: [{ type: 'text', text: 'started subagent p2' }],
+    details: { paneId: 'p2', taskId: 'task-9', background: true },
+  }) as { structuredContent: Record<string, unknown> };
+  assert.deepEqual(result.structuredContent, { action: 'spawn', paneId: 'p2', taskId: 'task-9', background: true });
+  assert.equal(
+    (attachSubagentStructuredContent('list', { content: [], details: {} }) as { structuredContent: { action: string } }).structuredContent.action,
+    'list',
+    'empty details still yield the action',
+  );
+  assert.equal(attachSubagentStructuredContent('output', undefined), undefined);
 });
 
 test('rekeySub: a revived entry drops its dead pane id so it is listed (and swept) once', () => {
@@ -450,4 +503,29 @@ test('subagent plugin: list shows live state, activity and a foreign cwd only wh
   } finally {
     await root.fiber.dispose();
   }
+});
+
+/* ── Phase 2 task slugs (RFC rfc-delegation-identity §3.1) ──────── */
+
+test('slugifyTask / allocateSubSlug / subRef: kebab-case, CJK fallback, dedupe numbering, display form', () => {
+  assert.equal(slugifyTask('Fix Auth Flow!'), 'fix-auth-flow');
+  assert.equal(slugifyTask('  read--me  '), 'read-me');
+  assert.equal(slugifyTask('a'.repeat(40)), 'a'.repeat(24), 'slug caps at 24 chars');
+  assert.equal(slugifyTask('探查'), '', 'non-ASCII sanitizes to nothing');
+  const taken = new Set(['fix-auth']);
+  assert.equal(allocateSubSlug('fix auth', 'taskid', taken), 'fix-auth-2');
+  assert.equal(allocateSubSlug('fix auth', 'taskid', new Set(['fix-auth', 'fix-auth-2'])), 'fix-auth-3');
+  assert.equal(allocateSubSlug('探查', '9faaa0e5-rest', new Set()), 'task-9faaa0', 'CJK falls back to a taskId prefix');
+  assert.equal(subRef({ paneId: 'p2', slug: 'fix-auth' }), 'fix-auth@p2');
+  assert.equal(subRef({ paneId: 'p2' }), 'p2', 'slug-less rows keep the bare paneId (back-compat)');
+});
+
+test('foldSubsRegistry: slug parses, survives replay, and old rows without it stay undefined', () => {
+  const entries = [
+    { type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { version: 2, subs: [{ paneId: 'p2', taskId: 't1' }] } },
+    { type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { version: 2, subs: [{ paneId: 'p2', taskId: 't1', slug: 'fix-auth' }, { paneId: 'p3', taskId: 't2' }] } },
+  ];
+  const registry = foldSubsRegistry(entries);
+  assert.equal(registry.subs.find((s) => s.paneId === 'p2')?.slug, 'fix-auth');
+  assert.equal(registry.subs.find((s) => s.paneId === 'p3')?.slug, undefined);
 });

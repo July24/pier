@@ -1,19 +1,14 @@
 /**
  * index.ts satellite parts: pipe dispatch, the D92 settlement-notice buffer with its rank hook, the
  * process-mode planner, cross-pane write locks, the pi-surface proxy with its tombstone compensation,
- * and two composition-root seams (the D-4 focus-poller kill switch, D93 sidebar identity transport).
+ * and the D93 sidebar identity transport seam.
  */
-import * as fs from 'node:fs';
-import * as net from 'node:net';
-import * as path from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import pier from '../src/index.ts';
 import { handlePipeRequest, type MachineRequest, type PipeHandlerSession } from '../src/index-pipe.ts';
 import { emptySubagentPortBox } from '../src/subagent-core.ts';
 import { collapseNotices, createNoticeBuffer } from '../src/index-notices.ts';
-import { planIndexMode, type IndexMode } from '../src/index-runtime.ts';
+import { applyRestoredWorkerMode, planIndexMode, type IndexMode } from '../src/index-runtime.ts';
 import { installWriteLocks } from '../src/index-locks.ts';
 import { lockTokenKey, lockTokenValue } from '../src/lock-core.ts';
 import { PiSurface } from '../src/pi-surface.ts';
@@ -21,8 +16,8 @@ import { DisposeLedger } from '../src/ledger.ts';
 import { createRoleRuntime } from '../src/index-roles.ts';
 import { TodosService } from '../src/todos-service.ts';
 import type { RuntimeRoleManifest } from '../src/tool-gate.ts';
-import { herdrSocketTarget, type AgentInfo, type HerdrEnv, type HerdrClientLike } from '../src/herdr-client.ts';
-import { fakeHerdr, fakePi, fire, withCleanup, type CleanupContext, type FakePi } from './test-utils.ts';
+import { type AgentInfo, type HerdrEnv, type HerdrClientLike } from '../src/herdr-client.ts';
+import { fakeHerdr, fakePi, fire, withCleanup, type FakePi } from './test-utils.ts';
 
 /* ── index-pipe: common-segment pipe dispatch ───────────────────── */
 
@@ -38,6 +33,8 @@ function pipeSession(over: Partial<PipeHandlerSession> = {}): PipeHandlerSession
     abort: () => {},
     setPendingMachineRequest: () => {},
     applyRoleSwitch: async () => ({ ok: true, message: 'stub' }),
+    deliverProgress: async () => {},
+    applyWorkerTodos: () => {},
     ...over,
   };
 }
@@ -80,6 +77,7 @@ test('handlePipeRequest: reply binds port, claims once, delivers notice', async 
     reconcileOnReply() { return ['Reconciled: x']; },
     async settleStatLine() { return 'stat: clean'; },
     listRunningSubs() { return []; },
+    listRows() { return []; },
   };
   const latch = new Set<string>();
   const session = pipeSession({
@@ -257,6 +255,20 @@ test('planIndexMode: worker flag wins inside herdr; herdr pane → master; no he
   for (const [name, env, expect] of CASES) assert.deepEqual(planIndexMode(env), expect, name);
 });
 
+test('applyRestoredWorkerMode: a worker marker flips a herdr boot without the env flag to worker mode', () => {
+  const herdr = { isSubagent: false, hasHerdr: true, composeMaster: true };
+  const worker = { isSubagent: true, hasHerdr: true, composeMaster: false };
+  assert.deepEqual(applyRestoredWorkerMode(herdr, '/s/a.jsonl', () => true), worker, 'marker → todo-only mount');
+  assert.deepEqual(applyRestoredWorkerMode(herdr, '/s/a.jsonl', () => false), herdr, 'no marker → master as before');
+  assert.deepEqual(applyRestoredWorkerMode(herdr, undefined, () => true), herdr, 'no session file to key on → env stays authoritative');
+  assert.deepEqual(applyRestoredWorkerMode(worker, '/s/a.jsonl', () => false), worker, 'env worker flag already wins');
+  assert.deepEqual(
+    applyRestoredWorkerMode({ isSubagent: false, hasHerdr: false, composeMaster: false }, '/s/a.jsonl', () => true),
+    { isSubagent: false, hasHerdr: false, composeMaster: false },
+    'outside herdr there is nothing to restore',
+  );
+});
+
 /* ── index-locks: write-lock installer wiring ───────────────────── */
 
 /** pi's tool_call dispatch: the first handler that returns a verdict wins. */
@@ -419,114 +431,6 @@ test('surface: pi 0.86 unsubscribe — retirement removes the listener instead o
   assert.match(((await callTool(pi, 't1')) as { content: Array<{ text: string }> }).content[0]!.text, /disposed/, 'tools still tombstone: pi has no unregisterTool');
 });
 
-/* ── index.ts composition root: the D-4 focus-poller kill switch ── */
-
-const FOCUS_WS = 'wP';
-const FOCUS_PANE = `${FOCUS_WS}:pMe`;
-
-/** Minimal herdr server for the real composition root: records every method, answers `layout.export`
- *  with the scripted focus sequence. index.ts builds its client from the environment, so the socket is
- *  the only seam — the client under test is the production one. */
-function scriptedHerdr(socketPath: string, focuses: readonly (string | null)[]): Promise<{ calls: string[]; close(): Promise<void> }> {
-  const calls: string[] = [];
-  let index = 0;
-  const server = net.createServer((sock) => {
-    let buf = '';
-    sock.setEncoding('utf8');
-    sock.on('data', (chunk) => {
-      buf += chunk;
-      const nl = buf.indexOf('\n');
-      if (nl < 0) return;
-      let req: { id?: string; method?: string };
-      try { req = JSON.parse(buf.slice(0, nl)); } catch { sock.destroy(); return; }
-      const method = String(req.method ?? '');
-      calls.push(method);
-      let result: unknown = { type: 'ok' };
-      if (method === 'layout.export') {
-        const focused = focuses[Math.min(index, focuses.length - 1)] ?? null;
-        index += 1;
-        // Both panes always exist and this pane is focused from the start: the first tick only records
-        // the baseline, so sampling never spawns a reflow child here.
-        result = {
-          type: 'layout_export',
-          layout: {
-            workspace_id: FOCUS_WS,
-            tab_id: `${FOCUS_WS}:t1`,
-            zoomed: false,
-            focused_pane_id: focused,
-            root: { type: 'split', first: { type: 'pane', pane_id: `${FOCUS_WS}:pOther` }, second: { type: 'pane', pane_id: FOCUS_PANE } },
-          },
-        };
-      }
-      sock.end(JSON.stringify({ id: req.id ?? '1', result }) + '\n');
-    });
-  });
-
-  const close = (): Promise<void> => {
-    const closed = Promise.withResolvers<void>();
-    // closeAllConnections exists at runtime (Node ≥18.2) but is missing from these @types/node.
-    const closable = server as unknown as { closeAllConnections?(): void };
-    closable.closeAllConnections?.();
-    server.close(() => closed.resolve());
-    return closed.promise;
-  };
-
-  const listening = Promise.withResolvers<{ calls: string[]; close(): Promise<void> }>();
-  server.listen(herdrSocketTarget(socketPath), () => listening.resolve({ calls, close }));
-  return listening.promise;
-}
-
-/** Boots the real composition root as a herdr pane over the scripted socket above. */
-async function mountHerdrIndex(cleanup: CleanupContext, pollMs: string) {
-  const env = cleanup.env();
-  for (const key of ['PI_HERDR_SUBAGENT', 'PI_HERDR_ROLE_MANIFEST']) env.delete(key);
-  const tmp = cleanup.tempDir('parts-focus').path;
-  const socketPath = path.join(tmp, 'herdr.sock');
-  for (const [key, value] of Object.entries({
-    HERDR_ENV: '1', HERDR_PANE_ID: FOCUS_PANE, HERDR_TAB_ID: `${FOCUS_WS}:t1`, HERDR_WORKSPACE_ID: FOCUS_WS,
-    HERDR_SOCKET_PATH: socketPath, PIER_FOCUS_POLL_MS: pollMs,
-  })) env.set(key, value);
-
-  const server = await scriptedHerdr(socketPath, [FOCUS_PANE]);
-  const pi = fakePi();
-  const cwd = path.join(tmp, 'ws');
-  fs.mkdirSync(cwd, { recursive: true });
-  try {
-    await pier(pi as never);
-    await fire(pi, 'session_start', { reason: 'new' }, { cwd, sessionManager: { getBranch: () => [] } });
-  } catch (err) {
-    await server.close();
-    throw err;
-  }
-  return { pi, server, calls: server.calls, samples: () => server.calls.filter((m) => m === 'layout.export').length };
-}
-
-test('index D-4: PIER_FOCUS_POLL_MS=0 关闭焦点采样（非零值仍采样）', withCleanup(async (cleanup) => {
-  // Off: bounded wait long enough for ~10 ticks of the control interval below.
-  const off = await mountHerdrIndex(cleanup, '0');
-  try {
-    // `ping` is awaited inside session_start, so this distinguishes the live production client from
-    // the Noop stand-in — without it the absence of layout.export below could pass vacuously.
-    assert.ok(off.calls.includes('ping'), 'the real client is wired to the scripted socket');
-    await delay(200);
-    assert.equal(off.samples(), 0, 'PIER_FOCUS_POLL_MS=0 must not sample the layout at all');
-  } finally {
-    await fire(off.pi, 'session_shutdown');
-    await off.server.close();
-  }
-
-  // On: the same mount with a small non-zero interval proves the poller path is otherwise live.
-  const on = await mountHerdrIndex(cleanup, '20');
-  try {
-    const deadline = Date.now() + 250;
-    while (on.samples() === 0 && Date.now() < deadline) await delay(20);
-    assert.ok(on.samples() > 0, 'a non-zero interval keeps sampling: 0 is a kill switch, not a broken mount');
-  } finally {
-    await fire(on.pi, 'session_shutdown');
-    await on.server.close();
-  }
-}));
-
 /* ── index-roles: D93 sidebar identity rides the herdr client ───── */
 
 const roleManifest = (role: string): RuntimeRoleManifest =>
@@ -586,3 +490,30 @@ test('role runtime: D93 sidebar identity is reported through the herdr client', 
   assert.equal(result.ok, true, result.message);
   assert.deepEqual(switchedTo, ['worker', 'master'], 'the switch reports the new role through the same transport');
 }));
+
+test('handlePipeRequest: progress routes to deliverProgress with the worker pane', async () => {
+  const seen: Array<{ paneId: string; text: string }> = [];
+  const res = await handlePipeRequest(
+    { type: 'progress', id: 'prog-1', paneId: 'p2', text: 'auth module done, tests green' },
+    pipeSession({ deliverProgress: async (paneId, text) => { seen.push({ paneId, text }); } }),
+  );
+  assert.deepEqual(res, { type: 'ok', id: 'prog-1' });
+  assert.deepEqual(seen, [{ paneId: 'p2', text: 'auth module done, tests green' }]);
+});
+
+test('handlePipeRequest: todo_sync routes the full worker list into the widget cache', async () => {
+  const seen: Array<{ paneId: string; items: unknown[]; summary: string }> = [];
+  const res = await handlePipeRequest(
+    {
+      type: 'todo_sync', id: 'ts-1', paneId: 'p2',
+      items: [{ content: 'auth tests', status: 'in_progress' }, { content: 'extract', status: 'completed' }],
+      summary: '▶1 ✓1 (1/2) · auth tests',
+    },
+    pipeSession({ applyWorkerTodos: (paneId, items, summary) => { seen.push({ paneId, items: [...items], summary }); } }),
+  );
+  assert.deepEqual(res, { type: 'ok', id: 'ts-1' });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0]!.paneId, 'p2');
+  assert.equal(seen[0]!.items.length, 2);
+  assert.equal(seen[0]!.summary, '▶1 ✓1 (1/2) · auth tests');
+});

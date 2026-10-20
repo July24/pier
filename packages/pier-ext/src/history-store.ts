@@ -29,6 +29,8 @@ export interface HistoryEntry {
   kind: string;
   paneId: string;
   tabId: string;
+  /** Phase 2 task slug — carried so resume-from-history keeps the tool-facing reference stable. */
+  slug?: string;
   tabName?: string;
   workspaceId: string;
   cwd: string;

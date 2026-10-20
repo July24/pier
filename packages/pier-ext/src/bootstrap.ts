@@ -12,6 +12,7 @@ import Group from '@deepseek-ai/cordis-plugin-group';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import * as path from 'node:path';
 import { DisposeLedger } from './ledger.ts';
+import { cordisProvide } from './cordis-services.ts';
 import { pierOption } from './pier-options.ts';
 
 export interface BootstrapHooks {
@@ -37,7 +38,7 @@ export async function createCordisApp(hooks: BootstrapHooks = {}): Promise<Cordi
   const root = new Context();
   const ledger = new DisposeLedger();
   // Inject the ledger through Cordis DI because loader transforms entry config and cannot carry live instances.
-  root.provide('pi-herdr.ledger', ledger);
+  cordisProvide(root, 'pi-herdr.ledger', ledger);
   if (hooks.onDispose) {
     root.effect(() => () => { hooks.onDispose?.(); }, 'session-root');
   }

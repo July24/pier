@@ -1,11 +1,11 @@
 {
   "role": "worker-default",
-  "version": "1.4.0",
-  "description": "默认worker角色（D83 继承制）：镜像 master.tools 减 subagent/terminal（禁嵌套、资源归属）；排除族显式 deny——在 D82 unknownTools=allow 姿态下仍持禁令；todos serial。v1.4.0: 工具合并后更新 deny 列表",
+  "version": "1.5.0",
+  "description": "默认worker角色（D83 继承制）：镜像 master.tools 减 subagent/terminal（禁嵌套、资源归属）；排除族显式 deny——在 D82 unknownTools=allow 姿态下仍持禁令；todos serial。v1.5.0: Phase 2 显式放行 report_progress（worker→master 检查点上报）；v1.4.0: 工具合并后更新 deny 列表",
   "manifest": {
     "unknownTools": "allow",
     "tools": [
-      "todo_write", "ask_user_question",
+      "todo_write", "ask_user_question", "report_progress",
       "read", "grep", "glob", "bash", "pwsh", "edit", "write",
       "web_search"
     ],

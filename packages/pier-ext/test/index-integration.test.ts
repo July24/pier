@@ -5,12 +5,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdir, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import pier from '../src/index.ts';
 import { pipeNameFor, pipeRequestTo, startPipeServer, type PipeRequest } from '../src/pipe-channel.ts';
 import { sessionDirName } from '../src/storage-layout.ts';
 import { fakePi, fire, jsonl, transcriptMessage, withCleanup, type CleanupContext, type FakePi } from './test-utils.ts';
+import { readWorkerMarker, writeWorkerMarker } from '../src/worker-marker.ts';
 
 type IndexMode = 'worker' | 'bare' | 'master';
 
@@ -378,6 +379,25 @@ test('index: turn_start resets lastStopReason (A11) so a stale abort cannot swal
   }
 }));
 
+test('index: before_agent_start marks the run busy so settlement notices enter the D92 buffer', withCleanup(async (cleanup) => {
+  const paneId = 'p_busy_start';
+  const pi = await mountIndex(cleanup, 'master', { HERDR_SOCKET_PATH: '/tmp/pier-test-sock-busy', HERDR_PANE_ID: paneId });
+  const cwd = cleanup.tempDir('pier-busy-ws').path;
+  const ctx = { cwd, sessionManager: { getBranch: () => [] } };
+  try {
+    await fire(pi, 'session_start', { reason: 'new' }, ctx);
+    // pi 1.2 counts the run as busy here, before turn_start fires.
+    await fire(pi, 'before_agent_start', { messageType: 'user', prompt: 'start', systemPromptOptions: { sections: {} } });
+    const res = await pipeRequestTo(cwd, paneId, { type: 'reply', id: 'r-busy-start', paneId: 'p_child', text: 'child finished', sessionFile: null });
+    assert.equal(res.type, 'ok');
+    assert.equal(pi.userSent.length, 0, 'a notice arriving during the start window is buffered');
+    await fire(pi, 'agent_settled', {}, ctx);
+    assert.equal(pi.userSent.length, 1, 'the buffered notice flushes once the run settles');
+  } finally {
+    await fire(pi, 'session_shutdown');
+  }
+}));
+
 test('settle fast-path (D49): an aborted settle keeps the machine request armed; the genuine settle pushes the reply', withCleanup(async (cleanup) => {
   const childPane = 'p_settle_child';
   // Own transcript under the temp agent home so the genuine settle finds its closing text.
@@ -519,4 +539,252 @@ test('/new: a fresh session does not inherit the previous session\'s todos', wit
   await pi.commands.get('todos')!.handler!([], { ui: { notify: (t: string) => { notified.push(t); } } });
   assert.doesNotMatch(notified.join('\n'), /Old session task/);
   await fire(pi, 'session_shutdown');
+}));
+
+/* ── herdr 0.9.2 restore identity: worker marker + self-reported resume ── */
+
+test('worker session_start writes the restore marker next to its session file', withCleanup(async (cleanup) => {
+  const pi = await mountIndex(cleanup, 'worker', { PI_SESSION_FILE: undefined, PI_SESSION_ID: undefined });
+  const dir = cleanup.tempDir('wmark');
+  const sessionFile = join(dir.path, '2026-10-08T01-00-00Z_a1b2c3d4.jsonl');
+  await fire(pi, 'session_start', { reason: 'new' }, {
+    sessionManager: { getBranch: () => [], getSessionFile: () => sessionFile, getSessionDir: () => dir.path },
+    cwd: dir.path,
+  });
+  assert.equal(existsSync(join(dir.path, 'herdr-pi', 'a1b2c3d4', 'worker.json')), true, 'marker keyed by bare session id');
+  await fire(pi, 'session_shutdown');
+}));
+
+test('a herdr boot whose session has a worker marker mounts todo-only (restored worker, no spawn env)', withCleanup(async (cleanup) => {
+  const dir = cleanup.tempDir('wmark-restore');
+  const sessionFile = join(dir.path, '2026-10-08T01-00-00Z_a1b2c3d4.jsonl');
+  writeWorkerMarker(sessionFile, 'worker-default');
+  const pi = await mountIndex(cleanup, 'master', { PI_SESSION_FILE: sessionFile });
+  assert.equal(pi.tools.has('subagent'), false, 'restored worker must not grow master delegation tools');
+  assert.equal(pi.tools.has('todo_write'), true, 'todo loop still mounts');
+  await fire(pi, 'session_shutdown');
+}));
+
+/* ── delegation identity chain (RFC rfc-delegation-identity §2): env > marker > branch fold ── */
+
+const DELEGATION_ENV_JSON = JSON.stringify({
+  parentPaneId: 'wD:p1',
+  parentSessionId: 'e5f6a7b8',
+  taskId: 't-42',
+  description: 'harden pipe channel',
+  role: 'worker-default',
+});
+
+/** Fires one before_agent_start and returns the sections map the handler mutated. */
+async function delegationSections(pi: FakePi): Promise<Record<string, string>> {
+  const sections: Record<string, string> = {};
+  await fire(pi, 'before_agent_start', { systemPromptOptions: { sections } });
+  return sections;
+}
+
+test('worker session_start: delegation env writes the first-frame entry, the prompt section, and the marker', withCleanup(async (cleanup) => {
+  const dir = cleanup.tempDir('delegation-env');
+  const sessionFile = join(dir.path, '2026-10-08T01-00-00Z_a1b2c3d4.jsonl');
+  const pi = await mountIndex(cleanup, 'worker', {
+    PI_SESSION_FILE: sessionFile,
+    PI_HERDR_DELEGATION: DELEGATION_ENV_JSON,
+  });
+  const ctx = { sessionManager: { getBranch: () => [], getSessionFile: () => sessionFile, getSessionDir: () => dir.path } };
+  await fire(pi, 'session_start', { reason: 'new' }, ctx);
+  const entry = pi.entries.find(([type]) => type === 'pi-herdr.delegation');
+  assert.ok(entry, 'first-frame delegation entry written');
+  assert.deepEqual(entry![1], { version: 1, parentPaneId: 'wD:p1', parentSessionId: 'e5f6a7b8', taskId: 't-42', description: 'harden pipe channel', role: 'worker-default', ts: (entry![1] as { ts: number }).ts });
+  const sections = await delegationSections(pi);
+  assert.match(sections['pier-delegation'] ?? '', /delegated subagent of the master pane wD:p1/);
+  assert.match(sections['pier-delegation'] ?? '', /Task: harden pipe channel/);
+  assert.deepEqual(readWorkerMarker(sessionFile)!.delegation, JSON.parse(DELEGATION_ENV_JSON));
+  await fire(pi, 'session_shutdown');
+}));
+
+test('restored worker: no env — the marker and the branch entry each re-arm the delegation identity', withCleanup(async (cleanup) => {
+  const dir = cleanup.tempDir('delegation-restore');
+  const sessionFile = join(dir.path, '2026-10-08T01-00-00Z_a1b2c3d4.jsonl');
+  writeWorkerMarker(sessionFile, 'worker-default', JSON.parse(DELEGATION_ENV_JSON));
+  const pi = await mountIndex(cleanup, 'worker', { PI_SESSION_FILE: sessionFile });
+  await fire(pi, 'session_start', { reason: 'resume' }, {
+    sessionManager: { getBranch: () => [], getSessionFile: () => sessionFile, getSessionDir: () => dir.path },
+  });
+  assert.match((await delegationSections(pi))['pier-delegation'] ?? '', /master pane wD:p1/, 'marker alone re-arms the section');
+
+  const pi2 = await mountIndex(cleanup, 'worker', { PI_SESSION_FILE: sessionFile });
+  await mkdir(join(dir.path, 'herdr-pi'), { recursive: true });
+  await fire(pi2, 'session_start', { reason: 'resume' }, {
+    sessionManager: {
+      getBranch: () => [{ type: 'custom', customType: 'pi-herdr.delegation', data: JSON.parse(DELEGATION_ENV_JSON) }],
+      getSessionFile: () => sessionFile,
+      getSessionDir: () => dir.path,
+    },
+  });
+  assert.match((await delegationSections(pi2))['pier-delegation'] ?? '', /master pane wD:p1/, 'branch entry alone re-arms the section');
+  assert.equal(pi2.entries.filter(([type]) => type === 'pi-herdr.delegation').length, 0, 'an existing branch entry is not duplicated');
+  await fire(pi, 'session_shutdown');
+  await fire(pi2, 'session_shutdown');
+}));
+
+test('master and delegation-less workers never grow a pier-delegation section', withCleanup(async (cleanup) => {
+  const master = await mountIndex(cleanup, 'master', { PI_HERDR_DELEGATION: DELEGATION_ENV_JSON });
+  // mountIndex only clears its baseline keys: unset the delegation env explicitly for the worker mount.
+  const worker = await mountIndex(cleanup, 'worker', { PI_HERDR_DELEGATION: undefined });
+  try {
+    assert.equal('pier-delegation' in (await delegationSections(master)), false, 'master ignores the delegation env');
+    await fire(worker, 'session_start', { reason: 'new' }, { sessionManager: { getBranch: () => [] } });
+    assert.equal('pier-delegation' in (await delegationSections(worker)), false, 'no delegation → no section');
+    assert.equal(worker.entries.filter(([type]) => type === 'pi-herdr.delegation').length, 0);
+  } finally {
+    // Shutdown must run even on assertion failure, or the mounted cordis handles hang the runner.
+    await fire(master, 'session_shutdown');
+    await fire(worker, 'session_shutdown');
+  }
+}));
+
+test('tool_execution_end.durationMs (pi ≥ 1.1) lands in the tools efficiency ledger', withCleanup(async (cleanup) => {
+  const pi = await mountIndex(cleanup, 'worker', { PI_SESSION_FILE: undefined, PI_SESSION_ID: undefined });
+  const dir = cleanup.tempDir('tools-ledger');
+  const sessionFile = join(dir.path, '2026-10-08T01-00-00Z_a1b2c3d4.jsonl');
+  const ctx = { sessionManager: { getBranch: () => [], getSessionFile: () => sessionFile, getSessionDir: () => dir.path }, cwd: dir.path };
+  await fire(pi, 'session_start', { reason: 'new' }, ctx);
+  await fire(pi, 'tool_execution_start', { toolCallId: 't1', toolName: 'bash' });
+  await fire(pi, 'tool_execution_end', { toolCallId: 't1', durationMs: 1234 });
+  const ledger = join(dir.path, 'herdr-pi', 'a1b2c3d4', 'efficiency-logs', 'tools.jsonl');
+  const row = JSON.parse((await readFile(ledger, 'utf8')).trim());
+  assert.equal(row.tool, 'bash', 'tool name recovered from the start event');
+  assert.equal(row.durationMs, 1234);
+  assert.equal(row.sessionId, 'a1b2c3d4');
+  // Old-pi shape (no durationMs on the event) logs nothing — no estimated wall-clock either.
+  await fire(pi, 'tool_execution_start', { toolCallId: 't2', toolName: 'read' });
+  await fire(pi, 'tool_execution_end', { toolCallId: 't2' });
+  const lines = (await readFile(ledger, 'utf8')).trim().split('\n');
+  assert.equal(lines.length, 1, 'a tool without a recorded duration stays out of the ledger');
+  await fire(pi, 'session_shutdown');
+}));
+
+test('report_progress: worker dials the master pipe; the master gets a display-less, turn-less custom message', withCleanup(async (cleanup) => {
+  const dir = cleanup.tempDir('progress-e2e');
+  // Master: real composition root, its pipe server binds pipeNameFor(master cwd, own pane).
+  const master = await mountIndex(cleanup, 'master', { HERDR_SOCKET_PATH: '/tmp/pier-test-sock' });
+  try {
+    const masterCwd = dir.path;
+    await fire(master, 'session_start', { reason: 'new' }, {
+      cwd: masterCwd,
+      sessionManager: { getBranch: () => [], getSessionFile: () => join(masterCwd, '2026-10-14T01-00-00Z_m1m1m1m1.jsonl'), getSessionDir: () => masterCwd },
+    });
+    const parentPipe = pipeNameFor(masterCwd, 'p1');
+
+    // Worker: delegation env carries the master's pipe (exactly what spawn hands over now).
+    const delegation = {
+      parentPaneId: 'p1', parentSessionId: 'm1m1m1m1', parentPipe,
+      taskId: 't-77', description: 'harden pipe channel', role: 'worker-default',
+    };
+    const worker = await mountIndex(cleanup, 'worker', {
+      PI_HERDR_DELEGATION: JSON.stringify(delegation),
+    });
+    try {
+      const exec = worker.tools.get('report_progress')?.execute;
+      assert.ok(exec, 'report_progress registers on worker panes only');
+      assert.equal(master.tools.has('report_progress'), false, 'master never grows the reporting tool');
+
+      const missing = await exec('t0', {}, undefined, undefined, {}) as { content: Array<{ text: string }> };
+      assert.match(missing.content[0]!.text, /`message` is required/);
+
+      const res = await exec('t0', { message: 'auth module done, tests green' }, undefined, undefined, {}) as { content: Array<{ text: string }> };
+      assert.match(res.content[0]!.text, /Progress delivered to the master/);
+
+      // The master's sendMessage received ONE display-less, turn-less custom message.
+      const sent = master.sent.filter((s) => (s.msg as { customType?: string }).customType === 'pi-herdr.progress');
+      assert.equal(sent.length, 1);
+      assert.equal((sent[0]!.msg as { content: string }).content, 'auth module done, tests green');
+      assert.equal((sent[0]!.msg as { display: boolean }).display, false);
+      assert.equal(sent[0]!.opts?.triggerTurn, false);
+      assert.equal((sent[0]!.msg as { details: { paneId?: string } }).details?.paneId, '', 'worker without a herdr pane reports an empty id');
+    } finally {
+      await fire(worker, 'session_shutdown');
+    }
+  } finally {
+    await fire(master, 'session_shutdown');
+  }
+}));
+
+test('report_progress: no delegation (or no pipe) fails with a modeling error, never a throw', withCleanup(async (cleanup) => {
+  const worker = await mountIndex(cleanup, 'worker');
+  try {
+    const exec = worker.tools.get('report_progress')?.execute!;
+    const res = await exec('t0', { message: 'orphan update' }, undefined, undefined, {}) as { content: Array<{ text: string }> };
+    assert.match(res.content[0]!.text, /no delegating master pipe/);
+  } finally {
+    await fire(worker, 'session_shutdown');
+  }
+}));
+
+test('D113 unified widget: worker todo_write pushes todo_sync to the master pipe; widget + /pier-tree render live worker state', withCleanup(async (cleanup) => {
+  const dir = cleanup.tempDir('widget-e2e');
+  const masterCwd = dir.path;
+  // A running registry row for pane w2: the tree/widget render REGISTRY rows joined with the push cache.
+  const branch = [
+    { type: 'custom', customType: 'pi-herdr.subs', data: { version: 2, subs: [{
+      taskId: 't-88', kind: 'task', paneId: 'w2', slug: 'harden-pipe', tabId: 't0', tabName: 'task',
+      cwd: masterCwd, description: 'harden pipe channel', background: true, status: 'running',
+      sessionFile: null, launchCommand: [], createdAt: Date.now() - 60_000,
+    }] } },
+  ];
+  const masterWidgets: string[][] = [];
+  const master = await mountIndex(cleanup, 'master');
+  try {
+    await fire(master, 'session_start', { reason: 'new' }, {
+      cwd: masterCwd,
+      ui: { setWidget: (_id: string, lines: string[]) => { masterWidgets.push(lines); } },
+      sessionManager: {
+        getBranch: () => branch,
+        getSessionFile: () => join(masterCwd, '2026-10-20T01-00-00Z_m1m1m1m1.jsonl'),
+        getSessionDir: () => masterCwd,
+      },
+    });
+    const parentPipe = pipeNameFor(masterCwd, 'p1');
+
+    // Worker with a herdr pane id, so its push keys the same paneId the registry row uses.
+    const worker = await mountIndex(cleanup, 'worker', {
+      HERDR_ENV: '1', HERDR_SOCKET_PATH: '/tmp/pier-test-sock-dead', HERDR_PANE_ID: 'w2',
+      PI_HERDR_DELEGATION: JSON.stringify({
+        parentPaneId: 'p1', parentSessionId: 'm1m1m1m1', parentPipe,
+        taskId: 't-88', description: 'harden pipe channel', role: 'worker-default',
+      }),
+    });
+    try {
+      const workerWidgets: string[][] = [];
+      const workerCtx = { ui: { setWidget: (_id: string, lines: string[]) => { workerWidgets.push(lines); } } };
+      await fire(worker, 'session_start', { reason: 'new' }, { ...workerCtx, sessionManager: { getBranch: () => [] } });
+      const todoWrite = worker.tools.get('todo_write')?.execute!;
+      await todoWrite('t1', { todos: [
+        { content: 'extract auth middleware', status: 'completed' },
+        { content: 'auth module tests', status: 'in_progress' },
+        { content: 'token refresh', status: 'pending' },
+      ] }, undefined, undefined, workerCtx);
+      assert.deepEqual(workerWidgets.at(-1), ['▶ auth module tests ✓1/3'], 'worker widget = one self line');
+
+      // The push arrived and re-rendered the MASTER widget with the live worker row.
+      await new Promise((r) => setTimeout(r, 50));
+      assert.ok(masterWidgets.some((lines) => lines.includes('↳ harden-pipe ▶ auth module tests ✓1/3')),
+        `master widget shows the worker line: ${JSON.stringify(masterWidgets.at(-1))}`);
+
+      // /pier-tree renders the full delegation tree with the worker's COMPLETE list.
+      const notified: string[] = [];
+      const tree = master.commands.get('pier-tree');
+      assert.ok(tree, '/pier-tree registers on master');
+      assert.equal(typeof tree!.handler, 'function');
+      await (tree!.handler as (args: unknown, ctx: unknown) => Promise<void>)([], { ui: { notify: (text: string) => { notified.push(text); } } });
+      const text = notified.join('\n');
+      assert.ok(text.includes('PIER DELEGATION TREE'));
+      assert.ok(text.includes('harden-pipe (w2 · running)'));
+      assert.ok(text.includes('auth module tests'), 'worker current item reaches the tree');
+      assert.ok(text.includes('extract auth middleware') && text.includes('token refresh'), 'worker FULL list is cached and rendered');
+    } finally {
+      await fire(worker, 'session_shutdown');
+    }
+  } finally {
+    await fire(master, 'session_shutdown');
+  }
 }));

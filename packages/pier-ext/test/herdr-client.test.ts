@@ -1,6 +1,7 @@
 /**
  * herdr-client: env detection, the Noop contract, the NDJSON socket protocol, and the A6 wire
- * contract — regenerate fixtures/herdr-contract.json after a herdr upgrade so drift shows up here.
+ * contract — fixtures/herdr-contract.json pins the 0.9.5 methods snapshot (protocol 22, regenerated
+ * from `herdr api schema`); after a herdr upgrade, re-verify protocol + method set so drift shows up here.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -165,6 +166,28 @@ rpcTest('HerdrClient: pane.list maps fields; connection roundtrip',
     assert.equal(server.received[0]?.method, 'pane.list');
   });
 
+rpcTest('HerdrClient: pane.process_info maps foreground processes; failure is null', {
+  'pane.process_info': {
+    type: 'pane_process_info',
+    process_info: {
+      pane_id: 'p2', shell_pid: 41,
+      foreground_processes: [{ name: 'zsh', argv0: '/bin/zsh', pid: 42, cwd: '/w' }, { name: null, argv0: null }],
+    },
+  },
+}, async (client, server) => {
+  const info = await client.processInfo('p2');
+  assert.deepEqual(info, {
+    paneId: 'p2', shellPid: 41,
+    foreground: [
+      { name: 'zsh', argv0: '/bin/zsh', pid: 42, cwd: '/w' },
+      { name: null, argv0: null, pid: null, cwd: null },
+    ],
+  });
+  assert.equal(server.received[0]?.method, 'pane.process_info');
+  server.error = { code: 'unknown_method', message: 'nope' };
+  assert.equal(await client.processInfo('p2'), null, 'an old server degrades to unknown');
+});
+
 rpcTest('HerdrClient: listAgents maps agent_session.value', {
   'agent.list': { agents: [{ pane_id: 'p2', agent: 'pi', agent_status: 'working', state_labels: { k: 'v' }, tokens: { 'pi-todo': 'x' },
     agent_session: { value: '/sess/a.jsonl', kind: 'path' } }] },
@@ -176,6 +199,18 @@ rpcTest('HerdrClient: listAgents maps agent_session.value', {
   assert.equal(agents[0].status, 'working');
   assert.equal(await client.getAgentSessionPath('p2'), '/sess/a.jsonl');
   assert.equal(await client.getAgentSessionPath('missing'), null);
+});
+
+rpcTest('HerdrClient: reportAgentSessionResume holds the pane first, then registers resume_argv (0.9.5+)', {}, async (client, server) => {
+  await client.reportAgentSessionResume('a1b2c3', ['pi', '-e', '/ext/index.ts', '--session', '/s/a.jsonl']);
+  const hold = server.received.find((r) => r.method === 'pane.report_agent');
+  assert.ok(hold, 'an idle state report must precede the resume report (resume_not_accepted)');
+  assert.equal(hold.params.state, 'idle');
+  const report = server.received.find((r) => r.method === 'pane.report_agent_session');
+  assert.ok(report, 'pane.report_agent_session reached the wire');
+  assert.equal(report.params.agent_session_id, 'a1b2c3');
+  assert.deepEqual(report.params.resume_argv, ['pi', '-e', '/ext/index.ts', '--session', '/s/a.jsonl']);
+  assert.ok(server.received.indexOf(report) > server.received.indexOf(hold), 'order: hold before report');
 });
 
 rpcTest('HerdrClient: splitPane extracts a nested pane_id via findIdIn',
@@ -312,13 +347,13 @@ rpcTest('HerdrClient: waitForOutput degrades to a discriminated timeout', {}, as
   assert.deepEqual(await client.waitForOutput('p2', { type: 'substring', value: 'x' }, 50), { matched: false, reason: 'timeout' });
 }, (server) => { server.error = { code: 'timeout', message: 'wait timeout' }; });
 
-rpcTest('HerdrClient (0.9.1): openPluginPane popup, nested agent.explain, ping version, 0.9.1 list fields', (method, params) => {
+rpcTest('HerdrClient (0.9.5): openPluginPane popup, nested agent.explain, ping version, list fields', (method, params) => {
   if (method === 'plugin.pane.open') {
     if (params.placement === 'popup') return { type: 'plugin_pane_opened', plugin_pane: { plugin_id: 'pier.workbench', entrypoint: 'dashboard', pane: { pane_id: 'w1:p8' } } };
     return { type: 'plugin_pane_opened', plugin_pane: { pane: { pane_id: 'w1:p8', tab_id: 'w1:t3' } } };
   }
   if (method === 'agent.explain') return { type: 'agent_explain', explain: { matched_rule: 'pi-standard', skip_state_reason: 'process_crashed' } };
-  if (method === 'ping') return { type: 'pong', version: '0.9.1', protocol: 22 };
+  if (method === 'ping') return { type: 'pong', version: '0.9.5', protocol: 22 };
   if (method === 'agent.list') {
     return { agents: [{ pane_id: 'p2', agent: 'pi', agent_status: 'working', state_labels: {}, tokens: {}, foreground_cwd: '/repo/sub',
       agent_session: { value: '/sess/a.jsonl', kind: 'path' } }] };
@@ -337,7 +372,7 @@ rpcTest('HerdrClient (0.9.1): openPluginPane popup, nested agent.explain, ping v
   assert.equal(explain?.skip_state_reason, 'process_crashed');
   assert.equal(explain?.type, undefined, 'unwraps {type, explain} envelope');
 
-  assert.equal(await client.getServerVersion(), '0.9.1');
+  assert.equal(await client.getServerVersion(), '0.9.5');
   assert.equal(server.received.filter((r) => r.method === 'ping').length, 1, 'the version is cached');
 
   const agents = await client.listAgents();
@@ -401,7 +436,9 @@ rpcTest('A6 contract: every request pier sends stays inside the herdr schema', r
   // Covers the requests pier actually sends (including the focus forwarding the client used to drop).
   await client.reportAgent('working', 'badge');
   await client.reportMetadata({ session: 'label', items: [{ content: 'x', status: 'in_progress' }] });
-  await client.listAgents();
+  await client.reportDelegationTokens({
+    parentPaneId: 'w1:p1', parentSessionId: 'a1b2', taskId: 't', description: 'd', role: 'worker-default',
+  });
   await client.waitAgent('w1:p2', ['idle'], 50);
   await client.splitPane({ direction: 'right', cwd: '/tmp', focus: false, targetPaneId: 'w1:p1', ratio: 0.3 });
   await client.paneLayout({ paneId: 'w1:p1' });
@@ -419,7 +456,6 @@ rpcTest('A6 contract: every request pier sends stays inside the herdr schema', r
   await client.waitForOutput('w1:p2', { type: 'substring', value: 'x' }, 50);
   await client.openPluginPane({ pluginId: 'pier.workbench', entrypoint: 'dashboard', placement: 'popup', width: '80%', height: '80%', focus: true });
   await client.agentExplain('w1:p1');
-
   assert.ok(server.received.length >= 10, `expected several kinds of request, recorded ${server.received.length}`);
   // The loop below only checks what was actually sent: a renamed/dropped readAgent call would skip its schema check.
   assert.ok(server.received.some((r) => r.method === 'agent.read'), 'agent.read reached the wire');
@@ -448,6 +484,22 @@ rpcTest('A6 contract: every request pier sends stays inside the herdr schema', r
   assert.ok(metaKeys.has('tokens') || metaKeys.has('clear_state_labels'), 'report_metadata uses the modern fields');
 });
 
+rpcTest('delegation projection: workerTag prefixes the title; pi-parent/pi-task ride their own token batch', respond, async (client, server) => {
+  await client.reportMetadata({ session: 's', items: [], workerTag: 'harden pipe channel' });
+  await client.reportMetadata({ session: 's', items: [{ content: 'x', status: 'in_progress' }], workerTag: 'harden pipe channel' });
+  await client.reportDelegationTokens({ parentPaneId: 'p0', parentSessionId: 'a1', taskId: 't', description: 'harden pipe channel', role: 'worker-default' });
+  await client.reportDelegationTokens(null);
+  await client.reportDelegationTokens({ parentPaneId: '', parentSessionId: 'a1', taskId: 't', description: 'd', role: 'r' });
+  const metadata = server.received.filter((r) => r.method === 'pane.report_metadata');
+  // First report of a session clears the legacy stale token batch (D96); then: title-only, title-only, delegation.
+  assert.equal(metadata.length, 4, 'stale batch + two title batches + one delegation batch');
+  assert.ok('tokens' in (metadata[0]!.params) && metadata[0]!.params.title === undefined, 'the stale-cleanup batch carries no title');
+  assert.equal(metadata[1]!.params.title, '↳ harden pipe channel', 'no todos yet → the delegated task stands alone');
+  assert.deepEqual(metadata[1]!.params.tokens, { 'pi-todo': '↳ harden pipe channel' }, 'title batch carries only the pi-todo mirror, never pi-parent/pi-task');
+  assert.match(String(metadata[2]!.params.title), /^\u21b3 /, 'a live todo title is prefixed with the worker tag');
+  assert.deepEqual(metadata[3]!.params.tokens, { 'pi-parent': 'p0', 'pi-task': 'harden pipe channel' });
+  assert.equal(metadata[3]!.params.title, undefined, 'the delegation batch carries no title');
+});
 rpcTest('A6 contract: pane.split really forwards focus (it used to be dropped silently)', respond, async (client, server) => {
   await client.splitPane({ direction: 'right', focus: false });
   const split = server.received.find((r) => r.method === 'pane.split');

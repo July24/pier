@@ -3,10 +3,12 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
+import { cordisProvide } from '../src/cordis-services.ts';
 import type { HerdrClientLike } from '../src/herdr-client.ts';
 import { PiSurface } from '../src/pi-surface.ts';
 import type { DisposeLedger } from '../src/ledger.ts';
 import subagentPlugin from '../src/plugins/subagent.ts';
+import type { SubagentDeps } from '../src/plugins/subagent.ts';
 import { SUBS_CUSTOM_TYPE, emptySubagentPortBox, type SubEntry, type SubagentPortBox } from '../src/subagent-core.ts';
 
 export interface CleanupContext {
@@ -189,10 +191,12 @@ export function fakeHerdr(over: Partial<HerdrClientLike> = {}): HerdrClientLike 
   return {
     available: true,
     reportAgent: noop,
+    reportAgentSessionResume: noop,
     reportMetadata: noop,
     reportLockTokens: noop,
     reportDisplayAgent: noop,
     reportAskFlag: noop,
+    reportDelegationTokens: noop,
     sendPaneText: noop,
     closePane: noop,
     tabClose: noop,
@@ -203,6 +207,7 @@ export function fakeHerdr(over: Partial<HerdrClientLike> = {}): HerdrClientLike 
     splitPane: async () => 'p2',
     createTab: async () => ({ tabId: 't9', paneId: 'p9' }),
     listPanes: async () => [],
+    processInfo: async () => null,
     exportLayout: async () => null,
     paneLayout: async () => null,
     tabList: async () => [],
@@ -255,7 +260,7 @@ export interface SubagentMountOptions {
   subs?: SubEntry[];
   env?: { paneId?: string; tabId?: string; workspaceId?: string };
   extPath?: string;
-  deps?: Record<string, unknown>;
+  deps?: Partial<SubagentDeps>;
 }
 
 export type SubagentMount = { root: Context; pi: FakePi; port: SubagentPortBox; client: HerdrClientLike };
@@ -266,8 +271,8 @@ export async function mountSubagent(opts: SubagentMountOptions = {}): Promise<Su
   const client = fakeHerdr(opts.client);
   const port = emptySubagentPortBox();
   const root = new Context();
-  root.provide('pi-herdr.surface', new PiSurface(pi as unknown as object, opts.ledger));
-  root.provide('pi-herdr.subagent-deps', {
+  cordisProvide(root, 'pi-herdr.surface', new PiSurface(pi as unknown as object, opts.ledger));
+  cordisProvide(root, 'pi-herdr.subagent-deps', {
     client,
     env: { paneId: 'p0', tabId: 't0', workspaceId: 'w1', ...opts.env },
     extPath: opts.extPath ?? new URL('../src/index.ts', import.meta.url).pathname,

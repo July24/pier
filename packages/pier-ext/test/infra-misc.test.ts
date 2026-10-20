@@ -394,8 +394,11 @@ function npxLayoutProbe(cleanup: CleanupContext): NpxLayoutProbe {
   writeFileSync(join(extPkg, 'package.json'), JSON.stringify({ name: 'pi-pier', version: '1.0.0' }));
   writeFileSync(extEntry, 'export default {};\n');
 
-  fakeCli('pi', { bin: binDir, fake: fakeDir, log: logFile }, "if (args[0] === '--version') console.log('0.90.1');");
-  fakeCli('herdr', { bin: binDir, fake: fakeDir, log: logFile }, "if (args[0] === '--version') console.log('0.9.1');");
+  fakeCli('pi', { bin: binDir, fake: fakeDir, log: logFile }, "if (args[0] === '--version') console.log('1.3.0');");
+  fakeCli('herdr', { bin: binDir, fake: fakeDir, log: logFile }, [
+    "if (args[0] === '--version') console.log('0.9.5');",
+    "else if (args[0] === 'plugin' && args[1] === 'list' && args.includes('--json')) console.log(JSON.stringify({ result: { plugins: [{ plugin_id: 'pier.workbench', name: 'pier-workbench', version: '1.0.0', enabled: true, plugin_root: '/tmp/pier-wb', source: { kind: 'github', commit: 'abcdef1234567890' } }] } }));",
+  ].join('\n'));
   fakeCli('npm', { bin: binDir, fake: fakeDir, log: logFile }, "console.log('1.0.0');");
 
   const env: NodeJS.ProcessEnv = { ...process.env, PI_CODING_AGENT_DIR: agentDir };
@@ -427,5 +430,7 @@ test('update refreshes the install in place: `pi update` runs and nothing is rem
   assert.equal(r.status, 0, r.stderr + r.stdout);
   const calls = probe.calls();
   assert.ok(calls.some((c) => c.join(' ') === 'pi update npm:pi-pier'), `expected \`pi update npm:pi-pier\`, got ${JSON.stringify(calls)}`);
+  assert.ok(calls.some((c) => c.join(' ') === 'herdr plugin update pier.workbench --yes'), `expected \`herdr plugin update\`, got ${JSON.stringify(calls)}`);
+  assert.ok(!calls.some((c) => c.join(' ') === 'herdr plugin install July24/pier/packages/pier-workbench --yes'), 'a successful plugin update must not reinstall');
   assert.deepEqual(calls.filter((c) => c.some((a) => a === 'remove' || a === 'uninstall')), [], 'update must not uninstall before updating');
 }));

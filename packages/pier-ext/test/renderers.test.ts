@@ -6,7 +6,8 @@ import {
   APPROVAL_NEEDED_CUSTOM_TYPE, ROLE_MANIFEST_CUSTOM_TYPE, installRenderers, type RenderComponent, type RenderTheme,
 } from '../src/renderers.ts';
 import { TODO_EDIT_CUSTOM_TYPE } from '../src/todo-core.ts';
-import { SUBS_CUSTOM_TYPE } from '../src/subagent-core.ts';
+import { SUBS_CUSTOM_TYPE, PROGRESS_CUSTOM_TYPE } from '../src/subagent-core.ts';
+import { DELEGATION_CUSTOM_TYPE } from '../src/delegation-core.ts';
 import { TERMINALS_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE } from '../src/terminal-core.ts';
 import { TODO_REMINDER_CUSTOM_TYPE } from '../src/todo-reminder-core.ts';
 
@@ -63,6 +64,7 @@ test('every card clips its lines to the requested width', () => {
     [SUBS_CUSTOM_TYPE, { version: 2, subs: [{ paneId: 'wD:p4', status: 'running', description: 'y'.repeat(200) }] }],
     [TERMINALS_CUSTOM_TYPE, { version: 1, terminals: [{ paneId: 'wD:p9', label: 'z'.repeat(200), cwd: '/repo' }] }],
     [ROLE_MANIFEST_CUSTOM_TYPE, { role: 'worker-default', manifestVersion: 'v1', tools: ['read'], permissions: { read: 'allow' } }],
+    [DELEGATION_CUSTOM_TYPE, { parentPaneId: 'wD:p1', description: 'x'.repeat(200) }],
     [APPROVAL_NEEDED_CUSTOM_TYPE, { role: 'worker', tool: 'bash' }],
   ];
   for (const [type, data] of cases) {
@@ -88,7 +90,7 @@ const CASES: RenderCase[] = [
   { name: 'todo edit malformed: no edits', kind: 'entry', type: TODO_EDIT_CUSTOM_TYPE, expanded: true, data: { edits: [] }, expect: ['todo · no edits'] },
   { name: 'todo edit malformed: edits not a list', kind: 'entry', type: TODO_EDIT_CUSTOM_TYPE, expanded: true, data: { edits: 'nope' }, expect: ['todo · no edits'] },
   { name: 'subagents collapsed', kind: 'entry', type: SUBS_CUSTOM_TYPE, data: { version: 2, subs: [{ paneId: 'wD:p4', status: 'running', description: 'workbench upgrade' }, { paneId: 'wD:p5', status: 'settled', description: 'poll-loop tests' }] }, expect: ['subagents · 2 tracked 1 running'] },
-  { name: 'subagents expanded', kind: 'entry', type: SUBS_CUSTOM_TYPE, expanded: true, data: { version: 2, subs: [{ paneId: 'wD:p4', status: 'running', description: 'workbench upgrade' }, { paneId: 'wD:p5', status: 'settled', description: 'poll-loop tests' }] }, expect: ['subagents · 2 tracked 1 running', '  ● wD:p4 · running · workbench upgrade', '  ○ wD:p5 · settled · poll-loop tests'] },
+  { name: 'subagents expanded', kind: 'entry', type: SUBS_CUSTOM_TYPE, expanded: true, data: { version: 2, subs: [{ paneId: 'wD:p4', slug: 'workbench-upgrade', status: 'running', description: 'workbench upgrade' }, { paneId: 'wD:p5', status: 'settled', description: 'poll-loop tests' }] }, expect: ['subagents · 2 tracked 1 running', '  ↳ workbench-upgrade@wD:p4 · running · workbench upgrade', '  ↳ wD:p5 · settled · poll-loop tests'] },
   { name: 'subagents empty list', kind: 'entry', type: SUBS_CUSTOM_TYPE, data: { version: 2, subs: [] }, expect: ['subagents · none'] },
   { name: 'subagents undefined data', kind: 'entry', type: SUBS_CUSTOM_TYPE, expect: ['subagents · none'] },
   { name: 'terminals collapsed', kind: 'entry', type: TERMINALS_CUSTOM_TYPE, data: { version: 1, terminals: [{ paneId: 'wD:p9', label: 'dev server', cwd: '/repo' }, { paneId: 'wD:p8', cwd: '/tmp' }] }, expect: ['terminals · 2 open'] },
@@ -97,10 +99,16 @@ const CASES: RenderCase[] = [
   { name: 'role manifest (marker theme)', kind: 'entry', type: ROLE_MANIFEST_CUSTOM_TYPE, theme: marker, data: { role: 'worker-default', manifestVersion: 'v1', tools: ['read', 'bash', 'write'], permissions: { bash: 'deny', write: 'ask', read: 'allow' } }, expect: ['[accent]**role** worker-default [dim]vv1 · 3 tools[warning] · 2 gated'] },
   { name: 'role manifest switched', kind: 'entry', type: ROLE_MANIFEST_CUSTOM_TYPE, theme: marker, data: { role: 'worker-default', manifestVersion: 'v1', tools: ['read', 'bash', 'write'], permissions: { bash: 'deny', write: 'ask', read: 'allow' }, origin: 'switch', switchedBy: 'p-master' }, expect: ['[accent]**role** worker-default [dim]vv1 · 3 tools[warning] · 2 gated[accent] ⇄ p-master'] },
   { name: 'role manifest missing', kind: 'entry', type: ROLE_MANIFEST_CUSTOM_TYPE, expect: ['role ? v? · 0 tools'] },
+  { name: 'delegation card collapsed', kind: 'entry', type: DELEGATION_CUSTOM_TYPE, theme: marker, data: { parentPaneId: 'wD:p1', parentSessionId: 'a1b2c3d4', taskId: 't-9', description: 'refactor auth flow', role: 'worker-default' }, expect: ['[accent]⟵ delegated [dim]by master wD:p1 · refactor auth flow'] },
+  { name: 'delegation card expanded', kind: 'entry', type: DELEGATION_CUSTOM_TYPE, expanded: true, data: { parentPaneId: 'wD:p1', parentSessionId: 'a1b2c3d4', taskId: 't-9', description: 'refactor auth flow', role: 'reviewer' }, expect: ['⟵ delegated by master wD:p1 · refactor auth flow', '  task t-9 · role reviewer · parent session a1b2c3d4'] },
+  { name: 'delegation card missing fields', kind: 'entry', type: DELEGATION_CUSTOM_TYPE, expanded: true, data: {}, expect: ['⟵ delegated by master ? · ', '  task ? · role ? · parent session ?'] },
   { name: 'approval needed', kind: 'entry', type: APPROVAL_NEEDED_CUSTOM_TYPE, data: { role: 'worker', tool: 'bash' }, expect: ['⚠ approval needed · bash (worker)'] },
   { name: 'approval needed without a tool', kind: 'entry', type: APPROVAL_NEEDED_CUSTOM_TYPE, data: {}, expect: ['⚠ approval needed · ? (?)'] },
   { name: 'todo reminder collapsed', kind: 'message', type: TODO_REMINDER_CUSTOM_TYPE, data: { content: 'Reminder 1/3: you stopped with unfinished todos\nsecond line' }, expect: ['↻ todo reminder', '  Reminder 1/3: you stopped with unfinished todos'] },
   { name: 'todo reminder expanded', kind: 'message', type: TODO_REMINDER_CUSTOM_TYPE, expanded: true, data: { content: 'Reminder 1/3: you stopped with unfinished todos\nsecond line' }, expect: ['↻ todo reminder', 'Reminder 1/3: you stopped with unfinished todos', 'second line'] },
+  { name: 'progress collapsed', kind: 'message', type: PROGRESS_CUSTOM_TYPE, data: { content: 'auth module done, tests green', details: { paneId: 'p2' } }, expect: ['⤴ progress · p2: auth module done, tests green'] },
+  { name: 'progress expanded multi-line', kind: 'message', type: PROGRESS_CUSTOM_TYPE, expanded: true, data: { content: 'first line\nsecond line', details: { paneId: 'p2' } }, expect: ['⤴ progress · p2: first line second line', 'first line', 'second line'] },
+  { name: 'progress without details', kind: 'message', type: PROGRESS_CUSTOM_TYPE, data: { content: 'x' }, expect: ['⤴ progress · ?: x'] },
   { name: 'terminal nudge with empty content', kind: 'message', type: TERM_REMINDER_CUSTOM_TYPE, data: {}, expect: ['↻ terminal nudge', '  terminal nudge'] },
 ];
 
@@ -116,8 +124,7 @@ test('card renderers: each custom type renders its lines', async (t) => {
 
 test('installRenderers: registers every pier custom type when the host API exists', () => {
   const harness = install();
-  assert.deepEqual([...harness.entries.keys()], [TODO_EDIT_CUSTOM_TYPE, SUBS_CUSTOM_TYPE, TERMINALS_CUSTOM_TYPE, ROLE_MANIFEST_CUSTOM_TYPE, APPROVAL_NEEDED_CUSTOM_TYPE]);
-  assert.deepEqual([...harness.messages.keys()], [TODO_REMINDER_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE]);
+  assert.deepEqual([...harness.entries.keys()], [TODO_EDIT_CUSTOM_TYPE, SUBS_CUSTOM_TYPE, TERMINALS_CUSTOM_TYPE, DELEGATION_CUSTOM_TYPE, ROLE_MANIFEST_CUSTOM_TYPE, APPROVAL_NEEDED_CUSTOM_TYPE]);
 });
 
 test('installRenderers: a missing API registers nothing, a throwing host is contained per type', () => {
@@ -128,6 +135,6 @@ test('installRenderers: a missing API registers nothing, a throwing host is cont
     registerEntryRenderer: () => { calls += 1; throw new Error('boom'); },
     registerMessageRenderer: () => { calls += 1; },
   });
-  assert.equal(calls, 7, 'one throwing registration must not skip the rest');
-  assert.deepEqual(registered, [TODO_REMINDER_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE]);
+  assert.equal(calls, 9, 'one throwing registration must not skip the rest');
+  assert.deepEqual(registered, [PROGRESS_CUSTOM_TYPE, TODO_REMINDER_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE]);
 });

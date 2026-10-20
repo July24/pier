@@ -3,6 +3,7 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Context } from '@deepseek-ai/cordis';
 import { PiSurface } from './pi-surface.ts';
+import { cordisProvide } from './cordis-services.ts';
 import todoPlugin from './plugins/todo.ts';
 import type { TodosService } from './todos-service.ts';
 import type { TodoUiSlot } from './plugins/todo.ts';
@@ -26,8 +27,8 @@ export interface TodoOnlyMount {
 export async function mountTodoOnly(m: TodoOnlyMount): Promise<void> {
   const workerRoot = new Context();
   const workerSurface = new PiSurface(m.pi as unknown as object);
-  workerRoot.provide('pi-herdr.surface', workerSurface);
-  workerRoot.provide('pi-herdr.todo-deps', {
+  cordisProvide(workerRoot, 'pi-herdr.surface', workerSurface);
+  cordisProvide(workerRoot, 'pi-herdr.todo-deps', {
     todos: m.todos,
     allowParallelInProgress: m.todos.config.allowParallelInProgress,
     maxItems: 15,

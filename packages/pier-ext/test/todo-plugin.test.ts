@@ -3,17 +3,20 @@
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { Context } from '@deepseek-ai/cordis';
+import { cordisProvide } from '../src/cordis-services.ts';
 import todoPlugin, { widgetLines } from '../src/plugins/todo.ts';
+import type { WorkerWidgetRow } from '../src/tree-view.ts';
 import { BLOCKED_LABEL_KEY, formatBlockedLabel, formatPaneTitle, sidebarTodoTokens, staleTokenClearance } from '../src/pane-title.ts';
 import { PiSurface } from '../src/pi-surface.ts';
 import { DisposeLedger } from '../src/ledger.ts';
 import { TodosService } from '../src/todos-service.ts';
 import type { TodoItem } from '../src/vocab.ts';
 import { fakePi, fire, type FakePi } from './test-utils.ts';
-const WIDGET_MAX_LINES = 10;
+
 interface TodoDepsOverrides {
   ledger?: DisposeLedger;
   getBlockedDepth?: () => number;
+  getWorkers?: () => readonly WorkerWidgetRow[];
   stopReminder?: { getBlockedDepth: () => number; getRunningSubs: () => number };
 }
 
@@ -24,8 +27,8 @@ async function mount(pi: FakePi, over: TodoDepsOverrides = {}) {
   const surface = new PiSurface(pi as unknown as object, ledger);
   const state: { renderWidget: (ctx: unknown) => void; rerenderWidget?: () => void } = { renderWidget: () => {}, rerenderWidget: () => {} };
   const ctx = new Context();
-  ctx.provide('pi-herdr.surface', surface);
-  ctx.provide('pi-herdr.todo-deps', {
+  cordisProvide(ctx, 'pi-herdr.surface', surface);
+  cordisProvide(ctx, 'pi-herdr.todo-deps', {
     todos,
     allowParallelInProgress: true,
     maxItems: 15,
@@ -117,6 +120,39 @@ test('core/todo：R1 归档清空执行链——窗口拍不清，终态拍 rm �
   await ctx.fiber.dispose();
 });
 
+test('pi 1.2 before_agent_start policy: user + compaction continuation only', async () => {
+  const pi = fakePi();
+  const { ctx, todos } = await mount(pi);
+  const hook = pi.listeners.get('before_agent_start')?.[0];
+  todos.replace([{ content: 'a', status: 'in_progress' }]);
+  const userRun = { messageType: 'user', prompt: 'continue', systemPromptOptions: { sections: {} } };
+  const customRun = (customType: string) => ({ messageType: 'custom', message: { customType } });
+  assert.ok((await hook?.(userRun)) as { message?: unknown } | undefined);
+  assert.equal(await hook?.(customRun('pi-herdr.todo-reminder')), undefined, 'own stop reminder must not re-inject');
+  assert.ok((await hook?.(customRun('pi-herdr.compaction-continue'))) as { message?: unknown } | undefined);
+  assert.equal(await hook?.(customRun('pi-herdr.config-guide')), undefined, 'config guide is not a user task');
+  assert.equal(await hook?.(customRun('third-party.run')), undefined, 'unknown custom runs stay untouched');
+  // pi 1.1 has no messageType: preserve the old user-run behavior.
+  assert.ok((await hook?.()) as { message?: unknown } | undefined);
+  await ctx.fiber.dispose();
+});
+
+test('pi 1.2 before_agent_start policy: skipped custom runs do not advance the guard cadence', async () => {
+  const pi = fakePi();
+  const { ctx, todos } = await mount(pi);
+  const hook = pi.listeners.get('before_agent_start')?.[0];
+  todos.replace([]);
+  const customReminder = { messageType: 'custom', message: { customType: 'pi-herdr.todo-reminder' } };
+  const userRun = { messageType: 'user', prompt: 'next', systemPromptOptions: { sections: {} } };
+  assert.ok((await hook?.(userRun)) as { message?: unknown } | undefined, 'first empty-list guard');
+  for (let i = 0; i < 4; i++) assert.equal(await hook?.(customReminder), undefined);
+  assert.equal(await hook?.(userRun), undefined, 'four skipped custom runs must not count as four turns');
+  const later = [];
+  for (let i = 0; i < 4; i++) later.push(await hook?.(userRun));
+  assert.ok(later.some((r) => r !== undefined), 'the guard still fires on real user turns');
+  await ctx.fiber.dispose();
+});
+
 /* ── stop reminder wiring ─────────────────────────────────────── */
 test('D41 stop 提醒：custom 通道 + 宽限窗 + 唤醒取消（决策矩阵见 todo-core.test.ts）', async () => {
   const pi = fakePi();
@@ -184,7 +220,7 @@ test('D41 stop 提醒：未配置 stopReminder 时不注册催办钩子', async 
 });
 
 /* ── widget slot wiring ───────────────────────────────────────── */
-test('core/todo：widget 槽回填 + 闸门深度 >0 折叠一行、归零恢复（rerender 复用上次 eventCtx）', async () => {
+test('core/todo：widget 槽回填（D113 单行自态）+ 闸门折叠一行、归零恢复（rerender 复用上次 eventCtx）', async () => {
   const pi = fakePi();
   let depth = 0;
   const captured: string[][] = [];
@@ -194,55 +230,74 @@ test('core/todo：widget 槽回填 + 闸门深度 >0 折叠一行、归零恢复
     { content: 'a', status: 'in_progress' },
     { content: 'b', status: 'pending' },
   ], widgetCtx);
-  assert.ok((captured.at(-1) ?? []).length > 1, '闸门关着 → 全量窗口');
+  assert.deepEqual(captured.at(-1), ['▶ a ✓0/2'], '统一 widget：自己一行 = 当前条 + done/total');
   depth = 1;
   state.rerenderWidget?.(); // index enterBlocked path: slot filled by the mount, last ctx reused
   assert.equal(captured.at(-1)?.length, 1, '闸门开着 → 一行摘要');
+  assert.match(captured.at(-1)![0]!, /\/todos 全量/);
   depth = 0;
   state.rerenderWidget?.(); // index exitBlocked path
-  assert.ok((captured.at(-1) ?? []).length > 1, '闸门释放 → 恢复全量');
+  assert.deepEqual(captured.at(-1), ['▶ a ✓0/2'], '闸门释放 → 恢复单行');
 });
 
-/* ── widgetLines: activity-anchored window ────────────────────── */
+test('core/todo：worker 行经 getWorkers 挂进统一 widget（master 挂载语义）', async () => {
+  const pi = fakePi();
+  const captured: string[][] = [];
+  const widgetCtx = { ui: { setWidget: (_id: string, lines: string[]) => { captured.push(lines); } } };
+  const { state } = await mount(pi, {
+    getWorkers: () => [
+      { paneId: 'p2', slug: 'fix-auth', description: 'fix auth', kind: 'task', todos: { items: [{ content: 'auth tests', status: 'in_progress' }, { content: 'extract middleware', status: 'completed' }] } },
+      { paneId: 'p3', slug: 'migration', description: 'migrate', kind: 'task', todos: { items: [{ content: 'confirm schema', status: 'blocked', blocker: '等人' }] } },
+    ],
+  });
+  await todoWrite(pi, [{ content: 'orchestrate', status: 'in_progress' }], widgetCtx);
+  assert.deepEqual(captured.at(-1), [
+    '▶ orchestrate ✓0/1',
+    '↳ fix-auth ▶ auth tests ✓1/2',
+    '↳ migration ■ confirm schema（等人） ✓0/1',
+  ]);
+  state.rerenderWidget?.();
+  assert.equal(captured.length, 2, 'rerender re-reads getWorkers（todo_sync 到达后即刷新）');
+});
+
+/* ── widgetLines: unified one-line-per-agent matrix (D113) ────── */
 const it = (content: string, status: TodoItem['status'], phase?: string): TodoItem =>
   ({ content, status, ...(phase ? { phase } : {}) }) as TodoItem;
 const DONE_LIST = [it('Verify gateway', 'completed', 'verify'), it('Verify ids', 'completed', 'verify'), it('Update doc', 'completed', 'doc')];
 const GATED_LIST = [it('Dispatch workers', 'in_progress', 'repro'), it('Wait user', 'blocked'), it('Old done', 'completed', 'repro')];
 interface WindowCase {
-  name: string; items: TodoItem[]; opts?: { archivedAgeMs?: number; blockedDepth?: number };
-  /** `exact` pins the full render; the summary token format is owned by that case alone. */
-  exact?: string[]; lines?: number; budget?: boolean; hidden?: boolean; includes?: string[]; excludes?: string[];
+  name: string; items: TodoItem[]; opts?: { archivedAgeMs?: number; blockedDepth?: number; workers?: readonly WorkerWidgetRow[] };
+  exact?: string[]; lines?: number; includes?: string[]; excludes?: string[];
 }
 const WINDOW_CASES: WindowCase[] = [
-  { name: '预算内全量：摘要 token + phase 分组渲染', items: [it('a', 'in_progress', 'P1'), it('b', 'pending', 'P1'), it('c', 'completed', 'P2')], exact: ['todo: 1▶ 1○ 0■ 1✓', '  [P1]', '  ▶ a', '  ○ b', '  [P2]', '  ✓ c'] },
-  { name: '空列表 → 空行数组', items: [], exact: [] },
-  { name: 'blocked 带 blocker 后缀', items: [{ content: 'x', status: 'blocked', blocker: '等审核' } as TodoItem], includes: ['■ x — 等审核'] },
-  {
-    name: '实证场景：老 phase 组让位，最新 open 组存活',
-    items: [it('改造 packages/pier-ext', 'completed', '打包'), it('编写 README', 'completed', '文档'), it('更新根目录文档', 'completed', '文档'), it('npm pack 验证', 'completed', '验证'), it('准备 workflow', 'completed', '发布'), it('发布 npm', 'in_progress', '发布'), it('打 tag', 'pending'), it('验证安装', 'blocked', '验证')],
-    budget: true, hidden: true,
-    includes: ['▶ 发布 npm', '■ 验证安装', '○ 打 tag', '/todos'], excludes: ['✓ 编写 README'],
-  },
-  { name: '活动锚定滚动：窗口跟着中部 in_progress 走', items: Array.from({ length: 12 }, (_, i) => it(`t${i}`, i === 4 ? 'in_progress' : 'pending')), budget: true, hidden: true, includes: ['▶ t4', '○ t5', '○ t3'], excludes: ['○ t0'] },
-  { name: '无 in_progress → 锚定最后一条 open', items: [...Array.from({ length: 10 }, (_, i) => it(`done${i}`, 'completed')), it('next1', 'pending'), it('next2', 'pending')], includes: ['○ next2', '○ next1'], excludes: ['done0'] },
-  { name: '反冻结：归档列表两行降权，死条目不再占视窗', items: DONE_LIST, opts: { archivedAgeMs: 16 * 3_600_000 }, lines: 2, includes: ['archived 16h', '/todos'], excludes: ['Verify gateway'] },
-  { name: '未传归档 → 原有全量渲染', items: DONE_LIST, includes: ['✓ Verify gateway'] },
-  { name: '闸门开着 → 一行摘要（带 /todos 指路）', items: GATED_LIST, opts: { blockedDepth: 1 }, lines: 1, includes: ['/todos'] },
+  { name: '自态单行：当前条 + done/total（phase 分组退出常驻面）', items: [it('a', 'in_progress', 'P1'), it('b', 'pending', 'P1'), it('c', 'completed', 'P2')], exact: ['▶ a ✓1/3'] },
+  { name: '空列表且无 worker → 空行数组（widget 隐藏）', items: [], exact: [] },
+  { name: 'blocked 带 blocker 后缀', items: [{ content: 'x', status: 'blocked', blocker: '等审核' } as TodoItem], includes: ['■ 等人: 等审核', '✓0/1'] },
+  { name: '全 completed → 只剩计数', items: DONE_LIST, exact: ['✓3/3'] },
+  { name: 'worker 行：全量条目 → 当前条 + 计数；blocked → 等人', items: [it('发布 npm', 'in_progress')], opts: { workers: [
+    { paneId: 'p2', slug: 'fix-auth', description: 'fix auth', todos: { items: [{ content: 'auth tests', status: 'in_progress' }, { content: 'done one', status: 'completed' }] } },
+    { paneId: 'p3', slug: 'migration', description: 'migrate', todos: { items: [{ content: 'confirm schema', status: 'blocked', blocker: '等人' }] } },
+  ] }, exact: ['▶ 发布 npm ✓0/1', '↳ fix-auth ▶ auth tests ✓1/2', '↳ migration ■ confirm schema（等人） ✓0/1'] },
+  { name: 'worker 冷缓存：摘要 token 兜底；无 slug 用 paneId+描述', items: [it('a', 'in_progress')], opts: { workers: [
+    { paneId: 'p2', slug: 'fix-auth', description: 'fix auth', todos: { summary: '▶1 ○2 ✓0 · wiring' } },
+    { paneId: 'p9', description: 'legacy row', todos: null },
+  ] }, exact: ['▶ a ✓0/1', '↳ fix-auth · ▶1 ○2 ✓0 · wiring', '↳ p9 · legacy row'] },
+  { name: 'worker 超预算折叠：>9 个 running 折计数行指路 /pier-tree', items: [], opts: { workers: Array.from({ length: 12 }, (_, i) => ({ paneId: `p${i}`, slug: `w${i}`, description: `d${i}`, todos: { items: [{ content: `cur${i}`, status: 'in_progress' }] } })) }, lines: 10, includes: ['…另 3 个子代理 · /pier-tree'] },
+  { name: '反冻结：归档一行降权 + worker 仍可见', items: DONE_LIST, opts: { archivedAgeMs: 16 * 3_600_000, workers: [{ paneId: 'p2', slug: 'fix-auth', description: 'fix auth', todos: null }] }, includes: ['archived 16h', '↳ fix-auth'], excludes: ['Verify gateway'] },
+  { name: '闸门开着 → 一行摘要（带 /todos 指路，worker 计数）', items: GATED_LIST, opts: { blockedDepth: 1, workers: [{ paneId: 'p2', slug: 'w', description: 'd', todos: null }] }, lines: 1, includes: ['/todos', '↳×1'] },
   { name: '闸门优先于归档', items: DONE_LIST, opts: { blockedDepth: 2, archivedAgeMs: 16 * 3_600_000 }, lines: 1 },
-  { name: '深度归零 → 恢复窗口行为', items: GATED_LIST, opts: { blockedDepth: 0 }, includes: ['Dispatch workers'] },
+  { name: '深度归零 → 恢复统一行', items: GATED_LIST, opts: { blockedDepth: 0 }, includes: ['▶ Dispatch workers'] },
 ];
-test('widgetLines: 窗口矩阵（预算内全量 / 活动锚定 / 归档降权 / 闸门折叠）', async (t) => {
+test('widgetLines: 统一状态条矩阵（自态单行 / worker 行 / 冷缓存 / 折叠 / 闸门）', async (t) => {
   for (const c of WINDOW_CASES) {
     await t.test(c.name, () => {
-      const lines = widgetLines(c.items, c.opts);
+      const lines = widgetLines(c.items, c.opts as Parameters<typeof widgetLines>[1]);
       if (c.exact) {
         assert.deepEqual(lines, c.exact, c.name);
         return;
       }
       const joined = lines.join('\n');
-      if (c.budget) assert.ok(lines.length <= WIDGET_MAX_LINES, `widget 自控 ≤${WIDGET_MAX_LINES} 行（实际 ${lines.length}）`);
       if (c.lines !== undefined) assert.equal(lines.length, c.lines, c.name);
-      if (c.hidden) assert.match(joined, /\+\d+ hidden/, '隐藏计数行存在');
       for (const s of c.includes ?? []) assert.ok(joined.includes(s), `${c.name}: 应含 ${s}`);
       for (const s of c.excludes ?? []) assert.ok(!joined.includes(s), `${c.name}: 不该含 ${s}`);
     });

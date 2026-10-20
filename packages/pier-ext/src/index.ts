@@ -10,6 +10,7 @@
  * details persist in session JSONL and getBranch() replay implements branch rollback.
  */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { Type } from 'typebox';
 import {
   ASK_PARAMETERS,
   ASK_PROMPT_GUIDELINES,
@@ -38,8 +39,18 @@ import { ABORT_STOP_REASON, planSettleWake, shouldPushSettleReply } from './sett
 import { parseRuntimeManifest } from './tool-gate.ts';
 import { formatPaneTitle } from './pane-title.ts';
 import { registerSlimFrame, updateSlimFrame } from './slim-frame.ts';
-import { planIndexMode } from './index-runtime.ts';
-import { emptySubagentPortBox } from './subagent-core.ts';
+import { applyRestoredWorkerMode, planIndexMode } from './index-runtime.ts';
+import { buildResumeArgv, emptySubagentPortBox, PROGRESS_CUSTOM_TYPE } from './subagent-core.ts';
+import { hasWorkerMarker, writeWorkerMarker, readWorkerMarker } from './worker-marker.ts';
+import {
+  DELEGATION_CUSTOM_TYPE,
+  applyWorkerTag,
+  buildDelegationSection,
+  foldDelegation,
+  parseDelegationContext,
+  type DelegationContext,
+} from './delegation-core.ts';
+import { formatDelegationTree, type WorkerTodoSnapshot, type WorkerWidgetRow } from './tree-view.ts';
 import { createNoticeBuffer } from './index-notices.ts';
 import { handlePipeRequest, type MachineRequest } from './index-pipe.ts';
 import { installWriteLocks } from './index-locks.ts';
@@ -62,25 +73,15 @@ import { handleReducerToolResult, type ToolResultEventLike } from './reducer-inv
 import { appendEfficiencyLog, efficiencyLogPath, pruneSessionObjects, resolveSessionRoot } from './efficiency-store.ts';
 import type { RoutingTelemetryRecord, RoutingTelemetryRow } from './routing-telemetry.ts';
 import { loadEfficiencyConfigFromDisk, resolveEfficiencyConfig, type EfficiencyConfig } from './efficiency-config-core.ts';
-import { resolveDefaultFocusPollMs, parseFocusSample, spawnReflow, startFocusPoller, type FocusPoller } from './focus-poller.ts';
 import { composeMasterRuntime, createRoleRuntime } from './index-roles.ts';
 import { createGateRuntime } from './index-gates.ts';
-
-/** D-4: PIER_FOCUS_POLL_MS=0 disables the poller; invalid values fall back to the version default. */
-function focusPollIntervalMs(env: NodeJS.ProcessEnv = process.env, herdrVersion?: string | null): number {
-  const defaultMs = resolveDefaultFocusPollMs(herdrVersion);
-  const ms = Number(env.PIER_FOCUS_POLL_MS);
-  return env.PIER_FOCUS_POLL_MS !== undefined && env.PIER_FOCUS_POLL_MS.trim() !== '' && Number.isFinite(ms) && ms >= 0
-    ? ms
-    : defaultMs;
-}
 
 function agentSessionsDir(): string {
   return process.env.PI_CODING_AGENT_DIR ? join(process.env.PI_CODING_AGENT_DIR, 'sessions') : platformPaths.sessionsDir;
 }
 
 export default async function (pi: ExtensionAPI) {
-  const mode = planIndexMode();
+  const mode = applyRestoredWorkerMode(planIndexMode(), process.env.PI_SESSION_FILE ?? null, hasWorkerMarker);
   const isSubagent = mode.isSubagent;
   const roleBase = process.env.PI_HERDR_ROLE_BASE || process.cwd();
 
@@ -89,7 +90,8 @@ export default async function (pi: ExtensionAPI) {
   let effConfig: EfficiencyConfig = resolveEfficiencyConfig();
   const coordinator = new CompactCoordinator();
   const { client, env } = createHerdrClient();
-
+  /** RFC rfc-delegation-identity §2.1: resolved env → marker → branch fold; worker panes only. */
+  let delegation: DelegationContext | null = parseDelegationContext(process.env.PI_HERDR_DELEGATION);
   const initialManifest =
     parseRuntimeManifest(process.env.PI_HERDR_ROLE_MANIFEST) ??
     (mode.composeMaster ? composeMasterRuntime() : null);
@@ -189,14 +191,44 @@ export default async function (pi: ExtensionAPI) {
     const p = progressOf(todos.items);
     const eta = estimateEta({ completedAt: completedStamps, total: p.total, now: Date.now() });
     const suffix = formatProgressSuffix({ completed: p.completed, total: p.total, eta });
-    const title = formatPaneTitle(todos.items, null, { progressSuffix: suffix, lastWriteAt: todos.lastWriteAt });
+    const title = applyWorkerTag(
+      formatPaneTitle(todos.items, null, { progressSuffix: suffix, lastWriteAt: todos.lastWriteAt }),
+      delegation?.description ?? null,
+    );
     updateSlimFrame({ title, items: todos.items, lastWriteAt: todos.lastWriteAt });
     client.reportMetadata({
       session: label,
       items: todos.items,
       progressSuffix: suffix,
       lastWriteAt: todos.lastWriteAt,
+      workerTag: delegation?.description ?? null,
     }).catch(() => {});
+    // D113: delegated workers also push the full list to the master's pipe so its resident widget
+    // and /pier-tree stay live without polling. Best effort — a lost push self-heals on the next write.
+    if (isSubagent && delegation?.parentPipe) {
+      void pipeRequest(delegation.parentPipe, {
+        type: 'todo_sync',
+        id: `tsync-${Date.now()}`,
+        paneId: env?.paneId ?? '',
+        items: todos.items.map((it) => ({ content: it.content, status: it.status, ...(it.blocker ? { blocker: it.blocker } : {}) })),
+        summary: title ?? delegation.description,
+      }, 3000).catch(() => {});
+    }
+  }
+
+  /** D113: per-worker todo cache (pipe pushes; summary fallback after a master resume). */
+  const workerTodos = new Map<string, WorkerTodoSnapshot>();
+  function applyWorkerTodos(workerPaneId: string, items: WorkerTodoSnapshot['items'], summary: string): void {
+    if (!workerPaneId) return;
+    workerTodos.set(workerPaneId, { items, summary, ts: Date.now() });
+    todoUi.rerenderWidget?.();
+  }
+  /** Running rows joined with their cached todos — feeds the unified widget and /pier-tree. */
+  function widgetWorkers(): WorkerWidgetRow[] {
+    return (subagentPort.current?.listRunningSubs() ?? []).map((s) => ({
+      ...s,
+      todos: workerTodos.get(s.paneId) ?? null,
+    }));
   }
 
   /** M17 settlement reconciliation: auto-complete settled todos / unblock on failure notes (idempotent). */
@@ -246,10 +278,24 @@ export default async function (pi: ExtensionAPI) {
       reportToolBadge();
     }
   });
-  pi.on('tool_execution_end', async (event: { toolCallId?: string }) => {
-    if (typeof event?.toolCallId === 'string') {
-      runningTools.delete(event.toolCallId);
-      reportToolBadge();
+  pi.on('tool_execution_end', async (event: { toolCallId?: string; toolName?: string; durationMs?: number }) => {
+    if (typeof event?.toolCallId !== 'string') return;
+    const tool = typeof event.toolName === 'string' ? event.toolName : runningTools.get(event.toolCallId) ?? null;
+    runningTools.delete(event.toolCallId);
+    reportToolBadge();
+    // pi ≥ 1.1 records the real execution time on the event; the tools ledger replaces wall-clock
+    // estimates in the efficiency trial with measured numbers. Absent on older pi — nothing logged.
+    if (typeof event.durationMs === 'number' && sessionRoot) {
+      try {
+        await appendEfficiencyLog(efficiencyLogPath(sessionRoot, 'tools'), {
+          sessionId: sessionId || 'unknown',
+          ts: Date.now(),
+          tool,
+          durationMs: event.durationMs,
+        });
+      } catch {
+        /* ledger is observability only */
+      }
     }
   });
 
@@ -272,6 +318,18 @@ export default async function (pi: ExtensionAPI) {
   const sendUserMessageAs = (content: string, mode: 'steer' | 'followUp'): Promise<void> => {
     (pi as unknown as { sendUserMessage?: (content: string, opts?: { deliverAs?: string; triggerTurn?: boolean }) => void })
       .sendUserMessage?.(content, { deliverAs: mode, triggerTurn: true });
+    return Promise.resolve();
+  };
+
+  /** Phase 2 (RFC rfc-delegation-identity §3.2): a worker's progress note enters master context as
+   * a display-less custom message — no turn, no visible chat line; renderers.ts gives it a card. */
+  const deliverProgress = (workerPaneId: string, text: string): Promise<void> => {
+    (pi as unknown as {
+      sendMessage?: (msg: { customType: string; content: string; display: boolean; details?: Record<string, unknown> }, opts?: { triggerTurn?: boolean }) => void;
+    }).sendMessage?.(
+      { customType: PROGRESS_CUSTOM_TYPE, content: text.slice(0, 2000), display: false, details: { paneId: workerPaneId } },
+      { triggerTurn: false },
+    );
     return Promise.resolve();
   };
   const notices = createNoticeBuffer({
@@ -341,13 +399,15 @@ export default async function (pi: ExtensionAPI) {
         abort: () => { latestCtx?.abort?.(); },
         setPendingMachineRequest: (next) => { pendingMachineRequest = next; },
         applyRoleSwitch: roles.applyRoleSwitch,
+        deliverProgress,
+        applyWorkerTodos,
       }));
     } catch {
       /* Pipe name collision (rare): this session has no channel; callers report after ping timeout. */
     }
   }
 
-  async function pushSettleReply(): Promise<void> {
+  async function pushSettleReply(aborted = false): Promise<void> {
     const req = pendingMachineRequest;
     if (!req || !req.push || !req.from) return;
     // An aborted settle is not a settlement: OCC's abort means the continuation turn is coming, and
@@ -356,6 +416,7 @@ export default async function (pi: ExtensionAPI) {
     // request armed; the post-compaction settle pushes it (settle-wake-core.ts).
     if (!shouldPushSettleReply({
       intentionalAbort: coordinator.intentionalAbort,
+      aborted,
       compactionInFlight: coordinator.compactionInFlight,
       lastStopReason,
     })) {
@@ -382,8 +443,6 @@ export default async function (pi: ExtensionAPI) {
       console.error(`pier: settle reply push to ${req.from} failed: ${(err as Error)?.message ?? err}`);
     }
   }
-
-  const sessionFocusPoller: { current: FocusPoller | null } = { current: null };
 
   pi.on('session_start', async (event, ctx) => {
     sessionId = resolveSessionId(ctx);
@@ -412,30 +471,56 @@ export default async function (pi: ExtensionAPI) {
     // Self-healing: the ask marker lives in herdr with a 24h TTL; a session killed
     // while a dialog was open must not keep the pane looking blocked forever.
     void client.reportAskFlag(null).catch(() => {});
-
-    // D-4 focus sampling: herdr <0.9.1 never delivered pane.focused to plugins;
-    // 0.9.1+ is event-first (pollMs 0). One poller per pane, self-scoped.
-    if (sessionFocusPoller.current) sessionFocusPoller.current.stop();
-    sessionFocusPoller.current = null;
-    const paneId = env?.paneId ?? '';
-    const serverVer = await client.getServerVersion();
-    const pollMs = focusPollIntervalMs(process.env, serverVer);
-    if (paneId && client.available && pollMs > 0) {
-      sessionFocusPoller.current = startFocusPoller({
-        myPaneId: paneId,
-        intervalMs: pollMs,
-        sample: async () => {
-          // layout.export reports the focused pane of our own tab; without the
-          // field (older herdr) the tick stays silent instead of guessing.
-          const layout = await client.exportLayout({ paneId });
-          const sample = parseFocusSample(layout);
-          return sample && sample.focusedPaneId !== null ? sample : null;
-        },
-        fire: (focusedPaneId, cause) => spawnReflow({ paneId: focusedPaneId, cause }),
-      });
+    if (isSubagent) {
+      // herdr 0.9.2 restore identity: the marker re-derives worker mode for the resumed boot
+      // (resume_argv cannot carry spawn env), and the self-reported command replays this exact
+      // session — extension, role model, approve, fullscreen — instead of a bare `pi --resume`.
+      const sm = typeof ctx === 'object' && ctx !== null && 'sessionManager' in ctx ? ctx.sessionManager : undefined;
+      const sessionFile = (typeof sm?.getSessionFile === 'function' ? sm.getSessionFile() : undefined)
+        ?? process.env.PI_SESSION_FILE ?? null;
+      // RFC rfc-delegation-identity §2.1: env (spawn) > marker (herdr restart) > branch fold (/resume).
+      if (!delegation) delegation = readWorkerMarker(sessionFile)?.delegation ?? null;
+      const branchEntries = (ctx as { sessionManager?: { getBranch?: () => readonly unknown[] } })
+        ?.sessionManager?.getBranch?.() ?? [];
+      const folded = foldDelegation(branchEntries as Parameters<typeof foldDelegation>[0]);
+      if (!delegation && folded) delegation = folded;
+      if (delegation && !folded) {
+        // First-frame card: write once — the entry doubles as the /resume replay source.
+        try {
+          pi.appendEntry(DELEGATION_CUSTOM_TYPE, { version: 1, ...delegation, ts: Date.now() });
+        } catch {
+          /* Best effort; the marker already carries the identity. */
+        }
+      }
+      if (delegation) void client.reportDelegationTokens(delegation).catch(() => {});
+      if (sessionRoot) {
+        writeWorkerMarker(sessionFile, roles.state.manifest?.role, delegation ?? undefined);
+        const resumeArgv = buildResumeArgv(process.argv);
+        if (resumeArgv && client.available) {
+          void client.reportAgentSessionResume(sessionId, resumeArgv).catch(() => {});
+        }
+      }
     }
+
+    // Focus heat is event-driven on herdr 0.9.5+: the workbench receives pane.focused directly,
+    // so no per-pane layout sampler is started here.
     startPipeServerFor(cwd);
   });
+
+  /* RFC rfc-delegation-identity §2.2: worker identity + delivery contract ride the prompt
+   * sections each turn (same diff discipline as pier-role; removal cleans up). */
+  if (isSubagent) {
+    pi.on('before_agent_start', async (event) => {
+      const sections = event.systemPromptOptions?.sections;
+      if (!sections) return;
+      if (delegation) {
+        const text = buildDelegationSection(delegation, env?.paneId ?? '');
+        if (sections['pier-delegation'] !== text) sections['pier-delegation'] = text;
+      } else {
+        delete sections['pier-delegation'];
+      }
+    });
+  }
 
   pi.on('session_tree', async (_event, ctx) => {
     sessionId = resolveSessionId(ctx);
@@ -445,6 +530,12 @@ export default async function (pi: ExtensionAPI) {
     roles.syncFromBranch(ctx);
     todoUi.renderWidget(ctx);
     mirrorTodos();
+  });
+
+  /* pi 1.2 counts the run as busy from `before_agent_start`, not `turn_start`: a settlement
+   * notice arriving in that window must enter the D92 buffer instead of being sent immediately. */
+  pi.on('before_agent_start', async () => {
+    agentActive = true;
   });
 
   pi.on('turn_start', async () => {
@@ -493,12 +584,16 @@ export default async function (pi: ExtensionAPI) {
     void notices.flush('steer');
   });
 
-  pi.on('agent_settled', async (_event: unknown, ctx) => {
+  pi.on('agent_settled', async (event: unknown, ctx) => {
     agentActive = false;
     gates.report('idle', null);
+    // pi ≥ 1.1 stamps cancelled runs on the event itself; stopReason tracking misses ESC mid-tool
+    // (no final assistant message), so the event field is authoritative when present.
+    const aborted = event !== null && typeof event === 'object' && 'aborted' in event && event.aborted === true;
     const plan = planSettleWake({
       lastStopReason,
       intentionalAbort: coordinator.intentionalAbort,
+      aborted,
       compactionPending: coordinator.selectedCompaction !== null || coordinator.compactionInFlight,
       running: subagentPort.current?.listRunningSubs() ?? [],
       lastNoticeKey: d96NoticeKey,
@@ -529,8 +624,8 @@ export default async function (pi: ExtensionAPI) {
         }),
       });
     }
-    if (lastStopReason !== ABORT_STOP_REASON) void notices.flush('followUp');
-    void pushSettleReply();
+    if (lastStopReason !== ABORT_STOP_REASON && !aborted) void notices.flush('followUp');
+    void pushSettleReply(aborted);
   });
 
   /* ── D101 ObservationPack (obs_recall tool & context projector) ── */
@@ -577,11 +672,52 @@ export default async function (pi: ExtensionAPI) {
     },
   });
 
+  /* ── report_progress (Phase 2, RFC rfc-delegation-identity §3.2): worker → master checkpoint ── */
+  if (isSubagent) {
+    pi.registerTool({
+      name: 'report_progress',
+      label: 'Report Progress',
+      description:
+        'Send the delegating master a short progress update without finishing the task. Use at meaningful checkpoints (a module done, a test went green, a blocker found) — the master sees it in its context but is not interrupted.',
+      promptSnippet: 'report_progress: mid-task checkpoint to the delegating master (does not end the task).',
+      promptGuidelines: [
+        'Call at meaningful checkpoints only — a milestone reached, a risk discovered, a decision the master should know early — not after every tool call.',
+        'One or two sentences per call; the final answer still goes in your normal closing message when the task finishes.',
+      ],
+      parameters: Type.Object({
+        message: Type.String({ description: 'Short checkpoint update for the delegating master.' }),
+      }),
+      async execute(_tc, params) {
+        const parentPipe = delegation?.parentPipe;
+        const message = typeof (params as { message?: unknown })?.message === 'string'
+          ? (params as { message: string }).message.trim()
+          : '';
+        if (!message) {
+          return { content: [{ type: 'text', text: 'Error: `message` is required (one or two sentences).' }], details: {} };
+        }
+        if (!parentPipe) {
+          return { content: [{ type: 'text', text: 'Error: no delegating master pipe is known to this session; progress cannot be delivered.' }], details: {} };
+        }
+        try {
+          const res = await pipeRequest(parentPipe, {
+            type: 'progress',
+            id: `prog-${Date.now()}`,
+            paneId: env?.paneId ?? '',
+            text: message,
+          }, 5000);
+          return res.type === 'ok'
+            ? { content: [{ type: 'text', text: 'Progress delivered to the master (visible in its context, no interruption).' }], details: {} }
+            : { content: [{ type: 'text', text: `Error: master rejected progress report: ${res.message}` }], details: {} };
+        } catch (err) {
+          return { content: [{ type: 'text', text: `Error: could not reach the master pipe: ${(err as Error)?.message ?? err}` }], details: {} };
+        }
+      },
+    });
+  }
+
   pi.on('session_shutdown', async () => {
     coordinator.compactionInFlight = false;
     coordinator.intentionalAbort = false;
-    sessionFocusPoller.current?.stop();
-    sessionFocusPoller.current = null;
     if (pipeServerBox.current) {
       try { pipeServerBox.current.close(); } catch { /* Already closed. */ }
       pipeServerBox.current = null;
@@ -612,6 +748,7 @@ export default async function (pi: ExtensionAPI) {
       noticePending: notices.noticePending,
       getSessionId: () => sessionId,
       getBlockedDepth: () => gates.depth(),
+      getWorkers: widgetWorkers,
       reconcileOnSettlement,
       withReconcileNotes,
       claimSettleNotice,
@@ -620,6 +757,42 @@ export default async function (pi: ExtensionAPI) {
       jev: { ask: (request, meta) => jevRuntime.ask(request, meta), getMinConfidence: () => effConfig.jev.minConfidence },
       appendRoutingLog,
     });
+
+    /* ── /pier-tree (D113): full todo × subagent delegation tree; the resident widget is minimal ── */
+    pi.registerCommand('pier-tree', {
+      description: 'Show the full delegation tree: your todos plus every subagent\'s todos and settled nodes',
+      handler: async (_args: unknown, ctx: unknown) => {
+        const ui = (ctx as { ui?: { notify?: (text: string, level?: string) => void } }).ui;
+        const rows = subagentPort.current?.listRows() ?? [];
+        const lines = formatDelegationTree({
+          selfItems: todos.items,
+          workers: widgetWorkers(),
+          settled: rows
+            .filter((r) => r.status === 'settled' || r.status === 'consumed')
+            .map((r) => ({ paneId: r.paneId, slug: r.slug, description: r.description, settledAt: r.settledAt })),
+          now: Date.now(),
+        });
+        ui?.notify?.(lines.join('\n'), 'info');
+      },
+    });
+
+    /** D113 resync: a resumed master rebuilds worker summaries from herdr pi-todo tokens until the
+     * next live push replaces them with full lists. */
+    const resyncWorkerTodos = async (): Promise<void> => {
+      try {
+        const agents = await client.listAgents();
+        for (const a of agents) {
+          const summary = a.tokens?.['pi-todo'];
+          if (typeof summary === 'string' && summary && !workerTodos.has(a.paneId)) {
+            workerTodos.set(a.paneId, { summary, ts: Date.now() });
+          }
+        }
+        todoUi.rerenderWidget?.();
+      } catch {
+        /* herdr absent or unreachable: live pushes remain the source */
+      }
+    };
+    pi.on('session_start', () => { void resyncWorkerTodos(); });
   } else {
     const { mountTodoOnly } = await import('./index-worker.ts');
     await mountTodoOnly({

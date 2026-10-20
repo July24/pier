@@ -1,6 +1,6 @@
 {
- "_source": "herdr 0.9.1, protocol 22 — extracted from `herdr api schema` (see cmd: herdr api schema --json)",
- "_generated": "2026-09-17",
+ "_source": "herdr 0.9.5, protocol 22 — method table regenerated from `herdr api schema --json` (schema_version 1; recent releases do not emit a methods map). After a herdr upgrade, diff `.protocol` against HERDR_PROTOCOL_EXPECTED and re-check the methods pier calls.",
+ "_generated": "2026-10-20",
  "methods": {
   "agent.explain": {
    "def": "AgentTarget",
@@ -49,8 +49,8 @@
   "agent.read": {
    "def": "AgentReadParams",
    "required": [
-    "source",
-    "target"
+    "target",
+    "source"
    ],
    "allowed": [
     "format",
@@ -73,8 +73,8 @@
   "agent.send_keys": {
    "def": "AgentSendKeysParams",
    "required": [
-    "keys",
-    "target"
+    "target",
+    "keys"
    ],
    "allowed": [
     "keys",
@@ -84,8 +84,8 @@
   "agent.start": {
    "def": "AgentStartParams",
    "required": [
-    "kind",
     "name",
+    "kind",
     "pane_id"
    ],
    "allowed": [
@@ -250,6 +250,15 @@
     "title"
    ]
   },
+  "pane.clear": {
+   "def": "PaneTarget",
+   "required": [
+    "pane_id"
+   ],
+   "allowed": [
+    "pane_id"
+   ]
+  },
   "pane.clear_agent_authority": {
    "def": "PaneClearAgentAuthorityParams",
    "required": [
@@ -273,9 +282,9 @@
   "pane.copy_motion": {
    "def": "PaneCopyMotionParams",
    "required": [
+    "pane_id",
     "cursor",
-    "motion",
-    "pane_id"
+    "motion"
    ],
    "allowed": [
     "content_revision",
@@ -287,11 +296,11 @@
   "pane.copy_search": {
    "def": "PaneCopySearchParams",
    "required": [
-    "content_revision",
-    "cursor",
-    "direction",
     "pane_id",
-    "query"
+    "query",
+    "direction",
+    "cursor",
+    "content_revision"
    ],
    "allowed": [
     "content_revision",
@@ -353,44 +362,6 @@
     "pane_id"
    ]
   },
-  "pane.graphics.clear": {
-   "def": "PaneGraphicsClearParams",
-   "required": [
-    "pane_id"
-   ],
-   "allowed": [
-    "layer_id",
-    "pane_id"
-   ]
-  },
-  "pane.graphics.info": {
-   "def": "PaneTarget",
-   "required": [
-    "pane_id"
-   ],
-   "allowed": [
-    "pane_id"
-   ]
-  },
-  "pane.graphics.set": {
-   "def": "PaneGraphicsSetParams",
-   "required": [
-    "format",
-    "image_height",
-    "image_width",
-    "pane_id"
-   ],
-   "allowed": [
-    "data_base64",
-    "format",
-    "image_height",
-    "image_width",
-    "layer_id",
-    "pane_id",
-    "placement",
-    "z_index"
-   ]
-  },
   "pane.input.set": {
    "def": "PaneInputSetParams",
    "required": [
@@ -412,9 +383,9 @@
   "pane.link.activate": {
    "def": "PaneLinkActivateParams",
    "required": [
-    "col",
     "pane_id",
-    "viewport_row"
+    "viewport_row",
+    "col"
    ],
    "allowed": [
     "col",
@@ -427,9 +398,9 @@
   "pane.link.resolve": {
    "def": "PaneLinkActivateParams",
    "required": [
-    "col",
     "pane_id",
-    "viewport_row"
+    "viewport_row",
+    "col"
    ],
    "allowed": [
     "col",
@@ -449,8 +420,8 @@
   "pane.move": {
    "def": "PaneMoveParams",
    "required": [
-    "destination",
-    "pane_id"
+    "pane_id",
+    "destination"
    ],
    "allowed": [
     "destination",
@@ -492,9 +463,9 @@
   "pane.release_agent": {
    "def": "PaneReleaseAgentParams",
    "required": [
-    "agent",
     "pane_id",
-    "source"
+    "source",
+    "agent"
    ],
    "allowed": [
     "agent",
@@ -516,9 +487,9 @@
   "pane.report_agent": {
    "def": "PaneReportAgentParams",
    "required": [
-    "agent",
     "pane_id",
     "source",
+    "agent",
     "state"
    ],
    "allowed": [
@@ -527,6 +498,7 @@
     "agent_session_path",
     "message",
     "pane_id",
+    "resume_argv",
     "seq",
     "source",
     "state"
@@ -535,15 +507,16 @@
   "pane.report_agent_session": {
    "def": "PaneReportAgentSessionParams",
    "required": [
-    "agent",
     "pane_id",
-    "source"
+    "source",
+    "agent"
    ],
    "allowed": [
     "agent",
     "agent_session_id",
     "agent_session_path",
     "pane_id",
+    "resume_argv",
     "seq",
     "session_start_source",
     "source"
@@ -585,8 +558,8 @@
   "pane.scroll": {
    "def": "PaneScrollParams",
    "required": [
-    "offset_from_bottom",
-    "pane_id"
+    "pane_id",
+    "offset_from_bottom"
    ],
    "allowed": [
     "offset_from_bottom",
@@ -596,9 +569,9 @@
   "pane.selection.read": {
    "def": "PaneSelectionReadParams",
    "required": [
+    "pane_id",
     "anchor",
-    "cursor",
-    "pane_id"
+    "cursor"
    ],
    "allowed": [
     "anchor",
@@ -621,8 +594,8 @@
   "pane.send_keys": {
    "def": "PaneSendKeysParams",
    "required": [
-    "keys",
-    "pane_id"
+    "pane_id",
+    "keys"
    ],
    "allowed": [
     "keys",
@@ -669,9 +642,9 @@
   "pane.wait_for_output": {
    "def": "PaneWaitForOutputParams",
    "required": [
-    "match",
     "pane_id",
-    "source"
+    "source",
+    "match"
    ],
    "allowed": [
     "lines",
@@ -778,8 +751,8 @@
   "plugin.pane.open": {
    "def": "PluginPaneOpenParams",
    "required": [
-    "entrypoint",
-    "plugin_id"
+    "plugin_id",
+    "entrypoint"
    ],
    "allowed": [
     "cwd",
@@ -812,8 +785,8 @@
   "product_announcement.dismiss": {
    "def": "ProductAnnouncementDismissParams",
    "required": [
-    "id",
-    "version"
+    "version",
+    "id"
    ],
    "allowed": [
     "id",
@@ -852,6 +825,15 @@
    "def": "EmptyParams",
    "required": [],
    "allowed": []
+  },
+  "server.ssh_agent.register": {
+   "def": "ServerSshAgentRegisterParams",
+   "required": [
+    "socket_path"
+   ],
+   "allowed": [
+    "socket_path"
+   ]
   },
   "server.stop": {
    "def": "EmptyParams",
@@ -911,8 +893,8 @@
   "tab.move": {
    "def": "TabMoveParams",
    "required": [
-    "insert_index",
-    "tab_id"
+    "tab_id",
+    "insert_index"
    ],
    "allowed": [
     "insert_index",
@@ -922,8 +904,8 @@
   "tab.rename": {
    "def": "TabRenameParams",
    "required": [
-    "label",
-    "tab_id"
+    "tab_id",
+    "label"
    ],
    "allowed": [
     "label",
@@ -977,8 +959,8 @@
   "workspace.move": {
    "def": "WorkspaceMoveParams",
    "required": [
-    "insert_index",
-    "workspace_id"
+    "workspace_id",
+    "insert_index"
    ],
    "allowed": [
     "insert_index",
@@ -998,8 +980,8 @@
   "workspace.rename": {
    "def": "WorkspaceRenameParams",
    "required": [
-    "label",
-    "workspace_id"
+    "workspace_id",
+    "label"
    ],
    "allowed": [
     "label",
@@ -1009,9 +991,9 @@
   "workspace.report_metadata": {
    "def": "WorkspaceReportMetadataParams",
    "required": [
+    "workspace_id",
     "source",
-    "tokens",
-    "workspace_id"
+    "tokens"
    ],
    "allowed": [
     "seq",

@@ -8,10 +8,7 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import type { HerdrClientLike } from './herdr-client.ts';
 
-/** pi surface pieces the gate runtime touches (ui_prompt events postdate the pinned devDependency). */
-type GatePi = ExtensionAPI & {
-  on?: (name: 'ui_prompt_start' | 'ui_prompt_end', handler: (event: unknown) => void) => void;
-};
+/** ui_prompt events are typed by pi ≥ 1.1 (they postdated the 0.86 pin this gate was written against). */
 
 /** Only inherently human-blocking kinds open the gate; `custom` covers resident overlays too (D97). */
 const GATING_PROMPT_KINDS = new Set(['select', 'confirm', 'input', 'editor']);
@@ -95,18 +92,15 @@ export function createGateRuntime(d: GateRuntimeDeps): GateRuntime {
     }
   });
 
-  const gatePi = d.pi as GatePi;
-  gatePi.on?.('ui_prompt_start', (event) => {
-    const rec = (event ?? {}) as { kind?: unknown; title?: unknown };
-    const title = typeof rec.title === 'string' && rec.title.trim() ? rec.title.trim() : null;
-    const kind = typeof rec.kind === 'string' ? rec.kind : 'prompt';
-    if (!GATING_PROMPT_KINDS.has(kind)) return;
-    const label = title ?? kind;
+  d.pi.on('ui_prompt_start', (event) => {
+    const title = typeof event.title === 'string' && event.title.trim() ? event.title.trim() : null;
+    if (!GATING_PROMPT_KINDS.has(event.kind)) return;
+    const label = title ?? event.kind;
     // The ask tool opens its own gate first, so this is usually a nested no-op;
     // prompts from other extensions or pi core open the gate here.
     if (enter(label)) emitHerdrBlocked(true, label);
   });
-  gatePi.on?.('ui_prompt_end', () => {
+  d.pi.on('ui_prompt_end', () => {
     if (exit()) emitHerdrBlocked(false, null);
   });
 

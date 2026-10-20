@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import type { Socket } from 'node:net';
+import type { Server, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { HerdrClientLike } from '../src/herdr-client.ts';
@@ -184,6 +184,8 @@ interface PipeEnv {
   port: SubagentPortBox;
   frames: PipeRequest[];
   closePaneCalls: string[];
+  /** env blocks handed to herdr pane creation (splitPane/createTab) in spawn order. */
+  spawnEnvs: Array<Record<string, string>>;
   /** Uncancellable poll loop: park it on a `waitAgent` that never resolves so a row it holds stays
    * `running` for the rest of the test. */
   parkPollers(): void;
@@ -193,31 +195,45 @@ interface PipeEnv {
 
 /** Mounts the plugin with a loopback pipe server standing in for the worker pane (p2): it records
  * the frames pier sends and answers ok, so the real `pipeRequestTo` path is exercised end to end. */
-async function withPipeEnv(fn: (env: PipeEnv) => Promise<void>, opts: { childCwd?: string } = {}): Promise<void> {
+/** Mounts the plugin with a loopback pipe server standing in for the worker pane (p2): it records
+ * the frames pier sends and answers ok, so the real `pipeRequestTo` path is exercised end to end.
+ * `paneSeq` hands out p2, p3, … (one pipe server per id) for multi-worker tests. */
+async function withPipeEnv(
+  fn: (env: PipeEnv) => Promise<void>,
+  opts: { childCwd?: string; paneSeq?: boolean } = {},
+): Promise<void> {
   const home = new TempHome('pier-spawn-home-');
   const cwd = mkdtempSync(join(tmpdir(), 'pier-spawn-cwd-'));
   const sessionFile = join(cwd, 'sub-session.jsonl');
   let parked = false;
   const env: PipeEnv = {
-    cwd, home, pi: undefined as never, port: undefined as never, frames: [], closePaneCalls: [],
+    cwd, home, pi: undefined as never, port: undefined as never, frames: [], closePaneCalls: [], spawnEnvs: [],
     parkPollers: () => { parked = true; }, rejectPrompt: false,
   };
-  const server = startPipeServer(pipeNameFor(opts.childCwd ?? cwd, 'p2'), async (req) => {
-    const isPrompt = req.type === 'prompt' || req.type === 'follow_up';
-    if (isPrompt) {
-      env.frames.push(req);
-      writeFileSync(sessionFile, jsonl(transcriptMessage('assistant', SUB_TEXT, Date.now())));
-      if (env.rejectPrompt) return { type: 'error', id: req.id, message: 'sim rejected' };
-    }
-    return { type: 'ok', id: req.id };
-  });
+  let paneCounter = 0;
+  const nextPaneId = (): string => (opts.paneSeq ? `p${2 + paneCounter++}` : 'p2');
   const sockets = new Set<Socket>();
-  server.on('connection', (sock) => {
-    sockets.add(sock);
-    sock.on('close', () => sockets.delete(sock));
-  });
-  server.unref();
-  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const servers: Server[] = [];
+  const ensureServer = (paneId: string): void => {
+    const server = startPipeServer(pipeNameFor(opts.childCwd ?? cwd, paneId), async (req) => {
+      const isPrompt = req.type === 'prompt' || req.type === 'follow_up';
+      if (isPrompt) {
+        env.frames.push(req);
+        writeFileSync(sessionFile, jsonl(transcriptMessage('assistant', SUB_TEXT, Date.now())));
+        if (env.rejectPrompt) return { type: 'error', id: req.id, message: 'sim rejected' };
+      }
+      return { type: 'ok', id: req.id };
+    });
+    servers.push(server);
+    server.on('connection', (sock) => {
+      sockets.add(sock);
+      sock.on('close', () => sockets.delete(sock));
+    });
+    server.unref();
+  };
+  ensureServer('p2');
+  if (opts.paneSeq) { ensureServer('p3'); ensureServer('p4'); }
+  await Promise.all(servers.map((s) => new Promise<void>((resolve) => s.once('listening', resolve))));
   const { root, pi, port } = await mountSubagent({
     client: {
       tabList: async () => [{ tabId: 't0', workspaceId: 'w1', label: 'main', paneCount: 1, agentStatus: 'idle' }],
@@ -226,6 +242,7 @@ async function withPipeEnv(fn: (env: PipeEnv) => Promise<void>, opts: { childCwd
         { paneId: 'p2', tabId: 't0', workspaceId: 'w1', agentStatus: 'idle' },
       ],
       waitAgent: async () => (parked ? new Promise<never>(() => {}) : 'idle'),
+      splitPane: async (o) => { env.spawnEnvs.push(o.env ?? {}); return nextPaneId(); },
       getAgentSessionPath: async () => sessionFile,
       closePane: async (paneId) => { env.closePaneCalls.push(paneId); },
     },
@@ -238,11 +255,10 @@ async function withPipeEnv(fn: (env: PipeEnv) => Promise<void>, opts: { childCwd
     await root.fiber.dispose();
     // Destroying the live connections first: a lingering client would keep close() pending forever.
     for (const sock of sockets) sock.destroy();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await Promise.all(servers.map((s) => new Promise<void>((resolve) => s.close(() => resolve()))));
     home.dispose();
   }
 }
-
 test('spawn action: piped prompt injection, settlement and rollback', async (t) => {
   await withPipeEnv(async (env) => {
     await t.test('a foreground run injects the prompt once and settles with the closing text', async () => {
@@ -259,7 +275,7 @@ test('spawn action: piped prompt injection, settlement and rollback', async (t) 
     await t.test('run_in_background returns immediately and keeps the row running', async () => {
       env.parkPollers();
       const result = await runSubagent(env.pi, { description: '后台探查', prompt: PROMPT, run_in_background: true }, env.cwd);
-      assert.match(result.content[0]!.text, /^started subagent p2 \(task [0-9a-f-]+\)$/);
+      assert.match(result.content[0]!.text, /^started subagent [a-z0-9-]+@p2 \(task [0-9a-f-]+\)$/);
       assert.equal(result.details?.background, true);
       assert.equal(result.details?.paneId, 'p2');
       assert.equal((env.frames[1] as { push?: boolean }).push, true, 'a background run asks for the settlement push');
@@ -280,18 +296,34 @@ test('spawn action: piped prompt injection, settlement and rollback', async (t) 
   });
 });
 
+test('spawn env: worker panes silence pi 1.1 OSC 7501 (pier is the single state reporter)', async () => {
+  await withPipeEnv(async (env) => {
+    await runSubagent(env.pi, { description: '探查', prompt: PROMPT }, env.cwd);
+    assert.equal(env.spawnEnvs.length, 1, 'one pane created for the worker');
+    assert.equal(env.spawnEnvs[0]!.PI_PROGRAM_STATUS, '0', 'pi program-status emission off — report_agent owns the pane state');
+    assert.equal(env.spawnEnvs[0]!.PI_HERDR_SUBAGENT, '1');
+    // Delegation identity (RFC rfc-delegation-identity §2.1): the worker learns parent/task/role.
+    const delegation = JSON.parse(env.spawnEnvs[0]!.PI_HERDR_DELEGATION ?? 'null') as Record<string, unknown>;
+    assert.equal(delegation.parentPaneId, 'p0', 'parent pane is the master pane');
+    assert.equal(delegation.description, '探查');
+    assert.equal(typeof delegation.taskId, 'string');
+    assert.equal(delegation.role, 'worker-default');
+    assert.equal(delegation.parentPipe, pipeNameFor(env.cwd, 'p0'), 'Phase 2: the worker can dial the master pipe for report_progress');
+  });
+});
+
 test('spawn/send: the reply pipe is scoped by the master session cwd, not the worker cwd', async () => {
   const other = mkdtempSync(join(tmpdir(), 'pier-spawn-other-'));
   await withPipeEnv(async (env) => {
     env.parkPollers();
     const spawned = await runSubagent(env.pi, { description: '跨仓库任务', prompt: PROMPT, run_in_background: true, cwd: other }, env.cwd);
-    assert.match(spawned.content[0]!.text, /^started subagent p2 /);
+    assert.match(spawned.content[0]!.text, /^started subagent [a-z0-9-]+@p2 /);
     const expected = pipeNameFor(env.cwd, 'p0');
     assert.equal((env.frames[0] as { from?: string }).from, expected, 'spawn replies to the master session pipe');
     assert.notEqual((env.frames[0] as { from?: string }).from, pipeNameFor(other, 'p0'));
 
     const sent = await runSubagent(env.pi, { action: 'send', agentId: 'p2', message: 'wrap up and report' }, env.cwd);
-    assert.match(sent.content[0]!.text, /Message sent to subagent p2/);
+    assert.match(sent.content[0]!.text, /Message sent to subagent [a-z0-9-]+@p2/);
     assert.equal((env.frames[1] as { from?: string }).from, expected, 'follow_up replies to the same master pipe');
   }, { childCwd: other });
 });
@@ -306,7 +338,7 @@ test('send/resume: short prefixes resolve at four characters and report ambiguit
     const short4 = fullTaskId.slice(0, 4);
 
     const sent8 = await runSubagent(env.pi, { action: 'send', agentId: short8, message: '8-char prefix message' }, env.cwd);
-    assert.match(sent8.content[0]!.text, /Message sent to subagent p2/);
+    assert.match(sent8.content[0]!.text, /Message sent to subagent [a-z0-9-]+@p2/);
     assert.equal((env.frames[1] as { text?: string }).text, '8-char prefix message');
 
     await runSubagent(env.pi, { action: 'send', agentId: short4, message: '4-char prefix message' }, env.cwd);
@@ -433,4 +465,33 @@ test('run: every failure becomes a GitError naming the operation', async () => {
       },
     );
   }
+});
+
+test('slugs: spawn allocates and dedupes; list/send accept slug, slug@paneId, and bare paneId', async () => {
+  await withPipeEnv(async (env) => {
+    env.parkPollers();
+    const first = await runSubagent(env.pi, { description: 'fix auth flow', prompt: PROMPT, run_in_background: true }, env.cwd);
+    assert.equal(first.details?.slug, 'fix-auth-flow');
+    assert.equal(first.details?.paneId, 'p2');
+
+    const second = await runSubagent(env.pi, { description: 'Fix Auth Flow!', prompt: PROMPT, run_in_background: true }, env.cwd);
+    assert.equal(second.details?.slug, 'fix-auth-flow-2', 'a repeated description gets a numbered slug');
+    assert.equal(second.details?.paneId, 'p3');
+
+    const listed = await runSubagent(env.pi, { action: 'list' }, env.cwd);
+    const text = listed.content[0]!.text as string;
+    assert.match(text, /fix-auth-flow@p2/, 'list prints slug@paneId');
+    assert.match(text, /fix-auth-flow-2@p3/);
+
+    // Bare slug, combined ref, and bare paneId all resolve to the SAME worker.
+    for (const ref of ['fix-auth-flow', `fix-auth-flow@p2`, 'p2']) {
+      env.frames.length = 0;
+      const sent = await runSubagent(env.pi, { action: 'send', agentId: ref, message: `ping ${ref}` }, env.cwd);
+      assert.match(sent.content[0]!.text, /Message sent to subagent fix-auth-flow@p2/, `ref "${ref}" resolves`);
+      assert.equal((env.frames[0] as { text?: string }).text, `ping ${ref}`);
+    }
+    // A stale combined ref (revived row changed its paneId) still resolves through the slug part.
+    const stale = await runSubagent(env.pi, { action: 'send', agentId: 'fix-auth-flow@pOld', message: 'still me' }, env.cwd);
+    assert.match(stale.content[0]!.text, /Message sent to subagent fix-auth-flow@p2/);
+  }, { paneSeq: true });
 });

@@ -23,6 +23,6 @@ herdr plugin link /path/to/pier/packages/pier-workbench   # Windows: F:\path\to\
 
 ## 依赖
 
-- herdr ≥ 0.9.0（Windows 为 preview beta）
+- herdr ≥ 0.9.5（Windows 为 preview beta；原生 `pane.focused`、subagent pane 自报告 resume、关机安全保存）
 - Node ≥ 22（跑 scripts）
-- 对端：pi 0.84+ 装有 `@pier/ext` 扩展且在该 workspace 的受管 pane 内运行
+- 对端：pi ≥ 1.3.0 装有 `pi-pier` 扩展且在该 workspace 的受管 pane 内运行
