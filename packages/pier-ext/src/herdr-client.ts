@@ -207,7 +207,6 @@ export interface HerdrClientLike {
   /** 0.9.1: Launch a manifest pane entrypoint with placement (popup/tab/split/overlay/zoomed). */
   openPluginPane(opts: OpenPluginPaneOptions): Promise<OpenPluginPaneResult>;
   agentExplain(target: string): Promise<Record<string, unknown> | null>;
-  getServerVersion(): Promise<string | null>;
   /** pane.send_keys; herdr key combos include ctrl+c, enter, and esc. */
   sendPaneKeys(paneId: string, keys: string[]): Promise<void>;
   readPane(paneId: string, opts?: ReadOptions): Promise<ReadBuffer>;
@@ -256,7 +255,6 @@ export class NoopHerdrClient implements HerdrClientLike {
   async exportLayout(): Promise<null> { return null; }
   async paneLayout(): Promise<null> { return null; }
   async agentExplain(): Promise<null> { return null; }
-  async getServerVersion(): Promise<null> { return null; }
   async readPane(): Promise<ReadBuffer> { return { text: '', revision: 0, truncated: false }; }
   async readAgent(): Promise<ReadBuffer> { return { text: '', revision: 0, truncated: false }; }
   async waitForOutput(): Promise<WaitForOutputResult> { return { matched: false, reason: 'unavailable' }; }
@@ -737,21 +735,6 @@ export class HerdrClient implements HerdrClientLike {
     } catch {
       return null;
     }
-  }
-
-  private cachedVersion: string | null = null;
-
-  async getServerVersion(): Promise<string | null> {
-    if (this.cachedVersion) return this.cachedVersion;
-    try {
-      const result = (await this.request('ping', {})) as { version?: unknown } | null;
-      if (typeof result?.version === 'string') {
-        this.cachedVersion = result.version;
-        return result.version;
-      }
-    } catch {
-    }
-    return null;
   }
 
   async sendPaneKeys(paneId: string, keys: string[]): Promise<void> {

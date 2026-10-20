@@ -232,7 +232,7 @@ interface ProbeCase {
 
 const PROBE_CASES: ProbeCase[] = [
   { name: 'untrusted workspace is ignored and marked', fixture: { trustWorkspace: false }, expect: [['efficiency', 'not trusted']],
-    extra: (s, fx) => {
+    extra: (s, _fx) => {
       assert.equal(s.workspaceTrusted, false); assert.equal(knobValue(s, 'efficiency', 'observationPack.enabled'), 'false [default]', 'the workspace value must not apply');
       assert.ok(renderGuide(s, 'efficiency').some((l) => l.includes('IGNORED: untrusted project')));
     } },

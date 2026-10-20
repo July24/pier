@@ -213,7 +213,6 @@ export function fakeHerdr(over: Partial<HerdrClientLike> = {}): HerdrClientLike 
     tabList: async () => [],
     openPluginPane: async () => ({ mode: 'popup', ok: true }),
     agentExplain: async () => null,
-    getServerVersion: async () => null,
     readPane: async () => ({ text: '', revision: 0, truncated: false }),
     readAgent: async () => ({ text: '', revision: 0, truncated: false }),
     waitForOutput: async () => ({ matched: false, reason: 'timeout' }),

@@ -347,13 +347,12 @@ rpcTest('HerdrClient: waitForOutput degrades to a discriminated timeout', {}, as
   assert.deepEqual(await client.waitForOutput('p2', { type: 'substring', value: 'x' }, 50), { matched: false, reason: 'timeout' });
 }, (server) => { server.error = { code: 'timeout', message: 'wait timeout' }; });
 
-rpcTest('HerdrClient (0.9.5): openPluginPane popup, nested agent.explain, ping version, list fields', (method, params) => {
+rpcTest('HerdrClient (0.9.5): openPluginPane popup, nested agent.explain, list fields', (method, params) => {
   if (method === 'plugin.pane.open') {
     if (params.placement === 'popup') return { type: 'plugin_pane_opened', plugin_pane: { plugin_id: 'pier.workbench', entrypoint: 'dashboard', pane: { pane_id: 'w1:p8' } } };
     return { type: 'plugin_pane_opened', plugin_pane: { pane: { pane_id: 'w1:p8', tab_id: 'w1:t3' } } };
   }
   if (method === 'agent.explain') return { type: 'agent_explain', explain: { matched_rule: 'pi-standard', skip_state_reason: 'process_crashed' } };
-  if (method === 'ping') return { type: 'pong', version: '0.9.5', protocol: 22 };
   if (method === 'agent.list') {
     return { agents: [{ pane_id: 'p2', agent: 'pi', agent_status: 'working', state_labels: {}, tokens: {}, foreground_cwd: '/repo/sub',
       agent_session: { value: '/sess/a.jsonl', kind: 'path' } }] };
@@ -372,9 +371,6 @@ rpcTest('HerdrClient (0.9.5): openPluginPane popup, nested agent.explain, ping v
   assert.equal(explain?.skip_state_reason, 'process_crashed');
   assert.equal(explain?.type, undefined, 'unwraps {type, explain} envelope');
 
-  assert.equal(await client.getServerVersion(), '0.9.5');
-  assert.equal(server.received.filter((r) => r.method === 'ping').length, 1, 'the version is cached');
-
   const agents = await client.listAgents();
   assert.equal(agents[0]?.foregroundCwd, '/repo/sub');
 
@@ -382,6 +378,9 @@ rpcTest('HerdrClient (0.9.5): openPluginPane popup, nested agent.explain, ping v
   assert.equal(panes[0]?.foregroundCwd, '/repo/sub');
   assert.equal(panes[0]?.terminalTitle, '⠋ npm run dev');
   assert.equal(panes[0]?.terminalTitleStripped, 'npm run dev');
+
+  assert.deepEqual(server.received.map((r) => r.method), ['plugin.pane.open', 'agent.explain', 'agent.list', 'pane.list'],
+    'one round-trip per call, in order — no cached or skipped request');
 });
 
 rpcTest('HerdrClient (0.9.0): an unknown `popup` variant retries as a tab', (method, params) => {

@@ -455,7 +455,7 @@ export default function subagentPlugin(ctx: Context): void {
     persistSubs();
   }
 
-  async function executeSubagentResume(params: ToolParams, toolCtx: unknown) {
+  async function executeSubagentResume(params: ToolParams) {
     if (!client.available) return toolError('requires a herdr-managed pane.');
     const rawTaskId = idParam(params, 'taskId', 'agentId');
     if (!rawTaskId) return toolError('missing taskId for resume (see action list or delegation ledger).');
@@ -700,7 +700,7 @@ export default function subagentPlugin(ctx: Context): void {
 
   const ACTIONS: Record<string, (params: ToolParams, toolCtx: unknown, onUpdate?: (u: unknown) => void) => Promise<unknown>> = {
     spawn: (params, toolCtx, onUpdate) => executeSubagentSpawn(params, toolCtx, onUpdate),
-    resume: (params, toolCtx) => executeSubagentResume(params, toolCtx),
+    resume: (params) => executeSubagentResume(params),
     list: () => executeSubagentList(),
     send: (params, toolCtx) => executeSubagentSend(params, toolCtx),
     interrupt: (params, toolCtx) => executeSubagentInterrupt(params, toolCtx),
