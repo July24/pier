@@ -71,6 +71,13 @@ function paneColumns(width: number): Array<[string, number]> {
 /** Pier agent statuses tallied per workspace; the summary line renders straight from this table. */
 const PIER_STATUSES: Record<string, number> = { working: 0, blocked: 0, idle: 0 };
 
+/** Herdr reports `unknown` for a pane with no agent (a plain shell). That is a pane kind, not a
+ *  stalled agent, so the STATUS column says `shell` instead of alarming the operator. */
+export function paneStatus(p: SnapshotPane): string {
+  const status = p.agent_status ?? 'unknown';
+  return status === 'unknown' && !p.agent ? 'shell' : status;
+}
+
 /**
  * Normalizes raw socket responses into SessionSnapshotData, accepting a direct snapshot object as
  * well as the `{ snapshot }` and `{ result: { snapshot } }` envelopes.
@@ -236,9 +243,17 @@ export function composeDashboardLines(
   lines.push(`Current Workspace: ${ws.workspace_id} (${ws.label ?? 'unnamed'}) | Tabs: ${wsTabs.length} | Panes: ${wsPanes.length}`);
 
   if (wsTabs.length > 0) {
+    // A tab whose panes are all plain shells has no agent status either; report the aggregate as
+    // `shell` instead of `unknown`, matching the pane rows.
+    const tabStatus = (t: SnapshotTab): string => {
+      const status = t.agent_status ?? 'unknown';
+      if (status !== 'unknown') return status;
+      const panes = wsPanes.filter((p) => p.tab_id === t.tab_id);
+      return panes.length > 0 && panes.every((p) => paneStatus(p) === 'shell') ? 'shell' : status;
+    };
     const tabParts = wsTabs.map((t) => {
       const focus = t.focused || t.tab_id === data.focused_tab_id ? '*' : ' ';
-      return `${focus}#${t.number ?? '?'}[${t.label ?? t.tab_id}](${t.agent_status ?? 'unknown'})`;
+      return `${focus}#${t.number ?? '?'}[${t.label ?? t.tab_id}](${tabStatus(t)})`;
     });
     lines.push(`Tabs: ${tabParts.join('  ')}`);
   }
@@ -250,7 +265,7 @@ export function composeDashboardLines(
   const counts: Record<string, number> = { ...PIER_STATUSES };
   let pierCount = 0;
   for (const p of wsPanes) {
-    const status = p.agent_status ?? 'unknown';
+    const status = paneStatus(p);
     if (p.agent === 'pi' || p.tokens?.['pi-todo']) {
       pierCount += 1;
       // Own keys only: `status in counts` also matches Object.prototype members from a stray status.
@@ -269,7 +284,7 @@ export function composeDashboardLines(
     && paneIds.has(p.tokens['pi-parent']);
 
   const pushPaneRow = (p: SnapshotPane, indent: boolean): void => {
-    const status = p.agent_status ?? 'unknown';
+    const status = paneStatus(p);
     // pi-todo wins; else the Herdr 0.9.1 stripped OSC title (the raw title may still carry a spinner).
     let desc = p.tokens?.['pi-todo'] ?? p.terminal_title_stripped ?? p.title ?? p.terminal_title ?? '';
     const locks = Object.keys(p.tokens ?? {}).filter((k) => k.startsWith('lock-')).length;

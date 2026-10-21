@@ -50,7 +50,7 @@ export const PIER_OPTIONS: readonly OptionSpec[] = [
   { name: 'PIER_TERMINAL_PROMPT', legacy: 'PI_HERDR_TERMINAL_PROMPT', fallback: '(auto from $SHELL)', description: 'prompt strategy for terminal readiness: bash|zsh|powershell|pwsh' },
   { name: 'PIER_SLIM_FRAME', legacy: 'PI_HERDR_SLIM_FRAME', fallback: '1', description: 'mutation frame around todo-tool cards (0 disables)' },
   { name: 'PIER_TRACE', legacy: 'PI_HERDR_TRACE', fallback: '', description: 'write diagnostics (renderers, swallowed errors) to stderr (or to this file when it is a path)' },
-  { name: 'PIER_TERM_IDLE_MS', legacy: 'PI_HERDR_TERM_IDLE_MS', fallback: '1800000', min: 1, description: 'idle time before pier nudges about an open terminal (0/NaN falls back to the default)' },
+  { name: 'PIER_TERM_IDLE_MS', legacy: 'PI_HERDR_TERM_IDLE_MS', fallback: '300000', min: 1, description: 'idle time before the second cleanup nudge for an open terminal (per-terminal max 2; 0/NaN falls back to the default)' },
   { name: 'PIER_TERM_GRACE_MS', legacy: 'PI_HERDR_TERM_GRACE_MS', fallback: '30000', min: 1, description: 'settle grace before the terminal idle nudge (0/NaN falls back to the default)' },
   { name: 'PIER_TERM_READ_MAX', legacy: 'PI_HERDR_TERM_READ_MAX', fallback: '8000', min: 1, description: 'characters returned per terminal read (0/NaN falls back to the default)' },
   { name: 'PIER_TODO_GRACE_MS', legacy: 'PI_HERDR_TODO_GRACE_MS', fallback: '30000', min: 1, description: 'settle grace before the unfinished-todo reminder (0/NaN falls back to the default)' },

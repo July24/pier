@@ -172,7 +172,7 @@ npm test          # node --test，733 项单测（规划器 / todo 重放 / 反�
 | `PIER_SESSION_TTL_SECONDS` | `600` | 秒 | 子代理进程退出后会话保留 TTL（超时清理） |
 | `PIER_GIT_TIMEOUT_MS` | `10000` | ms | Git 命令超时（worktree 创建、diff 汇总、清理） |
 | `PIER_TERM_READ_MAX` | `8000` | 字符 | 终端单次读取缓冲区字符上限 |
-| `PIER_TERM_IDLE_MS` | `1800000` | ms | 终端闲置多久后提醒一次 |
+| `PIER_TERM_IDLE_MS` | `300000` | ms | 第二次终端清理提醒的闲置阈值（第一轮在回合结束时对本回合用过的终端提醒） |
 | `PIER_TODO_GRACE_MS` | `30000` | ms | 未完成 todo 提醒前的静默宽限 |
 | `PIER_TRACE` | – | 开关 | 把诊断信息（工具渲染器、被吞掉的异常）写到 stderr |
 | `PIER_JEV_ENABLE` | `0` | 开关 | jev 决策层(TypeSafe System One 分类)总开关;逐点 fail-open,详见 `docs/rfc-jev-integration.md` |

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeSnapshot, composeDashboardLines, displayWidth, clipToWidth, wrapToWidth, fitDashboardLines, type SessionSnapshotData } from '../src/dashboard-model.ts';
+import { normalizeSnapshot, composeDashboardLines, paneStatus, displayWidth, clipToWidth, wrapToWidth, fitDashboardLines, type SessionSnapshotData } from '../src/dashboard-model.ts';
 
 const SAMPLE_SNAPSHOT: SessionSnapshotData = {
   version: '0.9.0', protocol: 22, focused_workspace_id: 'wD', focused_tab_id: 'wD:t1', focused_pane_id: 'wD:p1',
@@ -42,6 +42,29 @@ test('composeDashboardLines: renders the complete ops dashboard for the focused 
     assert.ok(text.includes(needle), needle);
   assert.ok(text.includes('⚠️  ALERT: 1 SUBAGENT(S) BLOCKED — WAITING ON HUMAN DECISION'));
   assert.ok(text.includes('Summary: 2 pane(s) | Pier agents: 2 (1 working, 1 blocked, 0 idle)'));
+});
+
+test('composeDashboardLines: panes without an agent render as shell, not unknown', () => {
+  const snapshot: SessionSnapshotData = {
+    version: '0.9.5', protocol: 22, focused_workspace_id: 'w1',
+    workspaces: [{ workspace_id: 'w1', label: 'pier' }],
+    tabs: [
+      { tab_id: 'w1:t1', workspace_id: 'w1', number: 1, label: 'main', agent_status: 'unknown' },
+      { tab_id: 'w1:t2', workspace_id: 'w1', number: 2, label: 'work', agent_status: 'idle' },
+    ],
+    panes: [
+      { pane_id: 'w1:p1', workspace_id: 'w1', tab_id: 'w1:t2', agent: 'pi', display_agent: 'master', agent_status: 'idle' },
+      { pane_id: 'w1:p2', workspace_id: 'w1', tab_id: 'w1:t1', agent: null, agent_status: 'unknown', title: 'zsh' },
+    ],
+  };
+  const text = composeDashboardLines(snapshot, { now: 1700000000000 }).join('\n');
+  assert.ok(text.includes('#1[main](shell)'), 'a shell-only tab reports shell, not unknown');
+  assert.ok(text.includes('#2[work](idle)'), 'an agent tab keeps its real status');
+  const row = text.split('\n').find((l) => l.includes('w1:p2'))!;
+  assert.ok(row, 'the shell pane is listed');
+  assert.match(row, /shell/, 'no agent → shell, not a stalled unknown');
+  assert.doesNotMatch(row, /unknown/);
+  assert.equal(paneStatus({ pane_id: 'p3', workspace_id: 'w1', tab_id: 'w1:t1', agent: 'pi', agent_status: 'unknown' }), 'unknown', 'a real agent with unknown status stays unknown');
 });
 
 test('composeDashboardLines: targetWorkspaceId option overrides focused workspace', () => {

@@ -8,7 +8,7 @@ import terminalPlugin from '../src/plugins/terminal.ts';
 import {
   MAX_TERMINALS, POSIX_PROMPT, POWERSHELL_PROMPT, PROMPT_TAIL_RE, SIGNAL_KEYS, TERMINALS_CUSTOM_TYPE, TERM_REMINDERS_MAX,
   TERM_REMINDER_CUSTOM_TYPE, classifyReadiness, closeTerminal, computeIncrement, detectFullscreenTUI, foldTerminalsRegistry,
-  makeTerminalsRegistry, nextTerminalId, planIdleTerminalReminder, planShellInit, promptStrategyFor, registerTerminal,
+  makeTerminalsRegistry, nextTerminalId, planTerminalReminder, planShellInit, promptStrategyFor, registerTerminal,
   classifyWaitMatch, sentinelEchoHazard, stripAnsi, summarizeSessions, terminalIdleMs, validateSendText, validateSignal,
   type PromptStrategy, type ReadinessTier, type TerminalEntry,
 } from '../src/terminal-core.ts';
@@ -20,7 +20,7 @@ import { fakeHerdr, fakePi, fire, withCleanup, type FakePi } from './test-utils.
 const base = { paneId: 'pane-a', tabId: 'tab-1', cwd: 'F:/work', label: 'dev server', createdAt: 1000, lastActivityAt: 1000 };
 
 const mkEntry = (over: Partial<TerminalEntry> = {}): TerminalEntry => ({
-  terminalId: 'term-1', status: 'open', closedAt: null, readRevision: null, readLen: 0, readTail: '', readEoTail: '', ...base, ...over,
+  terminalId: 'term-1', status: 'open', closedAt: null, nudges: 0, nudgedAt: null, readRevision: null, readLen: 0, readTail: '', readEoTail: '', ...base, ...over,
 }) as TerminalEntry;
 
 test('registry: 取最大号 +1、默认 label = cwd 尾段、到达上限拒绝；closeTerminal 幂等', () => {
@@ -169,9 +169,15 @@ test('foldTerminalsRegistry：last-wins 往返、nudgedAt 持久化、readTail �
   assert.equal(single[0].cwd, 'F:/work');
 
   const nudged = foldTerminalsRegistry([entry(makeTerminalsRegistry([
-    { ...mkEntry({ terminalId: 'term-1', paneId: 'p1' }), nudgedAt: 40 }, mkEntry({ terminalId: 'term-2', paneId: 'p2' })]))]);
-  assert.equal(nudged[0]?.nudgedAt, 40, 'a nudged timestamp survives the round trip');
-  assert.equal(nudged[1]?.nudgedAt, null, 'a never-nudged terminal defaults to null');
+    { ...mkEntry({ terminalId: 'term-1', paneId: 'p1' }), nudges: 2, nudgedAt: 40 },
+    mkEntry({ terminalId: 'term-3', paneId: 'p3' })]))]);
+  assert.equal(nudged[0]?.nudges, 2, 'the per-terminal nudge count survives the round trip');
+  assert.equal(nudged[0]?.nudgedAt, 40, 'the last nudge timestamp survives the round trip');
+  assert.equal(nudged[1]?.nudges, 0, 'a never-nudged terminal defaults to zero');
+  assert.equal(nudged[1]?.nudgedAt, null);
+  // Old JSONL records have nudgedAt but no nudges field: one nudge already delivered.
+  const legacyNudge = foldTerminalsRegistry([entry({ version: 1, terminals: [{ paneId: 'p2', terminalId: 'term-2', nudgedAt: 40 }] })]);
+  assert.equal(legacyNudge[0]?.nudges, 1, 'a legacy nudgedAt folds to one nudge');
 
   // A10: a fold that dropped the tail made the next computeIncrement throw on prev.tail.length, so the
   // round trip is exercised with a cursor the real computeIncrement produced.
@@ -189,27 +195,49 @@ test('foldTerminalsRegistry：last-wins 往返、nudgedAt 持久化、readTail �
   assert.equal(legacy.initialized, false);
 });
 
-test('planIdleTerminalReminder：闲置超阈值且未催过 → due；催过/未闲置/达上限 → 不催', () => {
-  const term = (id: string, lastActivityAt: number, nudgedAt: number | null = null) => ({ terminalId: id, cwd: `/w/${id}`, label: id, lastActivityAt, nudgedAt });
+test('planTerminalReminder：回合用过 → 首次提醒；再闲置超阈值 → 第二次；每个 terminal 最多两次', () => {
+  const term = (id: string, lastActivityAt: number, over: { nudges?: number; nudgedAt?: number | null; busy?: boolean } = {}) =>
+    ({ terminalId: id, cwd: `/w/${id}`, label: id, lastActivityAt, ...over });
   const now = 10_000_000;
   const idleMs = terminalIdleMs();
+  const turnStartedAt = now - 10_000;
 
-  // idle past the threshold and never nudged → due, and only the never-nudged terminal is listed
-  const due = planIdleTerminalReminder({ open: [term('term-1', now - idleMs - 1), term('term-2', now - idleMs - 1, now - 1000)], now, reminders: 0 });
-  assert.equal(due.due, true); assert.deepEqual(due.ids, ['term-1'], 'already-nudged term-2 stays out');
-  assert.match(due.content ?? '', /term-1/); assert.doesNotMatch(due.content ?? '', /term-2/);
-  // the notice must forbid replying to this internal housekeeping message (or it triggers a farewell turn)
-  assert.match(due.content!, /do NOT reply to the user and do NOT send any farewell/); assert.match(due.content!, new RegExp(`nudge 1/${TERM_REMINDERS_MAX}`));
+  // used by the run that just settled, never nudged → first notice
+  const used = planTerminalReminder({ open: [term('term-1', turnStartedAt + 1)], now, turnStartedAt });
+  assert.equal(used.due, true); assert.deepEqual(used.ids, ['term-1']);
+  assert.match(used.content ?? '', /used this turn/); assert.match(used.content ?? '', new RegExp(`nudge 1/${TERM_REMINDERS_MAX}`));
+  assert.match(used.content!, /do NOT reply to the user and do NOT send any farewell/);
 
-  // everything already nudged → nothing
-  assert.equal(planIdleTerminalReminder({ open: [term('term-2', now - idleMs - 1, now - 1000)], now, reminders: 1 }).due, false);
-  // below the idle threshold → nothing (a busy, long-running dev server terminal is touched recently)
-  assert.equal(planIdleTerminalReminder({ open: [term('term-1', now - 1000)], now, reminders: 0 }).due, false);
-  // per-process hard cap
-  for (let reminders = 0; reminders < TERM_REMINDERS_MAX + 2; reminders += 1) {
-    const plan = planIdleTerminalReminder({ open: [term('term-1', now - idleMs - 1)], now, reminders });
-    assert.equal(plan.due, reminders < TERM_REMINDERS_MAX, `reminders=${reminders}`);
-  }
+  // already idle past the threshold, never nudged → first notice with the idle reason
+  const idle = planTerminalReminder({ open: [term('term-2', now - idleMs - 1)], now, turnStartedAt });
+  assert.equal(idle.due, true); assert.deepEqual(idle.ids, ['term-2']);
+  assert.match(idle.content ?? '', /idle \d+m/);
+
+  // recent activity, never nudged, not used this turn → nothing (a dev server in use stays out)
+  assert.equal(planTerminalReminder({ open: [term('term-3', now - 1000)], now }).due, false);
+
+  // one nudge already delivered: idle again → second notice; still recently used → nothing
+  const second = planTerminalReminder({ open: [term('term-1', now - idleMs - 1, { nudges: 1 })], now });
+  assert.equal(second.due, true); assert.match(second.content ?? '', /still idle/); assert.match(second.content ?? '', /nudge 2\/2/);
+  assert.equal(planTerminalReminder({ open: [term('term-1', now - 1000, { nudges: 1 })], now, turnStartedAt }).due, false);
+  // the second notice waits another full idle window after the first one
+  const justNudged = term('term-1', now - idleMs - 1, { nudges: 1, nudgedAt: now - 1000 });
+  assert.equal(planTerminalReminder({ open: [justNudged], now }).due, false, 'no back-to-back second nudge');
+  const waited = term('term-1', now - idleMs - 1, { nudges: 1, nudgedAt: now - idleMs - 1 });
+  assert.equal(planTerminalReminder({ open: [waited], now }).due, true);
+
+  // a foreground job keeps even a just-used or long-idle pane out of the notice
+  assert.equal(planTerminalReminder({ open: [term('term-5', turnStartedAt + 1, { busy: true })], now, turnStartedAt }).due, false);
+  assert.equal(planTerminalReminder({ open: [term('term-5', now - idleMs - 1, { busy: true })], now }).due, false);
+
+  // per-terminal cap: two nudges is silent even when idle or used
+  assert.equal(planTerminalReminder({ open: [term('term-1', now - idleMs - 1, { nudges: 2 })], now }).due, false);
+  assert.equal(planTerminalReminder({ open: [term('term-1', turnStartedAt + 1, { nudges: 2 })], now, turnStartedAt }).due, false);
+
+  // legacy records (nudgedAt without nudges) count as one nudge
+  assert.equal(planTerminalReminder({ open: [term('term-4', now - 1000, { nudgedAt: 1 })], now, turnStartedAt }).due, false);
+  const legacy = planTerminalReminder({ open: [term('term-4', now - idleMs - 1, { nudgedAt: 1 })], now });
+  assert.equal(legacy.due, true); assert.match(legacy.content ?? '', /nudge 2\/2/);
 });
 
 /* ── plugins/terminal.ts wiring ─────────────────────────────────── */
@@ -390,6 +418,34 @@ test('open 采纳请求的 terminal_id：open/send 用同名 id 直达，不再�
 });
 
 
+test('plugins/terminal：前台有任务时不催——dev server 刚启动不会白白消耗 nudge 1', (t) => withCleanup(async (cleanup) => {
+  const env = cleanup.env();
+  env.set('PI_HERDR_TERM_IDLE_MS', '1');
+  env.set('PI_HERDR_TERM_GRACE_MS', '5');
+  mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  try {
+    const { pi, client } = await mountTerminal(t, { open: true });
+    client.processInfo = async () => ({ paneId: 'pane-2', shellPid: 100, foreground: [{ name: 'node', argv0: 'node', pid: 200, cwd: null }] });
+    await fire(pi, 'agent_start');
+    mock.timers.tick(50);
+    await fire(pi, 'agent_settled');
+    mock.timers.tick(5);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(pi.sent.length, 0, 'a pane running a foreground job is not nudged');
+
+    // The job exits, the shell is back at its prompt: the idle threshold catches the pane.
+    client.processInfo = async () => ({ paneId: 'pane-2', shellPid: 100, foreground: [{ name: 'zsh', argv0: 'zsh', pid: 100, cwd: null }] });
+    mock.timers.tick(50);
+    await fire(pi, 'agent_settled');
+    mock.timers.tick(5);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(pi.sent.length, 1);
+    assert.match(String(pi.sent[0]?.msg.content), /idle \d+m/);
+  } finally {
+    mock.timers.reset();
+  }
+})());
+
 test('plugins/terminal：会话生命周期——shutdown 关停全部 open pane，ledger 墓碑让工具 inert', async (t) => {
   const { pi, deps, ledger, calls } = await mountTerminal(t, { open: true });
   assert.ok(deps.state.activePaneIds().has('pane-2'), 'precondition: the pane is registered');
@@ -408,10 +464,10 @@ test('plugins/terminal：会话生命周期——shutdown 关停全部 open pane
   assert.match(tombstoned.content[0].text, /disposed/, 'the tool is inert after the tombstone');
 });
 
-test('plugins/terminal：agent_settled 催办闲置 terminal——每个 terminal 只催一次（告别循环守卫）', (t) => withCleanup(async (cleanup) => {
+test('plugins/terminal：agent_settled 催办——本回合用过先催一次，闲置超阈值再催一次（每个 terminal 上限两次）', (t) => withCleanup(async (cleanup) => {
   // Which terminals are due, and the nudge content itself, is the planner's contract
-  // (planIdleTerminalReminder). This test covers the delivery: a queued followUp that never wakes the
-  // agent, the persisted nudgedAt, and the absence of a second nudge.
+  // (planTerminalReminder). This test covers the delivery: a queued followUp that never wakes the
+  // agent, the persisted per-terminal count, and the cap.
   const env = cleanup.env();
   env.set('PI_HERDR_TERM_IDLE_MS', '1');
   env.set('PI_HERDR_TERM_GRACE_MS', '5');
@@ -419,6 +475,7 @@ test('plugins/terminal：agent_settled 催办闲置 terminal——每个 termina
   mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   try {
     const { pi, deps } = await mountTerminal(t, { open: true });
+    await fire(pi, 'agent_start'); // mark the terminal as used by this run
     const settle = async () => {
       mock.timers.tick(50); // produce an idle duration above the threshold
       await fire(pi, 'agent_settled');
@@ -427,13 +484,22 @@ test('plugins/terminal：agent_settled 催办闲置 terminal——每个 termina
     };
 
     await settle();
-    assert.equal(pi.sent.length, 1, 'one nudge for the idle terminal'); assert.equal(pi.sent[0]?.msg.customType, TERM_REMINDER_CUSTOM_TYPE);
+    assert.equal(pi.sent.length, 1, 'first nudge for the terminal used this turn');
+    assert.equal(pi.sent[0]?.msg.customType, TERM_REMINDER_CUSTOM_TYPE);
     assert.equal(pi.sent[0]?.opts?.deliverAs, 'followUp'); assert.equal(pi.sent[0]?.opts?.triggerTurn, undefined, 'a reminder must never wake the agent (goodbye loop)');
-    const nudged = pi.entries.filter(([type]) => type === TERMINALS_CUSTOM_TYPE).at(-1)?.[1] as { terminals: Array<{ nudgedAt: number | null }> };
-    assert.ok(nudged.terminals[0]!.nudgedAt != null, 'nudgedAt is persisted before the notice is delivered');
+    assert.match(String(pi.sent[0]?.msg.content), /used this turn/);
+    const nudged = pi.entries.filter(([type]) => type === TERMINALS_CUSTOM_TYPE).at(-1)?.[1] as { terminals: Array<{ nudges: number; nudgedAt: number | null }> };
+    assert.equal(nudged.terminals[0]!.nudges, 1, 'the first nudge is persisted before the notice is delivered');
+    assert.ok(nudged.terminals[0]!.nudgedAt != null);
 
     await settle();
-    assert.equal(pi.sent.length, 1, 'an already-nudged terminal is never nudged again — no farewell loop');
+    assert.equal(pi.sent.length, 2, 'a second nudge after the idle threshold');
+    assert.match(String(pi.sent[1]?.msg.content), /still idle \d+m/);
+    const twice = pi.entries.filter(([type]) => type === TERMINALS_CUSTOM_TYPE).at(-1)?.[1] as { terminals: Array<{ nudges: number }> };
+    assert.equal(twice.terminals[0]!.nudges, 2);
+
+    await settle();
+    assert.equal(pi.sent.length, 2, 'the per-terminal cap stops further nudges — no farewell loop');
     assert.deepEqual([...deps.state.activePaneIds()], ['pane-2'], 'a nudge only reminds, it never closes panes');
   } finally {
     mock.timers.reset();

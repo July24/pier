@@ -173,7 +173,7 @@ Runtime policies and operational limits are centralized in `runtime-policy.ts` (
 | `PIER_SESSION_TTL_SECONDS` | `600` | s | Session retention TTL after subagent exit before GC cleanup |
 | `PIER_GIT_TIMEOUT_MS` | `10000` | ms | Execution timeout for git operations (worktree creation, diff summary, cleanup) |
 | `PIER_TERM_READ_MAX` | `8000` | chars | Maximum terminal buffer characters read per operation |
-| `PIER_TERM_IDLE_MS` | `1800000` | ms | Idle time before pier nudges about an open terminal |
+| `PIER_TERM_IDLE_MS` | `300000` | ms | Idle time before the second terminal-cleanup nudge (one is sent at turn end for a terminal used that turn) |
 | `PIER_TODO_GRACE_MS` | `30000` | ms | Settle grace before the unfinished-todo reminder |
 | `PIER_TRACE` | – | flag | Write diagnostics (tool renderers, swallowed errors) to stderr |
 | `PIER_JEV_ENABLE` | `0` | flag | Jev decision layer (TypeSafe System One classification) master switch; every call site fails open — see `docs/rfc-jev-integration.md` |

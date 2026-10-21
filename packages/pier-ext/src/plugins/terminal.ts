@@ -23,7 +23,7 @@ import {
   detectFullscreenTUI,
   foldTerminalsRegistry,
   makeTerminalsRegistry,
-  planIdleTerminalReminder,
+  planTerminalReminder,
   planShellInit,
   promptStrategyFor,
   registerTerminal,
@@ -129,17 +129,20 @@ export default function terminalPlugin(ctx: Context): void {
     persistTerminals();
   });
 
-  // Turn-end nudge: remind the model to close terminals idle past the threshold. Same delivery
-  // shape as the todo stop reminder: grace window, cancel on agent_start, capped followUp.
+  // Turn-end nudge: remind the model to close terminals it just used, then once more after the idle
+  // threshold. Same delivery shape as the todo stop reminder: grace window, cancel on agent_start,
+  // capped per terminal.
   const piSend = surface.raw as {
     sendMessage?: (
       message: { customType: string; content: string; display?: boolean },
       opts?: { deliverAs?: string; triggerTurn?: boolean },
     ) => void;
   };
-  let idleReminders = 0;
+  /** Start of the current agent run; terminals touched since then count as "used this turn". */
+  let turnStartedAt: number | null = null;
   let idleReminderTimer: NodeJS.Timeout | null = null;
   scoped.on('agent_start', () => {
+    turnStartedAt = Date.now();
     if (idleReminderTimer !== null) {
       clearTimeout(idleReminderTimer);
       idleReminderTimer = null;
@@ -150,19 +153,33 @@ export default function terminalPlugin(ctx: Context): void {
       clearTimeout(idleReminderTimer);
       idleReminderTimer = null;
     }
-    const plan = planIdleTerminalReminder({
-      open: terminals.filter((t) => t.status === 'open'),
+    const open = await Promise.all(
+      terminals
+        .filter((t) => t.status === 'open')
+        .map(async (t) => {
+          // A pane running a foreground job (dev server, REPL, load test) is in use even when the
+          // last tool interaction is old: nudge only after it is back at a shell prompt.
+          const info = await client.processInfo(t.paneId).catch(() => null);
+          const busy = info?.shellPid != null
+            && info.foreground.some((p) => p.pid != null && p.pid !== info.shellPid);
+          return { ...t, busy };
+        }),
+    );
+    const plan = planTerminalReminder({
+      open,
       now: Date.now(),
-      reminders: idleReminders,
+      turnStartedAt,
     });
+    turnStartedAt = null;
     if (!plan.due || plan.content == null) return;
-    // Goodbye-loop guard: mark the covered terminals nudged NOW (persisted), and deliver the notice as a
-    // queued followUp WITHOUT triggerTurn — a reminder must never wake the agent, or the loop never ends.
+    // Goodbye-loop guard: bump each covered terminal's nudge count NOW (persisted), and deliver the
+    // notice as a queued followUp WITHOUT triggerTurn — a reminder must never wake the agent.
     const now = Date.now();
     const ids = new Set(plan.ids);
-    terminals = terminals.map((t) => (ids.has(t.terminalId) ? { ...t, nudgedAt: now } : t));
+    terminals = terminals.map((t) => (ids.has(t.terminalId)
+      ? { ...t, nudges: (t.nudges ?? (t.nudgedAt != null ? 1 : 0)) + 1, nudgedAt: now }
+      : t));
     persistTerminals();
-    idleReminders += 1;
     const content = plan.content;
     idleReminderTimer = setTimeout(() => {
       idleReminderTimer = null;
@@ -345,6 +362,8 @@ export default function terminalPlugin(ctx: Context): void {
   async function executeTerminalWait(params: ToolParams) {
     const entry = findOpenTerminal(params?.terminal_id);
     if (!entry) return fail(`unknown or closed terminal "${String(params?.terminal_id)}" (see action list)`);
+    // Waiting on a pane is use: keep it out of the "used this turn" cleanup nudge at settle.
+    touchTerminal(entry);
     const raw = typeof params?.pattern === 'string' ? params.pattern : '';
     if (!raw) return fail('pattern is required (literal text, or a regular expression with regex: true)');
     const useRegex = params?.regex === true;

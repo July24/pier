@@ -69,7 +69,9 @@ export interface TerminalEntry {
   label: string | null;
   createdAt: number;
   lastActivityAt: number;
-  /** Idle-nudge bookkeeping: set when this terminal has been nudged once (per-entry, persisted). */
+  /** Nudges delivered for this terminal (0..TERM_REMINDERS_MAX), persisted. */
+  nudges: number;
+  /** Timestamp of the last nudge; kept alongside `nudges` for legacy records and debugging. */
   nudgedAt: number | null;
   status: 'open' | 'closed';
   closedAt: number | null;
@@ -123,6 +125,7 @@ export function registerTerminal(
     label: opts.label ?? (opts.cwd ? basename(opts.cwd.replace(/\\/g, '/')) || opts.cwd : null),
     createdAt: opts.createdAt,
     lastActivityAt: opts.createdAt,
+    nudges: 0,
     nudgedAt: null,
     status: 'open',
     closedAt: null,
@@ -413,6 +416,9 @@ export function foldTerminalsRegistry(
         label: typeof t.label === 'string' ? t.label : null,
         createdAt: typeof t.createdAt === 'number' ? t.createdAt : 0,
         lastActivityAt: typeof t.lastActivityAt === 'number' ? t.lastActivityAt : 0,
+        nudges: typeof t.nudges === 'number'
+          ? Math.max(0, Math.min(TERM_REMINDERS_MAX, Math.floor(t.nudges)))
+          : (typeof t.nudgedAt === 'number' ? 1 : 0),
         nudgedAt: typeof t.nudgedAt === 'number' ? t.nudgedAt : null,
         status: t.status === 'closed' ? ('closed' as const) : ('open' as const),
         closedAt: typeof t.closedAt === 'number' ? t.closedAt : null,
@@ -426,17 +432,20 @@ export function foldTerminalsRegistry(
   return found;
 }
 
-/* ── Idle-terminal nudge: turn-end self-cleanup for shells the model forgot to close ──
- * Terminals persist by design, so a finished shell lingers as a dead split; delivery wiring mirrors
- * the todo stop-reminder in plugins/terminal. */
+/* ── Terminal nudge: turn-end self-cleanup for shells the model forgot to close ──
+ * Terminals persist by design, so a finished shell lingers as a dead split. Two notices per terminal:
+ *   1. at the end of the turn that used it ("used this turn") — or the first turn that finds it idle
+ *      past the threshold, for a shell nobody touched recently;
+ *   2. on a later settle once it has been idle past PIER_TERM_IDLE_MS.
+ * Delivery wiring mirrors the todo stop-reminder in plugins/terminal. */
 
-/** Cap idle-terminal nudges for the lifetime of the process (same shape as TODO_REMINDERS_MAX). */
+/** Per-terminal nudge cap: one after use, one after the idle threshold (goodbye-loop guard). */
 export const TERM_REMINDERS_MAX = 2;
 
-/** Idle threshold before a nudge is due; the env var is read per call so tests can use small values. */
+/** Idle threshold for the second nudge; the env var is read per call so tests can use small values. */
 export function terminalIdleMs(): number {
   // B10: canonical PIER_TERM_IDLE_MS, legacy PI_HERDR_TERM_IDLE_MS.
-  return Number(pierOption('PIER_TERM_IDLE_MS') ?? 30 * 60_000) || 30 * 60_000;
+  return Number(pierOption('PIER_TERM_IDLE_MS') ?? 5 * 60_000) || 5 * 60_000;
 }
 
 /** Grace from agent_settled to injection, letting the user read the answer and intervene; cancel on agent_start. */
@@ -446,55 +455,80 @@ export function terminalReminderGraceMs(): number {
 
 export const TERM_REMINDER_CUSTOM_TYPE = 'pi-herdr.term-reminder';
 
-export interface IdleTerminalInput {
+export interface TerminalNudgeInput {
   terminalId: string;
   cwd: string;
   label: string | null;
   lastActivityAt: number;
-  /** Set once this terminal has been nudged; a nudged terminal is never nudged again (goodbye-loop guard). */
+  /** Nudges already delivered; when absent, legacy `nudgedAt` counts as one. */
+  nudges?: number;
   nudgedAt?: number | null;
+  /** A non-shell foreground process owns the pane (dev server / running job); never nudge it. */
+  busy?: boolean;
 }
 
-export interface IdleTerminalReminderPlan {
+export interface TerminalReminderPlan {
   due: boolean;
   content: string | null;
-  /** Nudge count after successful injection, or the original count when due is false. */
-  nextReminders: number;
-  /** Terminal ids this nudge covers; the caller marks them nudged at schedule time. */
+  /** Terminals covered by this notice; the caller bumps each one's `nudges` at schedule time. */
   ids: string[];
 }
 
-function noIdleInject(reminders: number): IdleTerminalReminderPlan {
-  return { due: false, content: null, nextReminders: reminders, ids: [] };
+function noTerminalInject(): TerminalReminderPlan {
+  return { due: false, content: null, ids: [] };
+}
+
+function nudgesOf(t: TerminalNudgeInput): number {
+  return t.nudges ?? (t.nudgedAt != null ? 1 : 0);
+}
+
+/** `72m` / `3h12m`: the reason column reads at a glance without a timestamp. */
+function formatIdleAge(ms: number): string {
+  const minutes = Math.max(0, Math.floor(ms / 60_000));
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h${String(minutes % 60).padStart(2, '0')}m`;
 }
 
 /**
- * Due only when an OPEN terminal is idle past the threshold and never nudged; the idle filter also
- * keeps dev-server shells touched recently out of the nudge.
+ * First notice: the terminal was used by the agent run that just settled, or it is already idle past
+ * the threshold. Second notice: a terminal with one nudge is idle past the threshold again. A shell
+ * touched recently is never nudged, so a dev server in active use stays out.
  */
-export function planIdleTerminalReminder(
-  input: { open: readonly IdleTerminalInput[]; now: number; reminders: number },
-): IdleTerminalReminderPlan {
+export function planTerminalReminder(
+  input: { open: readonly TerminalNudgeInput[]; now: number; turnStartedAt?: number | null },
+): TerminalReminderPlan {
   const idleMs = terminalIdleMs();
-  const idle = input.open.filter(
-    (t) => !t.nudgedAt && input.now - t.lastActivityAt >= idleMs,
-  );
-  if (idle.length === 0 || input.reminders >= TERM_REMINDERS_MAX) {
-    return noIdleInject(input.reminders);
+  const rows: string[] = [];
+  const ids: string[] = [];
+  for (const t of input.open) {
+    if (t.busy) continue;
+    const nudges = nudgesOf(t);
+    if (nudges >= TERM_REMINDERS_MAX) continue;
+    const idleFor = input.now - t.lastActivityAt;
+    const sinceNudge = t.nudgedAt != null ? input.now - t.nudgedAt : Number.POSITIVE_INFINITY;
+    const usedThisTurn = input.turnStartedAt != null && t.lastActivityAt >= input.turnStartedAt;
+    // Second notice waits another full idle window after the first one, so a pane that was already
+    // idle for an hour at nudge 1 is not nudged twice back-to-back on the next settle.
+    const reason = nudges === 0 && usedThisTurn
+      ? 'used this turn'
+      : nudges === 0 && idleFor >= idleMs
+        ? `idle ${formatIdleAge(idleFor)}`
+        : nudges === 1 && idleFor >= idleMs && sinceNudge >= idleMs
+          ? `still idle ${formatIdleAge(idleFor)}`
+          : null;
+    if (reason == null) continue;
+    rows.push(`- ${t.terminalId} (${t.label ?? t.cwd}) — ${reason} · nudge ${nudges + 1}/${TERM_REMINDERS_MAX}`);
+    ids.push(t.terminalId);
   }
-  const list = idle.map((t) => `- ${t.terminalId} (${t.label ?? t.cwd})`).join('\n');
+  if (ids.length === 0) return noTerminalInject();
   const content = [
-    `<system-reminder>Open terminal(s) idle for a while (nudge ${input.reminders + 1}/${TERM_REMINDERS_MAX}):`,
-    list,
+    '<system-reminder>Open terminal(s) that may be finished:',
+    ...rows,
     'This is an internal housekeeping notice — do NOT reply to the user and do NOT send any farewell on this notice.',
     'If the work in them is done, close them now with terminal(action: "close", terminal_id: "…").',
     'Keep a terminal only if a long-running process still needs that shell.',
     '</system-reminder>',
   ].join('\n');
-  return {
-    due: true,
-    content,
-    nextReminders: input.reminders + 1,
-    ids: idle.map((t) => t.terminalId),
-  };
+  return { due: true, content, ids };
 }
