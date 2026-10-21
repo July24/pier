@@ -96,18 +96,37 @@ on = "pane.closed"
 platforms = ["windows"]
 command = ["powershell.exe", "-Command", "$r = $env:HERDR_PLUGIN_ROOT; if ($r.Length -gt 4 -and $r[0] -eq [char]92 -and $r[1] -eq [char]92) { $r = $r.Substring(4) }; & node ($r + '/scripts/heat-reflow.mjs')"]
 
-# ── Plugin Panes: Pier Ops Dashboard (0.9.0) ────────────────────────
-# One entry only: a pane id is the entrypoint used by `herdr plugin pane open --entrypoint dashboard`,
-# and herdr rejects a manifest that declares the same id twice (verified live: "duplicate pane id").
-# Unlike the event hooks above, this command needs no HERDR_PLUGIN_ROOT rewriting — the dashboard
-# reads HERDR_SOCKET_PATH from the environment and resolves everything else from cwd (plugin root).
-# [[panes]] entries are definitions, not autostart: the pane opens only on demand.
+# ── Plugin Panes: unified Pier panel + overlay escape hatches (0.9.0) ───────────
+# Pane ids are entrypoints used by `herdr plugin pane open --entrypoint <id>`; herdr rejects a
+# manifest that declares the same id twice (verified live: "duplicate pane id").
+# Unlike the event hooks above, these commands need no HERDR_PLUGIN_ROOT rewriting — they read
+# HERDR_SOCKET_PATH / PIER_TREE_FILE / PIER_PANEL from the environment and resolve the rest from cwd.
+# [[panes]] entries are definitions, not autostart: a pane opens only on demand.
+# `panel` is the singleton popup shared by /dashboard and /pier-tree (tabs inside one process).
+# `dashboard` / `tree` remain entrypoints for the explicit `/dashboard overlay` and
+# `/pier-tree overlay` escape hatches; all three run the same panel script.
+[[panes]]
+id = "panel"
+title = "Pier Panel"
+placement = "popup"
+width = "90%"
+height = "80%"
+platforms = ["linux", "macos", "windows"]
+command = ["node", "scripts/panel.mjs"]
+
 [[panes]]
 id = "dashboard"
 title = "Pier Dashboard"
-placement = "tab"
+placement = "overlay"
 platforms = ["linux", "macos", "windows"]
-command = ["node", "scripts/dashboard.mjs"]
+command = ["node", "scripts/panel.mjs"]
+
+[[panes]]
+id = "tree"
+title = "Pier Tree"
+placement = "overlay"
+platforms = ["linux", "macos", "windows"]
+command = ["node", "scripts/panel.mjs"]
 
 
 # ── Link handlers: recognize pi: session links and navigate to corresponding pane (M3, skeleton) ──

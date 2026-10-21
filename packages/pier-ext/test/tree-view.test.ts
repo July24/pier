@@ -10,7 +10,7 @@ const it = (content: string, status: TodoItem['status'], blocker?: string): Todo
 test('selfLine: current item variants', () => {
   assert.equal(selfLine([it('a', 'in_progress'), it('b', 'pending'), it('c', 'completed')]), '▶ a ✓1/3');
   assert.equal(selfLine([it('x', 'blocked', '等审核')]), '■ 等人: 等审核 ✓0/1');
-  assert.equal(selfLine([it('done1', 'completed'), it('done2', 'completed')]), '✓2/2');
+  assert.equal(selfLine([it('done1', 'completed'), it('done2', 'completed')]), null, 'a finished plan renders no self line');
   assert.equal(selfLine([]), null);
 });
 

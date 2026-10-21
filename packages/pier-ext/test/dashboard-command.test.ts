@@ -15,6 +15,7 @@ async function runDashboard(opts: {
   env?: HerdrEnv | null;
   todos?: TodoItem[];
   locks?: string[];
+  args?: string;
 }): Promise<{ notifications: Array<{ text: string; level?: string }>; opened: OpenPluginPaneOptions | null }> {
   let opened: OpenPluginPaneOptions | null = null;
   const client = fakeHerdr({
@@ -32,7 +33,7 @@ async function runDashboard(opts: {
   });
   const notifications: Array<{ text: string; level?: string }> = [];
   const ctx = { ui: { notify: (text: string, level?: string) => notifications.push({ text, level }) } };
-  await pi.commands.get('dashboard')!.handler!(null, ctx);
+  await pi.commands.get('dashboard')!.handler!(opts.args ?? null, ctx);
   return { notifications, opened };
 }
 
@@ -73,8 +74,20 @@ test('formatStandaloneDashboard: groups the todos by status, lists the write loc
 test('installDashboardCommand: Herdr 0.9.1 opens the popup plugin pane without notifying', async () => {
   const { notifications, opened } = await runDashboard({});
   assert.equal(opened?.pluginId, 'pier.workbench');
-  assert.equal(opened?.entrypoint, 'dashboard');
+  assert.equal(opened?.entrypoint, 'panel');
   assert.equal(opened?.placement, 'popup');
+  assert.equal(opened?.width, '90%');
+  assert.equal(opened?.env?.PIER_PANEL, 'dashboard');
+  assert.deepEqual(notifications, []);
+});
+
+test('installDashboardCommand: /dashboard overlay opens the independent overlay placement (no popup size)', async () => {
+  const { notifications, opened } = await runDashboard({ args: ' overlay ', open: { mode: 'pane', paneId: 'w1:p9' } });
+  assert.equal(opened?.entrypoint, 'dashboard');
+  assert.equal(opened?.placement, 'overlay');
+  assert.equal(opened?.env?.PIER_PANEL, 'dashboard');
+  assert.equal(opened?.width, undefined);
+  assert.equal(opened?.height, undefined);
   assert.deepEqual(notifications, []);
 });
 

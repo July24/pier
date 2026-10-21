@@ -273,11 +273,14 @@ const WINDOW_CASES: WindowCase[] = [
   { name: '自态单行：当前条 + done/total（phase 分组退出常驻面）', items: [it('a', 'in_progress', 'P1'), it('b', 'pending', 'P1'), it('c', 'completed', 'P2')], exact: ['▶ a ✓1/3'] },
   { name: '空列表且无 worker → 空行数组（widget 隐藏）', items: [], exact: [] },
   { name: 'blocked 带 blocker 后缀', items: [{ content: 'x', status: 'blocked', blocker: '等审核' } as TodoItem], includes: ['■ 等人: 等审核', '✓0/1'] },
-  { name: '全 completed → 只剩计数', items: DONE_LIST, exact: ['✓3/3'] },
+  { name: '全 completed → widget 隐藏（计数无可操作信息）', items: DONE_LIST, exact: [] },
   { name: 'worker 行：全量条目 → 当前条 + 计数；blocked → 等人', items: [it('发布 npm', 'in_progress')], opts: { workers: [
     { paneId: 'p2', slug: 'fix-auth', description: 'fix auth', todos: { items: [{ content: 'auth tests', status: 'in_progress' }, { content: 'done one', status: 'completed' }] } },
     { paneId: 'p3', slug: 'migration', description: 'migrate', todos: { items: [{ content: 'confirm schema', status: 'blocked', blocker: '等人' }] } },
   ] }, exact: ['▶ 发布 npm ✓0/1', '↳ fix-auth ▶ auth tests ✓1/2', '↳ migration ■ confirm schema（等人） ✓0/1'] },
+  { name: '全 completed + worker → 自态隐藏，worker 行保留', items: DONE_LIST, opts: { workers: [
+    { paneId: 'p2', slug: 'fix-auth', description: 'fix auth', todos: { items: [{ content: 'auth tests', status: 'in_progress' }] } },
+  ] }, exact: ['↳ fix-auth ▶ auth tests ✓0/1'] },
   { name: 'worker 冷缓存：摘要 token 兜底；无 slug 用 paneId+描述', items: [it('a', 'in_progress')], opts: { workers: [
     { paneId: 'p2', slug: 'fix-auth', description: 'fix auth', todos: { summary: '▶1 ○2 ✓0 · wiring' } },
     { paneId: 'p9', description: 'legacy row', todos: null },

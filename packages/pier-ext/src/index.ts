@@ -29,6 +29,8 @@ import { createHerdrClient } from './herdr-client.ts';
 import { bareSessionId, lastAssistantText, readSessionFile, resolveSessionFileValue } from './session-tail.ts';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
+import { mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { platformPaths } from './platform-paths.ts';
 import { TodosService, type TodoCompletionSource } from './todos-service.ts';
 import { reconcileTodos } from './reconcile-core.ts';
@@ -55,6 +57,7 @@ import { createNoticeBuffer } from './index-notices.ts';
 import { handlePipeRequest, type MachineRequest } from './index-pipe.ts';
 import { installWriteLocks } from './index-locks.ts';
 import { installDashboardCommand } from './dashboard-command.ts';
+import { openPierPanel } from './panel-open.ts';
 import { registerObservationPack, createCompactionBatchPackHook, type PickMiddleExcerpt } from './plugins/observation.ts';
 import { createJevRuntime } from './jev-client.ts';
 import {
@@ -222,6 +225,7 @@ export default async function (pi: ExtensionAPI) {
     if (!workerPaneId) return;
     workerTodos.set(workerPaneId, { items, summary, ts: Date.now() });
     todoUi.rerenderWidget?.();
+    refreshTreeSnapshot();
   }
   /** Running rows joined with their cached todos — feeds the unified widget and /pier-tree. */
   function widgetWorkers(): WorkerWidgetRow[] {
@@ -230,6 +234,46 @@ export default async function (pi: ExtensionAPI) {
       todos: workerTodos.get(s.paneId) ?? null,
     }));
   }
+
+  /* ── /pier-tree panel: the pi process owns the data, the popup/overlay owns the surface. ── */
+  /** Set while a panel is open; todo/worker updates republish the snapshot it polls. */
+  let treeSnapshot: { path: string } | null = null;
+
+  function renderTreeLines(): string[] {
+    const rows = subagentPort.current?.listRows() ?? [];
+    return formatDelegationTree({
+      selfItems: todos.items,
+      workers: widgetWorkers(),
+      settled: rows
+        .filter((r) => r.status === 'settled' || r.status === 'consumed')
+        .map((r) => ({ paneId: r.paneId, slug: r.slug, description: r.description, settledAt: r.settledAt })),
+      now: Date.now(),
+    });
+  }
+
+  function treeSnapshotPath(): string {
+    const id = (sessionId || (env ? `pane-${env.paneId}` : 'session')).replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
+    return join(tmpdir(), 'pier-tree', `${id}.txt`);
+  }
+
+  function publishTreeSnapshot(): string {
+    const path = treeSnapshotPath();
+    mkdirSync(join(tmpdir(), 'pier-tree'), { recursive: true });
+    writeFileSync(path, `${renderTreeLines().join('\n')}\n`);
+    treeSnapshot = { path };
+    return path;
+  }
+
+  function refreshTreeSnapshot(): void {
+    if (!treeSnapshot) return;
+    try {
+      writeFileSync(treeSnapshot.path, `${renderTreeLines().join('\n')}\n`);
+    } catch {
+      /* The panel may have been closed and its temp dir swept; the next command republishes. */
+    }
+  }
+
+  todos.on('todo.updated', () => refreshTreeSnapshot());
 
   /** M17 settlement reconciliation: auto-complete settled todos / unblock on failure notes (idempotent). */
   function reconcileOnSettlement(description: string, outcome: 'settled' | 'failed'): string[] {
@@ -647,6 +691,7 @@ export default async function (pi: ExtensionAPI) {
     env,
     getTodoItems: () => todos.items,
     getHeldLocks: () => locksHandle.getHeldLocks(),
+    prepareTree: () => publishTreeSnapshot(),
   });
 
   /* ── ask_user_question (v1.3 M8 human gate; master and subagents) ── */
@@ -728,6 +773,14 @@ export default async function (pi: ExtensionAPI) {
       } catch {
       }
     }
+    if (treeSnapshot) {
+      try {
+        unlinkSync(treeSnapshot.path);
+      } catch {
+        /* Already swept. */
+      }
+      treeSnapshot = null;
+    }
     client.close();
   });
 
@@ -761,17 +814,41 @@ export default async function (pi: ExtensionAPI) {
     /* ── /pier-tree (D113): full todo × subagent delegation tree; the resident widget is minimal ── */
     pi.registerCommand('pier-tree', {
       description: 'Show the full delegation tree: your todos plus every subagent\'s todos and settled nodes',
-      handler: async (_args: unknown, ctx: unknown) => {
+      handler: async (args: unknown, ctx: unknown) => {
         const ui = (ctx as { ui?: { notify?: (text: string, level?: string) => void } }).ui;
-        const rows = subagentPort.current?.listRows() ?? [];
-        const lines = formatDelegationTree({
-          selfItems: todos.items,
-          workers: widgetWorkers(),
-          settled: rows
-            .filter((r) => r.status === 'settled' || r.status === 'consumed')
-            .map((r) => ({ paneId: r.paneId, slug: r.slug, description: r.description, settledAt: r.settledAt })),
-          now: Date.now(),
-        });
+        const lines = renderTreeLines();
+        const overlay = typeof args === 'string' && args.trim().toLowerCase() === 'overlay';
+
+        if (client.available && env) {
+          const treeFile = publishTreeSnapshot();
+          if (overlay) {
+            try {
+              const res = await client.openPluginPane({
+                pluginId: 'pier.workbench',
+                entrypoint: 'tree',
+                placement: 'overlay',
+                focus: true,
+                env: { PIER_PANEL: 'tree', PIER_TREE_FILE: treeFile },
+              });
+              if (res.mode === 'pane') return;
+            } catch {
+              // Plugin missing / older herdr: fall back to the in-pane notify view below.
+            }
+          } else {
+            const res = await openPierPanel({ client, env }, { panel: 'tree', treeFile });
+            if (res === 'popup') return;
+            if (res === 'tab') {
+              ui?.notify?.('Herdr < 0.9.1: Pier Tree opened in new tab', 'info');
+              return;
+            }
+            if (res === 'busy') {
+              ui?.notify?.('Another popup is already open — close it and run /pier-tree again.', 'warning');
+              return;
+            }
+          }
+          // 'unavailable' / failed overlay → the old in-pane view.
+        }
+        treeSnapshot = null;
         ui?.notify?.(lines.join('\n'), 'info');
       },
     });

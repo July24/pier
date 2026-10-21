@@ -52,7 +52,8 @@ The installer also verifies node / pi / herdr versions.
 | Command | Purpose |
 |---|---|
 | `/todos` | Show the todo list, or edit it: `/todos done|drop|rm|unblock <fuzzy match>` |
-| `/pier-tree` | Master only: the full delegation tree — your complete todo list plus every running subagent's full list (live-pushed over the pipe) and settled nodes with ages; the resident widget stays one line per agent (D113) |
+| `/dashboard [overlay]` | Ops dashboard. Default opens the shared Pier **popup** on its `Dashboard` tab (90% × 80%, singleton); `overlay` opens the same view as an independent full-window pane. Non-Herdr falls back to an in-pane text view. |
+| `/pier-tree [overlay]` | Master only: the full delegation tree — your complete todo list plus every running subagent's full list (live-pushed over the pipe) and settled nodes with ages. Default opens the same shared popup on its `Tree` tab (the snapshot refreshes on every todo/worker push; `1`/`2`/`Tab` switch views inside the popup); `overlay` opens an independent full-window pane; bare pi / a missing plugin falls back to the in-pane notify view. The resident widget stays one line per agent and hides entirely once the self list is fully completed (D113/D114) |
 | `/locks` | Show write locks held by this pane and by live panes — the **human/operator view** of the write-lock beacons (herdr only). Agents see the holders inside their own write warnings; the raw tokens are readable via `herdr agent list` |
 | `/pier-role` | Show the current role + available role names, or switch mid-session: `/pier-role <name>` (widening beyond the current toolset asks for confirmation; the switch lands as a transcript tool delta) |
 | `/pier-config` | Read-only configuration guide over four planes: bare call = index + hands a guided change to the agent; `show [plane\|all]` = effective value + source (`env > workspace > user > default`); `check` = validate all planes; `doc [path]` = write a report |

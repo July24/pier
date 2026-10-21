@@ -77,12 +77,14 @@ export function workerLine(row: WorkerWidgetRow): string {
 }
 
 
-/** Self line: the current item with a done/total suffix — the anchored multi-line window is retired. */
+/** Self line: the current item with a done/total suffix — the anchored multi-line window is retired.
+ * A finished plan (no in_progress / blocked / pending item) has no actionable row, so it renders
+ * nothing at all: a bare `✓8/8` is noise that the human cannot act on. */
 export function selfLine(items: readonly TodoItem[]): string | null {
   if (items.length === 0) return null;
   const cur = currentOf(items);
+  if (!cur) return null;
   const counts = countsOf(items);
-  if (!cur) return counts;
   if (cur.status === 'blocked') return `■ 等人: ${clip(cur.blocker || cur.content, 40)} ${counts}`;
   return `▶ ${clip(cur.content)} ${counts}`;
 }
@@ -103,9 +105,11 @@ export function unifiedWidgetLines(
   }
   if (items.length === 0 && workers.length === 0) return [];
   // Archived plans keep their degraded two-line form; workers stay visible underneath.
+  const self = items.length > 0 ? selfLine(items) : null;
   const head = opts?.archivedAgeMs != null && items.length > 0
     ? [`${formatTodoSummary(items)} · archived ${formatAge(opts.archivedAgeMs)}`]
-    : items.length > 0 ? [selfLine(items)!] : [];
+    : self ? [self] : [];
+  if (head.length === 0 && workers.length === 0) return [];
   const rows = workers.map(workerLine);
   const budget = WIDGET_MAX_LINES - head.length - 1;
   const shown = rows.slice(0, Math.max(budget, 0));

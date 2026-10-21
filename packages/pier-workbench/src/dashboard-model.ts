@@ -48,22 +48,28 @@ export interface SessionSnapshotData {
 export interface ComposeDashboardOptions {
   targetWorkspaceId?: string | null;
   now?: number;
+  /** Render width in terminal cells; the description column absorbs the remainder. */
+  width?: number;
 }
 
-/** Pane table columns (title + width); the header and its rule are rendered from this table. */
-const PANE_COLUMNS: Array<[string, number]> = [
+/** Fixed pane-table columns; the description column gets whatever width is left. */
+const PANE_FIXED: ReadonlyArray<[string, number]> = [
   ['PANE ID', 10],
   ['ROLE', 8],
   ['STATUS', 10],
   ['FOC', 4],
-  ['TODO / TITLE / TOKENS', 44],
 ];
+const PANE_FIXED_WIDTH = PANE_FIXED.reduce((sum, [, width]) => sum + width, 0) + PANE_FIXED.length; // + separators
+const PANE_DESC_MIN = 20;
+const PANE_DESC_TITLE = 'TODO / TITLE / TOKENS';
+
+function paneColumns(width: number): Array<[string, number]> {
+  const desc = Math.max(PANE_DESC_MIN, width - PANE_FIXED_WIDTH);
+  return [...PANE_FIXED, [PANE_DESC_TITLE, desc]];
+}
 
 /** Pier agent statuses tallied per workspace; the summary line renders straight from this table. */
 const PIER_STATUSES: Record<string, number> = { working: 0, blocked: 0, idle: 0 };
-
-const RULE = '--------------------------------------------------------------------------------';
-const BANNER = '================================================================================';
 
 /**
  * Normalizes raw socket responses into SessionSnapshotData, accepting a direct snapshot object as
@@ -89,9 +95,101 @@ export function normalizeSnapshot(raw: unknown): SessionSnapshotData | null {
   };
 }
 
+/** Terminal cell width for one code point: wide CJK/emoji ranges count as two cells. */
+function charWidth(cp: number): number {
+  if (cp === 0 || cp === 0xfe0f || cp === 0x200d) return 0;
+  if (cp < 32 || (cp >= 0x7f && cp < 0xa0)) return 0;
+  return (cp >= 0x1100 && cp <= 0x115f)
+    || (cp >= 0x2e80 && cp <= 0xa4cf)
+    || (cp >= 0xac00 && cp <= 0xd7a3)
+    || (cp >= 0xf900 && cp <= 0xfaff)
+    || (cp >= 0xfe10 && cp <= 0xfe19)
+    || (cp >= 0xfe30 && cp <= 0xfe6f)
+    || (cp >= 0xff00 && cp <= 0xff60)
+    || (cp >= 0xffe0 && cp <= 0xffe6)
+    || (cp >= 0x1f300 && cp <= 0x1f64f)
+    || (cp >= 0x1f900 && cp <= 0x1f9ff)
+    || (cp >= 0x20000 && cp <= 0x3fffd)
+    ? 2
+    : 1;
+}
+
+export function displayWidth(str: string): number {
+  let width = 0;
+  for (const ch of str) width += charWidth(ch.codePointAt(0) ?? 0);
+  return width;
+}
+
+/** Hard-wrap a line into `width`-cell rows (wide characters stay whole). */
+export function wrapToWidth(str: string, width: number): string[] {
+  if (width <= 0) return [''];
+  const rows: string[] = [];
+  let out = '';
+  let used = 0;
+  for (const ch of str) {
+    const w = charWidth(ch.codePointAt(0) ?? 0);
+    if (used + w > width && out !== '') {
+      rows.push(out);
+      out = '';
+      used = 0;
+    }
+    out += ch;
+    used += w;
+  }
+  rows.push(out);
+  return rows;
+}
+
+/** Fit a line into `width` cells, appending `…` when content is dropped. */
+export function clipToWidth(str: string, width: number): string {
+  if (width <= 0) return '';
+  if (displayWidth(str) <= width) return str;
+  const limit = width - 1;
+  let out = '';
+  let used = 0;
+  for (const ch of str) {
+    const w = charWidth(ch.codePointAt(0) ?? 0);
+    if (used + w > limit) break;
+    out += ch;
+    used += w;
+  }
+  return `${out}…`;
+}
+
 function pad(str: string, width: number): string {
-  if (str.length > width) return str.slice(0, width - 1) + '…';
-  return str.padEnd(width, ' ');
+  const clipped = clipToWidth(str, width);
+  return clipped + ' '.repeat(Math.max(0, width - displayWidth(clipped)));
+}
+
+export interface DashboardView {
+  lines: string[];
+  /** Clamped scroll offset (0 = top). */
+  offset: number;
+  /** Total number of composed lines. */
+  total: number;
+  /** Rows visible in this window. */
+  visible: number;
+}
+
+/** Wrap to `width` and return the `height`-row viewport at `offset`; used by the popup renderer. */
+export function fitDashboardLines(
+  lines: readonly string[],
+  opts: { width?: number; height?: number; offset?: number } = {},
+): DashboardView {
+  const width = opts.width && opts.width > 0 ? opts.width : 0;
+  const wrapped = width > 0
+    ? lines.flatMap((line) => wrapToWidth(line, width))
+    : [...lines];
+  const total = wrapped.length;
+  const height = opts.height && opts.height > 0 ? Math.floor(opts.height) : total;
+  const maxOffset = Math.max(0, total - height);
+  const offset = Math.min(Math.max(0, Math.floor(opts.offset ?? 0)), maxOffset);
+  return {
+    lines: wrapped.slice(offset, offset + height),
+    offset,
+    total,
+    visible: Math.min(height, total),
+  };
 }
 
 export function composeDashboardLines(
@@ -99,20 +197,26 @@ export function composeDashboardLines(
   options?: ComposeDashboardOptions
 ): string[] {
   const data = normalizeSnapshot(rawSnapshot);
+  const width = options?.width && options.width > 0 ? Math.max(40, Math.floor(options.width)) : null;
+  const columns = paneColumns(width ?? 80);
+  const rule = '-'.repeat(width ?? 80);
+  const banner = '='.repeat(width ?? 80);
   const timeStr = new Date(options?.now ?? Date.now()).toTimeString().slice(0, 8);
   const meta = [
     data?.version ? `Herdr v${data.version}` : 'Herdr (offline)',
     data?.protocol ? `proto ${data.protocol}` : '',
   ].filter(Boolean).join(', ');
 
-  const lines = [`==================== PIER OPS DASHBOARD ==================== [${timeStr}] (${meta})`];
+  const label = ` PIER OPS DASHBOARD [${timeStr}] (${meta}) `;
+  const side = Math.max(0, (width ?? 80) - displayWidth(label));
+  const lines = [`${'='.repeat(Math.floor(side / 2))}${clipToWidth(label, width ?? 80)}${'='.repeat(Math.ceil(side / 2))}`];
   if (!data || (!data.workspaces.length && !data.panes.length)) {
     lines.push(
       '',
       '  No active Herdr session or empty workspace data.',
       '  Waiting for Herdr session snapshot...',
       '',
-      BANNER,
+      banner,
     );
     return lines;
   }
@@ -122,7 +226,7 @@ export function composeDashboardLines(
     const status = w.agent_status && w.agent_status !== 'unknown' ? `:${w.agent_status}` : '';
     return `[${focus}${w.workspace_id}: ${w.label ?? 'unnamed'}${status}]`;
   });
-  lines.push(`Workspaces (${wsItems.length}): ${wsItems.join(' ')}`, RULE);
+  lines.push(`Workspaces (${wsItems.length}): ${wsItems.join(' ')}`, rule);
 
   const targetId = options?.targetWorkspaceId ?? data.focused_workspace_id ?? data.workspaces[0]?.workspace_id;
   const ws = data.workspaces.find((w) => w.workspace_id === targetId)
@@ -138,10 +242,10 @@ export function composeDashboardLines(
     });
     lines.push(`Tabs: ${tabParts.join('  ')}`);
   }
-  lines.push(RULE);
+  lines.push(rule);
 
-  lines.push(PANE_COLUMNS.map(([title, width]) => pad(title, width)).join(' '));
-  lines.push(PANE_COLUMNS.map(([, width]) => '-'.repeat(width)).join(' '));
+  lines.push(columns.map(([title, colWidth]) => pad(title, colWidth)).join(' '));
+  lines.push(columns.map(([, colWidth]) => '-'.repeat(colWidth)).join(' '));
 
   const counts: Record<string, number> = { ...PIER_STATUSES };
   let pierCount = 0;
@@ -175,11 +279,11 @@ export function composeDashboardLines(
       desc = `cwd: ${cwd.split('/').pop() || cwd}`;
     }
     lines.push([
-      pad(indent ? `↳ ${p.pane_id}` : p.pane_id, 10),
-      pad(p.display_agent ?? (p.agent || '-'), 8),
-      pad(status === 'blocked' ? '! BLOCKED' : status, 10),
+      pad(indent ? `↳ ${p.pane_id}` : p.pane_id, columns[0]![1]),
+      pad(p.display_agent ?? (p.agent || '-'), columns[1]![1]),
+      pad(status === 'blocked' ? '! BLOCKED' : status, columns[2]![1]),
       p.focused || p.pane_id === data.focused_pane_id ? ' *  ' : '    ',
-      pad(desc, 44),
+      pad(desc, columns[4]![1]),
     ].join(' '));
   };
   for (const p of wsPanes) {
@@ -189,7 +293,7 @@ export function composeDashboardLines(
   }
 
   if (wsPanes.length === 0) lines.push('  (No panes in this workspace)');
-  lines.push(RULE);
+  lines.push(rule);
 
   if (counts.blocked > 0) {
     // Attribution answers "who is waiting on whom": worker ← delegating master pane.
@@ -201,7 +305,7 @@ export function composeDashboardLines(
   }
   lines.push(
     `Summary: ${wsPanes.length} pane(s) | Pier agents: ${pierCount} (${counts.working} working, ${counts.blocked} blocked, ${counts.idle} idle)`,
-    BANNER,
+    banner,
   );
 
   return lines;

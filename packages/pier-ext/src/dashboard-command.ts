@@ -1,4 +1,5 @@
 import type { HerdrClientLike, HerdrEnv } from './herdr-client.ts';
+import { openPierPanel } from './panel-open.ts';
 import { isTodoStatus, type TodoItem, type TodoStatus } from './vocab.ts';
 
 export interface DashboardCommandDeps {
@@ -9,6 +10,8 @@ export interface DashboardCommandDeps {
   env: HerdrEnv | null;
   getTodoItems?: () => readonly TodoItem[];
   getHeldLocks?: () => readonly string[];
+  /** Publishes the current delegation tree and returns its snapshot path (panel Tree tab). */
+  prepareTree?: () => string | null;
 }
 
 /** SUMMARY_ORDER fixes the summary-line order; LIVE_ROWS adds the detail line below it.
@@ -74,26 +77,48 @@ export function formatStandaloneDashboard(opts: {
 
 export function installDashboardCommand(deps: DashboardCommandDeps): void {
   deps.pi.registerCommand('dashboard', {
-    description: 'Open the Pier Ops Dashboard (modal popup in Herdr 0.9.1, tab fallback, or local TUI view)',
-    handler: async (_args, ctx) => {
+    description: 'Open the Pier Ops Dashboard (modal popup by default; `/dashboard overlay` = independent full-window pane)',
+    handler: async (args, ctx) => {
       const ui = (ctx as { ui?: { notify?: (text: string, level?: string) => void } }).ui;
+      const overlay = typeof args === 'string' && args.trim().toLowerCase() === 'overlay';
 
       if (deps.client.available && deps.env) {
-        try {
-          const res = await deps.client.openPluginPane({
-            pluginId: 'pier.workbench',
-            entrypoint: 'dashboard',
-            placement: 'popup',
-            width: '80%',
-            height: '80%',
-            focus: true,
-          });
-          if (res.mode === 'fallback_tab') {
-            ui?.notify?.('Herdr < 0.9.1: Pier Dashboard opened in new tab', 'info');
+        if (overlay) {
+          // Escape hatch: a real full-window pane instead of the singleton popup.
+          const treeFile = deps.prepareTree?.() ?? null;
+          try {
+            const res = await deps.client.openPluginPane({
+              pluginId: 'pier.workbench',
+              entrypoint: 'dashboard',
+              placement: 'overlay',
+              focus: true,
+              env: {
+                PIER_PANEL: 'dashboard',
+                ...(treeFile ? { PIER_TREE_FILE: treeFile } : {}),
+              },
+            });
+            if (res.mode === 'fallback_tab') {
+              ui?.notify?.('Herdr < 0.9.1: Pier Dashboard opened in new tab', 'info');
+            }
+            return;
+          } catch {
+            // Fall through to the local view.
           }
-          return;
-        } catch {
-          // Plugin missing or socket error: fall through to the Level 3 local view.
+        } else {
+          const res = await openPierPanel(
+            { client: deps.client, env: deps.env },
+            { panel: 'dashboard', treeFile: deps.prepareTree?.() ?? null },
+          );
+          if (res === 'popup') return;
+          if (res === 'tab') {
+            ui?.notify?.('Herdr < 0.9.1: Pier Dashboard opened in new tab', 'info');
+            return;
+          }
+          if (res === 'busy') {
+            ui?.notify?.('Another popup is already open — close it and run /dashboard again.', 'warning');
+            return;
+          }
+          // 'unavailable' → Level 3 local view.
         }
       }
 

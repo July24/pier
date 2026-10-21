@@ -28,7 +28,7 @@ pier 由**两个半区**组成，各装一处：
 - **交互式子代理**：每个子代理 = 独立 pane 的隔离 pi 会话（独立上下文窗口）；**人类可随时进入该 pane 直接对话**（修 bug、接管、回答 ask_user_question）
 - **委托身份一等公民**（D111）：spawn 时经 `PI_HERDR_DELEGATION` 把委托上下文（父 pane/父会话/taskId/任务/角色）下发 worker，env > worker marker > branch fold 三级回放；worker 系统提示注入 `pier-delegation` 段（身份 + 统一交付契约），首帧渲染「⟵ delegated by master …」卡片，pane title 带 `↳` 前缀；herdr `pi-parent`/`pi-task` token 独立批上报，dashboard 按 parent 分组树化、blocked 告警带 `worker ← master` 归属
 - **任务 slug + 主动进度上报**（D112）：spawn 分配任务 slug（冲突加序号），工具输出一律 `slug@paneId`，`agentId` 接受 slug/paneId/组合形式（revive 换 pane 后按 slug 兜底）；worker 侧 `report_progress` 工具经 pipe 把检查点以 display-less custom message 送进 master 上下文——不刷屏、不强制 turn，master 从轮询猜状态升级为关键节点被动接收
-- **统一 TUI 状态条**（D113）：常驻 widget 一行一 agent——自己一行 `▶ 当前条 ✓d/n`，每个 running 子代理一行 `↳ slug ▶ 当前条 ✓d/n`（blocked 显示任务+原因，settled 不占行）；worker `todo_write` 经 pipe 实时推送全量清单（事件驱动零轮询），`/pier-tree` 弹完整委托树（自己 + 各 worker 全量 todo + settled 节点）；`/dashboard` 仍是 ops 面板
+- **统一 TUI 状态条**（D113/D114）：常驻 widget 一行一 agent——自己一行 `▶ 当前条 ✓d/n`，每个 running 子代理一行 `↳ slug ▶ 当前条 ✓d/n`（blocked 显示任务+原因，settled 不占行；自己的清单全部完成时直接隐藏，不再只剩一个 `✓N/N`）；worker `todo_write` 经 pipe 实时推送全量清单（事件驱动零轮询），`/pier-tree` 在共享的 Pier **popup** 里打开完整委托树（自己 + 各 worker 全量 todo + settled 节点），与 `/dashboard` 是同一个单例面板，初始落在 `Tree` tab（面板内用 `1`/`2`/`Tab` 切换；显式 `/pier-tree overlay` 仍走独立全窗 pane；非 Herdr 环境回退为 pane 内通知）；`/dashboard` 打开同一面板的 `Dashboard` tab
 - **子代理输出预览**：`subagent(action: "output", agentId)` 返回后台子代理自上次调用以来的新输出——内存中的 per-pane 游标计算增量（优先 `agent.read`，旧版 herdr 回退 `pane.read`），结果带状态、revision、截断与 `restart` 标记（缓冲回卷/清屏），master 不必等到结算就能发现卡住的 worker
 - **软锁防争抢**（写路径按 pane 粒度锁 token，冲突时警告/阻止）
 - **角色档案**：`master` / `worker-default` 内置，自定义 role 按 `.pi-herdr/roles/<name>.json` 挂载；工具集按角色收敛（deny 规则不可绕过）

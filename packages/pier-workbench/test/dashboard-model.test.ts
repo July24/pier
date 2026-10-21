@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeSnapshot, composeDashboardLines, type SessionSnapshotData } from '../src/dashboard-model.ts';
+import { normalizeSnapshot, composeDashboardLines, displayWidth, clipToWidth, wrapToWidth, fitDashboardLines, type SessionSnapshotData } from '../src/dashboard-model.ts';
 
 const SAMPLE_SNAPSHOT: SessionSnapshotData = {
   version: '0.9.0', protocol: 22, focused_workspace_id: 'wD', focused_tab_id: 'wD:t1', focused_pane_id: 'wD:p1',
@@ -86,4 +86,54 @@ test('composeDashboardLines: Herdr 0.9.1 terminal_title_stripped and foreground_
   assert.ok(text.includes('npm test --watch'));
   assert.ok(text.includes('cwd: core'));
   assert.ok(!text.includes('⠋'), 'spinner-laden title must not win over terminal_title_stripped');
+});
+
+test('composeDashboardLines: every line fits the requested terminal width (including wide CJK)', () => {
+  const wide: SessionSnapshotData = {
+    version: '0.9.5', protocol: 22, focused_workspace_id: 'w1',
+    workspaces: [
+      { workspace_id: 'w1', label: '一个非常长的工作区名称-中文-copy', focused: true, agent_status: 'working' },
+      { workspace_id: 'w2', label: 'second-workspace-with-a-long-name' },
+    ],
+    tabs: [{ tab_id: 'w1:t1', workspace_id: 'w1', number: 1, label: '一个很长的任务标签页名称', agent_status: 'working' }],
+    panes: [{ pane_id: 'w1:p1', workspace_id: 'w1', tab_id: 'w1:t1', agent: 'pi', display_agent: 'master', agent_status: 'working', tokens: { 'pi-todo': '▶ 构建一个非常长的任务标题用于测试折行 ✓1/8' } }],
+  };
+  for (const width of [40, 60, 80, 120]) {
+    const composed = composeDashboardLines(wide, { width, now: 1700000000000 });
+    const lines = fitDashboardLines(composed, { width, height: 1000 }).lines;
+    for (const line of lines) assert.ok(displayWidth(line) <= width, `width ${width}: ${displayWidth(line)} cells: ${line}`);
+    assert.ok(lines.join('').includes('一个非常长的工作区名称'), 'wrapped free text keeps its content');
+  }
+});
+
+test('clipToWidth/displayWidth: wide characters are measured in cells, never split mid-surrogate', () => {
+  assert.equal(displayWidth('中a'), 3);
+  assert.equal(clipToWidth('中文中文', 5), '中文…');
+  assert.equal(clipToWidth('abcdef', 4), 'abc…');
+  assert.equal(displayWidth(clipToWidth('emoji ⚠️ done', 10)), 10);
+});
+
+test('fitDashboardLines: wraps rows, slices the viewport, and clamps the offset', () => {
+  const lines = Array.from({ length: 10 }, (_, i) => `line-${i}`);
+  const view = fitDashboardLines(lines, { width: 10, height: 3, offset: 0 });
+  assert.equal(view.total, 10);
+  assert.equal(view.visible, 3);
+  assert.equal(view.lines.length, 3);
+  const scrolled = fitDashboardLines(lines, { width: 10, height: 3, offset: 8 });
+  assert.equal(scrolled.offset, 7, 'offset clamps to total - height');
+  assert.equal(scrolled.lines[0], 'line-7');
+  const short = fitDashboardLines(lines.slice(0, 2), { width: 80, height: 10, offset: 5 });
+  assert.equal(short.offset, 0);
+  assert.equal(short.visible, 2);
+  // A long logical line becomes physical rows, so no horizontal information is clipped away.
+  const wrapped = fitDashboardLines(['0123456789ABCDEF'], { width: 10, height: 10 });
+  assert.deepEqual(wrapped.lines, ['0123456789', 'ABCDEF']);
+  assert.equal(wrapped.total, 2);
+});
+
+test('wrapToWidth: wide characters stay whole and no row exceeds the width', () => {
+  assert.deepEqual(wrapToWidth('abcdef', 4), ['abcd', 'ef']);
+  assert.deepEqual(wrapToWidth('中文中文', 4), ['中文', '中文']);
+  assert.deepEqual(wrapToWidth('a中b', 2), ['a', '中', 'b']);
+  assert.ok(wrapToWidth('emoji ⚠️ done', 5).every((line) => displayWidth(line) <= 5));
 });

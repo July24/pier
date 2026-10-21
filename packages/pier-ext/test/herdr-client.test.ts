@@ -394,6 +394,15 @@ rpcTest('HerdrClient (0.9.0): an unknown `popup` variant retries as a tab', (met
   assert.equal(res.paneId, 'w1:p9');
 });
 
+rpcTest('HerdrClient (0.9.5): ui_busy is a busy popup, not an old-server placement error', (method) => {
+  if (method !== 'plugin.pane.open') return {};
+  throw new Error('ui_busy: a popup pane is already open');
+}, async (client, server) => {
+  const res = await client.openPluginPane({ pluginId: 'pier.workbench', entrypoint: 'panel', placement: 'popup' });
+  assert.deepEqual(res, { mode: 'busy' });
+  assert.deepEqual(server.received.map((r) => r.method), ['plugin.pane.open'], 'no tab retry');
+});
+
 test('herdrUnavailableHint (B5): 传输层失败给出可动作的一句话，其它错误返回 null', () => {
   assert.match(String(herdrUnavailableHint(new Error('connect ENOENT /tmp/herdr.sock'))), /herdr unreachable/);
   assert.match(String(herdrUnavailableHint(new Error('connect ECONNREFUSED 127.0.0.1:1'))), /HERDR_SOCKET_PATH/);

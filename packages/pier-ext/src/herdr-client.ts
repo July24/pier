@@ -103,6 +103,8 @@ export interface OpenPluginPaneOptions {
 
 export type OpenPluginPaneResult =
   | { mode: 'popup'; ok: true }
+  /** Another popup/modal owns the session; the caller may switch that panel instead of opening a tab. */
+  | { mode: 'busy' }
   | { mode: 'pane'; paneId: string }
   | { mode: 'fallback_tab'; tabId?: string; paneId?: string };
 
@@ -710,8 +712,14 @@ export class HerdrClient implements HerdrClientLike {
       }
       return { mode: 'pane', paneId: findIdIn(result, 'pane_id') ?? '' };
     } catch (err) {
+      // A live popup/modal is a transient state, not an old server: opening a tab would orphan a
+      // second dashboard and silently change the surface. Callers decide whether to switch panels.
+      const message = err instanceof Error ? err.message : String(err);
+      if (opts.placement === 'popup' && /ui_busy|popup pane is already open/i.test(message)) {
+        return { mode: 'busy' };
+      }
       // 0.9.0 serde rejects unknown `popup` as "unknown variant" / invalid_params — not a dedicated
-      // invalid_placement code. Any popup failure retries as tab; tab failure surfaces to Level 3.
+      // invalid_placement code. Any other popup failure retries as tab; tab failure surfaces to Level 3.
       if (opts.placement !== 'popup') throw err;
       const { width: _width, height: _height, target_pane_id: _target, ...base } = params;
       const fallbackRes = (await this.request('plugin.pane.open', { ...base, placement: 'tab' })) as Record<string, unknown> | null;
