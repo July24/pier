@@ -706,7 +706,7 @@ export function planForegroundTick(input: {
 
 /* ── task-id resolution ─────────────────────────────────────────── */
 
-type TaskIdResolutionResult =
+export type TaskIdResolutionResult =
   | { kind: 'resolved'; taskId: string }
   | { kind: 'ambiguous'; query: string; candidates: string[] }
   | { kind: 'too_short'; query: string }
@@ -734,6 +734,19 @@ export function resolveTaskIdPrefix(
     return { kind: 'ambiguous', query: trimmed, candidates: matches };
   }
   return { kind: 'not_found', query: trimmed };
+}
+
+/** Error text for a non-resolved `resolveTaskIdPrefix` outcome; null for `resolved` (each caller owns
+ * its success path) and `not_found` (each caller words its own unknown-id hint). `rawQuery` keeps
+ * the caller's original string in the message even though matching works on the trimmed form. */
+export function taskIdResolutionError(
+  res: TaskIdResolutionResult,
+  label: 'task id' | 'subagent id',
+  rawQuery: string,
+): string | null {
+  if (res.kind === 'too_short') return `Error: ${label} prefix "${rawQuery}" is too short (minimum 4 characters).`;
+  if (res.kind === 'ambiguous') return ambiguousIdError(label, rawQuery, res.candidates);
+  return null;
 }
 
 /* ── outbound port (composition root → plugin) ──────────────────── */

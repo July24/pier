@@ -13,7 +13,6 @@ import {
   Semaphore,
   SUBAGENT_OUTPUT_SCHEMA,
   agoText,
-  ambiguousIdError,
   attachSubagentStructuredContent,
   buildAliveNotice,
   idParam,
@@ -22,6 +21,7 @@ import {
   newestPerTaskId,
   rekeySub,
   resolveTaskIdPrefix,
+  taskIdResolutionError,
   tabNameForTask,
   subRef,
   type AliveProbe,
@@ -421,8 +421,8 @@ export default function subagentPlugin(ctx: Context): void {
     const byTaskId = newestPerTaskId(subs.values());
     const res = resolveTaskIdPrefix(rawId, byTaskId.keys());
     if (res.kind === 'resolved') return { entry: byTaskId.get(res.taskId)! };
-    if (res.kind === 'ambiguous') return { error: ambiguousIdError('subagent id', rawId, res.candidates) };
-    if (res.kind === 'too_short') return { error: `Error: subagent id prefix "${rawId}" is too short (minimum 4 characters).` };
+    const resError = taskIdResolutionError(res, 'subagent id', rawId);
+    if (resError) return { error: resError };
 
     if (cwd) {
       const hist = readHistory(histFile(cwd));
@@ -435,7 +435,8 @@ export default function subagentPlugin(ctx: Context): void {
           return { entry };
         }
       }
-      if (histRes.kind === 'ambiguous') return { error: ambiguousIdError('subagent id', rawId, histRes.candidates) };
+      const histError = taskIdResolutionError(histRes, 'subagent id', rawId);
+      if (histError) return { error: histError };
     }
     return { error: `Error: unknown subagent id "${rawId}" (see action list)` };
   }
@@ -461,10 +462,8 @@ export default function subagentPlugin(ctx: Context): void {
     if (!rawTaskId) return toolError('missing taskId for resume (see action list or delegation ledger).');
     const running = newestPerTaskId([...subs.values()].filter((s) => s.background && s.status === 'running'));
     const live = resolveTaskIdPrefix(rawTaskId, running.keys());
-    if (live.kind === 'too_short') {
-      return toolError(`Error: task id prefix "${rawTaskId}" is too short (minimum 4 characters).`);
-    }
-    if (live.kind === 'ambiguous') return toolError(ambiguousIdError('task id', rawTaskId, live.candidates));
+    const liveError = taskIdResolutionError(live, 'task id', rawTaskId);
+    if (liveError) return toolError(liveError);
     if (live.kind === 'resolved') {
       const entry = running.get(live.taskId)!;
       return {
@@ -474,12 +473,9 @@ export default function subagentPlugin(ctx: Context): void {
     }
     const history = readHistoryTree(dirname(defaultAgentSessionsDir()));
     const resolution = resolveTaskIdPrefix(rawTaskId, history.map((e) => e.taskId));
-    if (resolution.kind === 'too_short') {
-      return toolError(`Error: task id prefix "${rawTaskId}" is too short (minimum 4 characters).`);
-    }
-    if (resolution.kind === 'ambiguous') return toolError(ambiguousIdError('task id', rawTaskId, resolution.candidates));
-    if (resolution.kind === 'not_found') {
-      return toolError(`Error: no history for task "${rawTaskId}" in this workspace or its spawned checkouts.`);
+    if (resolution.kind !== 'resolved') {
+      return toolError(taskIdResolutionError(resolution, 'task id', rawTaskId)
+        ?? `Error: no history for task "${rawTaskId}" in this workspace or its spawned checkouts.`);
     }
     const taskId = resolution.taskId;
     const latest = latestGeneration(history, taskId);
