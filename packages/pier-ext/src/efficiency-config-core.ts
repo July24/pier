@@ -9,6 +9,7 @@
  * top-level key disables every mechanism).
  */
 
+import { isPlainObject } from './guards.ts';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -85,10 +86,6 @@ export const DEFAULT_EFFICIENCY_CONFIG: EfficiencyConfig = Object.freeze({
   }),
   jev: Object.freeze({ enabled: false, logEnabled: false, model: 'jev-1.13.0', timeoutMs: 2000, minConfidence: 0.6 }),
 });
-
-function isPlainObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
-}
 
 type FieldKind = 'bool' | 'int' | 'number' | 'ratio' | 'string' | 'optionalString';
 

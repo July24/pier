@@ -4,6 +4,8 @@
  * top-level keys are reported (a typo like "rulez" must not silently fail) and every issue is
  * collected in one pass so a manifest can be repaired in one go.
  */
+import { isPlainObject } from './guards.ts';
+
 export type PermissionAction = 'allow' | 'ask' | 'deny';
 export type TodosMode = 'serial' | 'parallel';
 /** D82: stance for unknown tools—visibility is a trust relationship (user→master via install; master→delegated via mirror). */
@@ -47,9 +49,6 @@ const SEMVER_RE = /^\d+\.\d+\.\d+$/;
 const TOOL_KEY_RE = /^[a-z0-9_*-]+$/;
 const ACTIONS: readonly PermissionAction[] = ['allow', 'ask', 'deny'];
 
-function isPlainObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
-}
 
 export function validateRoleManifest(input: unknown): ValidateResult {
   const issues: string[] = [];

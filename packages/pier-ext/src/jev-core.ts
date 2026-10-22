@@ -8,6 +8,7 @@
  * question needs; instructions are English (CJK is weaker, hence the stricter P0-2 gate); and any
  * answer below its confidence gate counts as unanswered so callers fail open.
  */
+import { isPlainObject } from './guards.ts';
 import { containsLikelySecret, FAILURE_SIGNAL } from './reducer-core.ts';
 
 /* ── Request/response shapes (closed set) ── */
@@ -36,9 +37,6 @@ export type JevParsed =
   | { readonly ok: true; readonly answers: Record<string, JevAnswer>; readonly model: string; readonly usage: JevUsage }
   | { readonly ok: false; readonly reason: string };
 
-function isPlainObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
-}
 
 function finiteNumber(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined;

@@ -1,5 +1,6 @@
 /** D102 Evidence-Preserving Reducer core: diagnostic-command recognition, secret filtering, receipt
  * schema checking, byte-for-byte quote verification (storage I/O lives in efficiency-store.ts). */
+import { isPlainObject } from './guards.ts';
 
 import { createHash } from 'node:crypto';
 
@@ -104,9 +105,6 @@ function stripReceiptJsonFences(raw: string): string {
   return fenced?.[1]?.trim() ?? trimmed;
 }
 
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
-}
 
 function lineNumberOf(body: string, quote: string): number | undefined {
   const index = body.indexOf(quote);
@@ -168,7 +166,7 @@ export function validateReceipt(
     return { ok: false, reason: 'invalid-json' };
   }
 
-  if (!isRecord(parsed)) {
+  if (!isPlainObject(parsed)) {
     return { ok: false, reason: 'schema-mismatch' };
   }
 
@@ -189,7 +187,7 @@ export function validateReceipt(
   const seen = new Set<string>();
 
   for (const item of parsed.evidence) {
-    if (!isRecord(item)) {
+    if (!isPlainObject(item)) {
       return { ok: false, reason: 'schema-mismatch' };
     }
     const kind = item.kind;
