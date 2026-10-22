@@ -9,7 +9,8 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { DisposeLedger } from './ledger.ts';
 import type { PiSurface } from './pi-surface.ts';
 import type { TerminalDeps } from './plugins/terminal.ts';
-import type { TodoDeps } from './plugins/todo.ts';
+import type { TodoDeps, TodoUiSlot } from './plugins/todo.ts';
+import type { TodosService } from './todos-service.ts';
 import type { SubagentDeps } from './plugins/subagent.ts';
 
 export interface PierCordisServices {
@@ -37,4 +38,27 @@ export function cordisGet<K extends keyof PierCordisServices>(ctx: Context, key:
   const value = ctx.get(key) as PierCordisServices[K] | undefined;
   if (value === undefined) throw new Error(`[pi-herdr] cordis service missing: ${key}`);
   return value;
+}
+
+/** The six required 'pi-herdr.todo-deps' fields both mounts assemble identically (maxItems mirrors
+ * the tool prompt's "at most 15 entries"); masters and workers spread their own optional seams —
+ * getWorkers/getBlockedDepth/stopReminder — on top of this base. */
+export function baseTodoDeps(m: {
+  pi: unknown;
+  todos: TodosService;
+  todoUi: TodoUiSlot;
+  mirrorTodos: () => void;
+}): Pick<TodoDeps, 'todos' | 'allowParallelInProgress' | 'maxItems' | 'mirrorTodos' | 'appendEntry' | 'state'> {
+  return {
+    todos: m.todos,
+    allowParallelInProgress: m.todos.config.allowParallelInProgress,
+    maxItems: 15,
+    mirrorTodos: m.mirrorTodos,
+    appendEntry: (customType: string, data: unknown) => {
+      // Unchecked cast: pi's ExtensionAPI type omits this optional runtime entry-append seam.
+      const pi = m.pi as { appendEntry?: (t: string, d: unknown) => void };
+      pi.appendEntry?.(customType, data);
+    },
+    state: m.todoUi,
+  };
 }

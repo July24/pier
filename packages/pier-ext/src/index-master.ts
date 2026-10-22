@@ -5,7 +5,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { Server } from 'node:net';
 import { PiSurface } from './pi-surface.ts';
 import { createCordisApp } from './bootstrap.ts';
-import { cordisProvide } from './cordis-services.ts';
+import { baseTodoDeps, cordisProvide } from './cordis-services.ts';
 import { disposeSessionRoot } from './subagent-poller.ts';
 import terminalPlugin from './plugins/terminal.ts';
 import todoPlugin from './plugins/todo.ts';
@@ -88,14 +88,7 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
   await loadEntry(sessionRoot, useLoader, './plugins/terminal.ts', terminalPlugin);
 
   cordisProvide(sessionRoot, 'pi-herdr.todo-deps', {
-    todos: m.todos,
-    allowParallelInProgress: m.todos.config.allowParallelInProgress,
-    maxItems: 15,
-    mirrorTodos: m.mirrorTodos,
-    appendEntry: (customType: string, data: unknown) => {
-      (m.pi as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.(customType, data);
-    },
-    state: m.todoUi,
+    ...baseTodoDeps(m),
     ...(m.getWorkers ? { getWorkers: m.getWorkers } : {}),
     getBlockedDepth: m.getBlockedDepth,
     stopReminder: {
