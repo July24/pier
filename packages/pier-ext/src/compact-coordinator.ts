@@ -227,8 +227,9 @@ export class CompactCoordinator {
       return;
     }
 
-    // P1-3 backoff: after a failed summarization (token-cap class), skip compact decisions for a
-    // bounded window — each attempt aborts an in-flight turn, so a doomed retry burns turns.
+    // P1-3 backoff: after a failed summarization, skip compact decisions for a bounded window —
+    // each attempt aborts an in-flight turn, so a doomed retry burns turns. (The token-cap failure
+    // class is gone since pi 1.4.0 uncapped summary output; transient timeouts/aborts remain.)
     if (this.state.compactBackoffTurnEnds > 0) {
       this.state.compactBackoffTurnEnds--;
       if (opts.config.logEnabled) {

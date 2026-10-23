@@ -202,6 +202,15 @@ directions (remote machines, native worktrees, plugin actions):
 
 Three token-saving mechanisms ship **disabled by default** and are safe to try one at a time:
 
+**Origin — credit where due**: the mechanism ideas and names come from NVIDIA's
+[SoL-Pi](https://github.com/NVlabs/SoL-Pi) ([paper](https://arxiv.org/abs/2609.20519) ·
+[blog](https://nvlabs.github.io/SoL-Pi/)) — four harness-level efficiency mechanisms surfaced by
+scaled auto-research loops. pier adopts three of them (ObservationPack / EPR / OCC; the fourth,
+Action Fusion, is not adopted) and re-implements them on its own stack, extending the originals
+with a jev decision layer (small System One classifications at the diagnostic gate, excerpt-window
+pick, and settle attribution — [rfc-jev-integration.md](docs/rfc-jev-integration.md)), role gating,
+and the 4-plane efficiency config with per-mechanism JSONL telemetry (D100–D103).
+
 - **ObservationPack** — large tool outputs are projected as placeholders after the first `fullSends` requests, with paged retrieval via `obs_recall` (session JSONL stays untouched).
 - **EPR** — long diagnostic (`bash` test/build) logs are reduced in-process to a byte-verified evidence receipt; the raw log is archived first and stays readable.
 - **OCC** — `todo_write` boundaries drive pi's native compaction under a KV-cache cost model, carrying unfinished tasks across the compaction.

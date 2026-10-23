@@ -375,7 +375,23 @@ export function createPoller(h: PollerHost): Poller {
                   if (tail && settleAskIsSafe(tail)) {
                     const res = await h.jev.ask(
                       settleVerdictRequest({ description: current.description, tail }),
-                      { questionId: 'settle-attribution', timeoutMs: 2500 },
+                      {
+                        questionId: 'settle-attribution',
+                        timeoutMs: 2500,
+                        // Calibration fields (D115): noul answers carry no confidence, so the
+                        // probabilities and the composed verdict are what SETTLE_*_MIN_NOUL
+                        // tuning reads from jev.jsonl.
+                        enrich: ({ ok, answers }) => {
+                          if (!ok || !answers) return {};
+                          const match = answers.tail_matches_task;
+                          const fin = answers.tail_has_final_answer;
+                          return {
+                            tailMatchesTaskNoul: match?.type === 'noul' ? match.noul : null,
+                            tailHasFinalAnswerNoul: fin?.type === 'noul' ? fin.noul : null,
+                            settleVerdict: evaluateSettleVerdict(answers) ?? 'unanswered',
+                          };
+                        },
+                      },
                     );
                     if (res.ok) {
                       const verdict = evaluateSettleVerdict(res.answers);

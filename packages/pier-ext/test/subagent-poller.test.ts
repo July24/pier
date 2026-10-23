@@ -14,6 +14,7 @@ import type { HerdrAgentState, HerdrClientLike } from '../src/herdr-client.ts';
 import type { SubSessionState } from '../src/session-tail.ts';
 import type { SessionIo } from '../src/subagent-session.ts';
 import type { GitIo } from '../src/subagent-spawn.ts';
+import type { JevAskMeta } from '../src/jev-client.ts';
 
 /* ── planners ───────────────────────────────────────────────────── */
 
@@ -225,6 +226,66 @@ test('pollLoop: a turn that ended without text still settles, worded as no closi
   assert.equal(f.entry!.status, 'consumed');
   assert.equal(f.writes[0]!.patch?.outcome, null);
   assert.match(f.notices[0]!, /It left no closing message\./);
+});
+
+test('pollLoop: jev settle attribution classifies a null closing text and logs calibration fields', async () => {
+  const f = fixture(makeEntry('p-jev', { observationStartedAt: 10_000 }));
+  f.state({ text: null, activity: true, turnEnded: true });
+  f.host.session.readSettleTail = async () => 'tail text without secrets';
+  const asked: Array<{ questionId?: string; enrich?: JevAskMeta['enrich'] }> = [];
+  f.host.jev = {
+    ask: async (_request, meta) => {
+      asked.push(meta);
+      return {
+        ok: true,
+        answers: {
+          tail_matches_task: { type: 'noul', noul: 0.9 },
+          tail_has_final_answer: { type: 'noul', noul: 0.8 },
+        },
+        model: 'jev-1.13.0',
+        usage: { inputTokens: 100, outputTokens: 10 },
+        latencyMs: 5,
+      };
+    },
+    getMinConfidence: () => 0.6,
+  } as NonNullable<PollerHost['jev']>;
+  await start(f);
+  assert.equal(f.entry!.status, 'consumed');
+  assert.equal(asked.length, 1);
+  assert.equal(asked[0]!.questionId, 'settle-attribution');
+  assert.deepEqual(asked[0]!.enrich?.({
+    ok: true,
+    answers: {
+      tail_matches_task: { type: 'noul', noul: 0.9 },
+      tail_has_final_answer: { type: 'noul', noul: 0.8 },
+    },
+  }), {
+    tailMatchesTaskNoul: 0.9,
+    tailHasFinalAnswerNoul: 0.8,
+    settleVerdict: 'extraction-failed',
+  });
+  assert.match(f.notices[0]!, /could not be extracted/);
+});
+
+test('pollLoop: a confident jev mis-attribution rewords the notice instead of trusting the tail', async () => {
+  const f = fixture(makeEntry('p-jev2', { observationStartedAt: 10_000 }));
+  f.state({ text: null, activity: true, turnEnded: true });
+  f.host.session.readSettleTail = async () => 'tail about a different task';
+  f.host.jev = {
+    ask: async () => ({
+      ok: true,
+      answers: {
+        tail_matches_task: { type: 'noul', noul: 0.2 },
+        tail_has_final_answer: { type: 'noul', noul: 0.9 },
+      },
+      model: 'jev-1.13.0',
+      usage: { inputTokens: 100, outputTokens: 10 },
+      latencyMs: 5,
+    }),
+    getMinConfidence: () => 0.6,
+  } as NonNullable<PollerHost['jev']>;
+  await start(f);
+  assert.match(f.notices[0]!, /attribution is suspect/);
 });
 
 test('pollLoop: sustained idle during a user takeover hands control back and settles', async () => {

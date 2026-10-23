@@ -194,6 +194,29 @@ npm test          # node --test，733 项单测（规划器 / todo 重放 / 反�
 （跨机器、原生 worktree、plugin actions）见
 **[docs/rfc-upstream-absorption-2026-10.md](docs/rfc-upstream-absorption-2026-10.md)**。
 
+### 效率机制（D100–D103，默认关闭）
+
+三个省 token 机制**默认全部关闭**，可逐个安全试用：
+
+- **ObservationPack（观察打包）** —— 大体量工具结果在前 `fullSends` 次请求后投影为占位符，`obs_recall` 分页回捞（会话 JSONL 始终保留原文）。
+- **EPR（证据保真提炼）** —— 超长诊断日志（bash 测试/构建）在进程内提炼为逐字节验真的证据 receipt；替换前原文强制归档、始终可读。
+- **OCC（机会式上下文压缩）** —— `todo_write` 完成边界在 KV-cache 成本模型下驱动 pi 原生压缩，未完成任务跨越压缩自动续跑。
+
+```bash
+PI_HERDR_OBS_PACK_ENABLE=1 PI_HERDR_OBS_PACK_LOG=1 pi   # 从这里开始
+```
+
+完整快速开始、`efficiency-logs/*.jsonl` 看什么、回滚步骤与反馈模板见
+**[docs/efficiency-trial.md](docs/efficiency-trial.md)**；jev 决策层的配置键（`PIER_JEV_*`）
+可经 `/pier-config show efficiency` 在会话内查看。
+
+**出处**：三个机制的思路与命名源自 NVIDIA 的 [SoL-Pi](https://github.com/NVlabs/SoL-Pi)
+（[论文](https://arxiv.org/abs/2609.20519) · [博客](https://nvlabs.github.io/SoL-Pi/)）——
+其通过规模化自动研究循环发现的四个 harness 级效率机制中的三个（第四个 Action Fusion 未采纳）。
+pier 在自有栈上独立实现，并叠加了 jev 决策层（诊断门 / 摘录选窗 / 结算归因的小型
+System One 分类，见 [rfc-jev-integration.md](docs/rfc-jev-integration.md)）、角色门禁
+与四平面效率配置 + 分机制 JSONL 遥测。
+
 ## 设计原则
 
 - **会话 JSONL 是唯一权威**：todo / 委派 / 注册表全部回放自会话分支，重启与分支切换正确
