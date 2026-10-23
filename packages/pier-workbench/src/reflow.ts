@@ -18,7 +18,6 @@ import {
   unwrapLayout,
   type AgentStatusMap,
   type AskFlagMap,
-  type LayoutNode,
   type SplitFingerprint,
 } from './heat-layout.ts';
 
@@ -34,20 +33,28 @@ export interface ReflowEvent {
 export interface ReflowDeps {
   ev: ReflowEvent;
   request: (method: string, params?: Record<string, unknown>) => Promise<unknown>;
-  loadState: () => Record<string, unknown>;
-  saveState: (state: Record<string, unknown>) => void;
+  loadState: () => ReflowState;
+  saveState: (state: ReflowState) => void;
   /** Injected for testing (production = setTimeout sleep). */
   sleep: (ms: number) => Promise<void>;
-  /** Tier 2 semantic bridge: agent status snapshot per event (pane.list; default = unranked). */
-  listAgentStatuses?: () => Promise<AgentStatusMap>;
-  /** D95: ask_user_question waiting flag (tokens['pi-ask'] non-empty). Default = no ask. */
-  listAskFlags?: () => Promise<AskFlagMap>;
-  /** Tightening gate (Scenario B): only tabs containing pi panes reflow; non-pi tabs are left alone. */
-  piTabIds?: () => Promise<Set<string>>;
+  /** One `session.snapshot` per hook run: statuses + ask flags + pi-tab membership in a single RPC.
+   * herdr serves exactly one request per socket connection, so every extra pane.list/agent.list round
+   * trip costs a fresh connect. Absent (tests/legacy wiring) = ungated and unranked. */
+  loadSnapshot?: () => Promise<ReflowSnapshot>;
+}
+
+/** The three reflow views derived from one `session.snapshot` response. */
+export interface ReflowSnapshot {
+  /** paneId -> agent status for sibling tier weighting (Tier 2 / D95). */
+  statuses: AgentStatusMap;
+  /** paneId -> waiting on ask_user_question (tokens['pi-ask'] non-empty). */
+  askFlags: AskFlagMap;
+  /** Tabs hosting at least one pi pane (Scenario B gate). */
+  piTabIds: Set<string>;
 }
 
 /** Plugin state file: tabs (per-tab config + last apply), panes (age + tab mapping), debounce token. */
-type ReflowState = Record<string, any>;
+export type ReflowState = Record<string, any>;
 
 /** Which event asked for the reflow — only the status mode consults the drag hold. */
 type ReflowMode = 'focus' | 'count' | 'status';
@@ -77,15 +84,13 @@ export function writeJsonAtomic(file: string, value: unknown): void {
   }
 }
 
-/**
- * Passes through when the dep is omitted; a snapshot failure counts as not-in-set (conservative no-op).
- * Sticky war-room tabs: `state.tabs[tabId]` is written only after a pi-gated apply, so an all-shell main
- * tab keeps its focus zoom instead of being reclassified as foreign (Scenario B).
- */
-async function isPiTab(deps: ReflowDeps, tabId: string): Promise<boolean> {
-  if (!deps.piTabIds) return true;
+/** No loader wired (tests) = ungated; snapshot failures return before this runs. Sticky tabs below. */
+async function isPiTab(deps: ReflowDeps, tabId: string, snapshot: ReflowSnapshot | undefined): Promise<boolean> {
+  if (snapshot === undefined) return true;
+  // Sticky war-room tabs: `state.tabs[tabId]` is written only after a pi-gated apply, so an all-shell
+  // main tab keeps its focus zoom instead of being reclassified as foreign (Scenario B).
   if (deps.loadState().tabs?.[tabId]) return true;
-  try { return (await deps.piTabIds()).has(tabId); } catch { return false; }
+  return snapshot.piTabIds.has(tabId);
 }
 
 /** The one reflow path shared by all four events. Count/status reflows inherit the tab's last focused pane
@@ -106,11 +111,16 @@ async function reflowTab(
   await deps.sleep(REFLOW_DEBOUNCE_MS);
   const latest = deps.loadState() as ReflowState;
   if (!shouldFireDebounced({ stored: latest.debounce?.token ?? '', incoming: opts.token })) return;
-
+  // One session.snapshot for statuses + ask flags + pi-tab membership; a failure here is a conservative
+  // no-op (socket down), matching the old empty-set semantics.
+  let snapshot: ReflowSnapshot | undefined;
+  if (deps.loadSnapshot) {
+    try { snapshot = await deps.loadSnapshot(); } catch { return; }
+  }
   const exported = await deps.request('layout.export', opts.exportParams(latest));
   const { root, tabId: exportedTabId, zoomed } = unwrapLayout(exported);
   const tabId = exportedTabId ?? deps.ev.tabId;
-  if (!root || !tabId || !(await isPiTab(deps, tabId))) return;
+  if (!root || !tabId || !(await isPiTab(deps, tabId, snapshot))) return;
 
   const last = latest.tabs?.[tabId]?.lastFocusPaneId;
   const focusPaneId = opts.focusPaneId
@@ -129,8 +139,8 @@ async function reflowTab(
     paneCount: countPanes(root),
     zoomed,
     enabled: tabCfg.enabled !== false,
-    statuses: await (deps.listAgentStatuses?.() ?? Promise.resolve({})),
-    askFlags: await (deps.listAskFlags?.() ?? Promise.resolve({})),
+    statuses: snapshot?.statuses ?? {},
+    askFlags: snapshot?.askFlags ?? {},
   });
   if (plan.type !== 'apply') return;
   for (const op of plan.ops) {
@@ -212,6 +222,25 @@ export function askFlagsFromListResult(result: unknown): AskFlagMap {
     if (id && typeof tokens['pi-ask'] === 'string' && tokens['pi-ask'] !== '') map[id] = true;
   }
   return map;
+}
+
+/**
+ * Maps one `session.snapshot` response (raw RPC value or `{snapshot}` envelope) onto the three reflow
+ * views. Pane rows carry agent_status/agent/tab_id; agent rows carry the pi-ask token, with pane rows
+ * as the fallback source (same union askFlagsFromListResult already handles).
+ */
+export function reflowSnapshot(result: unknown): ReflowSnapshot {
+  const rec = result && typeof result === 'object' ? result as Record<string, unknown> : {};
+  const snap = rec.snapshot && typeof rec.snapshot === 'object' ? rec.snapshot as Record<string, unknown> : rec;
+  const rows = Array.isArray(snap.panes) ? snap.panes.filter((r) => r && typeof r === 'object') : [];
+  const statuses: AgentStatusMap = {};
+  const piTabIds = new Set<string>();
+  for (const row of rows as Array<Record<string, unknown>>) {
+    if (typeof row.pane_id !== 'string') continue;
+    if (typeof row.agent_status === 'string') statuses[row.pane_id] = row.agent_status;
+    if (row.agent === 'pi' && typeof row.tab_id === 'string') piTabIds.add(row.tab_id);
+  }
+  return { statuses, askFlags: askFlagsFromListResult(snap), piTabIds };
 }
 
 /**

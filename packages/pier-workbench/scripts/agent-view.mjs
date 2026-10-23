@@ -4,7 +4,9 @@
  * Strictly best-effort: any socket/API error exits silently so herdr workflows are never disrupted.
  */
 import { request } from './herdr-rpc.mjs';
-import { buildAgentViewSetParams } from '../src/agent-view.ts';
+import { loadSrc } from './load-src.mjs';
+
+const { buildAgentViewSetParams } = await loadSrc('agent-view');
 
 const params = buildAgentViewSetParams();
 

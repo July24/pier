@@ -8,7 +8,9 @@
  */
 import { readFileSync } from 'node:fs';
 import { request } from './herdr-rpc.mjs';
-import { clipToWidth, composeDashboardLines, fitDashboardLines } from '../src/dashboard-model.ts';
+import { loadSrc } from './load-src.mjs';
+
+const { clipToWidth, composeDashboardLines, fitDashboardLines } = await loadSrc('dashboard-model');
 
 const onceMode = process.argv.includes('--once');
 const entrypoint = process.env.HERDR_PLUGIN_ENTRYPOINT_ID || 'panel';

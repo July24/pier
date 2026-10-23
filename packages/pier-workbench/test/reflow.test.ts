@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { askFlagsFromListResult, parseEventEnv, readJsonSafe, runReflow, writeJsonAtomic } from '../src/reflow.ts';
+import { askFlagsFromListResult, parseEventEnv, readJsonSafe, reflowSnapshot, runReflow, writeJsonAtomic } from '../src/reflow.ts';
 import { layoutFingerprint, unwrapLayout } from '../src/heat-layout.ts';
 import { OLD_PANE, OLD_TAB, REFLOW_LAYOUT, callRatioOps, calledRpc, makeReflowDeps, piTabIds, type ReflowDepsOpts } from './heat-fixtures.ts';
 
@@ -70,7 +70,7 @@ test('runReflow：焦点年龄闸（F1 白名单 / d90 修正）', async (t) => 
 test('runReflow：agent_status_changed（档3 语义桥）', async (t) => {
   await t.test('焦点沿用 lastFocus + 原地分级', async () => {
     const h = await reflow({ ev: { hook: 'pane.agent_status_changed', paneId: 'pane-c', cause: null }, state: { tabs: { 'tab-1': OLD_TAB } },
-      listAgentStatuses: async () => ({ 'pane-c': 'blocked', 'pane-b': 'idle', 'pane-a': 'idle' }) });
+      loadSnapshot: async () => ({ statuses: { 'pane-c': 'blocked', 'pane-b': 'idle', 'pane-a': 'idle' }, askFlags: {}, piTabIds: new Set(['tab-1']) }) });
     assert.ok(!calledRpc(h.calls, 'pane.swap'), '零 swap：位置不动');
     // focus pane-a (root first, depth 1), blocked in a sibling → root=0.60; sibling stack b(1) vs c(3) → first share 0.25
     assert.deepEqual(callRatioOps(h.calls), [['', 0.6], ['1', 0.25]]);
@@ -78,7 +78,7 @@ test('runReflow：agent_status_changed（档3 语义桥）', async (t) => {
   });
   await t.test('无 lastFocus 的 count/status 重排 → 退化 first pane 为焦点', async () => {
     const h = await reflow({ ev: { hook: 'pane.agent_status_changed', paneId: 'pane-b', cause: null },
-      state: { tabs: { 'tab-1': { enabled: true } } }, listAgentStatuses: async () => ({}) });
+      state: { tabs: { 'tab-1': { enabled: true } } }, loadSnapshot: async () => ({ statuses: {}, askFlags: {}, piTabIds: new Set(['tab-1']) }) });
     assert.equal(h.state.tabs['tab-1'].lastFocusPaneId, 'pane-a', 'first pane 兜底');
   });
 });
@@ -98,7 +98,7 @@ const GATE_CASES: GateCase[] = [
   { name: 'piTabIds 缺省（旧接线/单测）→ 不过滤，行为不变', opts: {}, ratio: true, msg: '缺省放行' },
   { name: 'tab 不在 pi 集合（claude code / codex / 纯 shell 的 tab）→ export 后止步', opts: piTabIds('tab-other'), ratio: false, msg: '非 pi tab 零 ratio', exports: true },
   { name: 'tab 含 pi pane → 正常 reflow', opts: piTabIds('tab-1'), ratio: true, msg: 'pi tab 照常' },
-  { name: 'piTabIds 快照抛错 → 保守不动（空集合语义）', opts: { piTabIds: async () => { throw new Error('socket down'); } }, ratio: false, msg: '快照失败零 ratio' },
+  { name: 'loadSnapshot 抛错 → 保守不动（空集合语义）', opts: { loadSnapshot: async () => { throw new Error('socket down'); } }, ratio: false, msg: '快照失败零 ratio' },
   { name: 'status 路径受闸：非 pi tab 的 blocked 不触发重排', ratio: false, msg: '非 pi tab 的 blocked 不触发重排', opts: { ...piTabIds('tab-other'), ev: { hook: 'pane.agent_status_changed', paneId: 'pane-c', cause: null }, state: { tabs: { 'tab-old': OLD_TAB } }, listAgentStatuses: async () => ({ 'pane-c': 'blocked' }) } },
   { name: 'created 路径受闸：非 pi tab 的数量变化不触发重排', ratio: false, msg: '非 pi tab 的数量变化不触发重排', opts: { ...piTabIds('tab-other'), ev: { hook: 'pane.created', paneId: 'pane-new' } } },
 ];
@@ -116,7 +116,7 @@ test('runReflow：收紧闸——只有含 pi pane 的 tab 参与重排', async 
 test('runReflow：粘性 pi tab——全部 pi 退回 shell 后记账 tab 仍 reflow（退出命令行仍可焦点放大）', async () => {
   let liveSet = new Set(['tab-1']); // pi still running: visible to the live scan
   let state: Record<string, any> = { tabs: {}, panes: { 'pane-b': OLD_PANE }, debounce: null };
-  const bound = { piTabIds: async () => liveSet, loadState: () => state, saveState: (s: Record<string, any>) => { state = s; } };
+  const bound = { loadSnapshot: async () => ({ statuses: {}, askFlags: {}, piTabIds: liveSet }), loadState: () => state, saveState: (s: Record<string, any>) => { state = s; } };
   const holder = await reflow(bound);
   assert.ok(calledRpc(holder.calls, 'layout.set_split_ratio'), 'live pi tab 照常应用');
   assert.ok(state.tabs['tab-1'], '成功 apply 写入记账（粘性来源）');
@@ -133,6 +133,24 @@ test('askFlagsFromListResult：非空 pi-ask 为 true', () => {
   assert.deepEqual(askFlagsFromListResult({
     agents: [{ pane_id: 'p1', tokens: { 'pi-ask': 'q?' } }, { pane_id: 'p2', tokens: { 'pi-ask': '' } }, { pane_id: 'p3' }],
   }), { p1: true });
+});
+
+test('reflowSnapshot：一次 session.snapshot 映射三张表（envelope / 裸 snapshot 双形状）', () => {
+  const snapshot = {
+    panes: [
+      { pane_id: 'p1', tab_id: 't1', agent: 'pi', agent_status: 'blocked', tokens: { 'pi-ask': 'q?' } },
+      { pane_id: 'p2', tab_id: 't1', agent: 'pi', agent_status: 'idle' },
+      { pane_id: 'p3', tab_id: 't2', agent: 'claude', agent_status: 'working' },
+    ],
+    agents: [{ pane_id: 'p1', tokens: { 'pi-ask': 'q?' } }, { pane_id: 'p2', tokens: { 'pi-ask': '' } }],
+  };
+  for (const shape of [snapshot, { type: 'session_snapshot', snapshot }]) {
+    const view = reflowSnapshot(shape);
+    assert.deepEqual(view.statuses, { p1: 'blocked', p2: 'idle', p3: 'working' }, 'pane 行的 agent_status 全收');
+    assert.deepEqual([...view.piTabIds], ['t1'], '仅含 pi pane 的 tab 入集合');
+    assert.deepEqual(view.askFlags, { p1: true }, 'pi-ask 非空（agents 行优先，空值跳过）');
+  }
+  assert.deepEqual(reflowSnapshot(null).statuses, {}, '非法输入 → 空表不抛');
 });
 
 test('runReflow：status 在同 pane 集合上手拖 hold；created 重建基线', async () => {

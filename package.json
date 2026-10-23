@@ -31,8 +31,9 @@
     "packages/*"
   ],
   "scripts": {
+    "build:workbench": "tsc -p packages/pier-workbench/tsconfig.build.json",
     "typecheck": "tsc --noEmit -p packages/pier-ext/tsconfig.json",
-    "test": "npm run typecheck && node --test \"packages/*/test/*.test.ts\"",
+    "test": "npm run build:workbench && npm run typecheck && node --test \"packages/*/test/*.test.ts\"",
     "test:mutation": "stryker run",
     "prepare": "node ./install.mjs --prepare"
   },

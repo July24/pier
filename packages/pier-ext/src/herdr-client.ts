@@ -144,7 +144,7 @@ export function herdrUnavailableHint(err: unknown): string | null {
   return `herdr unreachable (${msg}) — check that the herdr server is running and HERDR_SOCKET_PATH matches its socket`;
 }
 
-/** Wire protocol this client is written against (herdr 0.9.1). See test/fixtures/herdr-contract.json. */
+/** Wire protocol this client is written against (herdr 0.9.5, contract fixture regenerated 2026-10-20). */
 export const HERDR_PROTOCOL_EXPECTED = 22;
 
 export type WaitForOutputResult =

@@ -1,0 +1,236 @@
+/**
+ * Heat reflow domain logic for the pane focused/created/closed/agent_status_changed hooks; herdr access is
+ * injected via `ReflowDeps`, and hook processes cannot use cordis — a user-mode checkout has no node_modules.
+ */
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { REFLOW_DEBOUNCE_MS, applyHeatOps, containsPane, countPanes, firstPaneId, layoutFingerprint, planGridHeat, shouldAcceptFocus, shouldFireDebounced, shouldHoldHeat, unwrapLayout, } from "./heat-layout.js";
+export function readJsonSafe(file, fallback) {
+    try {
+        return JSON.parse(fs.readFileSync(file, 'utf8'));
+    }
+    catch {
+        return fallback;
+    }
+}
+/** F15: concurrent hook processes interleave plain writes and leave truncated JSON behind — write a unique
+ * temp file in the same directory and rename over the target, since rename is atomic. */
+export function writeJsonAtomic(file, value) {
+    const dir = path.dirname(file);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${Date.now()}.tmp`);
+    const json = JSON.stringify(value);
+    fs.writeFileSync(tmp, json);
+    try {
+        fs.renameSync(tmp, file);
+    }
+    catch {
+        // Windows can refuse the replace while another process holds the file: fall back to a direct write.
+        try {
+            fs.unlinkSync(tmp);
+        }
+        catch { }
+        fs.writeFileSync(file, json);
+    }
+}
+/** No loader wired (tests) = ungated; snapshot failures return before this runs. Sticky tabs below. */
+async function isPiTab(deps, tabId, snapshot) {
+    if (snapshot === undefined)
+        return true;
+    // Sticky war-room tabs: `state.tabs[tabId]` is written only after a pi-gated apply, so an all-shell
+    // main tab keeps its focus zoom instead of being reclassified as foreign (Scenario B).
+    if (deps.loadState().tabs?.[tabId])
+        return true;
+    return snapshot.piTabIds.has(tabId);
+}
+/** The one reflow path shared by all four events. Count/status reflows inherit the tab's last focused pane
+ * as the focus; a focus event passes its own. */
+async function reflowTab(deps, opts) {
+    const state = deps.loadState();
+    state.debounce = { token: opts.token, paneId: deps.ev.paneId, at: Date.now() };
+    deps.saveState(state);
+    await deps.sleep(REFLOW_DEBOUNCE_MS);
+    const latest = deps.loadState();
+    if (!shouldFireDebounced({ stored: latest.debounce?.token ?? '', incoming: opts.token }))
+        return;
+    // One session.snapshot for statuses + ask flags + pi-tab membership; a failure here is a conservative
+    // no-op (socket down), matching the old empty-set semantics.
+    let snapshot;
+    if (deps.loadSnapshot) {
+        try {
+            snapshot = await deps.loadSnapshot();
+        }
+        catch {
+            return;
+        }
+    }
+    const exported = await deps.request('layout.export', opts.exportParams(latest));
+    const { root, tabId: exportedTabId, zoomed } = unwrapLayout(exported);
+    const tabId = exportedTabId ?? deps.ev.tabId;
+    if (!root || !tabId || !(await isPiTab(deps, tabId, snapshot)))
+        return;
+    const last = latest.tabs?.[tabId]?.lastFocusPaneId;
+    const focusPaneId = opts.focusPaneId
+        ?? (typeof last === 'string' && containsPane(root, last) ? last : firstPaneId(root));
+    const tabCfg = latest.tabs?.[tabId] ?? { enabled: true };
+    // Status reflow must not fight a manual drag: hold while the pane set is unchanged and ratios drifted.
+    if (opts.mode === 'status' && shouldHoldHeat({
+        prior: tabCfg.lastFingerprint,
+        current: layoutFingerprint(root),
+        acceptedFocus: false,
+    }).hold)
+        return;
+    const plan = planGridHeat({
+        root,
+        focusPaneId,
+        paneCount: countPanes(root),
+        zoomed,
+        enabled: tabCfg.enabled !== false,
+        statuses: snapshot?.statuses ?? {},
+        askFlags: snapshot?.askFlags ?? {},
+    });
+    if (plan.type !== 'apply')
+        return;
+    for (const op of plan.ops) {
+        await deps.request('layout.set_split_ratio', { tab_id: tabId, path: op.path, ratio: op.ratio });
+    }
+    // Recording the fingerprint is what lets a later status reflow hold a user drag.
+    latest.tabs = latest.tabs ?? {};
+    latest.tabs[tabId] = {
+        ...tabCfg,
+        lastFocusPaneId: focusPaneId,
+        lastApplyAt: Date.now(),
+        lastFingerprint: layoutFingerprint(applyHeatOps(root, plan.ops)),
+    };
+    deps.saveState(latest);
+}
+async function onCreated(deps, paneId) {
+    const state = deps.loadState();
+    state.panes = state.panes ?? {};
+    if (!state.panes[paneId])
+        state.panes[paneId] = { createdAt: Date.now() };
+    // D95: record the pane -> tab mapping (pane.closed carries no tab_id, so close needs the reverse lookup).
+    if (deps.ev.tabId)
+        state.panes[paneId].tabId = deps.ev.tabId;
+    deps.saveState(state);
+    await onCountChanged(deps);
+}
+/** Pane set changed (created/closed): re-sort dimensions, keep positions, inherit the last focus. */
+async function onCountChanged(deps) {
+    const evPaneId = deps.ev.paneId;
+    await reflowTab(deps, {
+        token: `cnt:${Date.now()}:${evPaneId ?? ''}`,
+        exportParams: (state) => {
+            // D95: a closed event has no tab_id -> reverse-lookup the tab recorded by onCreated, else export by pane.
+            const closedTab = evPaneId ? state.panes?.[evPaneId]?.tabId : null;
+            if (closedTab)
+                return { tab_id: closedTab };
+            return evPaneId ? { pane_id: evPaneId } : {};
+        },
+        mode: 'count',
+    });
+}
+async function onFocused(deps) {
+    const paneId = deps.ev.paneId;
+    if (!paneId)
+        return;
+    const known = deps.loadState().panes?.[paneId];
+    // d90: an unrecorded pane predates this plugin's tracking -> accept it. Improvising createdAt=now would
+    // reject every click on it, while the age gate only exists to suppress spawn auto-focus (F1).
+    if (known && !shouldAcceptFocus({ paneAgeMs: Date.now() - known.createdAt, cause: deps.ev.cause }))
+        return;
+    await reflowTab(deps, {
+        token: `${Date.now()}:${paneId}`,
+        exportParams: () => ({ pane_id: paneId }),
+        mode: 'focus',
+        focusPaneId: paneId,
+    });
+}
+/** Tier 2 semantic bridge (D90-F): an agent status change reflows the secondary panes, focus fixed.
+ * Event-driven, never polled (D3). */
+async function onAgentStatusChanged(deps) {
+    const paneId = deps.ev.paneId;
+    if (!paneId)
+        return;
+    await reflowTab(deps, {
+        token: `st:${Date.now()}:${paneId}`,
+        exportParams: () => ({ pane_id: paneId }),
+        mode: 'status',
+    });
+}
+export function askFlagsFromListResult(result) {
+    const rec = result && typeof result === 'object' ? result : {};
+    const rows = Array.isArray(rec.agents) ? rec.agents : Array.isArray(rec.panes) ? rec.panes : [];
+    const map = {};
+    for (const row of rows) {
+        if (!row || typeof row !== 'object')
+            continue;
+        const o = row;
+        const id = typeof o.pane_id === 'string' ? o.pane_id : null;
+        const tokens = o.tokens && typeof o.tokens === 'object' ? o.tokens : {};
+        if (id && typeof tokens['pi-ask'] === 'string' && tokens['pi-ask'] !== '')
+            map[id] = true;
+    }
+    return map;
+}
+/**
+ * Maps one `session.snapshot` response (raw RPC value or `{snapshot}` envelope) onto the three reflow
+ * views. Pane rows carry agent_status/agent/tab_id; agent rows carry the pi-ask token, with pane rows
+ * as the fallback source (same union askFlagsFromListResult already handles).
+ */
+export function reflowSnapshot(result) {
+    const rec = result && typeof result === 'object' ? result : {};
+    const snap = rec.snapshot && typeof rec.snapshot === 'object' ? rec.snapshot : rec;
+    const rows = Array.isArray(snap.panes) ? snap.panes.filter((r) => r && typeof r === 'object') : [];
+    const statuses = {};
+    const piTabIds = new Set();
+    for (const row of rows) {
+        if (typeof row.pane_id !== 'string')
+            continue;
+        if (typeof row.agent_status === 'string')
+            statuses[row.pane_id] = row.agent_status;
+        if (row.agent === 'pi' && typeof row.tab_id === 'string')
+            piTabIds.add(row.tab_id);
+    }
+    return { statuses, askFlags: askFlagsFromListResult(snap), piTabIds };
+}
+/**
+ * Parses the Herdr hook event environment variables (HERDR_PLUGIN_EVENT / _EVENT_JSON). Real payloads
+ * have two shapes (d84 dump): pane_focused flat (data.pane_id) and pane_created nested (data.pane.pane_id).
+ * Manual/test flat + cause shapes stay compatible.
+ */
+export function parseEventEnv(env = process.env) {
+    let event = {};
+    try {
+        event = JSON.parse(env.HERDR_PLUGIN_EVENT_JSON ?? '{}');
+    }
+    catch { }
+    const hook = env.HERDR_PLUGIN_EVENT ?? event.type ?? '';
+    const data = event.data ?? event;
+    const pane = data.pane && typeof data.pane === 'object' ? data.pane : {};
+    return {
+        hook,
+        type: event.type ?? hook,
+        paneId: data.pane_id ?? pane.pane_id ?? event.pane_id ?? null,
+        workspaceId: data.workspace_id ?? pane.workspace_id ?? event.workspace_id ?? null,
+        tabId: data.tab_id ?? pane.tab_id ?? event.tab_id ?? null,
+        cause: data.cause ?? pane.cause ?? event.cause ?? null,
+    };
+}
+/**
+ * Event routing table: hook and payload type both carry the kind ('pane.created', 'pane_created'),
+ * normalized to one key. Order matters — closed is matched before created.
+ */
+const ROUTES = [
+    // D95: pane recycling (subagent finished and GC'd) -> count reflow; the tree contracts, nothing migrates.
+    ['paneclosed', onCountChanged],
+    ['panecreated', (deps) => (deps.ev.paneId ? onCreated(deps, deps.ev.paneId) : Promise.resolve())],
+    ['panefocused', onFocused],
+    ['paneagentstatuschanged', onAgentStatusChanged],
+];
+export async function runReflow(deps) {
+    const kind = `${deps.ev.hook}${deps.ev.type}`.toLowerCase().replace(/[._]/g, '');
+    const route = ROUTES.find(([name]) => kind.includes(name));
+    if (route)
+        await route[1](deps);
+}

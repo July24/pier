@@ -4,7 +4,9 @@
  * Herdr injects HERDR_PLUGIN_EVENT_JSON + HERDR_SOCKET_PATH; one-shot, no daemon footprint.
  */
 import { request } from './herdr-rpc.mjs';
-import { buildNotificationParams } from '../src/notify.ts';
+import { loadSrc } from './load-src.mjs';
+
+const { buildNotificationParams } = await loadSrc('notify');
 
 const rawEvent = process.env.HERDR_PLUGIN_EVENT_JSON;
 if (!rawEvent) process.exit(0); // No payload (link validation / manual dry-run): exit silently.

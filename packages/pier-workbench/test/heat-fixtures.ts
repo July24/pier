@@ -47,7 +47,8 @@ export const OLD_PANE = { createdAt: Date.now() - 60_000 };
 export const OLD_TAB = { enabled: true, lastFocusPaneId: 'pane-a', lastApplyAt: 1 };
 
 export const calledRpc = (calls: Calls, method: string): boolean => calls.some(([m]) => m === method);
-export const piTabIds = (...ids: string[]) => ({ piTabIds: async () => new Set(ids) });
+/** Deps override wiring loadSnapshot to a pi-tab set (statuses/askFlags default empty). */
+export const piTabIds = (...ids: string[]) => ({ loadSnapshot: async () => ({ statuses: {}, askFlags: {}, piTabIds: new Set(ids) }) });
 
 export type ReflowDepsOpts = Omit<Partial<ReflowDeps>, 'ev'> & { ev?: Partial<ReflowEvent>; exported?: unknown; state?: Record<string, any> };
 

@@ -23,4 +23,6 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: npm install --ignore-scripts
       - run: npm test
+      # npm test regenerates src/*.js for pier-workbench; committed artifacts must not drift from src/*.ts.
+      - run: git diff --exit-code -- packages/pier-workbench/src
 

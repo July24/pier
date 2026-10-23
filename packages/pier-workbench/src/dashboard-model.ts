@@ -217,7 +217,7 @@ export function composeDashboardLines(
   const label = ` PIER OPS DASHBOARD [${timeStr}] (${meta}) `;
   const side = Math.max(0, (width ?? 80) - displayWidth(label));
   const lines = [`${'='.repeat(Math.floor(side / 2))}${clipToWidth(label, width ?? 80)}${'='.repeat(Math.ceil(side / 2))}`];
-  if (!data || (!data.workspaces.length && !data.panes.length)) {
+  if (!data || (!data.workspaces?.length && !data.panes?.length)) {
     lines.push(
       '',
       '  No active Herdr session or empty workspace data.',
@@ -228,18 +228,18 @@ export function composeDashboardLines(
     return lines;
   }
 
-  const wsItems = data.workspaces.map((w) => {
+  const wsItems = (data.workspaces ?? []).map((w) => {
     const focus = w.focused || w.workspace_id === data.focused_workspace_id ? '*' : '';
     const status = w.agent_status && w.agent_status !== 'unknown' ? `:${w.agent_status}` : '';
     return `[${focus}${w.workspace_id}: ${w.label ?? 'unnamed'}${status}]`;
   });
   lines.push(`Workspaces (${wsItems.length}): ${wsItems.join(' ')}`, rule);
 
-  const targetId = options?.targetWorkspaceId ?? data.focused_workspace_id ?? data.workspaces[0]?.workspace_id;
-  const ws = data.workspaces.find((w) => w.workspace_id === targetId)
+  const targetId = options?.targetWorkspaceId ?? data.focused_workspace_id ?? data.workspaces?.[0]?.workspace_id;
+  const ws = (data.workspaces ?? []).find((w) => w.workspace_id === targetId)
     ?? { workspace_id: targetId ?? 'unknown', label: 'default' };
-  const wsTabs = data.tabs.filter((t) => t.workspace_id === ws.workspace_id);
-  const wsPanes = data.panes.filter((p) => p.workspace_id === ws.workspace_id);
+  const wsTabs = (data.tabs ?? []).filter((t) => t.workspace_id === ws.workspace_id);
+  const wsPanes = (data.panes ?? []).filter((p) => p.workspace_id === ws.workspace_id);
   lines.push(`Current Workspace: ${ws.workspace_id} (${ws.label ?? 'unnamed'}) | Tabs: ${wsTabs.length} | Panes: ${wsPanes.length}`);
 
   if (wsTabs.length > 0) {
