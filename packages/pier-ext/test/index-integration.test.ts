@@ -528,7 +528,10 @@ test('OCC end-to-end: the intentional abort settles into ctx.compact (not swallo
   await todoWrite('c2', { todos: [{ content: 'a', status: 'completed' }, { content: 'b', status: 'in_progress' }] }, undefined, undefined, ctx);
   await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'toolUse' } }, ctx);
   assert.equal(aborts, 1, 'the boundary turn is aborted on purpose');
-  await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'aborted' } }, ctx);
+  // pi checks the signal only inside the next request: the aborted run still opens a turn first,
+  // and that request fails as an 'error' stop ("This operation was aborted").
+  await fire(pi, 'turn_start');
+  await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'error' } }, ctx);
   await fire(pi, 'agent_settled', {}, ctx);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(compacts.length, 1, 'the settled OCC abort must reach ctx.compact');

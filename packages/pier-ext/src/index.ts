@@ -598,10 +598,12 @@ export default async function (pi: ExtensionAPI) {
     lastStopReason = null;
     // Safety fallback: pi core prohibits prompts while compaction is active.
     coordinator.compactionInFlight = false;
+    // OCC aborts at turn_end, but pi checks the signal only inside the next request, so the aborted
+    // run still opens one turn: keep the selection for its agent_settled (dropping it parked the
+    // session on "This operation was aborted"). Any later turn_start drops a selection that never
+    // became startable, so it cannot latch every later decision and the settle-wake hold.
+    if (!coordinator.intentionalAbort) coordinator.selectedCompaction = null;
     coordinator.intentionalAbort = false;
-    // A selection that never became startable must not latch every later decision (and the
-    // settle-wake hold) until the next human input.
-    coordinator.selectedCompaction = null;
     gates.report('working', currentActivity(todos.items));
   });
 
