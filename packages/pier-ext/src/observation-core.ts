@@ -138,6 +138,8 @@ export interface RecallSliceResult {
   text: string;
   bytes: number;
   lines: number;
+  /** Byte offset the returned text actually starts at (after line-start alignment). */
+  offset: number;
   nextOffset: number;
   eof: boolean;
 }
@@ -157,7 +159,7 @@ export function sliceBufferChunk(
   limits: { maxBytes: number; maxLines: number },
 ): RecallSliceResult {
   if (offset >= buf.length) {
-    return { text: '', bytes: 0, lines: 0, nextOffset: buf.length, eof: true };
+    return { text: '', bytes: 0, lines: 0, offset, nextOffset: buf.length, eof: true };
   }
 
   let end = Math.min(buf.length - offset, limits.maxBytes);
@@ -169,6 +171,15 @@ export function sliceBufferChunk(
     }
   }
 
+  // A byte-cap cut mid-line would make the next page (and its aligned next_offset) skip the rest of
+  // that line; end this page at the previous line boundary instead. A line longer than maxBytes has
+  // no boundary to snap to and stays byte-sliced.
+  const cappedAt = offset + end;
+  if (cappedAt < buf.length && buf[cappedAt - 1] !== 0x0a) {
+    const lastNewline = buf.lastIndexOf(0x0a, cappedAt - 1);
+    if (lastNewline >= offset) end = lastNewline + 1 - offset;
+  }
+
   const chunkBuf = buf.subarray(offset, offset + trimUtf8End(buf.subarray(offset), end));
   const text = chunkBuf.toString('utf8');
   const nextOffset = offset + chunkBuf.length;
@@ -176,6 +187,7 @@ export function sliceBufferChunk(
     text,
     bytes: chunkBuf.length,
     lines: countLines(text),
+    offset,
     nextOffset,
     eof: nextOffset >= buf.length,
   };

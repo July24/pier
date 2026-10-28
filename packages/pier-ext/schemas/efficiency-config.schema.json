@@ -20,6 +20,12 @@
         },
         "firstCompactionRequestScale": { "type": "number", "default": 2.0, "minimum": 1.0 },
         "subsequentCompactionMargin": { "type": "number", "default": 1.5, "minimum": 1.0 },
+        "summaryThinkingLevel": {
+          "type": "string",
+          "enum": ["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"],
+          "default": "low",
+          "description": "压缩摘要请求的 thinking 等级上限（只降不升，结束后恢复会话等级）。inherit 表示沿用会话等级"
+        },
         "keepRecentTokens": {
           "type": "integer",
           "default": 20000,

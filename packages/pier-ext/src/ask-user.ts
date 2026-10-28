@@ -37,49 +37,38 @@ const RESERVED_LOWER: Record<string, true> = {
 };
 
 const OptionSchema = Type.Object({
-  label: Type.String({ description: 'Short display label (1-5 words)' }),
-  description: Type.Optional(Type.String({ description: 'Tradeoff / meaning of this choice' })),
+  label: Type.String({ description: 'Short label (1-5 words)' }),
+  description: Type.Optional(Type.String({ description: 'Tradeoff of this choice' })),
 });
 
 export const ASK_PARAMETERS = Type.Object({
-  question: Type.Optional(Type.String({ description: 'The question to ask the human. Required unless questions is set.' })),
-  options: Type.Optional(Type.Array(OptionSchema, {
-    description: '2-5 authored choices. Do NOT include Other; the UI appends it.',
-  })),
-  multi: Type.Optional(Type.Boolean({ description: 'Allow multiple selections (default false). In the TUI this opens an interactive toggle list (space toggles, enter confirms, esc declines).' })),
-  allowOther: Type.Optional(Type.Boolean({ description: 'Set false to offer the authored choices only, with no free-text row (default true).' })),
-  recommended: Type.Optional(Type.Number({ description: '0-based index of the recommended option; UI adds (Recommended)' })),
+  question: Type.Optional(Type.String({ description: 'Flat form: the question. Required unless questions is set.' })),
+  options: Type.Optional(Type.Array(OptionSchema, { description: 'Flat form: 2-5 choices' })),
+  multi: Type.Optional(Type.Boolean({ description: 'Allow several selections (default false)' })),
+  allowOther: Type.Optional(Type.Boolean({ description: 'false = authored choices only, no free-text row (default true)' })),
+  recommended: Type.Optional(Type.Number({ description: '0-based default option; the UI adds "(Recommended)", never write it in the label' })),
   questions: Type.Optional(Type.Array(
     Type.Object({
       id: Type.Optional(Type.String({ description: 'Stable id for mapping answers' })),
-      question: Type.String({ description: 'Question text' }),
-      options: Type.Array(OptionSchema, {
-        description: '2-5 authored choices. Do NOT include Other; the UI appends it unless allowOther is false.',
-      }),
-      multi: Type.Optional(Type.Boolean({ description: 'Allow multiple selections (default false). In the TUI this opens an interactive toggle list (space toggles, enter confirms).' })),
-      allowOther: Type.Optional(Type.Boolean({ description: 'Set false to offer the authored choices only, with no free-text row (default true).' })),
-      recommended: Type.Optional(Type.Number({ description: '0-based recommended option index' })),
+      question: Type.String(),
+      options: Type.Array(OptionSchema, { description: '2-5 choices' }),
+      multi: Type.Optional(Type.Boolean()),
+      allowOther: Type.Optional(Type.Boolean()),
+      recommended: Type.Optional(Type.Number()),
     }),
-    { description: '1-4 related questions in one call. Wins over top-level question/options when set.' },
+    { description: 'Batched form: 1-4 questions; wins over top-level question/options' },
   )),
 });
 
 export const ASK_TOOL_DESCRIPTION = [
-  'Ask the human a question and wait for their answer.',
-  'Use this when you genuinely need a human decision (approval, direction, trade-off) — not for information you can find yourself.',
-  'While waiting, the pane shows as blocked in herdr (the human sees it and can step in).',
-  'Prefer 2-5 options with short labels; put tradeoffs in description.',
-  'Do NOT include an "Other" option — the UI appends "Other (type your own)" automatically.',
-  'Use recommended (0-based) to mark the default; "(Recommended)" is added automatically — do NOT write it in the label.',
-  'Use multi: true when several options can apply — the TUI opens an interactive toggle list (space toggles a row, a toggles all, enter confirms, esc declines) instead of making the human type numbers.',
-  'Set allowOther: false when the authored choices are exhaustive and a free-text answer would be misleading.',
+  'Ask the human and wait for the answer — only for a real decision (approval, direction, trade-off), not for information you can find yourself. While waiting, the pane shows as blocked in herdr.',
+  'Two shapes. Flat form (no questions key; do not close with ]): {"question":"Store?","options":[{"label":"Redis","description":"In-memory"},{"label":"Postgres"}]}. Batched form: {"questions":[{"question":"Store?","options":[{"label":"Redis"},{"label":"Postgres"}]},{"question":"Region?","options":[{"label":"EU"},{"label":"US"}],"multi":true}]}.',
 ].join(' ');
 
 export const ASK_PROMPT_GUIDELINES = [
-  'Default to action. Ask only when options have materially different tradeoffs the user must decide.',
-  'Do NOT include "Other" in options; the UI appends it unless allowOther is false. Group related questions in questions (max 4) rather than calling this tool repeatedly.',
-  'For multi questions the human toggles rows in a list and confirms with enter — never instruct them to type indices.',
-  'Short option labels; explanatory tradeoffs in description.',
+  'Default to action. Ask only when options have materially different tradeoffs the user must decide; group related questions in one call (max 4).',
+  'Do NOT include "Other" in options: the UI appends it unless allowOther is false. Set allowOther: false when the choices are exhaustive.',
+  'Use multi: true when several options can apply; the human toggles rows and confirms — never ask them to type indices.',
 ];
 
 export type AskOption = { label: string; description?: string };
@@ -114,6 +103,8 @@ export type AskDetails = {
 export type AskToolResult = {
   content: Array<{ type: 'text'; text: string }>;
   details: AskDetails;
+  /** Set on failures so pi/UI do not count a rejected ask as a successful tool call. */
+  isError?: boolean;
 };
 
 export type AskUi = {
@@ -144,6 +135,7 @@ function errorResult(text: string, code: string): AskToolResult {
   return {
     content: [{ type: 'text', text }],
     details: { answers: [], cancelled: true, error: code },
+    isError: true,
   };
 }
 
@@ -233,6 +225,42 @@ function parseQuestion(raw: unknown): { ok: true; question: AskQuestion } | { ok
   };
 }
 
+type AskParams = Type.Static<typeof ASK_PARAMETERS>;
+
+/** Repair the argument spellings models have sent historically, before pi validates them: `options` or
+ *  `questions` as a JSON string instead of an array. Only strings that parse to arrays are replaced, so
+ *  anything genuinely malformed still reaches prepareAsk and gets its normal error text. */
+export function prepareAskArguments(args: unknown): AskParams {
+  const rec = asRecord(args);
+  if (!rec) return {};
+  const parseArray = (value: unknown): unknown[] | undefined => {
+    if (typeof value !== 'string') return undefined;
+    try {
+      const parsed: unknown = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  let changed = false;
+  const next: Record<string, unknown> = { ...rec };
+  const options = parseArray(rec.options);
+  if (options) {
+    next.options = options;
+    changed = true;
+  }
+  const questions = parseArray(rec.questions);
+  if (questions) {
+    next.questions = questions.map((item) => {
+      const question = asRecord(item);
+      const questionOptions = question ? parseArray(question.options) : undefined;
+      return question && questionOptions ? { ...question, options: questionOptions } : item;
+    });
+    changed = true;
+  }
+  return (changed ? next : rec) as AskParams;
+}
+
 export function prepareAsk(params: unknown): PrepareAskResult {
   const rec = asRecord(params);
   if (!rec) return fail('Error: `question` must be a non-empty string', 'empty_question');
@@ -312,15 +340,33 @@ function withId(question: AskQuestion, answer: AskAnswer): AskAnswer {
   return question.id ? { ...answer, id: question.id } : answer;
 }
 
-/** Free-text answer behind the Other row; shared by the dialog and the typed-prompt fallback. */
-async function askOtherText(ui: AskUi, question: AskQuestion, signal?: AbortSignal): Promise<AskAnswer | undefined> {
+/** Free-text answer behind the Other row; shared by the dialog and the typed-prompt fallback. `labels`
+ *  are the rows toggled when the dialog opened Other — a multi-select custom answer keeps them.
+ *  Returns 'empty' for a blank answer so the caller can go back to the choices. */
+async function askOtherText(
+  ui: AskUi,
+  question: AskQuestion,
+  labels: readonly string[],
+  signal?: AbortSignal,
+): Promise<AskAnswer | 'empty' | undefined> {
   const typed = await ui.input(`${question.question}\n\n${CUSTOM_ANSWER_TITLE}`, '', signal ? { signal } : undefined);
-  if (typed == null || !typed.trim()) return undefined;
+  if (typed == null) return undefined;
+  const customInput = typed.trim();
+  if (!customInput) return 'empty';
+  if (question.multi && labels.length > 0) {
+    return withId(question, {
+      question: question.question,
+      kind: 'multi',
+      answer: null,
+      selected: [...labels],
+      customInput,
+    });
+  }
   return withId(question, {
     question: question.question,
     kind: 'custom',
     answer: OTHER_ANSWER,
-    customInput: typed.trim(),
+    customInput,
   });
 }
 
@@ -376,53 +422,71 @@ function parseTypedPicks(
 }
 
 /** Ask one question, both modes: the pier dialog, then the host's select dialog (single only), then
- *  the typed prompt. `ui.custom` is absent (or resolves undefined) in RPC mode, hence every rung. */
+ *  the typed prompt. `ui.custom` is absent (or resolves undefined) in RPC mode, hence every rung.
+ *  A blank Other answer goes back to the choices instead of declining the question. */
 async function askQuestion(ui: AskUi, question: AskQuestion, signal?: AbortSignal): Promise<AskAnswer | undefined> {
   const { multi } = question;
-  if (typeof ui.custom === 'function') {
-    const toggleToolsExpanded = ui.getToolsExpanded && ui.setToolsExpanded
-      ? (): void => ui.setToolsExpanded!(!ui.getToolsExpanded!())
-      : undefined;
-    const outcome = await runSelectDialog(
-      ui.custom,
-      question.question,
-      {
-        options: question.options,
-        allowOther: question.allowOther,
-        multi,
-        ...(question.recommended !== undefined ? { recommended: question.recommended } : {}),
-      },
-      { ...(signal ? { signal } : {}), ...(toggleToolsExpanded ? { toggleToolsExpanded } : {}) },
-    );
-    if (outcome?.kind === 'cancel') return undefined;
-    if (outcome?.kind === 'other') return askOtherText(ui, question, signal);
-    if (outcome?.kind === 'selected') {
-      return withId(
-        question,
-        multi
-          ? { question: question.question, kind: 'multi', answer: null, selected: outcome.labels }
-          : { question: question.question, kind: 'option', answer: outcome.labels[0]! },
+  const toggleToolsExpanded = ui.getToolsExpanded && ui.setToolsExpanded
+    ? (): void => ui.setToolsExpanded!(!ui.getToolsExpanded!())
+    : undefined;
+  let custom = typeof ui.custom === 'function' ? ui.custom : undefined;
+  let toggled: string[] = [];
+  for (;;) {
+    const dialog = custom;
+    if (dialog) {
+      const outcome = await runSelectDialog(
+        dialog,
+        question.question,
+        {
+          options: question.options,
+          allowOther: question.allowOther,
+          multi,
+          ...(question.recommended !== undefined ? { recommended: question.recommended } : {}),
+          ...(toggled.length > 0 ? { initialSelected: question.options.map((option) => toggled.includes(option.label)) } : {}),
+        },
+        { ...(signal ? { signal } : {}), ...(toggleToolsExpanded ? { toggleToolsExpanded } : {}) },
       );
+      if (outcome?.kind === 'cancel') return undefined;
+      if (outcome?.kind === 'other') {
+        const answer = await askOtherText(ui, question, outcome.labels, signal);
+        if (answer !== 'empty') return answer;
+        toggled = outcome.labels;
+        continue;
+      }
+      if (outcome?.kind === 'selected') {
+        return withId(
+          question,
+          multi
+            ? { question: question.question, kind: 'multi', answer: null, selected: outcome.labels }
+            : { question: question.question, kind: 'option', answer: outcome.labels[0]! },
+        );
+      }
+      // The host cannot render custom components (RPC mode): fall through to the typed prompt.
+      custom = undefined;
     }
+    const lines = optionLines(question);
+    const opts = signal ? { signal } : undefined;
+    // A multi question has no single-pick host dialog; its typed prompt is always the fallback.
+    const select = multi ? undefined : ui.select;
+    const hint = multi
+      ? (question.allowOther ? MULTI_INSTRUCTIONS : MULTI_NO_OTHER_INSTRUCTIONS)
+      : NUMBERED_HINT;
+    const raw = select
+      ? await select(question.question, lines, opts)
+      : await ui.input(`${question.question}\n\n${lines.join('\n')}\n\n${hint}`, multi ? '1,3' : '1', opts);
+    if (raw == null) return undefined;
+    const picks = parseTypedPicks(question, lines, raw, select === undefined);
+    if (picks === 'other') {
+      const answer = await askOtherText(ui, question, [], signal);
+      if (answer !== 'empty') return answer;
+      continue;
+    }
+    return picks?.[0];
   }
-  const lines = optionLines(question);
-  const opts = signal ? { signal } : undefined;
-  // A multi question has no single-pick host dialog; its typed prompt is always the fallback.
-  const select = multi ? undefined : ui.select;
-  const hint = multi
-    ? (question.allowOther ? MULTI_INSTRUCTIONS : MULTI_NO_OTHER_INSTRUCTIONS)
-    : NUMBERED_HINT;
-  const raw = select
-    ? await select(question.question, lines, opts)
-    : await ui.input(`${question.question}\n\n${lines.join('\n')}\n\n${hint}`, multi ? '1,3' : '1', opts);
-  if (raw == null) return undefined;
-  const picks = parseTypedPicks(question, lines, raw, select === undefined);
-  if (picks === 'other') return askOtherText(ui, question, signal);
-  return picks?.[0];
 }
 
 export function formatAskContent(details: AskDetails): string {
-  if (details.cancelled || details.answers.length === 0) return DECLINE_TEXT;
+  if (details.answers.length === 0) return DECLINE_TEXT;
   const entries = details.answers.map((answer) => {
     if (answer.kind === 'custom' && answer.answer === OTHER_ANSWER) {
       const notes = answer.customInput ? ` user notes: ${answer.customInput}` : '';
@@ -430,11 +494,15 @@ export function formatAskContent(details: AskDetails): string {
     }
     if (answer.kind === 'multi') {
       const labels = answer.selected?.length ? answer.selected.join(', ') : '(none)';
-      return `"${answer.question}"="${labels}"`;
+      const notes = answer.customInput ? ` user notes: ${answer.customInput}` : '';
+      return `"${answer.question}"="${labels}"${notes}`;
     }
     return `"${answer.question}"="${answer.answer ?? ''}"`;
   });
-  return `User has answered your questions: ${entries.join(', ')}. You can now continue with the user's answers in mind.`;
+  const answered = `User has answered your questions: ${entries.join(', ')}.`;
+  return details.cancelled
+    ? `${answered} The user declined the remaining questions — continue with these answers and your best judgment.`
+    : `${answered} You can now continue with the user's answers in mind.`;
 }
 
 export async function runAsk(spec: AskSpec, ui: AskUi, signal?: AbortSignal): Promise<AskToolResult> {

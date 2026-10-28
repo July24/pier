@@ -4,7 +4,7 @@
  * needed and older pi builds degrade to "no renderer".
  */
 import { TODO_EDIT_CUSTOM_TYPE, type TodoEditPayload } from './todo-core.ts';
-import { SUBS_CUSTOM_TYPE, PROGRESS_CUSTOM_TYPE, subRef, type SubsRegistry } from './subagent-core.ts';
+import { SUBS_CUSTOM_TYPE, subRef, type SubsRegistry } from './subagent-core.ts';
 import { DELEGATION_CUSTOM_TYPE } from './delegation-core.ts';
 import { TERMINALS_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE, type TerminalsRegistry } from './terminal-core.ts';
 import { TODO_REMINDER_CUSTOM_TYPE } from './todo-reminder-core.ts';
@@ -159,17 +159,6 @@ function approvalLines(data: unknown, theme: RenderTheme): string[] {
   return [`${theme.fg('warning', '⚠ approval needed')} ${theme.fg('dim', `· ${tool} (${role})`)}`];
 }
 
-/** Phase 2: worker progress note (display-less custom message) as a one-line card — the sender
- * pane rides `details.paneId`; keep it recognizable without flooding the transcript. */
-function progressLines(message: unknown, theme: RenderTheme, expanded: boolean): string[] {
-  const rec = (message ?? {}) as { content?: unknown; details?: { paneId?: unknown } };
-  const from = typeof rec.details?.paneId === 'string' && rec.details.paneId ? rec.details.paneId : '?';
-  const content = typeof rec.content === 'string' ? rec.content : '';
-  const head = `${theme.fg('accent', '⤴ progress')} ${theme.fg('dim', `· ${from}: ${clip(content, 100)}`)}`;
-  if (!expanded) return [head];
-  return [head, ...content.split('\n').map((line) => theme.fg('dim', line))];
-}
-
 /** Reminder custom messages carry the full injected text; restyle without altering it. */
 function reminderLines(message: unknown, theme: RenderTheme, label: string, expanded: boolean): string[] {
   const content = typeof (message as { content?: unknown } | undefined)?.content === 'string'
@@ -215,7 +204,6 @@ export function installRenderers(pi: unknown): string[] {
   entry(DELEGATION_CUSTOM_TYPE, delegationLines);
   entry(ROLE_MANIFEST_CUSTOM_TYPE, (data, theme) => roleManifestLines(data, theme));
   entry(APPROVAL_NEEDED_CUSTOM_TYPE, (data, theme) => approvalLines(data, theme));
-  message(PROGRESS_CUSTOM_TYPE, progressLines);
   message(TODO_REMINDER_CUSTOM_TYPE, (msg, theme, expanded) => reminderLines(msg, theme, 'todo reminder', expanded));
   message(TERM_REMINDER_CUSTOM_TYPE, (msg, theme, expanded) => reminderLines(msg, theme, 'terminal nudge', expanded));
   return registered;

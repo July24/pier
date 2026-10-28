@@ -18,6 +18,15 @@ export class TodosService extends EventEmitter {
   }
   /** Clock anchor for staleness/archiving; null until the first write. */
   lastWriteAt: number | null = null;
+  /** True when the anti-freeze rewrite window was offered for the current list (reached through the
+   *  persisted marker on rebuild, so a resumed session skips straight to the terminal clear). */
+  private _archiveWindowOffered = false;
+  get archiveWindowOffered(): boolean {
+    return this._archiveWindowOffered;
+  }
+  markArchiveWindowOffered(): void {
+    this._archiveWindowOffered = true;
+  }
   readonly config: TodosConfig;
 
   constructor(config: TodosConfig) {
@@ -40,6 +49,7 @@ export class TodosService extends EventEmitter {
     if (listsEqual(this._items, next)) return { changed: false };
     const before = this._items;
     this._items = next;
+    this._archiveWindowOffered = false;
     this.lastWriteAt = Date.now();
     this.emitCompletedTransitions(before, this._items, opts?.source ?? 'tool');
     this.emit('todo.updated', { items: this._items });
@@ -51,6 +61,7 @@ export class TodosService extends EventEmitter {
     const next = applyTodoEdits(this._items, edits);
     if (listsEqual(before, next)) return { changed: false };
     this._items = next;
+    this._archiveWindowOffered = false;
     this.lastWriteAt = Date.now();
     this.emitCompletedTransitions(before, this._items, opts?.source ?? 'reconcile');
     this.emit('todo.edited', { edits, items: this._items });
@@ -74,6 +85,7 @@ export class TodosService extends EventEmitter {
     const folded = foldLatestTodosMeta(entries as Parameters<typeof foldLatestTodosMeta>[0]);
     this._items = folded ? folded.items : [];
     this.lastWriteAt = folded ? folded.writtenAt : null;
+    this._archiveWindowOffered = folded ? folded.archiveWindowOffered : false;
     this.emit('todo.updated', { items: this._items, reason: 'rebuild' });
   }
 }

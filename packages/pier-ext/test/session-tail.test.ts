@@ -201,6 +201,9 @@ test('agent_settled.aborted (pi ≥ 1.1): a cancelled run wakes nothing even whe
 test('shouldPushSettleReply: an aborted settle keeps the machine request armed for the re-run', () => {
   assert.equal(shouldPushSettleReply({ aborted: true, lastStopReason: 'stop' }), false);
   assert.equal(shouldPushSettleReply({ lastStopReason: 'stop' }), true);
+  // A provider failure pi retries is not a settlement: answering would consume the request with a
+  // null-text reply before the retry can deliver the real closing message.
+  assert.equal(shouldPushSettleReply({ lastStopReason: 'error' }), false);
 });
 
 test('OCC abort: silent settle that still hands off to the compaction coordinator', () => {
@@ -263,7 +266,7 @@ test('settle reply guard: OCC abort / in-flight compaction / user abort keep the
   // A worker whose turn OCC aborted reads stopReason 'error'; only the flags distinguish it.
   assert.equal(shouldPushSettleReply({ ...natural, intentionalAbort: true }), false, 'OCC abort → continuation is coming');
   assert.equal(shouldPushSettleReply({ ...natural, compactionInFlight: true }), false, 'compaction summary still running');
-  assert.equal(shouldPushSettleReply({ lastStopReason: 'error' }), true, 'a plain provider-error settle still replies');
+  assert.equal(shouldPushSettleReply({ lastStopReason: 'error' }), false, 'provider error is retried: keep the request armed for the retry');
   assert.equal(shouldPushSettleReply({ lastStopReason: 'aborted' }), false, 'a user-aborted run may re-run');
   assert.equal(shouldPushSettleReply({ lastStopReason: null }), true, 'an unknown stopReason (older pi) still replies');
 });

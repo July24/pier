@@ -124,22 +124,18 @@ test('bundled manifests: loadable for both built-ins, and worker mirrors master 
     assert.equal(role.role, name); assert.match(role.version, /^\d+\.\d+\.\d+$/, name);
     assert.equal(role.model, undefined, `${name} leaves model routing to the process default`);
   }
-  // D83 inheritance: worker-default.tools ≡ (master.tools − subagent − terminal) ∪ worker-only,
-  // pinned against drift. report_progress is worker-only (Phase 2): a master has no parent to
-  // report to, so it must NOT appear in master.tools.
+  // D83 inheritance: worker-default.tools ≡ master.tools − subagent − terminal, pinned against drift.
   const EXCLUDED = ['subagent', 'terminal'];
-  const WORKER_ONLY = ['report_progress'];
   const master = loadRoleConfig('master');
   const worker = loadRoleConfig('worker-default');
   assert.deepEqual(
     [...new Set(worker.manifest.tools)].sort(),
-    [...new Set([...master.manifest.tools.filter((t) => !EXCLUDED.includes(t)), ...WORKER_ONLY])].sort(),
+    [...new Set(master.manifest.tools.filter((t) => !EXCLUDED.includes(t)))].sort(),
   );
   for (const family of EXCLUDED) assert.equal(worker.manifest.rules?.[family], 'deny', `${family} stays denied under unknownTools=allow`);
-  for (const need of ['todo_write', 'ask_user_question', 'report_progress', 'subagent', 'terminal', 'pwsh', 'web_search']) assert.ok(
-    need === 'report_progress' ? worker.manifest.tools.includes(need) && !master.manifest.tools.includes(need) : master.manifest.tools.includes(need),
-    `tool placement: ${need}`,
-  );
+  for (const need of ['todo_write', 'ask_user_question', 'subagent', 'terminal', 'pwsh', 'web_search']) {
+    assert.ok(master.manifest.tools.includes(need), `tool placement: ${need}`);
+  }
   assert.equal(master.manifest.unknownTools, 'allow'); assert.equal(worker.manifest.unknownTools, 'allow');
 });
 

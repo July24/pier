@@ -27,9 +27,9 @@ pier 由**两个半区**组成，各装一处：
 - **todo 反冻结**：全完成列表 ≥6 轮未写 → 读钩复读改为改写警告；≥1h 未写 → 归档——先给一次带旧条目参照的重写窗口，无视后终态通知并清空列表（rm 落 JSONL，空守卫接管，多步工作必须重建清单）；`/todos` 永远可查历史，会话 JSONL 权威不动
 - **交互式子代理**：每个子代理 = 独立 pane 的隔离 pi 会话（独立上下文窗口）；**人类可随时进入该 pane 直接对话**（修 bug、接管、回答 ask_user_question）
 - **委托身份一等公民**（D111）：spawn 时经 `PI_HERDR_DELEGATION` 把委托上下文（父 pane/父会话/taskId/任务/角色）下发 worker，env > worker marker > branch fold 三级回放；worker 系统提示注入 `pier-delegation` 段（身份 + 统一交付契约），首帧渲染「⟵ delegated by master …」卡片，pane title 带 `↳` 前缀；herdr `pi-parent`/`pi-task` token 独立批上报，dashboard 按 parent 分组树化、blocked 告警带 `worker ← master` 归属
-- **任务 slug + 主动进度上报**（D112）：spawn 分配任务 slug（冲突加序号），工具输出一律 `slug@paneId`，`agentId` 接受 slug/paneId/组合形式（revive 换 pane 后按 slug 兜底）；worker 侧 `report_progress` 工具经 pipe 把检查点以 display-less custom message 送进 master 上下文——不刷屏、不强制 turn，master 从轮询猜状态升级为关键节点被动接收
+- **任务 slug**（D112）：spawn 分配任务 slug（冲突加序号），工具输出一律 `slug@paneId`，`agentId` 接受 slug/paneId/组合形式（revive 换 pane 后按 slug 兜底）。后台 worker 运行期间 master 的 bash 若 sleep ≥60s，结果会附一句「结算通知会自动到达」（D125；此前的 `report_progress` 工具一次都没被调用过，已删除）
 - **统一 TUI 状态条**（D113/D114）：常驻 widget 一行一 agent——自己一行 `▶ 当前条 ✓d/n`，每个 running 子代理一行 `↳ slug ▶ 当前条 ✓d/n`（blocked 显示任务+原因，settled 不占行；自己的清单全部完成时直接隐藏，不再只剩一个 `✓N/N`）；worker `todo_write` 经 pipe 实时推送全量清单（事件驱动零轮询），`/pier-tree` 在共享的 Pier **popup** 里打开完整委托树（自己 + 各 worker 全量 todo + settled 节点），与 `/dashboard` 是同一个单例面板，初始落在 `Tree` tab（面板内用 `1`/`2`/`Tab` 切换；显式 `/pier-tree overlay` 仍走独立全窗 pane；非 Herdr 环境回退为 pane 内通知）；`/dashboard` 打开同一面板的 `Dashboard` tab
-- **子代理输出预览**：`subagent(action: "output", agentId)` 返回后台子代理自上次调用以来的新输出——内存中的 per-pane 游标计算增量（优先 `agent.read`，旧版 herdr 回退 `pane.read`），结果带状态、revision、截断与 `restart` 标记（缓冲回卷/清屏），master 不必等到结算就能发现卡住的 worker
+- **子代理输出预览**：`subagent(action: "output", agentId)` 返回后台子代理自上次调用以来的新输出——内存中的 per-pane 游标计算增量（优先 `agent.read`，旧版 herdr 回退 `pane.read`），结果带状态、revision、截断与 `restart` 标记（缓冲回卷/清屏），master 不必等到结算就能发现卡住的 worker。TUI 外框/页脚会被剥掉；worker 完成后以完整 transcript 终稿替代 pane 里有损的渲染副本，之后的结算通知只指向那次交付、不再重复全文（D124）
 - **软锁防争抢**（写路径按 pane 粒度锁 token，冲突时警告/阻止）
 - **角色档案**：`master` / `worker-default` 内置，自定义 role 按 `.pi-herdr/roles/<name>.json` 挂载；工具集按角色收敛（deny 规则不可绕过）
 - **人类闸门**：子代理 `ask_user_question` → 侧边栏 blocked 标记 + 通知；用户手动接管（ESC 打断后输入）→ 启发式检测自动暂停/归还 master 管理
@@ -164,7 +164,7 @@ npm test          # node --test，733 项单测（规划器 / todo 重放 / 反�
 |---|---|---|---|
 | `PIER_SUBAGENT_TIMEOUT_MS` | `600000` | ms | 子代理无活动超时预算（超时强行终止） |
 | `PIER_SETTLEMENT_WINDOW_MS` | `60000` | ms | 结算通知窗口、机器注入宽限期及接管空闲判定阈值 |
-| `PIER_OBSERVATION_WINDOW_MS` | `30000` | ms | 结算后观察窗口（超时前自动消费） |
+| `PIER_OBSERVATION_WINDOW_MS` | `30000` | ms | 结算后观察窗口（超时前自动消费）；worker transcript 已有终稿回答且 pane 空闲时跳过 |
 | `PIER_FOREGROUND_PATIENCE_MS` | `300000` | ms | 前台等待耐心阈值（超时自动切入后台） |
 | `PIER_GC_TICK_MS` | `30000` | ms | 子代理垃圾回收轮询间隔 |
 | `PIER_POLL_INTERVAL_MS` | `30000` | ms | 子代理状态观测轮询间隔 |

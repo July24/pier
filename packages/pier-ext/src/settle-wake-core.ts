@@ -7,6 +7,9 @@
 
 export const ABORT_STOP_REASON = 'aborted';
 
+/** pi/provider failure stop. pi auto-retries these, so the run has not settled for the user. */
+export const ERROR_STOP_REASON = 'error';
+
 /** D96: cooldown before repeating a notice for the same running set. */
 export const D96_REPEAT_NOTICE_MS = 10 * 60_000;
 
@@ -80,7 +83,9 @@ export function planSettleWake(input: SettleWakeInput): SettleWakePlan {
  * coming: answering now reports "finished, no closing message" for live work and — worse —
  * consumes the one-shot request plus the parent's claim latch, so the real closing message can
  * never be delivered (observed: a worker mid-compaction announced finished; its final report
- * never reached the parent). A user abort ('aborted') likewise settles a run that may re-run.
+ * never reached the parent). A user abort ('aborted') likewise settles a run that may re-run, and
+ * an 'error' stop is an upstream failure pi retries — answering then consumes the latch for a
+ * parent's claim that the retry's closing message still has to satisfy.
  */
 export function shouldPushSettleReply(input: {
   intentionalAbort?: boolean;
@@ -92,5 +97,6 @@ export function shouldPushSettleReply(input: {
   return !input.intentionalAbort
     && input.aborted !== true
     && !input.compactionInFlight
-    && input.lastStopReason !== ABORT_STOP_REASON;
+    && input.lastStopReason !== ABORT_STOP_REASON
+    && input.lastStopReason !== ERROR_STOP_REASON;
 }

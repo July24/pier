@@ -2,19 +2,20 @@
  * CompactCoordinator lifecycle (sampling, guards, abort→compact→continue, backoff) over a mock pi. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import type { ExtensionAPI, ExtensionContext, SessionEntry } from '@earendil-works/pi-coding-agent';
-import { decideCompaction, estimateRemainingRequests, nativeCompactionFeasible, resolveCacheRatioFromCost, type CompactionDecision } from '../src/compact-economics-core.ts';
+import type { CompactionResult, ExtensionAPI, ExtensionContext, SessionEntry } from '@earendil-works/pi-coding-agent';
+import { decideCompaction, estimateRemainingRequests, MAX_HORIZON_REQUESTS, nativeCompactionFeasible, resolveCacheRatioFromCost, type CompactionDecision } from '../src/compact-economics-core.ts';
 import {
   CompactCoordinator, COMPACT_STATE_CUSTOM_TYPE, COMPACTION_CONTINUE_TEXT, COMPACTION_CONTINUE_TYPE, COMPACTION_INFLIGHT_TYPE,
-  COMPACTION_SETTLED_TYPE, restoreCoordinatorState,
+  CACHE_HIT_PRIOR_TOKENS, COMPACTION_SETTLED_TYPE, DEFERRED_REEVALUATION_REQUESTS, horizonTodos, prefixCacheHitRate, restoreCoordinatorState,
 } from '../src/compact-coordinator.ts';
 import type { TodoItem } from '../src/todo-core.ts';
 import { fakePi, type FakePi } from './test-utils.ts';
 /* economics / feasibility core */
 /** Baseline horizon: 5 requests per boundary, ample window. */
 const horizonBase = {
-  completedBoundaryRequestCounts: [4, 6], remainingBoundaries: 3, scale: 1.0, standardDeviationK: 0.0,
+  completedBoundaryRequestCounts: [4, 6], remainingBoundaries: 3, scale: 1.0,
   contextTokens: 10000, contextWindowTokens: 100000, averageContextTokenIncrement: 1000,
+  observedRequestsSinceBoundary: 0,
 };
 const estimate = (over: Partial<typeof horizonBase> = {}) => estimateRemainingRequests({ ...horizonBase, ...over });
 
@@ -28,21 +29,44 @@ const decideBase = {
 const decide = (over: Partial<typeof decideBase> = {}) => decideCompaction({ ...decideBase, ...over });
 
 test('estimateRemainingRequests: mean × remaining boundaries, capped by the context window', () => {
-  // mean = 5 → unbounded = 1 + floor(5 * 3) = 16; window cap = floor((100000 - 10000) / 1000) = 90
+  // damped mean = (5 × 2 + 5 × 2) / 4 = 5 → unbounded = 1 + floor(5 * 3) = 16;
+  // window cap = floor((100000 - 10000) / 1000) = 90
   const wide = estimate();
   assert.equal(wide.requestsPerBoundaryMean, 5);
-  assert.equal(wide.requestsPerBoundaryLowerBound, 5);
-  assert.equal(wide.unboundedExpectedRemainingRequests, 16);
+  assert.equal(wide.requestsPerBoundaryEstimate, 5);
   assert.equal(wide.windowRequestUpperBound, 90);
   assert.equal(wide.expectedRemainingRequests, 16);
-  // Tight window: unbounded = 1 + floor(10 * 5) = 51, cap = floor((100000 - 90000) / 2000) = 5
+  // Tight window: damped mean 6.67 over 5 boundaries = 34, cap = floor((100000 - 90000) / 2000) = 5
   const tight = estimate({ completedBoundaryRequestCounts: [10], remainingBoundaries: 5, contextTokens: 90000, averageContextTokenIncrement: 2000 });
-  assert.deepEqual([tight.unboundedExpectedRemainingRequests, tight.windowRequestUpperBound, tight.expectedRemainingRequests], [51, 5, 5]);
+  assert.ok(Math.abs(tight.requestsPerBoundaryEstimate - 20 / 3) < 1e-9);
+  assert.deepEqual([tight.windowRequestUpperBound, tight.expectedRemainingRequests], [5, 5]);
+});
+
+test('estimateRemainingRequests: sparse samples shrink toward the prior, the horizon is capped, and visible work floors it', () => {
+  // One 127-request boundary projected over ten todos used to predict 509 remaining requests.
+  const sparse = estimate({ completedBoundaryRequestCounts: [127], remainingBoundaries: 10, contextTokens: 0, averageContextTokenIncrement: 0 });
+  assert.ok(sparse.requestsPerBoundaryEstimate < 127, 'a single long sample must not extrapolate linearly');
+  assert.equal(sparse.expectedRemainingRequests, MAX_HORIZON_REQUESTS);
+  // An empty todo list while the agent keeps issuing requests must not collapse the horizon to 1.
+  const working = estimate({ completedBoundaryRequestCounts: [], remainingBoundaries: 0, contextTokens: 0, averageContextTokenIncrement: 0, observedRequestsSinceBoundary: 24 });
+  assert.equal(working.expectedRemainingRequests, 24);
+  const stalled = estimate({ completedBoundaryRequestCounts: [], remainingBoundaries: 0, contextTokens: 0, averageContextTokenIncrement: 0 });
+  assert.equal(stalled.expectedRemainingRequests, 1);
+});
+
+test('horizonTodos: blocked work waits outside the agent and does not pace the remaining horizon', () => {
+  const todos: TodoItem[] = [
+    { content: 'done', status: 'completed' },
+    { content: 'abandoned', status: 'abandoned' },
+    { content: 'blocked', status: 'blocked', blocker: 'awaiting approval' },
+    { content: 'open', status: 'pending' },
+  ];
+  assert.deepEqual(horizonTodos(todos).map((todo) => todo.content), ['open']);
 });
 
 /** [case, overrides, compacts, reason, extra assertions on the decision] */
 const DECIDE_CASES: Array<[string, Partial<typeof decideBase>, boolean, string, ((d: CompactionDecision) => void)?]> = [
-  // breakeven = 45000 * 11.5 / 21000 = 24.64; horizon: mean 10 × 3 boundaries = 31, first compaction ×2 → 62
+  // breakeven = 45000 * 11.5 / 21000 = 24.64; damped mean 7.5 × 3 boundaries + 1 = 23, first compaction ×2 → 46
   ['breakeven met is economic', { writeTokens: 45000, completedBoundaryRequestCounts: [10, 10] }, true, 'economic', (d) => {
     assert.ok(Math.abs(d.breakevenRequests! - 24.642857) < 0.001);
     assert.equal(d.incrementalCacheCostRatio, 11.5);
@@ -50,10 +74,10 @@ const DECIDE_CASES: Array<[string, Partial<typeof decideBase>, boolean, string, 
   ['archiveTokens ≤ memoTokens is non_positive_saving', { writeTokens: 20000, archiveTokens: 1000, memoTokens: 1000, contextTokens: 20000 }, false, 'non_positive_saving'],
   // reserve 16384 → window cutoff 83616 ≤ 95000
   ['window protection compacts below breakeven', { writeTokens: 90000, archiveTokens: 15000, contextTokens: 95000, completedBoundaryRequestCounts: [1], remainingBoundaries: 1, contextWindowTokens: 100000, priorCompactionCount: 1 }, true, 'window_protection'],
-  // ratio 2.0 (increment 1.0): single breakeven 30000/19000 = 1.57 ≤ 21, combined (500000+30000)/19000 = 27.89 > 21
+  // ratio 2.0 (increment 1.0): single breakeven 30000/19000 = 1.57 ≤ 14, combined (500000+30000)/19000 = 27.89 > 14
   ['unpaid debt raises the combined breakeven', { writeTokens: 30000, archiveTokens: 20000, contextTokens: 30000, completedBoundaryRequestCounts: [10], remainingBoundaries: 2, contextWindowTokens: 100000, priorCompactionCount: 1, carriedDebtTokens: 500000, cacheDebtRepaymentTokens: 19000, cacheWriteReadRatio: 2.0 }, false, 'deferred_carried_debt'],
-  // increment 2.0 → breakeven 40000 * 2 / 10000 = 8.0 ≤ 11, but 8.0 × 1.5 = 12.0 > 11
-  ['a later compaction needs a 1.5× margin', { writeTokens: 40000, archiveTokens: 11000, contextTokens: 40000, completedBoundaryRequestCounts: [10], remainingBoundaries: 1, contextWindowTokens: 100000, priorCompactionCount: 1, cacheWriteReadRatio: 3.0 }, false, 'deferred_subsequent_margin'],
+  // increment 2.0 → breakeven 40000 * 2 / 10000 = 8.0 ≤ 9, but 8.0 × 1.5 = 12.0 > 9
+  ['a later compaction needs a 1.5× margin', { writeTokens: 40000, archiveTokens: 11000, contextTokens: 40000, completedBoundaryRequestCounts: [15], remainingBoundaries: 1, contextWindowTokens: 100000, priorCompactionCount: 1, cacheWriteReadRatio: 3.0 }, false, 'deferred_subsequent_margin'],
   // ratio 2 → increment 1 → breakeven 40000/21000 ≈ 1.905; horizon = 1, the old ×2.0 invented a 2
   ['the last boundary gets no first-compaction boost', { writeTokens: 40000, contextTokens: 40000, completedBoundaryRequestCounts: [10, 10], remainingBoundaries: 0, contextWindowTokens: 1000000, cacheWriteReadRatio: 2.0 }, false, 'deferred_economic', (d) => {
     assert.equal(d.effectiveHorizonRequests, 1);
@@ -68,6 +92,22 @@ test('decideCompaction: one named reason per decision shape', () => {
     assert.equal(decision.reason, reason, name);
     check?.(decision);
   }
+});
+
+test('decideCompaction: prefix cache misses raise the expected saving and can open the decision', () => {
+  // ratio 10 → increment 9 → all-hit breakeven 40000 × 9 / 21000 ≈ 17.1 exceeds the first-compaction horizon.
+  const shape = { ...decideBase, remainingBoundaries: 1, cacheWriteReadRatio: 10 };
+  const allHits = decideCompaction(shape);
+  assert.equal(allHits.compact, false);
+  assert.equal(allHits.savingTokensPerRequest, 21000);
+  // 5% of requests bill the archived prefix at 10× → expected saving × (0.95 + 0.05 × 10) = × 1.45.
+  const missing = decideCompaction({ ...shape, prefixCacheHitRate: 0.95 });
+  assert.ok(Math.abs(missing.savingTokensPerRequest - 30450) < 1e-6);
+  assert.ok(Math.abs(missing.breakevenRequests! - allHits.breakevenRequests! / 1.45) < 1e-9);
+  assert.equal(missing.compact, true);
+  assert.equal(missing.reason, 'economic');
+  // A sub-1 ratio must not turn misses into a discount.
+  assert.equal(decideCompaction({ ...shape, cacheWriteReadRatio: 0.5, prefixCacheHitRate: 0 }).savingTokensPerRequest, 21000);
 });
 
 test('resolveCacheRatioFromCost: explicit config > cost metadata > provider family > token account', () => {
@@ -98,20 +138,22 @@ test('nativeCompactionFeasible: an empty or small branch is not compactable', ()
 /** The subset of `ctx.compact()` the coordinator passes. */
 interface CompactCall {
   customInstructions: string;
-  onComplete: (compaction: { summary?: string } | undefined) => void;
+  onComplete: (compaction: Partial<CompactionResult>) => void;
   onError: (error: Error) => void;
 }
 
 /** The coordinator reads only these fields of OnlineContextCompactConfig. */
 const configBase = { enabled: true, logEnabled: false, cacheWriteReadRatio: 2.0, firstCompactionRequestScale: 2.0, subsequentCompactionMargin: 1.5 };
 const CONFIG = configBase as never;
+const turnPi = (): ExtensionAPI => fakePi() as unknown as ExtensionAPI;
 
-function mockContext(opts: { tokens?: number; hasPending?: boolean; branch?: unknown[] }): {
+function mockContext(opts: { tokens?: number; hasPending?: boolean; branch?: unknown[]; model?: unknown }): {
   ctx: ExtensionContext; abortCalls: () => number; compactCalls: CompactCall[];
 } {
   let abortCalls = 0;
   const compactCalls: CompactCall[] = [];
   const ctx = {
+    model: opts.model,
     getContextUsage: () => ({ tokens: opts.tokens ?? 50000, contextWindow: 128000 }),
     getSystemPrompt: () => 'System prompt text', hasPendingMessages: () => opts.hasPending ?? false, isIdle: () => true,
     sessionManager: { getBranch: () => opts.branch ?? [], getSessionDir: () => '/tmp/sessions', getSessionId: () => 'test_sess_01' },
@@ -183,17 +225,17 @@ test('CompactCoordinator: turn_end does not abort when disabled, with a queued m
   const coordinator = new CompactCoordinator();
   coordinator.pendingBoundaryCompleted = true;
   const disabled = mockContext({});
-  coordinator.onTurnEnd({ ctx: disabled.ctx, todos, config: { ...configBase, enabled: false } as never });
+  coordinator.onTurnEnd({ ctx: disabled.ctx, todos, config: { ...configBase, enabled: false } as never, pi: turnPi(), lastStopReason: null });
   assert.equal(disabled.abortCalls(), 0);
   coordinator.pendingBoundaryCompleted = true;
   const pending = mockContext({ hasPending: true });
-  coordinator.onTurnEnd({ ctx: pending.ctx, todos, config: CONFIG });
+  coordinator.onTurnEnd({ ctx: pending.ctx, todos, config: CONFIG, pi: turnPi(), lastStopReason: null });
   assert.equal(pending.abortCalls(), 0, 'queued-message guard');
   // usage.tokens null/0 falls back to the last known context instead of polluting the state.
   coordinator.state.lastContextTokens = 35000; coordinator.pendingBoundaryCompleted = true;
   const stale = mockContext({});
   stale.ctx.getContextUsage = () => ({ tokens: null, contextWindow: 128000, percent: 0 }) as never;
-  coordinator.onTurnEnd({ ctx: stale.ctx, todos: [{ content: 'test', status: 'completed' }], config: CONFIG });
+  coordinator.onTurnEnd({ ctx: stale.ctx, todos: [{ content: 'test', status: 'completed' }], config: CONFIG, pi: turnPi(), lastStopReason: null });
   assert.equal(coordinator.state.lastContextTokens, 35000);
 });
 
@@ -207,7 +249,7 @@ test('CompactCoordinator: abort → compact → markers → silent continuation'
   ];
   const mock = mockContext({ tokens: 60000, branch: bigBranch() });
   let reminderCancelled = false;
-  coordinator.onTurnEnd({ ctx: mock.ctx, todos, config: CONFIG, cancelReminder: () => { reminderCancelled = true; } });
+  coordinator.onTurnEnd({ ctx: mock.ctx, todos, config: CONFIG, pi: turnPi(), lastStopReason: null, cancelReminder: () => { reminderCancelled = true; } });
   assert.equal(mock.abortCalls(), 1); assert.equal(coordinator.intentionalAbort, true);
   assert.equal(reminderCancelled, true, 'cancel the pending reminder before aborting');
   assert.ok(coordinator.selectedCompaction !== null);
@@ -270,6 +312,32 @@ test('CompactCoordinator: a cancelled compaction stays cancelled, a failed one w
   assert.equal(outcome(aborted.pi), 'cancelled');
 });
 
+test('CompactCoordinator: the summary runs at the capped thinking level and the session level comes back', async () => {
+  const run = (sessionLevel: string, summaryThinkingLevel: string) => {
+    const coordinator = new CompactCoordinator();
+    coordinator.selectedCompaction = economicDecision();
+    coordinator.intentionalAbort = true;
+    const mock = mockContext({});
+    const pi = fakePi();
+    pi.thinkingLevel = sessionLevel;
+    const settle = coordinator.onAgentSettled({ ctx: mock.ctx, todos: [], pi: pi as unknown as ExtensionAPI, config: { ...configBase, summaryThinkingLevel } as never });
+    return { mock, pi, settle, atCompact: pi.thinkingSets.slice() };
+  };
+  // A failed summary still restores the session's level.
+  const lowered = run('max', 'low');
+  assert.deepEqual(lowered.atCompact, ['low'], 'the summary request sees the cap');
+  lowered.mock.compactCalls[0]!.onError(new Error('Summarization failed'));
+  await lowered.settle;
+  assert.deepEqual(lowered.pi.thinkingSets, ['low', 'max']);
+  // The cap never raises a lower session level, and `inherit` leaves it alone.
+  for (const [session, cap] of [['minimal', 'low'], ['max', 'inherit']] as const) {
+    const kept = run(session, cap);
+    kept.mock.compactCalls[0]!.onComplete({ summary: 'ok' });
+    await kept.settle;
+    assert.deepEqual(kept.pi.thinkingSets, [], `${session}/${cap}: no level change`);
+  }
+});
+
 test('restoreCoordinatorState: the last marker wins and missing fields keep their defaults', () => {
   const branch = [
     { type: 'message', id: 'm1' },
@@ -287,6 +355,7 @@ test('restoreCoordinatorState: the last marker wins and missing fields keep thei
   assert.equal(restored.carriedDebtTokens, 12000); assert.equal(restored.priorCompactionCount, 2); assert.equal(restored.lastContextTokens, 45000);
   // Fields missing from an old marker must not pollute the state (shallow merge onto defaults).
   assert.equal(restored.consecutiveCompactionFailures, 0); assert.equal(restored.compactBackoffTurnEnds, 0); assert.equal(restored.version, 1);
+  assert.equal(restored.lastEvaluationRequestCount, -1); assert.equal(restored.retainedTokensAfterCompaction, 0);
 });
 
 test('CompactCoordinator: every provider request repays the cache debt, clearing the rate at zero', () => {
@@ -308,7 +377,7 @@ test('P1-3: a failed compaction backs off, pays no abort during the window, and 
     coordinator.pendingBoundaryCompleted = true;
   };
   rearm();
-  coordinator.onTurnEnd({ ctx, todos, config: CONFIG });
+  coordinator.onTurnEnd({ ctx, todos, config: CONFIG, pi: turnPi(), lastStopReason: null });
   assert.equal(abortCalls(), 1, 'the first decision takes the normal OCC path');
   const pi = fakePi();
   const settled = coordinator.onAgentSettled({ ctx, todos, pi: pi as unknown as ExtensionAPI, config: CONFIG });
@@ -323,16 +392,138 @@ test('P1-3: a failed compaction backs off, pays no abort during the window, and 
   assert.equal(restored.compactBackoffTurnEnds, coordinator.state.compactBackoffTurnEnds);
   assert.equal(pi.sent[0]!.msg.display, true, 'the failure notice must be visible'); assert.match(String(pi.sent[0]!.msg.content), /FAILED/);
   rearm();
-  coordinator.onTurnEnd({ ctx, todos, config: CONFIG });
+  coordinator.onTurnEnd({ ctx, todos, config: CONFIG, pi: turnPi(), lastStopReason: null });
   assert.equal(abortCalls(), 1, 'no second abort inside the backoff window');
   rearm();
-  coordinator.onTurnEnd({ ctx, todos, config: CONFIG }); // window 2 → 1
+  coordinator.onTurnEnd({ ctx, todos, config: CONFIG, pi: turnPi(), lastStopReason: null }); // window 2 → 1
   rearm();
-  coordinator.onTurnEnd({ ctx, todos, config: CONFIG }); // window 0 → normal decisions
+  coordinator.onTurnEnd({ ctx, todos, config: CONFIG, pi: turnPi(), lastStopReason: null }); // window 0 → normal decisions
   assert.equal(abortCalls(), 2, 'aborting resumes once the backoff is exhausted');
   const settled2 = coordinator.onAgentSettled({ ctx, todos, pi: pi as unknown as ExtensionAPI, config: CONFIG });
   compactCalls.at(-1)!.onComplete({ summary: 'ok' });
   await settled2;
   assert.equal(coordinator.state.consecutiveCompactionFailures, 0, 'the failure count resets on success');
   assert.equal(coordinator.state.compactBackoffTurnEnds, 0, 'the backoff resets on success');
+});
+
+test('CompactCoordinator: a deferred decision is re-evaluated every N requests without a new boundary', () => {
+  const coordinator = new CompactCoordinator();
+  const todos: TodoItem[] = [{ content: 'Done', status: 'completed' }];
+  // keepRecent 48000 leaves a 995-token saving, so breakeven ≈ 50 requests.
+  const config = { ...configBase, keepRecentTokens: 48000 } as never;
+  const mock = mockContext({ tokens: 50000, branch: bigBranch() });
+  for (let i = 0; i < 5; i++) coordinator.onBeforeProviderRequest(50000);
+  coordinator.pendingBoundaryCompleted = true;
+  coordinator.onTurnEnd({ ctx: mock.ctx, todos, config, pi: turnPi(), lastStopReason: 'toolUse' });
+  assert.equal(mock.abortCalls(), 0, 'only 5 observed requests: not yet repayable');
+  assert.equal(coordinator.state.lastEvaluationRequestCount, 5);
+  // Only a tool-call turn proves the work continues: a final stop must not summarize.
+  for (let i = 0; i < DEFERRED_REEVALUATION_REQUESTS; i++) coordinator.onBeforeProviderRequest(50000);
+  coordinator.onTurnEnd({ ctx: mock.ctx, todos, config, pi: turnPi(), lastStopReason: 'stop' });
+  assert.equal(mock.abortCalls(), 0, 'a settled final turn is not work continuing');
+  // The stale all-completed todo list produces no further boundary; the per-request re-evaluation
+  // must still fire once enough visible work clears the breakeven.
+  for (let step = 0; step < DEFERRED_REEVALUATION_REQUESTS * 5; step++) {
+    coordinator.onBeforeProviderRequest(50000);
+    coordinator.onTurnEnd({ ctx: mock.ctx, todos, config, pi: turnPi(), lastStopReason: 'toolUse' });
+  }
+  assert.equal(mock.abortCalls(), 1, 'the accumulated work floor clears the breakeven');
+  assert.ok(coordinator.selectedCompaction !== null);
+});
+
+test('CompactCoordinator: a selected compaction that cannot start is dropped instead of latching', async () => {
+  const coordinator = new CompactCoordinator();
+  coordinator.selectedCompaction = economicDecision();
+  coordinator.intentionalAbort = true;
+  const nonIdle = mockContext({});
+  nonIdle.ctx.isIdle = () => false;
+  await coordinator.onAgentSettled({ ctx: nonIdle.ctx, todos: [], pi: turnPi(), config: CONFIG });
+  assert.equal(nonIdle.compactCalls.length, 0);
+  assert.equal(coordinator.selectedCompaction, null, 'the stale selection must not latch OCC off');
+  assert.equal(coordinator.intentionalAbort, false);
+  // A later boundary still selects a compaction: dropping the stale one did not disable OCC.
+  const idle = mockContext({ branch: bigBranch() });
+  coordinator.state.completedBoundaryRequestCounts = [10];
+  coordinator.state.currentBoundaryRequestCount = 10;
+  coordinator.pendingBoundaryCompleted = true;
+  coordinator.onTurnEnd({ ctx: idle.ctx, todos: [], config: CONFIG, pi: turnPi(), lastStopReason: null });
+  assert.equal(idle.abortCalls(), 1);
+});
+
+test('CompactCoordinator: compaction usage sets the debt and the retained floor', async () => {
+  const coordinator = new CompactCoordinator();
+  coordinator.selectedCompaction = economicDecision();
+  coordinator.state.carriedDebtTokens = 700; // unpaid remainder from an earlier compaction
+  const mock = mockContext({ model: { cost: { cacheRead: 0.003 } } });
+  const pi = fakePi();
+  const settle = coordinator.onAgentSettled({ ctx: mock.ctx, todos: [], pi: pi as unknown as ExtensionAPI, config: CONFIG });
+  const usage = {
+    input: 1000, output: 200, cacheRead: 0, cacheWrite: 0, totalTokens: 1200,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.03 },
+  };
+  mock.compactCalls[0]!.onComplete({ summary: 'ok', usage, tokensBefore: 90000, estimatedTokensAfter: 30000 });
+  await settle;
+  // $0.03 at $0.003 per million cache-read tokens = 10M read-token equivalents, plus the remainder.
+  assert.ok(Math.abs(coordinator.state.carriedDebtTokens - 10_000_700) < 1e-3);
+  assert.equal(coordinator.state.retainedTokensAfterCompaction, 30000);
+});
+
+test('CompactCoordinator: prefix cache hits are measured per request, reset by a compaction, and survive resume', async () => {
+  const coordinator = new CompactCoordinator();
+  assert.equal(prefixCacheHitRate(coordinator.state), 1, 'no evidence prices every request as a hit');
+  coordinator.onAssistantUsage({ input: 50000 }); // session start: no reusable prefix yet
+  coordinator.onAssistantUsage({ input: 1000, cacheRead: 50000 });
+  coordinator.onAssistantUsage({ input: 52000, cacheRead: 0 }); // TTL miss on a 51000-token prefix
+  coordinator.onAssistantUsage(undefined);
+  coordinator.onAssistantUsage({ input: 0, cacheRead: 0 }); // errored request: measures nothing
+  assert.equal(coordinator.state.cachePrefixTokens, 101000);
+  assert.equal(coordinator.state.cacheReadTokens, 50000);
+  assert.equal(prefixCacheHitRate(coordinator.state), (50000 + CACHE_HIT_PRIOR_TOKENS) / (101000 + CACHE_HIT_PRIOR_TOKENS));
+
+  coordinator.selectedCompaction = economicDecision();
+  const mock = mockContext({});
+  const pi = fakePi();
+  const settle = coordinator.onAgentSettled({ ctx: mock.ctx, todos: [], pi: pi as unknown as ExtensionAPI, config: CONFIG });
+  mock.compactCalls[0]!.onComplete({ summary: 'ok' });
+  await settle;
+  assert.equal(coordinator.state.cacheDebtRepaymentTokens, economicDecision().savingTokensPerRequest);
+  // The first request after the summary is a cold rewrite the debt already prices, not a cache miss.
+  coordinator.onAssistantUsage({ input: 30000, cacheRead: 0 });
+  assert.equal(coordinator.state.cachePrefixTokens, 101000);
+  const restored = restoreCoordinatorState(pi.entries.map(([customType, data]) => ({ type: 'custom', customType, data })));
+  assert.equal(restored.cachePrefixTokens, 101000);
+  assert.equal(restored.cacheReadTokens, 50000);
+});
+
+test('CompactCoordinator: the retained floor from the previous compaction replaces the fixed-overhead estimate', () => {
+  const coordinator = new CompactCoordinator();
+  coordinator.state.retainedTokensAfterCompaction = 59000;
+  coordinator.state.currentBoundaryRequestCount = 10;
+  coordinator.pendingBoundaryCompleted = true;
+  const mock = mockContext({ tokens: 60000, branch: bigBranch() });
+  coordinator.onTurnEnd({ ctx: mock.ctx, todos: [{ content: 'Done', status: 'completed' }], config: CONFIG, pi: turnPi(), lastStopReason: null });
+  // Calibrated archive = 60000 − 59000 + 1000 = 2000 → saving 1000 → breakeven 60 > 10 visible
+  // requests. The fixedTokens/keepRecent estimate would have claimed ~39K saved and compacted.
+  assert.equal(mock.abortCalls(), 0);
+  assert.equal(coordinator.selectedCompaction, null);
+});
+
+test('debt ledger: repayment persists across resume and unpaid debt carries into the next compaction', async () => {
+  const coordinator = new CompactCoordinator();
+  coordinator.state.carriedDebtTokens = 500;
+  coordinator.state.cacheDebtRepaymentTokens = 100;
+  const pi = fakePi();
+  for (const tokens of [10000, 10500, 11000]) coordinator.onBeforeProviderRequest(tokens);
+  assert.equal(coordinator.state.carriedDebtTokens, 200);
+  // Persist the repayment: restore otherwise resurrects the marker's pre-repayment debt.
+  coordinator.onTurnEnd({ ctx: mockContext({}).ctx, todos: [], config: CONFIG, pi: pi as unknown as ExtensionAPI, lastStopReason: 'stop' });
+  const restored = restoreCoordinatorState(pi.entries.map(([customType, data]) => ({ type: 'custom', customType, data })));
+  assert.equal(restored.carriedDebtTokens, 200);
+  // The next compaction adds its real cost to the unpaid remainder instead of overwriting it.
+  coordinator.selectedCompaction = economicDecision();
+  const mock = mockContext({});
+  const settle = coordinator.onAgentSettled({ ctx: mock.ctx, todos: [], pi: pi as unknown as ExtensionAPI, config: CONFIG });
+  mock.compactCalls[0]!.onComplete({ summary: 'ok' });
+  await settle;
+  assert.equal(coordinator.state.carriedDebtTokens, 200 + 60000);
 });

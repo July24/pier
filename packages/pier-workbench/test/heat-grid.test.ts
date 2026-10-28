@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  ASK_WEIGHT, BLOCKED_WEIGHT, FOCUS_SHARE, FOCUS_SHARE_BLOCKED, RATIO_FLOOR, SLIM_THRESHOLD,
+  ASK_WEIGHT, BLOCKED_WEIGHT, FOCUS_SHARE, FOCUS_SHARE_BLOCKED, NON_AGENT_RATIO_FLOOR, RATIO_FLOOR, SLIM_THRESHOLD,
   applyHeatOps, countPanes, flattenPanes, paneAreaShares, planGridHeat, tierWeight, type LayoutNode,
 } from '../src/heat-layout.ts';
 import { planSpawnSplitRatio, simulateSplit, SPAWN_PLACEHOLDER_ID } from '../../pier-ext/src/plugins/heat-plan.ts';
@@ -109,6 +109,44 @@ test('D95 窄条衰减：非焦点 pane ≥ SLIM_THRESHOLD 时 idle/working 权�
   const s1 = paneAreaShares(applyHeatOps(slimTree(), slimmed.ops));
   const s2 = paneAreaShares(applyHeatOps(slimTree(), unslimmed.ops));
   assert.ok(s1.a < s2.a, `slim working a=${s1.a} 应小于未衰减 a=${s2.a}`);
+});
+
+test('非 agent pane 在混合拆分中保留最小份额（不落到 0.10 地板）', () => {
+  assert.equal(NON_AGENT_RATIO_FLOOR, 0.25);
+  // Sibling subtree: shell(idle 1) vs two blocked agents(3+3) → weight ratio 1/7 ≈ 0.14 without the floor.
+  const root = split('right', pane('agent'), split('down', pane('shell'), split('down', pane('b1'), pane('b2'))));
+  const p = planGridHeat({
+    root,
+    focusPaneId: 'agent',
+    paneCount: 4,
+    statuses: { agent: 'working', b1: 'blocked', b2: 'blocked' },
+  });
+  assert.ok(p.type === 'apply');
+  const shellSplit = p.ops.find((o) => o.path.length === 1 && o.path[0] === true);
+  assert.equal(shellSplit?.ratio, NON_AGENT_RATIO_FLOOR, 'the shell side is not compressed toward the 0.10 engine floor');
+  const shares = paneAreaShares(applyHeatOps(root, p.ops));
+  assert.ok(shares.shell! > 0.06, `shell share ${shares.shell} must stay readable`);
+
+  // Along the focus path at depth 2 the focus share would leave only 0.72^(1/2) → 15% for a shell-only sibling;
+  // the floor lifts the shell column to 25% of the tab.
+  const pathRoot = split('right', split('down', pane('a1'), pane('focus')), pane('shell'));
+  const pathPlan = planGridHeat({
+    root: pathRoot,
+    focusPaneId: 'focus',
+    paneCount: 3,
+    statuses: { a1: 'working', focus: 'working' },
+  });
+  assert.ok(pathPlan.type === 'apply');
+  assert.equal(pathPlan.ops.find((o) => o.path.length === 0)?.ratio, 1 - NON_AGENT_RATIO_FLOOR);
+  assert.ok(Math.abs(paneAreaShares(applyHeatOps(pathRoot, pathPlan.ops)).shell! - NON_AGENT_RATIO_FLOOR) < 1e-9);
+});
+
+test('agent 之间的拆分不受非 agent 地板影响', () => {
+  const root = split('down', pane('a'), pane('b'));
+  const p = planGridHeat({ root, focusPaneId: 'a', paneCount: 2, statuses: { a: 'blocked', b: 'working' } });
+  assert.ok(p.type === 'apply');
+  // Off-path sibling is a leaf; only the root op exists (focus first = FOCUS_SHARE).
+  assert.deepEqual(ratioOps(p.ops), [['', FOCUS_SHARE]]);
 });
 
 test('planSpawnSplitRatio 与 planGridHeat 新节点 op 锁步', () => {

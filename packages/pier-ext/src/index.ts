@@ -10,7 +10,6 @@
  * details persist in session JSONL and getBranch() replay implements branch rollback.
  */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
-import { Type } from 'typebox';
 import {
   ASK_PARAMETERS,
   ASK_PROMPT_GUIDELINES,
@@ -20,6 +19,7 @@ import {
   hasAskUi,
   noUiResult,
   prepareAsk,
+  prepareAskArguments,
   runAsk,
 } from './ask-user.ts';
 import { pipeNameFor, pipeRequest, startPipeServer } from './pipe-channel.ts';
@@ -42,7 +42,7 @@ import { parseRuntimeManifest } from './tool-gate.ts';
 import { formatPaneTitle } from './pane-title.ts';
 import { registerSlimFrame, updateSlimFrame } from './slim-frame.ts';
 import { applyRestoredWorkerMode, planIndexMode } from './index-runtime.ts';
-import { buildResumeArgv, emptySubagentPortBox, PROGRESS_CUSTOM_TYPE } from './subagent-core.ts';
+import { buildResumeArgv, emptySubagentPortBox, sleepWhileSubsRunningNote } from './subagent-core.ts';
 import { hasWorkerMarker, writeWorkerMarker, readWorkerMarker } from './worker-marker.ts';
 import {
   DELEGATION_CUSTOM_TYPE,
@@ -58,18 +58,16 @@ import { handlePipeRequest, type MachineRequest } from './index-pipe.ts';
 import { installWriteLocks } from './index-locks.ts';
 import { installDashboardCommand } from './dashboard-command.ts';
 import { openPierPanel } from './panel-open.ts';
-import { registerObservationPack, createCompactionBatchPackHook, type PickMiddleExcerpt } from './plugins/observation.ts';
+import { registerObservationPack, createCompactionBatchPackHook, type PickMiddleExcerpts } from './plugins/observation.ts';
 import { createJevRuntime } from './jev-client.ts';
 import {
   NOTICE_RANK_MIN_CONFIDENCE,
-  buildExcerptWindows,
   composeNoticeRanking,
   evaluateExcerptPick,
-  excerptAskIsSafe,
   excerptPickRequest,
   noticeRankRequest,
+  planExcerptAsks,
 } from './jev-core.ts';
-import { completeLineExcerpt } from './observation-core.ts';
 import { installConfigCommand } from './config-command.ts';
 import { CompactCoordinator } from './compact-coordinator.ts';
 import { handleReducerToolResult, type ToolResultEventLike } from './reducer-invoker.ts';
@@ -113,30 +111,37 @@ export default async function (pi: ExtensionAPI) {
   /* ── Jev decision layer (RFC docs/rfc-jev-integration.md): direct HTTP, total-budget
    * abort, fail-open at every site. Disabled or keyless → behavior identical to before. ── */
   const jevRuntime = createJevRuntime(() => effConfig.jev, { getSessionRoot: () => sessionRoot, getSessionId: () => sessionId || null });
-  /** P0-3: candidate windows are generated in code; jev only picks (rerank pattern). */
-  const pickMiddleExcerpt: PickMiddleExcerpt = async (text, excerptBudgetBytes) => {
-    if (!jevRuntime.available) return null;
-    const halfBudget = Math.floor(excerptBudgetBytes / 2);
-    const windows = buildExcerptWindows(text, halfBudget);
-    if (windows.length === 0) return null; // degenerate budget only
-    const headExcerpt = completeLineExcerpt(text, halfBudget, false);
-    const tailExcerpt = completeLineExcerpt(text, excerptBudgetBytes - halfBudget, true);
-    // Credential-shaped text never leaves the process (§8 privacy boundary).
-    if (!excerptAskIsSafe(windows, headExcerpt, tailExcerpt)) return null;
-    const request = excerptPickRequest(windows, headExcerpt, tailExcerpt);
-    if (!request) return null;
+  /** P0-3: candidate windows are generated in code; jev only picks (rerank pattern), one request per batch. */
+  const pickMiddleExcerpts: PickMiddleExcerpts = async (items, excerptBudgetBytes) => {
+    const picks: Array<{ text: string; label: string } | null> = items.map(() => null);
+    if (!jevRuntime.available) return picks;
+    const asked = planExcerptAsks(items, excerptBudgetBytes);
+    const request = excerptPickRequest(asked);
+    if (!request) return picks;
     const result = await jevRuntime.ask(request, {
       questionId: 'obs-excerpt-window',
-      extra: { site: 'obs-excerpt', candidates: windows.map((w) => w.id) },
+      extra: {
+        site: 'obs-excerpt',
+        items: asked.map((a) => ({ obsId: a.obsId, windows: a.windows.map((w) => ({ id: w.id, startLine: w.startLine })) })),
+      },
       enrich: ({ answers }) => {
-        if (!answers || answers.window === undefined || answers.window.type !== 'choice') return {};
-        return { picked: answers.window.choice, confidence: answers.window.confidence };
+        if (!answers) return {};
+        return {
+          picked: asked.map((_, i) => {
+            const answer = answers[`excerpt_${i}_window`];
+            return answer?.type === 'choice' ? { choice: answer.choice, confidence: answer.confidence } : null;
+          }),
+        };
       },
     });
-    if (!result.ok) return null;
-    const picked = evaluateExcerptPick(result.answers, effConfig.jev.minConfidence);
-    const window = picked === null ? undefined : windows.find((w) => w.id === picked);
-    return window ? { text: window.text, label: window.label } : null;
+    if (!result.ok) return picks;
+    for (let i = 0; i < asked.length; i++) {
+      const { index, windows } = asked[i]!;
+      const picked = evaluateExcerptPick(result.answers, i, effConfig.jev.minConfidence);
+      const window = picked === null ? undefined : windows.find((w) => w.id === picked);
+      if (window) picks[index] = { text: window.text, label: window.label };
+    }
+    return picks;
   };
 
   const rendererTypes = installRenderers(pi);
@@ -290,6 +295,8 @@ export default async function (pi: ExtensionAPI) {
         }
         todos.applyEdits(plan.edits, { source: 'reconcile' });
         mirrorTodos();
+        // Reconcile is not a tool call, so nothing else refreshes the resident widget after an edit.
+        todoUi.rerenderWidget?.();
       }
       return plan.noteLines;
     } catch {
@@ -353,6 +360,18 @@ export default async function (pi: ExtensionAPI) {
     });
   });
 
+  /* ── Masters sleep-polled background workers (sleep 120…840) instead of trusting the settlement notice. ── */
+  if (!isSubagent) {
+    pi.on('tool_result', async (event: unknown) => {
+      const rec = (event ?? {}) as { toolName?: unknown; input?: { command?: unknown }; content?: unknown };
+      if (rec.toolName !== 'bash' || typeof rec.input?.command !== 'string') return;
+      const note = sleepWhileSubsRunningNote(rec.input.command, subagentPort.current?.listRunningSubs() ?? []);
+      if (!note) return;
+      const content = Array.isArray(rec.content) ? rec.content as Array<{ type: 'text'; text: string }> : [];
+      return { content: [...content, { type: 'text' as const, text: note }] };
+    });
+  }
+
   let locksHandle = { getHeldLocks: () => [] as readonly string[] };
   if (env) {
     locksHandle = installWriteLocks(pi, { client, env, hard: process.env[WRITE_LOCK_ENV] === '1' });
@@ -365,19 +384,11 @@ export default async function (pi: ExtensionAPI) {
     return Promise.resolve();
   };
 
-  /** Phase 2 (RFC rfc-delegation-identity §3.2): a worker's progress note enters master context as
-   * a display-less custom message — no turn, no visible chat line; renderers.ts gives it a card. */
-  const deliverProgress = (workerPaneId: string, text: string): Promise<void> => {
-    (pi as unknown as {
-      sendMessage?: (msg: { customType: string; content: string; display: boolean; details?: Record<string, unknown> }, opts?: { triggerTurn?: boolean }) => void;
-    }).sendMessage?.(
-      { customType: PROGRESS_CUSTOM_TYPE, content: text.slice(0, 2000), display: false, details: { paneId: workerPaneId } },
-      { triggerTurn: false },
-    );
-    return Promise.resolve();
-  };
   const notices = createNoticeBuffer({
-    isBusy: () => agentActive || lastStopReason === ABORT_STOP_REASON,
+    // pi core rejects prompts while it is compacting (and drops fire-and-forget sends), so a
+    // settlement landing inside the compaction window must stay buffered until the continuation
+    // run settles — otherwise the result is lost with nobody left to retry it.
+    isBusy: () => agentActive || lastStopReason === ABORT_STOP_REASON || coordinator.compactionInFlight,
     send: sendUserMessageAs,
     // P0-2: rank collapsed batches by relevance to the master's in-progress work.
     rank: async (contents) => {
@@ -443,7 +454,6 @@ export default async function (pi: ExtensionAPI) {
         abort: () => { latestCtx?.abort?.(); },
         setPendingMachineRequest: (next) => { pendingMachineRequest = next; },
         applyRoleSwitch: roles.applyRoleSwitch,
-        deliverProgress,
         applyWorkerTodos,
       }));
     } catch {
@@ -589,6 +599,9 @@ export default async function (pi: ExtensionAPI) {
     // Safety fallback: pi core prohibits prompts while compaction is active.
     coordinator.compactionInFlight = false;
     coordinator.intentionalAbort = false;
+    // A selection that never became startable must not latch every later decision (and the
+    // settle-wake hold) until the next human input.
+    coordinator.selectedCompaction = null;
     gates.report('working', currentActivity(todos.items));
   });
 
@@ -612,15 +625,20 @@ export default async function (pi: ExtensionAPI) {
     // flush ran regardless. The merged handler keeps both semantics.
     const msg = event !== null && typeof event === 'object' && 'message' in event ? (event as { message: unknown }).message : null;
     if (msg !== null && typeof msg === 'object') {
-      const { role, stopReason } = msg as { role?: unknown; stopReason?: unknown };
+      const { role, stopReason, usage } = msg as { role?: unknown; stopReason?: unknown; usage?: unknown };
       if (role === 'assistant' && typeof stopReason === 'string') {
         lastStopReason = stopReason;
+      }
+      if (role === 'assistant' && usage !== null && typeof usage === 'object') {
+        coordinator.onAssistantUsage(usage as { input?: number; cacheRead?: number; cacheWrite?: number });
       }
       if (ctx && typeof ctx === 'object') {
         coordinator.onTurnEnd({
           ctx,
           todos: todos.items,
           config: effConfig.onlineContextCompact,
+          pi,
+          lastStopReason: typeof stopReason === 'string' ? stopReason : null,
           cancelReminder: todoUi.cancelReminder,
         });
       }
@@ -654,6 +672,13 @@ export default async function (pi: ExtensionAPI) {
       void sendUserMessageAs(notice, 'followUp');
     }
     if (plan.compact && ctx && typeof ctx === 'object') {
+      // Settlement notices that land inside the compaction window stay buffered (isBusy includes
+      // compactionInFlight). The continuation run flushes them at its own agent_settled; a cancelled
+      // or rejected compaction sends no continuation, so release the buffer once the coordinator is
+      // done and no run has started.
+      const flushAfterCompaction = (): void => {
+        if (!coordinator.compactionInFlight && !agentActive) void notices.flush('followUp');
+      };
       void coordinator.onAgentSettled({
         ctx,
         todos: todos.items,
@@ -664,9 +689,9 @@ export default async function (pi: ExtensionAPI) {
           getObsConfig: () => effConfig.observationPack,
           getManifest: () => roles.state.manifest,
           getSessionId: () => sessionId,
-          pickMiddleExcerpt,
+          pickMiddleExcerpts,
         }),
-      });
+      }).then(flushAfterCompaction, flushAfterCompaction);
     }
     if (lastStopReason !== ABORT_STOP_REASON && !aborted) void notices.flush('followUp');
     void pushSettleReply(aborted);
@@ -677,7 +702,7 @@ export default async function (pi: ExtensionAPI) {
     pi,
     getConfig: () => effConfig,
     getRuntimeManifest: () => roles.state.manifest,
-    pickMiddleExcerpt,
+    pickMiddleExcerpts,
     getRemainingHorizon: () => {
       const usage = (latestCtx as { getContextUsage?: () => { contextWindow?: number } })?.getContextUsage?.();
       return coordinator.getRemainingHorizon(3, usage?.contextWindow ?? null);
@@ -701,6 +726,8 @@ export default async function (pi: ExtensionAPI) {
     description: ASK_TOOL_DESCRIPTION,
     promptGuidelines: ASK_PROMPT_GUIDELINES,
     parameters: ASK_PARAMETERS,
+    // Models sometimes send options/questions as a JSON string; repair them before pi validates.
+    prepareArguments: prepareAskArguments,
     async execute(_tc, params, signal, _upd, ctx) {
       const prepared = prepareAsk(params);
       if (!prepared.ok) return prepared.result;
@@ -716,49 +743,6 @@ export default async function (pi: ExtensionAPI) {
       }
     },
   });
-
-  /* ── report_progress (Phase 2, RFC rfc-delegation-identity §3.2): worker → master checkpoint ── */
-  if (isSubagent) {
-    pi.registerTool({
-      name: 'report_progress',
-      label: 'Report Progress',
-      description:
-        'Send the delegating master a short progress update without finishing the task. Use at meaningful checkpoints (a module done, a test went green, a blocker found) — the master sees it in its context but is not interrupted.',
-      promptSnippet: 'report_progress: mid-task checkpoint to the delegating master (does not end the task).',
-      promptGuidelines: [
-        'Call at meaningful checkpoints only — a milestone reached, a risk discovered, a decision the master should know early — not after every tool call.',
-        'One or two sentences per call; the final answer still goes in your normal closing message when the task finishes.',
-      ],
-      parameters: Type.Object({
-        message: Type.String({ description: 'Short checkpoint update for the delegating master.' }),
-      }),
-      async execute(_tc, params) {
-        const parentPipe = delegation?.parentPipe;
-        const message = typeof (params as { message?: unknown })?.message === 'string'
-          ? (params as { message: string }).message.trim()
-          : '';
-        if (!message) {
-          return { content: [{ type: 'text', text: 'Error: `message` is required (one or two sentences).' }], details: {} };
-        }
-        if (!parentPipe) {
-          return { content: [{ type: 'text', text: 'Error: no delegating master pipe is known to this session; progress cannot be delivered.' }], details: {} };
-        }
-        try {
-          const res = await pipeRequest(parentPipe, {
-            type: 'progress',
-            id: `prog-${Date.now()}`,
-            paneId: env?.paneId ?? '',
-            text: message,
-          }, 5000);
-          return res.type === 'ok'
-            ? { content: [{ type: 'text', text: 'Progress delivered to the master (visible in its context, no interruption).' }], details: {} }
-            : { content: [{ type: 'text', text: `Error: master rejected progress report: ${res.message}` }], details: {} };
-        } catch (err) {
-          return { content: [{ type: 'text', text: `Error: could not reach the master pipe: ${(err as Error)?.message ?? err}` }], details: {} };
-        }
-      },
-    });
-  }
 
   pi.on('session_shutdown', async () => {
     coordinator.compactionInFlight = false;

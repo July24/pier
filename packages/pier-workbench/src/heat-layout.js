@@ -9,6 +9,10 @@ export const PANE_MIN_AGE_MS = 3000;
 export const REFLOW_DEBOUNCE_MS = 150;
 /** Herdr engine silent ratio clamp lower bound (0.8.2 set_ratio_at clamps to [0.1, 0.9]). */
 export const RATIO_FLOOR = 0.10;
+/** A split that mixes agent panes with agent-less panes (plain shells, no reported agent status)
+ *  keeps the shell side at least this wide/down share: a 0.10 shell column cannot show command
+ *  output, and the heat planner only exists to rank agent attention. */
+export const NON_AGENT_RATIO_FLOOR = 0.25;
 /** Target area share of the focused pane (whole tab), split geometrically along the path at T^(1/depth) per level to avoid deep compounding shrinkage. */
 export const FOCUS_SHARE = 0.72;
 /** Focused pane yields share (0.72 -> 0.60) when blocked panes exist outside the focus. */
@@ -105,13 +109,28 @@ function clampRatio(r) {
 function weightOf(node, statuses, askFlags, slim) {
     return flattenPanes(node).reduce((sum, id) => sum + tierWeight(statuses[id], askFlags[id] === true, slim), 0);
 }
+/** A pane is an agent pane only when the snapshot reports a real status; missing or `unknown`
+ *  marks a plain shell (terminal panes), which must stay usable in mixed splits. */
+function hasAgentPanes(node, statuses) {
+    return flattenPanes(node).some((id) => statuses[id] !== undefined && statuses[id] !== 'unknown');
+}
+/** Clamp a first-share ratio for `node`, keeping a shell-only side at NON_AGENT_RATIO_FLOOR. */
+function splitRatio(node, ratio, statuses) {
+    const firstAgent = hasAgentPanes(node.first, statuses);
+    const secondAgent = hasAgentPanes(node.second, statuses);
+    if (firstAgent && !secondAgent)
+        ratio = Math.min(ratio, 1 - NON_AGENT_RATIO_FLOOR);
+    else if (!firstAgent && secondAgent)
+        ratio = Math.max(ratio, NON_AGENT_RATIO_FLOOR);
+    return clampRatio(ratio);
+}
 /** Inside sibling subtrees: each split divides share by first/second weight ratio (ratio = first share). */
 function weightedEqualize(node, path, statuses, askFlags, slim, ops) {
     if (node.type === 'pane')
         return;
     const wFirst = weightOf(node.first, statuses, askFlags, slim);
     const wSecond = weightOf(node.second, statuses, askFlags, slim);
-    ops.push({ kind: 'ratio', path, ratio: clampRatio(wFirst / (wFirst + wSecond)) });
+    ops.push({ kind: 'ratio', path, ratio: splitRatio(node, wFirst / (wFirst + wSecond), statuses) });
     weightedEqualize(node.first, [...path, false], statuses, askFlags, slim, ops);
     weightedEqualize(node.second, [...path, true], statuses, askFlags, slim, ops);
 }
@@ -149,7 +168,7 @@ export function planGridHeat(opts) {
     const ops = steps.map((step, i) => ({
         kind: 'ratio',
         path: onPathPaths[i],
-        ratio: step.side === 'first' ? r : 1 - r,
+        ratio: splitRatio(step.node, step.side === 'first' ? r : 1 - r, statuses),
     }));
     for (const sibling of offPath) {
         weightedEqualize(sibling.node, sibling.path, statuses, askFlags, slim, ops);

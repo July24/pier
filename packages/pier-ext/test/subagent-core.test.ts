@@ -7,13 +7,40 @@ import { mountSubagent, runSubagent, subEntry } from './test-utils.ts';
 import {
   FOREGROUND_POLL_MS, SUBS_CUSTOM_TYPE, TAB_NAME_MAX, Semaphore, agoText, buildAliveNotice, buildBlockedGateNotice,
   allocateSubSlug, slugifyTask, subRef,
-  attachSubagentStructuredContent, buildLaunchLine, buildLaunchParts, buildResumeArgv, classifyWorktreeZone, foldSubsRegistry, formatSubagentResult, isAlive,
+  attachSubagentStructuredContent, buildLaunchLine, buildLaunchParts, buildResumeArgv, classifyWorktreeZone, foldSubsRegistry, formatIsolateLocation, formatSubagentResult, isAlive,
   makeProgressUpdate, nextTaskTabName, rekeySub, planForegroundTick, planLaunchValidation, planShellReady, planTabPlacement, resolveTaskIdPrefix, shellProcessName,
-  flattenToolParams, idParam, tabNameForTask, type AliveProbe, type SubEntry,
+  flattenToolParams, idParam, sleepWhileSubsRunningNote, tabNameForTask, type AliveProbe, type SubEntry,
 } from '../src/subagent-core.ts';
 import { planReadyAttempt, readyBackoffMs, readyFailureText } from '../src/subagent-spawn.ts';
 
 const RT = { nodePath: '/usr/local/bin/node', cliPath: '/opt/pi/dist/cli.js', extPath: '/ext/index.ts' };
+
+/** [case, command, running workers, note expected] */
+const SLEEP_NOTE_CASES: Array<[string, string, number, boolean]> = [
+  ['a long sleep while a worker runs', 'sleep 120; echo waited', 1, true],
+  ['the longest of several sleeps counts', 'sleep 5 && make && sleep 300', 1, true],
+  ['an `s` suffix is still seconds', 'cd x && sleep 90s; tail log', 2, true],
+  ['exactly the threshold', 'sleep 60', 1, true],
+  ['a short poll is left alone', 'sleep 30; tail -5 build.log', 1, false],
+  ['no background worker → no note', 'sleep 840', 0, false],
+  ['a minute suffix is not misread as seconds', 'sleep 2m', 1, false],
+  ['a word containing sleep is not a sleep', 'grep nosleep 600 x', 1, false],
+];
+
+test('sleepWhileSubsRunningNote: long sleeps while background workers run get the auto-notice reminder', () => {
+  for (const [name, command, workers, expected] of SLEEP_NOTE_CASES) {
+    const running = Array.from({ length: workers }, (_, i) => ({ paneId: `p${i}`, slug: `task-${i}` }));
+    const note = sleepWhileSubsRunningNote(command, running);
+    assert.equal(note !== null, expected, name);
+    if (note) assert.ok(note.includes('task-0@p0') && /arrives automatically/.test(note), name);
+  }
+});
+
+test('foldSubsRegistry: a persisted report delivery survives the fold; a malformed one is dropped', () => {
+  const row = (reportDelivered: unknown) => ({ type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { subs: [{ paneId: 'p1', reportDelivered }] } });
+  assert.deepEqual(foldSubsRegistry([row({ fingerprint: 'tail', at: 5 })]).subs[0]!.reportDelivered, { fingerprint: 'tail', at: 5 });
+  assert.equal(foldSubsRegistry([row({ fingerprint: 3 })]).subs[0]!.reportDelivered, undefined);
+});
 
 test('planShellReady: only a shell foreground means a fresh pane can take the launch line', () => {
   assert.equal(shellProcessName('/bin/zsh'), 'zsh');
@@ -220,6 +247,15 @@ test('formatSubagentResult: five outcomes', () => {
   assert.match(formatSubagentResult({ kind: 'spawn-failed', text: 'boom' }, 't'), /boom/);
 });
 
+test('formatIsolateLocation: gives the absolute worktree path, empty for a shared checkout', () => {
+  assert.equal(formatIsolateLocation(null), '');
+  assert.equal(formatIsolateLocation(undefined), '');
+  assert.equal(
+    formatIsolateLocation({ worktreePath: '/Users/dev/.herdr/worktrees/apnv3-backend/pier-implement-20680', branch: 'pier/implement-20680' }),
+    '\nWorktree: /Users/dev/.herdr/worktrees/apnv3-backend/pier-implement-20680 (branch pier/implement-20680)',
+  );
+});
+
 const NOW = 1_800_000_000_000;
 const probe = (over: Partial<AliveProbe>): AliveProbe => ({ paneExists: true, agentStatus: null, lastActivityMs: null, ...over });
 
@@ -250,6 +286,8 @@ test('buildAliveNotice: backgrounded pane — do not redo the work, a notice wil
   assert.match(text, /last session activity 12s ago/);
   assert.match(text, /Do NOT redo its work/);
   assert.match(text, /moved it to background/i);
+  assert.match(text, /next turn boundary/);
+  assert.match(text, /do NOT sleep or poll/i);
   assert.match(text, /subagent\(action: "list"\)/);
 });
 
@@ -467,15 +505,13 @@ test('subagent plugin: tool_result hook only rewrites our errors, and stays sile
   await root.fiber.dispose();
 });
 
-test('subagent plugin: prompt surface is present and a missing action normalizes to spawn', async () => {
+test('subagent plugin: help returns the manual, and a missing action normalizes to spawn', async () => {
   const { root, pi } = await mountSubagent();
   const def = pi.tools.get('subagent')!;
-  assert.match(String(def.promptSnippet ?? ''), /subagent/);
-  assert.ok((def.promptGuidelines?.length ?? 0) >= 4);
-  const guidelines = (def.promptGuidelines ?? []).join(' ');
-  assert.match(guidelines, /run_in_background/);
-  assert.match(guidelines, /isolate/);
-  assert.match(guidelines, /action: "send"/);
+  const help = await runSubagent(pi, { action: 'help' });
+  assert.match(help.content[0]!.text, /^subagent manual/);
+  for (const topic of ['isolate', 'role + allowed_tools', 'resume', 'history.jsonl']) assert.ok(help.content[0]!.text.includes(topic), topic);
+  assert.equal(String(def.description).includes('history.jsonl'), false, 'ledger detail rides help, not every request');
   assert.deepEqual(def.prepareArguments?.({ description: 'x', prompt: 'y' }), { description: 'x', prompt: 'y', action: 'spawn' });
   assert.deepEqual(def.prepareArguments?.({ action: 'list' }), { action: 'list' });
   assert.deepEqual(def.prepareArguments?.(undefined), { action: 'spawn' });
@@ -500,6 +536,33 @@ test('subagent plugin: list shows live state, activity and a foreign cwd only wh
     const lines = (await runSubagent(pi, { action: 'list' })).content[0]!.text.split('\n');
     assert.equal(lines[0], 'p-1 [running working] (task) [cwd: sub] Worker 1');
     assert.equal(lines[1], 'p-2 [running working] (task) Worker 2', 'no cwd tag when the foreground cwd is the worker cwd');
+  } finally {
+    await root.fiber.dispose();
+  }
+});
+
+test('subagent plugin: list prints the isolate worktree path, not the branch', async () => {
+  const isolate = {
+    worktreePath: '/Users/dev/.herdr/worktrees/apnv3-backend/pier-implement-20680',
+    branch: 'pier/implement-20680',
+    baseSha: 'abc1234',
+    releasedAt: null,
+    retainNotified: false,
+  };
+  const { root, pi } = await mountSubagent({
+    client: {
+      available: false,
+      listPanes: async () => [{ paneId: 'wA:p5D', tabId: 't-1', workspaceId: 'w1', agentStatus: 'idle' }],
+    },
+    subs: [subEntry({
+      paneId: 'wA:p5D', taskId: 'task-iso', tabId: 't-1', tabName: 'pier-implement-20680',
+      cwd: isolate.worktreePath, description: 'implement 20680', createdAt: 1, isolate,
+    })],
+  });
+  try {
+    const text = (await runSubagent(pi, { action: 'list' })).content[0]!.text;
+    assert.match(text, /\[wt: \/Users\/dev\/\.herdr\/worktrees\/apnv3-backend\/pier-implement-20680\]/);
+    assert.ok(!text.includes('[wt: pier/implement-20680]'), 'a branch is not a directory the master can enter');
   } finally {
     await root.fiber.dispose();
   }

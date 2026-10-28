@@ -15,7 +15,7 @@ import { makeProgressUpdate } from '../subagent-core.ts';
 import { TODO_DETAILS_KEY, TODO_STATUSES, TODO_TOOL_NAME, formatTodoConfirmation, type TodoItem } from '../vocab.ts';
 import { toolError } from '../tool-error.ts';
 import { formatAge, isArchived } from '../stale-core.ts';
-import { TODO_EDIT_CUSTOM_TYPE, completionTransitions, fuzzyFind, listsEqual, makeSnapshot, normalizeStrict, revertedCompleted, validateTodos, type TodoEditOp } from '../todo-core.ts';
+import { TODO_ARCHIVE_WINDOW_CUSTOM_TYPE, TODO_EDIT_CUSTOM_TYPE, completionTransitions, fuzzyFind, listsEqual, makeSnapshot, normalizeStrict, revertedCompleted, todoListHash, validateTodos, type TodoEditOp } from '../todo-core.ts';
 import { formatTodoSummary, renderTodoGroups } from '../todo-window.ts';
 import { unifiedWidgetLines, type WorkerWidgetRow } from '../tree-view.ts';
 import { swallow } from '../swallow.ts';
@@ -52,13 +52,10 @@ export interface TodoDeps {
 }
 
 const TOOL_DESCRIPTION = [
-  'Record and update the complete task list for the current work. Every call REPLACES the entire list (last write wins), so always resend the full list.',
-  'Entries: `content` (non-empty, unique; short imperative, what-not-how; no numbering prefixes), `status` (pending | in_progress | completed | blocked | abandoned), optional `blocker` (only when blocked: what it is waiting for), optional `phase` (group name for multi-stage plans; omit for a flat list).',
-  'Keep the list short (at most 15 entries): one entry per meaningful unit of work, not per micro-step.',
-  'Mark tasks you are actively working on as in_progress; several may be in_progress when work genuinely runs in parallel.',
-  'Before stopping, reconcile open entries: anything waiting on a human (decision, approval, or an ops action you cannot perform) must be marked blocked with a blocker note — never left pending, and never executed just to clear the list; finished or obsolete entries must be completed or removed.',
-  'Do not make todo_write the only tool call of a turn — batch it together with real work.',
-  'Delegated work belongs on this list too. When you hand an entry to a subagent, append ` <sub>` to its content (the subagent is doing it, not you); when the subagent settles, a matching entry is auto-completed — you will see "Reconciled:" in the settlement note. If no auto-match fired, update the entry yourself.',
+  'Record the complete task list for the current work. Every call REPLACES the whole list, so always resend it in full.',
+  'Entries: `content` (unique short imperative, no numbering), `status`, `blocker` (only when blocked: what it waits for), optional `phase` (group for a multi-stage plan). At most 15 entries, one per meaningful unit of work; several may be in_progress when work truly runs in parallel.',
+  'Do not make todo_write the only tool call of a turn — batch it with real work.',
+  'When you hand an entry to a subagent, append ` <sub>` to its content; it auto-completes when the subagent settles ("Reconciled:" in the note), otherwise update it yourself.',
 ].join(' ');
 
 
@@ -126,7 +123,7 @@ export default function todoPlugin(ctx: Context): void {
     staleNotices = 0;
   });
 
-  scoped.on('before_agent_start', async (eventCtx?: unknown) => {
+  scoped.on('before_agent_start', async (eventCtx?: unknown, ctx?: unknown) => {
     // pi 1.2+ also fires this for extension-triggered runs; skip the ones that would double-inject
     // or consume the guard cadence (stop reminder, config guide, third-party custom runs).
     if (!shouldRunTodoRead(eventCtx)) return;
@@ -139,12 +136,28 @@ export default function todoPlugin(ctx: Context): void {
       now: Date.now(),
       staleNotices,
       lastStaleGuardTurn,
+      archiveWindowOffered: todos.archiveWindowOffered,
     });
     if (plan.inject && plan.effect === 'stale-notice') {
       staleNotices += 1;
       lastStaleGuardTurn = todoReadTurn;
     }
-    // Empty, archive, and R2 rewrite notices share one cadence so adjacent notices do not each consume the grace window.
+    // Persist the one-window offer against this list identity: the plugin closure dies with the
+    // process, and on /resume the same dead list must reach the terminal clear instead of re-warning.
+    if (plan.inject && plan.offerArchiveWindow) {
+      try {
+        appendEntry(TODO_ARCHIVE_WINDOW_CUSTOM_TYPE, {
+          version: 1,
+          itemsHash: todoListHash(todos.items),
+        });
+      } catch (err) {
+        // The in-memory mark still advances escalation in this process.
+        swallow('todo.persist-archive-window', err);
+      }
+      todos.markArchiveWindowOffered();
+    }
+    // Empty-list guards and the archive rewrite window share one cadence so adjacent notices do not
+    // each consume the grace window; the terminal clear is immediate and only marks the tick.
     if (plan.inject && (plan.effect === 'empty-guard' || plan.archived)) {
       lastEmptyGuardTurn = todoReadTurn;
     }
@@ -159,6 +172,11 @@ export default function todoPlugin(ctx: Context): void {
         swallow('todo.persist-archive', err);
       }
       todos.replace([], { source: 'archive' });
+      // The clear is the one todo mutation outside the tool/human paths that must refresh the
+      // title, sidebar token and widget; the dead list would otherwise stay authoritative. The hook's
+      // first argument is the event (no ui), so render through the run ctx; tests pass a ui ctx first.
+      mirrorTodos();
+      renderWidget(ctx ?? eventCtx);
     }
     todoReadTurn += 1;
     if (!plan.inject) return;
@@ -194,11 +212,18 @@ export default function todoPlugin(ctx: Context): void {
       const { role, stopReason } = msg as { role?: unknown; stopReason?: unknown };
       if (role === 'assistant' && typeof stopReason === 'string') lastAssistantStopReason = stopReason;
     });
-    for (const ev of ['agent_start', 'session_shutdown']) scoped.on(ev, () => cancelTodoReminder());
-    scoped.on('agent_settled', async () => {
+    // A retry starts a fresh turn, not necessarily a fresh agent_start: cancel the pending reminder
+    // there too so a provider-error retry cannot be interrupted by a stale 30 s timer.
+    for (const ev of ['agent_start', 'turn_start', 'session_shutdown']) scoped.on(ev, () => cancelTodoReminder());
+    scoped.on('agent_settled', async (event: unknown) => {
       cancelTodoReminder();
+      // pi ≥ 1.1 carries `aborted` on agent_settled: authoritative for ESC mid-tool, where stopReason
+      // tracking sees a stale natural reason and would still schedule a reminder.
+      const aborted = event !== null && typeof event === 'object'
+        && 'aborted' in event && event.aborted === true;
       const plan = planStopTodoReminder({
         lastStopReason: lastAssistantStopReason,
+        aborted,
         intentionalAbort: stopReminder.isIntentionalAbort?.() ?? false,
         compactionInFlight: stopReminder.isCompactionInFlight?.() ?? false,
         reminders: todoReminders,
@@ -236,23 +261,20 @@ export default function todoPlugin(ctx: Context): void {
     label: 'Todo',
     description: TOOL_DESCRIPTION,
     promptGuidelines: [
-      'Before stopping with open todo_write entries, reconcile them: entries waiting on a human decision, approval, or ops action must be marked blocked with a blocker note — never left pending, and never executed just to clear the list.',
+      'Before stopping, reconcile open entries: anything waiting on a human (decision, approval, an ops action you cannot perform) is marked blocked with a blocker note — never left pending, never executed just to clear the list; finished or obsolete entries are completed or removed.',
     ],
     parameters: Type.Object({
       todos: Type.Array(
         Type.Object(
           {
-            content: Type.String({ description: 'What the task is — a short imperative line' }),
-            status: Type.Union(
-              TODO_STATUSES.map((status) => Type.Literal(status)),
-              { description: TODO_STATUSES.join(' | ') },
-            ),
-            blocker: Type.Optional(Type.String({ description: 'Only when status is "blocked": what it is waiting for. Omit the field entirely (never an empty string) for other statuses' })),
-            phase: Type.Optional(Type.String({ description: 'Optional group name (≤30 chars); omit for a flat list (never an empty string)' })),
+            content: Type.String({ description: 'Short imperative line' }),
+            status: Type.Union(TODO_STATUSES.map((status) => Type.Literal(status))),
+            blocker: Type.Optional(Type.String({ description: 'Only for blocked; omit otherwise (never an empty string)' })),
+            phase: Type.Optional(Type.String({ description: 'Group name (≤30 chars); omit for a flat list' })),
           },
           { additionalProperties: false },
         ),
-        { description: 'The COMPLETE task list; this call replaces the previous list' },
+        { description: 'The COMPLETE list; replaces the previous one' },
       ),
     }),
     async execute(toolCallId: string, params: ToolParams, signal: AbortSignal | undefined, onUpdate: ((update: unknown) => void) | undefined, eventCtx: unknown) {

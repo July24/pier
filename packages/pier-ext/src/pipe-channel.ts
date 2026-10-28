@@ -59,14 +59,6 @@ export type PipeRequest =
       role: string;
     }
   | {
-      /** Phase 2 (RFC rfc-delegation-identity §3.2): worker → master progress report. The master
-       * injects it as a display-less custom message (no turn, no visible chat noise). */
-      type: 'progress';
-      id: string;
-      paneId: string;
-      text: string;
-    }
-  | {
       /** D113 (RFC rfc-unified-widget): worker → master full todo push on every todo_write, so the
        * master's resident widget and /pier-tree render live worker state without polling herdr. */
       type: 'todo_sync';

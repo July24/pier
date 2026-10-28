@@ -55,6 +55,37 @@ test('readStoredObjectChunk: next_offset is an absolute file offset, not the win
   assert.equal(last.eof, true);
 }));
 
+test('readStoredObjectChunk: a mid-line offset aligns to the next line start and reports it', withCleanup(async (cleanup) => {
+  const filePath = join(cleanup.tempDir('align').path, 'objects', 'aligned.txt');
+  const content = 'alpha line\nbeta line\ngamma line\n';
+  await storeContentAddressedObject(filePath, content);
+
+  // 3 bytes into "beta line": the page must open on "gamma line", and the header offset says so.
+  const mid = await readStoredObjectChunk(filePath, 14, { maxBytes: 1024, maxLines: 10 });
+  assert.equal(mid.offset, content.indexOf('gamma'));
+  assert.equal(mid.text, 'gamma line\n');
+  assert.equal(mid.nextOffset, content.length);
+  assert.equal(mid.eof, true);
+
+  // An offset already on a boundary is left alone.
+  const boundary = await readStoredObjectChunk(filePath, content.indexOf('beta'), { maxBytes: 1024, maxLines: 10 });
+  assert.equal(boundary.offset, content.indexOf('beta'));
+  assert.equal(boundary.text, 'beta line\ngamma line\n');
+
+  // Byte-capped pages end on a line boundary: paging never skips the tail of a cut line.
+  let paged = '';
+  let offset = 0;
+  for (;;) {
+    const page = await readStoredObjectChunk(filePath, offset, { maxBytes: 15, maxLines: 10 });
+    assert.equal(page.offset, offset, 'each page starts where the previous one ended');
+    assert.ok(page.text.endsWith('\n'));
+    paged += page.text;
+    if (page.eof) break;
+    offset = page.nextOffset;
+  }
+  assert.equal(paged, content);
+}));
+
 test('appendEfficiencyLog: appends newline-delimited JSON', withCleanup(async (cleanup) => {
   const logPath = join(cleanup.tempDir('log').path, 'logs', 'test.jsonl');
   await appendEfficiencyLog(logPath, { event: 'step_1', val: 100 }); await appendEfficiencyLog(logPath, { event: 'step_2', val: 200 });

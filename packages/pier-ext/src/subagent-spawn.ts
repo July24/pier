@@ -27,6 +27,7 @@ import {
   buildLaunchLine,
   buildLaunchParts,
   classifyWorktreeZone,
+  formatIsolateLocation,
   formatSubagentResult,
   formatWorktreeStat,
   isAlive,
@@ -592,7 +593,7 @@ export function createSpawnAction(h: SpawnActionHost) {
       delegationEnvPatch = delegationEnv({
         parentPaneId: env?.paneId ?? '',
         parentSessionId: bareSessionId(h.getSessionId()),
-        // Phase 2: the master's own pipe so the worker's report_progress can dial home (D49).
+        // The master's own pipe so the worker's todo_sync push can dial home (D49).
         parentPipe: pipeNameFor(masterCwd, env?.paneId ?? ''),
         taskId,
         description: spec.description,
@@ -733,7 +734,7 @@ export function createSpawnAction(h: SpawnActionHost) {
       if (background) {
         handToPoller(`prompt-${taskId}`);
         return {
-          content: [{ type: 'text', text: `started subagent ${subRef(entry)} (task ${taskId})` }],
+          content: [{ type: 'text', text: `started subagent ${subRef(entry)} (task ${taskId})${formatIsolateLocation(isolateMeta)}` }],
           details: { paneId, taskId, background: true, role: kind, slug },
         };
       }
@@ -752,7 +753,7 @@ export function createSpawnAction(h: SpawnActionHost) {
           const question = await readAskFlag(paneId);
           handToPoller(`prompt-${taskId}`);
           return {
-            content: [{ type: 'text', text: buildBlockedGateNotice({ paneId, description: spec.description, question }) }],
+            content: [{ type: 'text', text: `${buildBlockedGateNotice({ paneId, description: spec.description, question })}${formatIsolateLocation(isolateMeta)}` }],
             details: { paneId, taskId, background: true, blocked: true, role: kind },
           };
         }
@@ -776,7 +777,7 @@ export function createSpawnAction(h: SpawnActionHost) {
         if (isAlive(probe, Date.now())) {
           handToPoller(`prompt-${taskId}`);
           return {
-            content: [{ type: 'text', text: buildAliveNotice({ paneId, description: spec.description, scenario: 'moved-to-bg', probe }, Date.now()) }],
+            content: [{ type: 'text', text: `${buildAliveNotice({ paneId, description: spec.description, scenario: 'moved-to-bg', probe }, Date.now())}${formatIsolateLocation(isolateMeta)}` }],
             details: { paneId, taskId, background: true, movedToBackground: true, role: kind },
           };
         }
@@ -791,7 +792,7 @@ export function createSpawnAction(h: SpawnActionHost) {
       h.persistSubs();
       h.writeHistory(entry, { outcome: outcome.kind === 'completed' ? text : null }, 'fg-settle');
       return {
-        content: [{ type: 'text', text: formatSubagentResult(outcome, spec.description) }],
+        content: [{ type: 'text', text: `${formatSubagentResult(outcome, spec.description)}${formatIsolateLocation(isolateMeta)}` }],
         details: { paneId, taskId, background, role: kind },
       };
     } catch (err) {

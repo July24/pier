@@ -121,6 +121,11 @@ export interface FakePi {
   setActiveTools(names: string[]): void;
   /** Registration surface consumed by the role runtime's switch path (`planSwitchActiveTools`). */
   getAllTools(): Array<{ name: string }>;
+  /** Current session thinking level (default `high`); `thinkingSets` records each `setThinkingLevel`. */
+  thinkingLevel: string;
+  thinkingSets: string[];
+  getThinkingLevel(): string;
+  setThinkingLevel(level: string): void;
 }
 
 /**
@@ -136,6 +141,7 @@ export function fakePi(): FakePi {
   const userSent: Array<{ content: string; opts?: unknown }> = [];
   const entries: Array<[string, unknown]> = [];
   const emitted: Array<{ channel: string; data: unknown }> = [];
+  const thinkingSets: string[] = [];
   return {
     tools,
     commands,
@@ -177,6 +183,15 @@ export function fakePi(): FakePi {
     getActiveTools: () => [...tools.keys()],
     setActiveTools: () => undefined,
     getAllTools: () => [...tools.keys()].map((name) => ({ name })),
+    thinkingLevel: 'high',
+    thinkingSets,
+    getThinkingLevel() {
+      return this.thinkingLevel;
+    },
+    setThinkingLevel(level) {
+      this.thinkingLevel = level;
+      thinkingSets.push(level);
+    },
   };
 }
 

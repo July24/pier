@@ -44,6 +44,16 @@ test('planObservationTick: window opens, machine injects reset it, a human takeo
   assert.equal(planObservationTick({ ...base, now: 30_001, agentStatus: 'idle', machineInjectAgoMs: 99_000 }).kind, 'settle');
 });
 
+test('planObservationTick: a finalized answer on a non-working pane skips the window; a working pane keeps it', () => {
+  const base = { observationStartedAt: null, now: 10, windowMs: 30_000, machineInjectGraceMs: 60_000, machineInjectAgoMs: 1 };
+  assert.equal(planObservationTick({ ...base, agentStatus: 'idle', finalized: true }).kind, 'settle');
+  assert.equal(planObservationTick({ ...base, agentStatus: 'done', finalized: true }).kind, 'settle');
+  assert.equal(planObservationTick({ ...base, agentStatus: null, finalized: true }).kind, 'settle', 'an unreadable agent lookup still settles the finalized transcript');
+  assert.equal(planObservationTick({ ...base, agentStatus: 'working', finalized: true }).kind, 'start-observation', 'a human may have taken over the pane');
+  assert.equal(planObservationTick({ ...base, agentStatus: 'blocked', finalized: true }).kind, 'start-observation', 'a blocked pane still needs its human gate');
+  assert.equal(planObservationTick({ ...base, agentStatus: 'idle' }).kind, 'start-observation', 'the window still guards the ambiguous no-text case');
+});
+
 test('planVacuumTick: a null wait state is a heartbeat; a dead pane outranks the timeout', () => {
   assert.deepEqual(planVacuumTick({ waitState: null, paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 100 }), { refreshActivity: true, action: 'continue' });
   assert.deepEqual(planVacuumTick({ waitState: 'idle', paneAlive: false, now: 50, lastActivityAt: 1, timeoutMs: 10 }), { refreshActivity: false, action: 'pane-closed' });
@@ -217,6 +227,74 @@ test('pollLoop: a lost settle claim suppresses the notice but not the ledger wri
   assert.equal(f.entry!.status, 'consumed');
   assert.equal(f.writes.length, 1, 'the ledger row is written even when the notice is dropped');
   assert.equal(f.notices.length, 0);
+});
+
+test('pollLoop: a finalized answer on an idle pane settles on the detecting tick, not after the window', async () => {
+  const f = fixture(makeEntry('p-fast'));
+  const slept: number[] = [];
+  const sleep = f.host.sleep!;
+  f.host.sleep = async (ms) => { slept.push(ms); await sleep(ms); };
+  await start(f);
+  assert.equal(f.entry!.status, 'consumed');
+  assert.equal(f.entry!.consumedAt, 13_000, 'the detecting tick settles; the observation window was not waited');
+  assert.deepEqual(slept, [], 'no observation tick was scheduled');
+  assert.equal(f.notices.length, 1);
+});
+
+test('pollLoop: a closing message `subagent output` already returned is pointed at, not repeated', async () => {
+  const report = 'FULL REPORT: four files changed, two tests green, committed on the bugfix branch.';
+  const f = fixture(makeEntry('p-seen', { reportDelivered: { fingerprint: report.slice(-64), at: 12_000 } }));
+  f.state({ text: report });
+  await start(f);
+  assert.match(f.notices[0]!, /closing message is the report subagent\(action:"output"\) already returned at/);
+  assert.doesNotMatch(f.notices[0]!, /FULL REPORT/);
+  assert.match(f.notices[0]!, /- Reconciled: desc/, 'stat line and reconcile notes still ride along');
+  assert.equal(f.writes[0]!.patch?.outcome, report, 'the ledger keeps the full closing text');
+
+  const changed = fixture(makeEntry('p-changed', { reportDelivered: { fingerprint: 'an older report tail', at: 12_000 } }));
+  changed.state({ text: report });
+  await start(changed);
+  assert.match(changed.notices[0]!, /Its closing message: FULL REPORT/, 'a different report is delivered in full');
+});
+
+test('pollLoop: a turn that ended without text still waits the observation window', async () => {
+  const f = fixture(makeEntry('p-ambiguous'));
+  f.state({ text: null, pendingTool: false, activity: true, turnEnded: true });
+  await start(f);
+  assert.equal(f.entry!.status, 'consumed');
+  assert.equal(f.entry!.consumedAt, 15_000, 'the no-text case keeps the 1s first tick + 2s window');
+});
+
+test('pollLoop: a finalized answer on a working pane keeps the human-takeover guard', async () => {
+  const f = fixture(makeEntry('p-fast-takeover'));
+  f.agentStatus('working'); // no machine inject on record → past the grace window
+  const sleep = f.host.sleep!;
+  let ticks = 0;
+  f.host.sleep = async (ms) => { if (++ticks === 2) f.entry!.status = 'settled'; await sleep(ms); };
+  await start(f);
+  assert.equal(f.entry!.userTakeover, true);
+  assert.equal(f.entry!.lastAgentStatus, 'working');
+  assert.equal(f.writes.length, 0, 'a human-driven pane is never consumed');
+});
+
+test('pollLoop: a notice refused during compaction leaves the row running and retries the settlement', async () => {
+  const f = fixture(makeEntry('p-compact', { observationStartedAt: 10_000 }));
+  let attempts = 0;
+  let rowAtFirstAttempt: { status: string; writes: number } | null = null;
+  f.host.injectNotice = async (content) => {
+    if (attempts++ === 0) {
+      rowAtFirstAttempt = { status: f.entry!.status, writes: f.writes.length };
+      throw new Error('pi is compacting');
+    }
+    f.notices.push(content);
+  };
+  await start(f);
+  assert.deepEqual(rowAtFirstAttempt, { status: 'running', writes: 0 }, 'the row is not consumed before the notice is accepted');
+  assert.equal(attempts, 2, 'the rejected notice is retried, not lost');
+  assert.equal(f.entry!.status, 'consumed');
+  assert.equal(f.writes.length, 1, 'one ledger row for the one settlement');
+  assert.deepEqual(f.claimKeys, ['p-compact:req-1'], 'the retry reuses the claim it already owns');
+  assert.match(f.notices[0]!, /Background subagent p-compact \(desc\) finished/);
 });
 
 test('pollLoop: a turn that ended without text still settles, worded as no closing message', async () => {

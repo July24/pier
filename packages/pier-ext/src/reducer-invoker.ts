@@ -68,6 +68,8 @@ type ReducerModelOutput = {
   content?: readonly unknown[];
   text?: unknown;
   usage?: UsageLike;
+  stopReason?: string;
+  errorMessage?: string;
 };
 
 type ReducerModel = NonNullable<ExtensionContext['model']>;
@@ -139,23 +141,23 @@ function resolveCandidate(
 }
 
 /**
- * Step 6, jev first (RFC §3 P0-1): a confident jev rejection is authoritative even for regex-listed
- * commands; the regex list decides only when jev is absent, fails or answers below the confidence
- * gate (credential-shaped command lines stay local).
+ * Step 6, regex first: only regex-listed commands are candidates; jev may veto them (a confident
+ * rejection is authoritative) but never promotes an unlisted command. Asking jev about every result
+ * flipped 0 of 437 decisions over a week while blocking each tool result ~0.8s and uploading every
+ * command line (D122). Jev failures, low confidence and credential-shaped commands keep the regex hit.
  */
 async function isDiagnosticCandidate(
   command: string,
   gate: JevEprGateDependency | undefined,
   sessionId: string | undefined,
 ): Promise<boolean> {
-  const regexHit = isDiagnosticCommand(command);
-  if (!gate || containsLikelySecret(command)) return regexHit;
+  if (!isDiagnosticCommand(command)) return false;
+  if (!gate || containsLikelySecret(command)) return true;
   const result = await gate.ask(diagnosticGateRequest(command), {
     questionId: 'epr-diagnostic-gate',
     timeoutMs: 2500, // cold TLS hit 1002ms at 1s; at 1500ms a real session still saw 14/73 calls (19%) time out — 2.5s keeps the gate decisive without stalling reducers
     sessionId,
-    // regex_hit makes the flip observable: how often and in which direction jev overrides the regex list (jev.jsonl).
-    extra: { site: 'epr-gate', commandSha256: sha256Hex(command), regexHit },
+    extra: { site: 'epr-gate', commandSha256: sha256Hex(command) },
     enrich: ({ answers }) => {
       if (!answers) return {};
       const verdict = evaluateDiagnosticGate(answers, gate.getMinConfidence());
@@ -167,10 +169,9 @@ async function isDiagnosticCandidate(
       };
     },
   });
-  if (!result.ok) return regexHit;
+  if (!result.ok) return true;
   const verdict = evaluateDiagnosticGate(result.answers, gate.getMinConfidence());
-  if (verdict.hit) return true;
-  return isDiagnosticGateUnanswered(verdict) ? regexHit : false;
+  return verdict.hit || isDiagnosticGateUnanswered(verdict);
 }
 
 /** Step 7: the untruncated source; both failure modes write the same `truncated-source` evidence
@@ -317,7 +318,10 @@ export async function handleReducerToolResult(
   if (config.localOnly) return undefined; // Archival is the whole job in local-only mode.
 
   const reducer = resolveReducerModel(ctx, config);
-  if (!reducer) return undefined;
+  if (!reducer) {
+    await log({ sourceBytes, model: config.model ?? 'default', verificationOk: false, reason: 'no-reducer-model', action: 'fallback_full_text' });
+    return undefined;
+  }
   /** Evidence row for a fail-open exit taken after the reducer model was resolved. */
   const fallbackRow = (reason: string, durationMs: number, extra: Record<string, unknown> = {}): Promise<void> =>
     log({
@@ -354,7 +358,14 @@ export async function handleReducerToolResult(
     : typeof output.text === 'string'
       ? output.text
       : '';
-  if (!modelOutput.trim()) return undefined;
+  if (!modelOutput.trim()) {
+    // pi's complete() reports provider failures as an empty `error` message instead of throwing.
+    await fallbackRow(output.stopReason === 'error' ? 'invoke-failed' : 'empty-output', durationMs, {
+      ...(output.stopReason ? { stopReason: output.stopReason } : {}),
+      ...(output.errorMessage ? { error: output.errorMessage } : {}),
+    });
+    return undefined;
+  }
 
   const validated = validateReceipt(modelOutput, sourceHash, body, event.isError);
   if (!validated.ok) {
@@ -377,7 +388,10 @@ export async function handleReducerToolResult(
     totalTokens: output.usage?.totalTokens,
   });
   const receiptBytes = Buffer.byteLength(receipt, 'utf8');
-  if (receiptBytes >= sourceBytes) return undefined;
+  if (receiptBytes >= sourceBytes) {
+    await fallbackRow('receipt-not-smaller', durationMs, { receiptBytes });
+    return undefined;
+  }
 
   await log({
     sourceBytes,

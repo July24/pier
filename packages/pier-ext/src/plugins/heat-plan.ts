@@ -10,6 +10,7 @@ import { type ShapeNode } from './grid-shape.ts';
 
 export const SPAWN_PLACEHOLDER_ID = '__pier_new__';
 const RATIO_FLOOR = 0.10;
+const NON_AGENT_RATIO_FLOOR = 0.25;
 const FOCUS_SHARE = 0.72;
 const FOCUS_SHARE_BLOCKED = 0.60;
 const MAX_AUTO_LAYOUT_PANES = 10;
@@ -55,6 +56,19 @@ function containsPane(node: LayoutNode, paneId: string): boolean {
 
 function clampRatio(r: number): number {
   return Math.min(1 - RATIO_FLOOR, Math.max(RATIO_FLOOR, r));
+}
+
+/** Agent-less panes (plain shells report no status or `unknown`) keep NON_AGENT_RATIO_FLOOR in mixed splits. */
+function hasAgentPanes(node: LayoutNode, statuses: AgentStatusMap): boolean {
+  return flattenPanes(node).some((id) => statuses[id] !== undefined && statuses[id] !== 'unknown');
+}
+
+function splitRatio(node: SplitNode, ratio: number, statuses: AgentStatusMap): number {
+  const firstAgent = hasAgentPanes(node.first, statuses);
+  const secondAgent = hasAgentPanes(node.second, statuses);
+  if (firstAgent && !secondAgent) ratio = Math.min(ratio, 1 - NON_AGENT_RATIO_FLOOR);
+  else if (!firstAgent && secondAgent) ratio = Math.max(ratio, NON_AGENT_RATIO_FLOOR);
+  return clampRatio(ratio);
 }
 
 function tierWeight(status: string | undefined, isAsk = false, slim = false): number {
@@ -129,7 +143,8 @@ export function planSpawnSplitRatio(opts: {
   if (paneCount <= 1 || paneCount > MAX_AUTO_LAYOUT_PANES) return null;
   if (!containsPane(simulated, opts.focusPaneId) || !containsPane(simulated, newId)) return null;
 
-  const statuses = opts.statuses ?? {};
+  // The new pane is an agent pane; `idle` weighs the same as a missing status.
+  const statuses: AgentStatusMap = { [newId]: 'idle', ...opts.statuses };
   const askFlags = opts.askFlags ?? {};
   const slim = paneCount - 1 >= SLIM_THRESHOLD;
   const focusSteps = findPath(simulated, opts.focusPaneId);
@@ -148,11 +163,11 @@ export function planSpawnSplitRatio(opts: {
     const r = clampRatio(target ** (1 / focusSteps.length));
     const at = focusSteps.find((s) => s.node === newSplit);
     if (!at) return null;
-    return at.side === 'first' ? r : 1 - r;
+    return splitRatio(newSplit, at.side === 'first' ? r : 1 - r, statuses);
   }
 
   const wFirst = weightOf(newSplit.first, statuses, askFlags, slim);
   const wSecond = weightOf(newSplit.second, statuses, askFlags, slim);
   if (wFirst + wSecond <= 0) return null;
-  return clampRatio(wFirst / (wFirst + wSecond));
+  return splitRatio(newSplit, wFirst / (wFirst + wSecond), statuses);
 }

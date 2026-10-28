@@ -4,11 +4,11 @@
  * compaction, then continues the task. State persists to session entries (branch rebuilds restore it).
  */
 
-import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import type { CompactionResult, ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { decideCompaction, DEFAULT_COMPACTION_ECONOMICS, estimateRemainingRequests, MAX_BOUNDARY_SAMPLES, nativeCompactionFeasible, resolveCacheRatioFromCost, type CompactionDecision } from './compact-economics-core.ts';
 import type { TodoItem } from './todo-core.ts';
 import type { TodoCompletionSource } from './todos-service.ts';
-import type { OnlineContextCompactConfig } from './efficiency-config-core.ts';
+import { SUMMARY_THINKING_LEVELS, type OnlineContextCompactConfig } from './efficiency-config-core.ts';
 import { appendEfficiencyLog, efficiencyLogPath, resolveSessionRoot } from './efficiency-store.ts';
 import { swallow } from './swallow.ts';
 
@@ -26,6 +26,20 @@ export const COMPACTION_INFLIGHT_TYPE = 'pi-herdr.compaction-inflight';
 export const COMPACTION_SETTLED_TYPE = 'pi-herdr.compaction-settled';
 const DEFAULT_KEEP_RECENT_TOKENS = 20_000;
 const DEFAULT_MEMO_TOKENS = 1_000;
+/**
+ * A non-compacting decision is revisited after this many provider requests even without a fresh todo
+ * boundary: an empty or stale todo list must not block OCC until the session ends (observed: 25/43
+ * decisions deferred at zero remaining boundaries, with a median of 45 further requests).
+ */
+export const DEFERRED_REEVALUATION_REQUESTS = 10;
+
+/**
+ * Prefix-cache hit evidence is smoothed toward this many fully cached prefix tokens, so a single
+ * early miss cannot multiply the expected saving (~15 requests of a 60k context).
+ */
+export const CACHE_HIT_PRIOR_TOKENS = 1_000_000;
+/** Past this many observed prefix tokens both sums halve, so the rate tracks recent provider behavior. */
+export const CACHE_HIT_WINDOW_TOKENS = 20_000_000;
 
 /** Fields persisted in the state marker; `version: 1` gates restores. */
 interface CoordinatorState {
@@ -39,7 +53,18 @@ interface CoordinatorState {
   positiveContextDeltaCount: number;
   lastContextTokens: number | null;
   currentBoundaryRequestCount: number;
+  /** Request count of the last non-compacting decision; -1 when no re-evaluation is scheduled. */
+  lastEvaluationRequestCount: number;
+  /**
+   * Context tokens pi estimated right after the last compaction (0 = unknown). Used as the retained
+   * floor for archive savings: fixed system-prompt/keepRecent arithmetic excludes tool schemas.
+   */
+  retainedTokensAfterCompaction: number;
   consecutiveCompactionFailures: number;
+  /** Prompt tokens of the previous request, summed per observed request (the reusable prefix). */
+  cachePrefixTokens: number;
+  /** Of those, tokens the provider served from cache. */
+  cacheReadTokens: number;
   /** P1-3: turn-end compact decisions to skip after a failure (each abort costs an in-flight turn). */
   compactBackoffTurnEnds: number;
 }
@@ -52,7 +77,11 @@ const NUMERIC_STATE_FIELDS = [
   'positiveContextDeltaTotal',
   'positiveContextDeltaCount',
   'currentBoundaryRequestCount',
+  'lastEvaluationRequestCount',
+  'retainedTokensAfterCompaction',
   'consecutiveCompactionFailures',
+  'cachePrefixTokens',
+  'cacheReadTokens',
   'compactBackoffTurnEnds',
 ] as const satisfies readonly (keyof CoordinatorState)[];
 
@@ -68,7 +97,11 @@ function initialCoordinatorState(): CoordinatorState {
     positiveContextDeltaCount: 0,
     lastContextTokens: null,
     currentBoundaryRequestCount: 0,
+    lastEvaluationRequestCount: -1,
+    retainedTokensAfterCompaction: 0,
     consecutiveCompactionFailures: 0,
+    cachePrefixTokens: 0,
+    cacheReadTokens: 0,
     compactBackoffTurnEnds: 0,
   };
 }
@@ -98,8 +131,21 @@ function averageContextIncrement(state: CoordinatorState): number | null {
     : null;
 }
 
+export function prefixCacheHitRate(state: CoordinatorState): number {
+  return (state.cacheReadTokens + CACHE_HIT_PRIOR_TOKENS) / (state.cachePrefixTokens + CACHE_HIT_PRIOR_TOKENS);
+}
+
 function remainingTodos(todos: readonly TodoItem[]): readonly TodoItem[] {
   return todos.filter((it) => it.status !== 'completed' && it.status !== 'abandoned');
+}
+
+/**
+ * Todos that pace the remaining-work horizon. Blocked items wait on something outside the agent's
+ * control and may never become actionable, so they must not inflate the horizon (observed: 7 blocked
+ * items were counted as seven remaining boundaries).
+ */
+export function horizonTodos(todos: readonly TodoItem[]): readonly TodoItem[] {
+  return remainingTodos(todos).filter((it) => it.status !== 'blocked');
 }
 
 /** P1-3: bound the payload — a huge open-task list inflates the summary request itself. */
@@ -122,6 +168,10 @@ export class CompactCoordinator {
   intentionalAbort = false;
   selectedCompaction: CompactionDecision | null = null;
   pendingBoundaryCompleted = false;
+  /** Last carried-debt value written to the session; 0 on a fresh state (nothing to persist). */
+  private persistedDebtTokens = 0;
+  /** Prompt size of the previous request; 0 = no reusable prefix (session start, after compaction). */
+  private lastPromptTokens = 0;
 
   recordBoundaryCompleted(count: number, source?: TodoCompletionSource): void {
     // Only model tool calls count, and the sample is the requests spent reaching this boundary.
@@ -140,6 +190,15 @@ export class CompactCoordinator {
 
   onBeforeProviderRequest(contextTokens: number): void {
     this.state.currentBoundaryRequestCount++;
+    // Fallback calibration: when pi omitted estimatedTokensAfter, the first request after a
+    // compaction measures the retained context (summary + kept turns + fixed overhead) directly.
+    if (
+      this.state.retainedTokensAfterCompaction === 0 &&
+      this.state.priorCompactionCount > 0 &&
+      contextTokens > 0
+    ) {
+      this.state.retainedTokensAfterCompaction = contextTokens;
+    }
     if (this.state.carriedDebtTokens > 0 && this.state.cacheDebtRepaymentTokens > 0) {
       this.state.carriedDebtTokens = Math.max(
         0,
@@ -152,6 +211,25 @@ export class CompactCoordinator {
       this.state.positiveContextDeltaCount++;
     }
     this.state.lastContextTokens = contextTokens;
+  }
+
+  /**
+   * Measures how much of the previous request's prompt the provider served from cache. Fed from each
+   * assistant message's `usage`; a request with no usage (error, abort) measures nothing.
+   */
+  onAssistantUsage(usage: { input?: number; cacheRead?: number; cacheWrite?: number } | undefined): void {
+    const cacheRead = usage?.cacheRead ?? 0;
+    const promptTokens = (usage?.input ?? 0) + cacheRead + (usage?.cacheWrite ?? 0);
+    if (promptTokens <= 0) return;
+    if (this.lastPromptTokens > 0) {
+      this.state.cachePrefixTokens += this.lastPromptTokens;
+      this.state.cacheReadTokens += Math.min(cacheRead, this.lastPromptTokens);
+      if (this.state.cachePrefixTokens > CACHE_HIT_WINDOW_TOKENS) {
+        this.state.cachePrefixTokens /= 2;
+        this.state.cacheReadTokens /= 2;
+      }
+    }
+    this.lastPromptTokens = promptTokens;
   }
 
   onInput(event: { text?: string; source?: string; streamingBehavior?: string }): void {
@@ -167,6 +245,7 @@ export class CompactCoordinator {
     this.selectedCompaction = null;
     this.intentionalAbort = false;
     this.pendingBoundaryCompleted = false;
+    this.state.lastEvaluationRequestCount = -1;
     // completedBoundaryRequestCounts deliberately survives: it measures requests-per-boundary pacing,
     // which holds across human turns — clearing it pinned expectedRemainingRequests at 1 every prompt.
     this.state.carriedDebtTokens = 0;
@@ -177,15 +256,32 @@ export class CompactCoordinator {
     ctx: ExtensionContext;
     todos: readonly TodoItem[];
     config: OnlineContextCompactConfig;
+    pi: ExtensionAPI;
+    /** stopReason of the assistant message that ended this turn ('toolUse' = work continues). */
+    lastStopReason: string | null;
     cancelReminder?: () => void;
   }): void {
+    if (opts.config.enabled) this.persistDebt(opts.pi);
+
     const boundary = this.pendingBoundaryCompleted;
     this.pendingBoundaryCompleted = false;
 
-    if (!boundary || this.selectedCompaction) return;
+    if (this.selectedCompaction) return;
     if (!opts.config.enabled) return;
     // Safety guard: never abort while the user has a queued message.
     if (opts.ctx.hasPendingMessages?.()) return;
+
+    // Revisit a non-compacting decision every N provider requests. Without this, a deferral made
+    // when the todo list is momentarily empty is never reassessed: the horizon stays collapsed at 1
+    // while the agent keeps working (evidence: 25/43 deferrals with zero open todos, median 45
+    // further requests, up to 249). Only a tool-call turn proves the work continues; a final 'stop'
+    // turn must not trigger a summary (and a spurious continuation) after the task is done.
+    const requestCount = this.state.currentBoundaryRequestCount;
+    const deferredDue =
+      opts.lastStopReason === 'toolUse' &&
+      this.state.lastEvaluationRequestCount >= 0 &&
+      requestCount - this.state.lastEvaluationRequestCount >= DEFERRED_REEVALUATION_REQUESTS;
+    if (!boundary && !deferredDue) return;
 
     const usage = opts.ctx.getContextUsage?.();
     const contextTokens =
@@ -196,15 +292,24 @@ export class CompactCoordinator {
     // System prompt is re-sent verbatim, so it is never part of the compressible archive; ~4 chars/token.
     const fixedTokens = Math.ceil(Buffer.byteLength(opts.ctx.getSystemPrompt?.() ?? '') / 4);
     const keepRecentTokens = opts.config.keepRecentTokens ?? DEFAULT_KEEP_RECENT_TOKENS;
-    const archiveTokens = Math.max(0, contextTokens - fixedTokens - keepRecentTokens);
+    const memoTokens = DEFAULT_MEMO_TOKENS;
+    // pi's estimatedTokensAfter is the measured retained context (summary + kept recent turns + all
+    // fixed overhead, tool schemas included). Prefer it over the fixedTokens/keepRecent arithmetic,
+    // which ignores tool schemas and understates the retained floor (observed: savings overstated
+    // ~23%). The estimate already contains the memo, so rebuild the gross archive the model expects.
+    const retainedTokens = this.state.retainedTokensAfterCompaction;
+    const archiveTokens = retainedTokens > 0 && retainedTokens < contextTokens
+      ? contextTokens - retainedTokens + memoTokens
+      : Math.max(0, contextTokens - fixedTokens - keepRecentTokens);
 
     const decision = decideCompaction({
       writeTokens: contextTokens,
       archiveTokens,
-      memoTokens: DEFAULT_MEMO_TOKENS,
+      memoTokens,
       contextTokens,
       completedBoundaryRequestCounts: this.state.completedBoundaryRequestCounts,
-      remainingBoundaries: remainingTodos(opts.todos).length,
+      remainingBoundaries: horizonTodos(opts.todos).length,
+      observedRequestsSinceBoundary: requestCount,
       averageContextTokenIncrement: averageContextIncrement(this.state),
       contextWindowTokens,
       priorCompactionCount: this.state.priorCompactionCount,
@@ -215,6 +320,7 @@ export class CompactCoordinator {
         opts.ctx.model?.cost,
         { provider: opts.ctx.model?.provider, modelId: opts.ctx.model?.id },
       ),
+      prefixCacheHitRate: prefixCacheHitRate(this.state),
       economics: {
         ...DEFAULT_COMPACTION_ECONOMICS,
         firstCompactionRequestScale: opts.config.firstCompactionRequestScale,
@@ -223,6 +329,7 @@ export class CompactCoordinator {
     });
 
     if (!decision.compact) {
+      this.state.lastEvaluationRequestCount = requestCount;
       if (opts.config.logEnabled) this.logDecision(opts.ctx, decision);
       return;
     }
@@ -232,6 +339,7 @@ export class CompactCoordinator {
     // class is gone since pi 1.4.0 uncapped summary output; transient timeouts/aborts remain.)
     if (this.state.compactBackoffTurnEnds > 0) {
       this.state.compactBackoffTurnEnds--;
+      this.state.lastEvaluationRequestCount = requestCount;
       if (opts.config.logEnabled) {
         this.logDecision(opts.ctx, { ...decision, compact: false, reason: 'failure_backoff' });
       }
@@ -240,12 +348,14 @@ export class CompactCoordinator {
 
     const branch = opts.ctx.sessionManager?.getBranch?.() ?? [];
     if (!nativeCompactionFeasible(branch, keepRecentTokens)) {
+      this.state.lastEvaluationRequestCount = requestCount;
       if (opts.config.logEnabled) {
         this.logDecision(opts.ctx, { ...decision, compact: false, reason: 'native_not_compactable' });
       }
       return;
     }
 
+    this.state.lastEvaluationRequestCount = -1;
     this.selectedCompaction = decision;
     this.intentionalAbort = true;
     opts.cancelReminder?.();
@@ -260,7 +370,15 @@ export class CompactCoordinator {
     cancelReminder?: () => void;
     onBeforeCompact?: (sessionRoot: string, ctx: ExtensionContext) => Promise<void>;
   }): Promise<void> {
-    if (!this.selectedCompaction || !opts.ctx.isIdle()) return;
+    if (!this.selectedCompaction) return;
+    if (!opts.ctx.isIdle()) {
+      // The settlement is not consumable (another run already started): drop the stale selection.
+      // Keeping it would latch OCC off every later turn and suppress settle-wake notices until the
+      // next human input; a fresh decision re-selects when the economics still hold.
+      this.selectedCompaction = null;
+      this.intentionalAbort = false;
+      return;
+    }
 
     // Announce the compaction window before the summary request starts: the supervising master
     // polls this file, and its observation window is shorter than a large-context compaction.
@@ -282,41 +400,75 @@ export class CompactCoordinator {
       }
     }
 
+    // pi summarizes at the session's thinking level; at `max`, 67% of summary output was reasoning
+    // and one compaction took 144 s. Cap it for the summary only, and always restore the session's.
+    const sessionThinking = opts.pi.getThinkingLevel();
+    const cap = opts.config.summaryThinkingLevel;
+    const lowered = cap !== 'inherit'
+      && SUMMARY_THINKING_LEVELS.indexOf(cap) < SUMMARY_THINKING_LEVELS.indexOf(sessionThinking);
+    if (lowered) opts.pi.setThinkingLevel(cap);
     const startMs = Date.now();
     const settled = Promise.withResolvers<void>();
-    opts.ctx.compact({
-      customInstructions: compactionInstructions(opts.todos),
-      onComplete: (compaction) => {
-        try {
-          this.finishCompaction(opts, decision, startMs, compaction);
-        } finally {
-          settled.resolve();
-        }
-      },
-      onError: (error) => {
-        try {
-          this.failCompaction(opts, decision, startMs, error);
-        } finally {
-          settled.resolve();
-        }
-      },
-    });
-    await settled.promise;
+    try {
+      opts.ctx.compact({
+        customInstructions: compactionInstructions(opts.todos),
+        onComplete: (compaction) => {
+          try {
+            this.finishCompaction(opts, decision, startMs, compaction);
+          } finally {
+            settled.resolve();
+          }
+        },
+        onError: (error) => {
+          try {
+            this.failCompaction(opts, decision, startMs, error);
+          } finally {
+            settled.resolve();
+          }
+        },
+      });
+      await settled.promise;
+    } finally {
+      if (lowered) opts.pi.setThinkingLevel(sessionThinking);
+    }
   }
 
   private finishCompaction(
     opts: { ctx: ExtensionContext; pi: ExtensionAPI; config: OnlineContextCompactConfig },
     decision: CompactionDecision,
     startMs: number,
-    compaction: { summary?: string } | undefined,
+    compaction: CompactionResult | undefined,
   ): void {
+    const usage = compaction?.usage;
+    // Debt is the summary request's real extra spend, converted to cache-read-token units so the
+    // ledger stays in the same unit as savingTokens. Fall back to the modeled rewrite surcharge when
+    // pi reports no usage or the model has no cache-read price.
+    const cacheReadPricePerToken = (opts.ctx.model?.cost?.cacheRead ?? 0) / 1_000_000;
+    const measuredDebtTokens =
+      usage !== undefined && cacheReadPricePerToken > 0
+        ? usage.cost.total / cacheReadPricePerToken
+        : null;
+    const summaryDebtTokens =
+      measuredDebtTokens ?? decision.writeTokens * (decision.incrementalCacheCostRatio ?? 0);
+    // Unpaid debt from the previous compaction survives: repayment happens per subsequent request,
+    // so a new compaction must not write off what the ledger has not collected yet.
+    const unpaidDebtTokens = this.state.carriedDebtTokens;
+
     this.state.priorCompactionCount++;
-    this.state.carriedDebtTokens = decision.writeTokens * (decision.incrementalCacheCostRatio ?? 0);
-    this.state.cacheDebtRepaymentTokens = Math.max(0, decision.archiveTokens - decision.memoTokens);
+    this.state.carriedDebtTokens = unpaidDebtTokens + summaryDebtTokens;
+    this.state.cacheDebtRepaymentTokens = decision.savingTokensPerRequest;
+    // The summary replaced the prefix: the next request is a cold rewrite the debt already prices.
+    this.lastPromptTokens = 0;
+    this.state.retainedTokensAfterCompaction =
+      typeof compaction?.estimatedTokensAfter === 'number' ? compaction.estimatedTokensAfter : 0;
+    // The pacing window restarts after a compaction: requests before it measured the old context.
+    this.state.currentBoundaryRequestCount = 0;
+    this.state.lastEvaluationRequestCount = -1;
     this.state.epoch++;
     this.state.consecutiveCompactionFailures = 0;
     this.state.compactBackoffTurnEnds = 0;
     this.appendMarker(opts.pi, COMPACT_STATE_CUSTOM_TYPE, this.state);
+    this.persistedDebtTokens = this.state.carriedDebtTokens;
 
     if (opts.config.logEnabled) {
       this.logCompact(opts.ctx, {
@@ -327,7 +479,9 @@ export class CompactCoordinator {
         breakevenRequests: decision.breakevenRequests,
         expectedRemainingRequests: decision.expectedRemainingRequests,
         carriedDebtTokens: this.state.carriedDebtTokens,
-        summaryTokens: typeof compaction?.summary === 'string' ? Math.ceil(compaction.summary.length / 4) : 0,
+        summaryTokens: usage !== undefined
+          ? usage.output
+          : Math.ceil((compaction?.summary.length ?? 0) / 4),
         priorCompactionCount: this.state.priorCompactionCount,
         durationMs: Date.now() - startMs,
       });
@@ -364,6 +518,12 @@ export class CompactCoordinator {
       outcome: cancelled ? 'cancelled' : 'failed',
       at: Date.now(),
     });
+    // P1-3: record the failure and back off exponentially (cap 4 skipped decisions). Increment
+    // before logging so the record carries this failure's ordinal instead of the previous count.
+    if (!cancelled) {
+      this.state.consecutiveCompactionFailures++;
+      this.state.compactBackoffTurnEnds = Math.min(2 ** this.state.consecutiveCompactionFailures, 4);
+    }
     if (opts.config.logEnabled) {
       this.logCompact(opts.ctx, {
         event: 'compaction-failed',
@@ -376,12 +536,10 @@ export class CompactCoordinator {
     }
     if (cancelled) return;
 
-    // P1-3: record the failure and back off exponentially (cap 4 skipped decisions).
-    this.state.consecutiveCompactionFailures++;
-    this.state.compactBackoffTurnEnds = Math.min(2 ** this.state.consecutiveCompactionFailures, 4);
     // Persist the bumped counters: state is restored from this marker, so a restart without it
     // would reset the P1-3 backoff window and retry the doomed compaction immediately.
     this.appendMarker(opts.pi, COMPACT_STATE_CUSTOM_TYPE, this.state);
+    this.persistedDebtTokens = this.state.carriedDebtTokens;
 
     // OCC aborted the turn on purpose, so a failed compaction would leave the session parked on an
     // aborted message; the notice must be visible rather than a silent failure.
@@ -406,6 +564,16 @@ export class CompactCoordinator {
     }
   }
 
+  /**
+   * Persist repayment progress when the debt moves. restoreCoordinatorState reads the last state
+   * marker, so an in-memory-only ledger resurrects already-repaid debt after a resume.
+   */
+  private persistDebt(pi: ExtensionAPI): void {
+    if (this.persistedDebtTokens === this.state.carriedDebtTokens) return;
+    this.appendMarker(pi, COMPACT_STATE_CUSTOM_TYPE, this.state);
+    this.persistedDebtTokens = this.state.carriedDebtTokens;
+  }
+
   /** Resume the task after compaction; must never throw into the detached settled handler. */
   private sendContinuation(pi: ExtensionAPI, content: string, display: boolean): void {
     try {
@@ -416,6 +584,7 @@ export class CompactCoordinator {
 
   rebuildFromBranch(entries: readonly unknown[]): void {
     this.state = restoreCoordinatorState(entries);
+    this.persistedDebtTokens = this.state.carriedDebtTokens;
     this.selectedCompaction = null;
     this.compactionInFlight = false;
     this.intentionalAbort = false;
@@ -429,10 +598,10 @@ export class CompactCoordinator {
       completedBoundaryRequestCounts: counts,
       remainingBoundaries,
       scale: DEFAULT_COMPACTION_ECONOMICS.remainingRequestScale,
-      standardDeviationK: DEFAULT_COMPACTION_ECONOMICS.remainingRequestStddevK,
       contextTokens: this.state.lastContextTokens ?? 0,
       contextWindowTokens,
       averageContextTokenIncrement: averageContextIncrement(this.state),
+      observedRequestsSinceBoundary: this.state.currentBoundaryRequestCount,
     });
     return Math.max(1, est.expectedRemainingRequests);
   }
@@ -464,6 +633,8 @@ export class CompactCoordinator {
       // Without resolvedRatio/model a cache_ratio_unavailable run is undiagnosable from logs alone.
       resolvedRatio: decision.cacheWriteReadRatio,
       incrementalCacheCostRatio: decision.incrementalCacheCostRatio,
+      prefixCacheHitRate: decision.prefixCacheHitRate,
+      savingTokensPerRequest: decision.savingTokensPerRequest,
       remainingBoundaries: decision.remainingBoundaries,
       model: ctx.model?.id ?? undefined,
       provider: ctx.model?.provider ?? undefined,

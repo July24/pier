@@ -10,7 +10,7 @@ import { readFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
-  HERDR_PROTOCOL_EXPECTED, HerdrClient, NoopHerdrClient, createHerdrClient, detectHerdrEnv,
+  HERDR_PROTOCOL_EXPECTED, HerdrClient, NoopHerdrClient, classifyWaitFailure, createHerdrClient, detectHerdrEnv,
   herdrSocketTarget, herdrUnavailableHint,
 } from '../src/herdr-client.ts';
 import { LOCK_BATCH_LIMIT } from '../src/lock-core.ts';
@@ -343,9 +343,24 @@ rpcTest('HerdrClient: readAgent sends agent.read and unwraps the read envelope',
   assert.deepEqual(server.received[1]?.params, { target: 'w1:p3', source: 'recent', format: 'text', strip_ansi: true });
 });
 
+test('classifyWaitFailure: an exhausted wait budget is a timeout regardless of the server label', () => {
+  assert.equal(classifyWaitFailure('unavailable: waits are disabled on this server', 80, 50), 'timeout',
+    'a server that consumed the budget must not be reported as unavailable');
+  assert.equal(classifyWaitFailure('error: unavailable: method not supported', 5, 3000), 'unavailable');
+  assert.equal(classifyWaitFailure('herdr pane.wait_for_output: timeout', 5, 3000), 'timeout');
+  assert.equal(classifyWaitFailure('error: timed out waiting for output', 5, 3000), 'timeout');
+  assert.equal(classifyWaitFailure('ECONNRESET', 5, 3000), null, 'transport errors still surface');
+});
+
 rpcTest('HerdrClient: waitForOutput degrades to a discriminated timeout', {}, async (client) => {
   assert.deepEqual(await client.waitForOutput('p2', { type: 'substring', value: 'x' }, 50), { matched: false, reason: 'timeout' });
 }, (server) => { server.error = { code: 'timeout', message: 'wait timeout' }; });
+
+rpcTest('HerdrClient: an immediate unavailable wait stays unavailable', {},
+  async (client) => {
+    assert.deepEqual(await client.waitForOutput('p2', { type: 'substring', value: 'x' }, 3000), { matched: false, reason: 'unavailable' });
+  },
+  (server) => { server.error = { code: 'unavailable', message: 'method not supported' }; });
 
 rpcTest('HerdrClient (0.9.5): openPluginPane popup, nested agent.explain, list fields', (method, params) => {
   if (method === 'plugin.pane.open') {

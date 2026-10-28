@@ -114,7 +114,7 @@ export function buildResumeArgv(workerArgv: readonly string[], piBin = 'pi'): st
 export const SUBAGENT_OUTPUT_SCHEMA = Type.Object({
   action: Type.Union([
     Type.Literal('spawn'), Type.Literal('resume'), Type.Literal('list'),
-    Type.Literal('send'), Type.Literal('interrupt'), Type.Literal('output'), Type.Literal('role'),
+    Type.Literal('send'), Type.Literal('interrupt'), Type.Literal('output'), Type.Literal('role'), Type.Literal('help'),
   ]),
   paneId: Type.Optional(Type.String()),
   taskId: Type.Optional(Type.String()),
@@ -195,6 +195,14 @@ export interface AliveProbe {
   foregroundCwd?: string | null;
 }
 
+/** Trailing line for isolate spawn results: the branch (`pier/<slug>`) reads like a directory and
+ *  masters have cd'd into `<repo>/pier/<slug>`; only the worktree path is an actual directory. */
+export function formatIsolateLocation(
+  isolate: Pick<NonNullable<SubEntry['isolate']>, 'worktreePath' | 'branch'> | null | undefined,
+): string {
+  return isolate ? `\nWorktree: ${isolate.worktreePath} (branch ${isolate.branch})` : '';
+}
+
 /**
  * A subagent outlives its "no output" result: a working/blocked agent is alive regardless of session
  * age, otherwise recent session writes decide. `paneExists: false` is death — an unavailable probe is
@@ -224,7 +232,7 @@ export function buildAliveNotice(
     return [
       `Subagent "${description}" is still running in pane ${paneId} (agent_status=${status}${activity}).`,
       'The foreground wait has moved it to background so this call returns now.',
-      'Do NOT redo its work. When it settles you will receive a notification with its closing output.',
+      'Do NOT redo its work and do NOT sleep or poll: when it settles, its result is delivered automatically as a settlement notice at your next turn boundary.',
       'Use subagent(action: "list") to check its live state; subagent(action: "send") to give it follow-up work.',
     ].join(' ');
   }
@@ -274,6 +282,9 @@ export interface SubEntry {
   userTakeover?: boolean;
   observationStartedAt?: number | null;
   lastAgentStatus?: string | null;
+  /** The final report `subagent output` already returned (tail fingerprint + time): the settlement
+   *  notice then points at that delivery instead of repeating the report. Durable across resume. */
+  reportDelivered?: { fingerprint: string; at: number } | null;
   /** D98: isolate worktree metadata; `releasedAt` set once the worktree is removed. */
   isolate?: {
     worktreePath: string;
@@ -317,7 +328,30 @@ export function subRef(sub: { paneId: string; slug?: string }): string {
   return sub.slug ? `${sub.slug}@${sub.paneId}` : sub.paneId;
 }
 
-export const PROGRESS_CUSTOM_TYPE = 'pi-herdr.progress';
+/** Identity of a final report across the output action and the settlement notice: its tail. */
+export function reportFingerprint(report: string): string {
+  return report.slice(-64);
+}
+
+/** Shorter sleeps are ordinary polling of builds/logs; from a minute up, they were waits on workers. */
+const SLEEP_NOTE_MIN_SECONDS = 60;
+
+/**
+ * Note for a master bash call that sleeps ≥ SLEEP_NOTE_MIN_SECONDS while background workers run:
+ * masters slept 660-840 s per worker although the settlement notice arrives on its own. Worded so a
+ * sleep that waits on something else (a load test, a build) is left alone.
+ */
+export function sleepWhileSubsRunningNote(
+  command: string,
+  running: ReadonlyArray<{ paneId: string; slug?: string }>,
+): string | null {
+  if (running.length === 0) return null;
+  const longest = Math.max(0, ...[...command.matchAll(/\bsleep\s+(\d+)s?\b/g)].map((m) => Number(m[1])));
+  if (longest < SLEEP_NOTE_MIN_SECONDS) return null;
+  return `[pier] ${running.length} background subagent(s) running (${running.map(subRef).join(', ')}): their settlement `
+    + 'notice arrives automatically at your next tool boundary, so do not sleep to wait for them — keep working or end '
+    + 'your turn. Sleeping is only needed for other work (builds, logs).';
+}
 
 export interface SubsRegistry {
   version: 2;
@@ -371,6 +405,10 @@ export function foldSubsRegistry(entries: ReadonlyArray<{ type?: string; customT
             releasedAt: typeof s.isolate.releasedAt === 'number' ? s.isolate.releasedAt : null,
             retainNotified: s.isolate.retainNotified === true,
           }
+          : undefined,
+        reportDelivered: s.reportDelivered && typeof s.reportDelivered === 'object'
+          && typeof s.reportDelivered.fingerprint === 'string' && typeof s.reportDelivered.at === 'number'
+          ? { fingerprint: s.reportDelivered.fingerprint, at: s.reportDelivered.at }
           : undefined,
       }));
     found = { version: 2, subs };

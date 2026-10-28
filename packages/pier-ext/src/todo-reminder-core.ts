@@ -1,10 +1,10 @@
 /**
  * Reminders about unfinished todos when stopping go out as sendMessage(custom) and ask for
  * reconciliation rather than continuation, so human-blocked items are a first-class outcome. Guards:
- * suppress on abort, cap reminders, skip while a subagent runs, a human gate is blocked, or no open
- * item remains.
+ * suppress on abort or provider error, cap reminders, skip while a subagent runs, a human gate is
+ * blocked, or no open item remains.
  */
-import { ABORT_STOP_REASON } from './settle-wake-core.ts';
+import { ABORT_STOP_REASON, ERROR_STOP_REASON } from './settle-wake-core.ts';
 import { pierOption } from './pier-options.ts';
 
 /** Cap reminders for the lifetime of the process. */
@@ -25,6 +25,8 @@ export function todoReminderGraceMs(): number {
 interface TodoReminderInput {
   /** Stop reason of the last assistant turn (null = natural completion). */
   lastStopReason: string | null;
+  /** agent_settled.aborted: authoritative for ESC mid-tool, where no final assistant message set the reason. */
+  aborted?: boolean;
   intentionalAbort?: boolean;
   compactionInFlight?: boolean;
   reminders: number;
@@ -48,8 +50,10 @@ interface TodoReminderPlan {
  */
 export function planStopTodoReminder(input: TodoReminderInput): TodoReminderPlan {
   const noInject: TodoReminderPlan = { due: false, content: null, nextReminders: input.reminders };
-  if (input.intentionalAbort || input.compactionInFlight) return noInject;
-  if (input.lastStopReason === ABORT_STOP_REASON) return noInject;
+  if (input.intentionalAbort || input.compactionInFlight || input.aborted) return noInject;
+  // An error stop is an upstream/provider failure that pi retries; the reminder's triggerTurn would
+  // fire another request into the failing window (observed: 3 reminders during one outage).
+  if (input.lastStopReason === ABORT_STOP_REASON || input.lastStopReason === ERROR_STOP_REASON) return noInject;
   if (input.reminders >= REMINDERS_MAX) return noInject;
   if (input.runningSubs > 0) return noInject;
   if (input.blockedDepth > 0) return noInject;

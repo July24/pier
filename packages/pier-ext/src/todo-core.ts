@@ -9,6 +9,17 @@ const PHASE_MAX_LEN = 30;
 /** Session entry type for human/automated edits, replayed during branch rebuild (D38). */
 export const TODO_EDIT_CUSTOM_TYPE = 'pi-herdr.todo-edit';
 
+/** Session entry type recording that the near-archive rewrite window was already offered for one
+ *  list; folded on rebuild so a resumed session proceeds to the terminal clear instead of re-warning. */
+export const TODO_ARCHIVE_WINDOW_CUSTOM_TYPE = 'pi-herdr.todo-archive-window';
+
+export interface ArchiveWindowMarker {
+  version: 1;
+  /** Ordered list identity at offer time. The marker only applies after the last snapshot, so any
+   *  rewrite (new snapshot) or edit (list mutation) invalidates it without a timestamp comparison. */
+  itemsHash: string;
+}
+
 export type TodoEditOp = 'done' | 'drop' | 'rm' | 'unblock';
 
 export interface TodoEdit {
@@ -115,6 +126,20 @@ export function listsEqual(a: readonly TodoItem[], b: readonly TodoItem[]): bool
   return true;
 }
 
+/** Stable list identity (FNV-1a over content/status/blocker/phase): keys the archive-window marker
+ *  so it never applies to a list that was edited after the window was offered. */
+export function todoListHash(items: readonly TodoItem[]): string {
+  let hash = 0x811c9dc5;
+  for (const it of items) {
+    const text = `${it.content}\u0000${it.status}\u0000${it.blocker ?? ''}\u0000${it.phase ?? ''}\u0001`;
+    for (let i = 0; i < text.length; i++) {
+      hash ^= text.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193);
+    }
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
 /** Items completed by this write (D36: surfaced back to the caller). */
 export function completionTransitions(prev: readonly TodoItem[], next: readonly TodoItem[]): string[] {
   const prevMap = new Map(prev.map((it) => [it.content, it.status]));
@@ -123,8 +148,11 @@ export function completionTransitions(prev: readonly TodoItem[], next: readonly 
     .map((it) => it.content);
 }
 
-/** Completed items pushed back to open by this write (D37: reversible, but warn). */
+/** Completed items pushed back to open by this write (D37: reversible, but warn). A previous list
+ *  with no open item was a finished plan, and a new plan legitimately reuses generic task names, so
+ *  content-keyed reversion is meaningless there: warn only while the same plan is still in flight. */
 export function revertedCompleted(prev: readonly TodoItem[], next: readonly TodoItem[]): string[] {
+  if (!prev.some((it) => it.status === 'pending' || it.status === 'in_progress')) return [];
   const nextMap = new Map(next.map((it) => [it.content, it.status]));
   return prev
     .filter((it) => {
@@ -206,6 +234,15 @@ export interface FoldedTodos {
   items: TodoItem[];
   /** Timestamp of the last write that shaped these items; null when the entry carried none. */
   writtenAt: number | null;
+  /** True when the anti-freeze rewrite window was already offered for exactly this untouched list. */
+  archiveWindowOffered: boolean;
+}
+
+function extractArchiveWindowMarker(data: unknown): ArchiveWindowMarker | null {
+  if (typeof data !== 'object' || data === null) return null;
+  const raw = data as Partial<ArchiveWindowMarker>;
+  if (raw.version !== 1 || typeof raw.itemsHash !== 'string') return null;
+  return { version: 1, itemsHash: raw.itemsHash };
 }
 
 function entryTimestamp(entry: BranchEntryLike): number | null {
@@ -222,6 +259,9 @@ function entryTimestamp(entry: BranchEntryLike): number | null {
 export function foldLatestTodosMeta(entries: readonly BranchEntryLike[]): FoldedTodos | null {
   let found: TodoItem[] | null = null;
   let writtenAt: number | null = null;
+  // The marker applies only when it follows the last snapshot; a later snapshot resets it, and any
+  // edit that actually changes the list makes the hash mismatch (a no-op edit leaves it untouched).
+  let windowMarker: ArchiveWindowMarker | null = null;
   for (const entry of entries) {
     if (entry.type === 'message') {
       const msg = entry.message as { role?: unknown; toolName?: unknown; details?: unknown } | null | undefined;
@@ -231,6 +271,7 @@ export function foldLatestTodosMeta(entries: readonly BranchEntryLike[]): Folded
       if (snapshot) {
         found = snapshot.items.map((it) => ({ ...it }));
         writtenAt = entryTimestamp(entry);
+        windowMarker = null;
       }
     } else if (entry.type === 'custom' && entry.customType === TODO_EDIT_CUSTOM_TYPE) {
       const payload = extractEditPayload(entry.data);
@@ -238,9 +279,13 @@ export function foldLatestTodosMeta(entries: readonly BranchEntryLike[]): Folded
         found = applyTodoEdits(found, payload.edits);
         writtenAt = entryTimestamp(entry) ?? (payload.ts > 0 ? payload.ts : writtenAt);
       }
+    } else if (entry.type === 'custom' && entry.customType === TODO_ARCHIVE_WINDOW_CUSTOM_TYPE && found) {
+      windowMarker = extractArchiveWindowMarker(entry.data);
     }
   }
-  return found ? { items: found, writtenAt } : null;
+  if (!found) return null;
+  const archiveWindowOffered = windowMarker != null && windowMarker.itemsHash === todoListHash(found);
+  return { items: found, writtenAt, archiveWindowOffered };
 }
 
 function extractSnapshotFromDetails(details: unknown): TodoSnapshot | null {

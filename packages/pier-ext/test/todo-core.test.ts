@@ -2,8 +2,9 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  applyTodoEdits, boundedView, completionTransitions, currentActivity, foldLatestTodosMeta, fuzzyFind,
-  listsEqual, normalizeStrict, revertedCompleted, validateTodos, type TodoItem,
+  TODO_ARCHIVE_WINDOW_CUSTOM_TYPE, applyTodoEdits, boundedView, completionTransitions, currentActivity,
+  foldLatestTodosMeta, fuzzyFind, listsEqual, normalizeStrict, revertedCompleted, todoListHash, validateTodos,
+  type TodoItem,
 } from '../src/todo-core.ts';
 import { planTodoReadHook } from '../src/todo-read-hook.ts';
 import { STALE_CLOCK_MS, STALE_NOTICE_MAX, STALE_TURNS } from '../src/stale-core.ts';
@@ -117,6 +118,22 @@ test('completionTransitions/revertedCompleted: 过渡与回退', () => {
   ];
   assert.deepEqual(completionTransitions(prev, next), ['a', 'b']); assert.deepEqual(revertedCompleted(prev, next), ['c']);
 });
+test('revertedCompleted: 完结计划切新计划复用同名项不警告；同一计划内回退仍警告', () => {
+  const finished: TodoItem[] = [
+    { content: 'Fix in worktree + verify', status: 'completed' },
+    { content: 'Push to origin', status: 'completed' },
+  ];
+  const nextPlan: TodoItem[] = [
+    { content: 'Fix in worktree + verify', status: 'in_progress' },
+    { content: 'Triage new report', status: 'pending' },
+  ];
+  assert.deepEqual(revertedCompleted(finished, nextPlan), [], 'finished plan → no cross-plan false warning');
+  const samePlan: TodoItem[] = [
+    { content: 'Fix in worktree + verify', status: 'completed' },
+    { content: 'Triage new report', status: 'in_progress' },
+  ];
+  assert.deepEqual(revertedCompleted(samePlan, nextPlan), ['Fix in worktree + verify'], 'same plan re-opening a completed item still warns');
+});
 test('applyTodoEdits: done/drop/rm 语义与幂等', () => {
   const items: TodoItem[] = [
     { content: 'a', status: 'pending' },
@@ -208,7 +225,7 @@ test('boundedView: 预算内原样；超预算隐最老保最新（open 截头�
 /* ── read hook (planTodoReadHook) ─────────────────────────────── */
 
 /** Planner input mirrored locally: a drifted field surfaces at the call site. */
-interface ReadHookInput { items: readonly TodoItem[]; turn: number; lastEmptyGuardTurn: number | null; lastWriteAt: number | null; turnsSinceWrite: number | null; now: number; staleNotices: number; lastStaleGuardTurn: number | null }
+interface ReadHookInput { items: readonly TodoItem[]; turn: number; lastEmptyGuardTurn: number | null; lastWriteAt: number | null; turnsSinceWrite: number | null; now: number; staleNotices: number; lastStaleGuardTurn: number | null; archiveWindowOffered: boolean }
 
 /** Fresh baseline: written 1 turn / 1 minute ago. */
 const FRESH: ReadHookInput = {
@@ -220,6 +237,7 @@ const FRESH: ReadHookInput = {
   now: 100 * HOUR + 60_000,
   staleNotices: 0,
   lastStaleGuardTurn: null,
+  archiveWindowOffered: false,
 };
 
 /** Real shape: a frozen list, all done (3✓). */
@@ -233,10 +251,11 @@ const STALE: Partial<ReadHookInput> = { lastWriteAt: 100 * HOUR, turnsSinceWrite
 const IDLE_16H: Partial<ReadHookInput> = { lastWriteAt: 100 * HOUR, turnsSinceWrite: 1, now: 100 * HOUR + 16 * HOUR };
 interface ReadCase {
   name: string; input?: Partial<ReadHookInput>; inject?: boolean; effect?: string; archived?: boolean;
-  clearArchived?: boolean; customType?: string; display?: boolean; matches?: RegExp[]; notMatches?: RegExp[];
+  clearArchived?: boolean; offerArchiveWindow?: boolean; customType?: string; display?: boolean; matches?: RegExp[]; notMatches?: RegExp[];
 }
 const READ_CASES: ReadCase[] = [
   { name: '新鲜 → 每轮复读（静默注入，自带通道类型）', input: { items: KIMI, turn: 1 }, inject: true, effect: 'recite', display: false, customType: 'pi-herdr.todo-read', matches: [/Clone kimi/] },
+  { name: '复读：blocked 项保留 blocker（与 widget 同一行格式）', input: { items: [{ content: '等网关', status: 'blocked', blocker: '等运维放行' }], turn: 1 }, inject: true, effect: 'recite', matches: [/■ 等网关 — 等运维放行/] },
   { name: '刚全完成但新鲜 → 照常复读', input: { items: ALL_DONE, turn: 2 }, effect: 'recite' },
   { name: '空列表：会话开始注入一次', input: { items: [], turn: 0 }, inject: true, effect: 'empty-guard', matches: [/empty/] },
   { name: '空列表：N 轮内静默', input: { items: [], turn: 1, lastEmptyGuardTurn: 0 }, inject: false },
@@ -245,19 +264,24 @@ const READ_CASES: ReadCase[] = [
   { name: 'stale：节奏内未到 → 跳过', input: { items: ALL_DONE, turn: 8, ...STALE, staleNotices: 1, lastStaleGuardTurn: 6 }, inject: false, effect: 'none' },
   { name: 'stale：已封顶 3 → 跳过', input: { items: ALL_DONE, turn: 12, ...STALE, staleNotices: STALE_NOTICE_MAX, lastStaleGuardTurn: 6 }, inject: false, effect: 'none' },
   { name: 'stale：节奏到且未封顶 → 注入', input: { items: ALL_DONE, turn: 12, ...STALE, staleNotices: STALE_NOTICE_MAX - 1, lastStaleGuardTurn: 6 }, inject: true },
-  { name: 'archived（R2）：首个到期拍 = 重写窗口，不清空', input: { items: ALL_DONE, turn: 0, ...IDLE_16H }, inject: true, effect: 'stale-notice', archived: true, clearArchived: false, matches: [/rewrite window/i, /about to be archived/, /Verify gateway forwarding/] },
-  { name: 'archived：窗口后与空守卫共享节奏 → 静默', input: { items: ALL_DONE, turn: 1, lastEmptyGuardTurn: 0, ...IDLE_16H, staleNotices: 1, lastStaleGuardTurn: 0 }, inject: false },
+  { name: 'archived（R2）：首个到期拍 = 重写窗口，不清空', input: { items: ALL_DONE, turn: 0, ...IDLE_16H }, inject: true, effect: 'stale-notice', archived: true, clearArchived: false, offerArchiveWindow: true, matches: [/rewrite window/i, /about to be archived/, /Verify gateway forwarding/, /on your next message/] },
+  { name: 'archived：窗口未给过且节奏未到 → 静默，不清空', input: { items: ALL_DONE, turn: 5, lastEmptyGuardTurn: 4, ...IDLE_16H }, inject: false, effect: 'none', archived: true, clearArchived: false, offerArchiveWindow: false },
   {
-    name: 'archived（R1/R3）：窗口被无视 → 终态通知 + clearArchived，明细不复读',
-    input: { items: ALL_DONE, turn: 4, lastEmptyGuardTurn: 0, ...IDLE_16H, staleNotices: 1, lastStaleGuardTurn: 0 },
+    name: 'archived（R1/R3）：窗口已给过 → 下一次运行立即终态通知 + clearArchived，明细不复读',
+    input: { items: ALL_DONE, turn: 1, lastEmptyGuardTurn: 0, ...IDLE_16H, archiveWindowOffered: true, staleNotices: 1, lastStaleGuardTurn: 0 },
     inject: true,
     effect: 'archive-notice',
     archived: true,
     clearArchived: true,
+    offerArchiveWindow: false,
     matches: [/3 completed entries/, /16h ago/, /cleared from tracking.*list is now empty/s, /multi-step work must be tracked/],
-    notMatches: [/if tracking is not needed/, /Verify gateway forwarding/],
+    notMatches: [/rewrite window/i, /if tracking is not needed/, /Verify gateway forwarding/],
   },
-  { name: 'archived：非到期拍不置 clearArchived', input: { items: ALL_DONE, turn: 5, lastEmptyGuardTurn: 4, ...IDLE_16H, staleNotices: 1, lastStaleGuardTurn: 0 }, inject: false, clearArchived: false },
+  {
+    name: 'archived：窗口已给过且节奏未到也立即清空（死区修复不回退）',
+    input: { items: ALL_DONE, turn: 3, lastEmptyGuardTurn: 2, ...IDLE_16H, archiveWindowOffered: true },
+    inject: true, effect: 'archive-notice', archived: true, clearArchived: true,
+  },
   { name: 'archived：时钟阈值边界即窗口态（时钟优先于 turns）', input: { items: ALL_DONE, turn: 3, lastWriteAt: 0, turnsSinceWrite: 2, now: STALE_CLOCK_MS }, effect: 'stale-notice', archived: true },
 ];
 test('读钩矩阵：复读 / 空守卫 / 停滞警告 / 归档窗口（同一 planner，不同输入）', async (t) => {
@@ -269,6 +293,7 @@ test('读钩矩阵：复读 / 空守卫 / 停滞警告 / 归档窗口（同一 p
       if (c.effect !== undefined) assert.equal(plan.effect, c.effect, c.name);
       if (c.archived !== undefined) assert.equal(plan.archived, c.archived, c.name);
       if (c.clearArchived !== undefined) assert.equal(plan.clearArchived, c.clearArchived, c.name);
+      if (c.offerArchiveWindow !== undefined) assert.equal(plan.offerArchiveWindow, c.offerArchiveWindow, c.name);
       if (c.display !== undefined) assert.equal(plan.message.display, c.display, c.name);
       if (c.customType !== undefined) assert.equal(plan.message.customType, c.customType, c.name);
       for (const re of c.matches ?? []) assert.match(plan.message.content, re, c.name);
@@ -281,7 +306,7 @@ test('读钩矩阵：复读 / 空守卫 / 停滞警告 / 归档窗口（同一 p
 
 /** Planner input mirrored locally: a drifted field surfaces at the call site. */
 interface ReminderInput {
-  lastStopReason: string | null; intentionalAbort?: boolean; compactionInFlight?: boolean; reminders: number;
+  lastStopReason: string | null; aborted?: boolean; intentionalAbort?: boolean; compactionInFlight?: boolean; reminders: number;
   runningSubs: number; blockedDepth: number; items: ReadonlyArray<{ content: string; status: string }>;
 }
 const REMINDER_BASE: ReminderInput = {
@@ -317,6 +342,8 @@ const REMINDER_CASES: ReminderCase[] = [
   { name: 'null stopReason = 未知 → 视作自然结束，正常评估', over: { lastStopReason: null }, due: true, nextReminders: 1 },
   { name: '编号随计数递增（Reminder n/3）', over: { reminders: 2 }, due: true, nextReminders: 3, matches: [/Reminder 3\/3/] },
   { name: 'ESC 中止后的 settled 不催', over: { lastStopReason: 'aborted' }, due: false, nextReminders: 0 },
+  { name: 'agent_settled.aborted（ESC mid-tool，stopReason 陈旧）不催', over: { aborted: true }, due: false, nextReminders: 0 },
+  { name: 'provider error stop 不催（pi 会重试，triggerTurn 会打进故障窗口）', over: { lastStopReason: 'error' }, due: false, nextReminders: 0 },
   { name: '封顶：已达 3 不再注入', over: { reminders: 3 }, due: false, nextReminders: 3 },
   { name: '在途 subagent：主控本就在等，不催', over: { runningSubs: 2 }, due: false },
   { name: 'blocked 深度 >0：主控在等人工，不催', over: { blockedDepth: 1 }, due: false },
@@ -406,6 +433,37 @@ describe('todos-service', () => {
     svc.rebuild([{ type: 'message', message: { role: 'user', content: 'hi' } }]);
     assert.deepEqual(svc.items, []);
     assert.equal(svc.lastWriteAt, null);
+  });
+  test('rebuild: 归档重写窗口标记按列表身份折叠；列表一变即失效', () => {
+    const svc = new TodosService(TodosService.configFromRuntime(null, false));
+    const iso = '2026-08-24T09:11:20.291Z';
+    const items: TodoItem[] = [{ content: 'B', status: 'completed' }];
+    const marker = (list: readonly TodoItem[] = items) => ({
+      type: 'custom',
+      customType: TODO_ARCHIVE_WINDOW_CUSTOM_TYPE,
+      data: { version: 1, itemsHash: todoListHash(list) },
+    });
+
+    svc.rebuild([mkSnap(items, iso), marker()]);
+    assert.equal(svc.archiveWindowOffered, true, 'resume sees the window already offered for this list');
+
+    // Any list mutation invalidates the marker: a new snapshot resets it, and an edit changes identity.
+    svc.rebuild([mkSnap(items, iso), marker(), mkSnap([{ content: 'C', status: 'completed' }], iso)]);
+    assert.equal(svc.archiveWindowOffered, false, 'a later snapshot is a different list');
+    svc.rebuild([
+      mkSnap(items, iso),
+      marker(),
+      { type: 'custom', customType: 'pi-herdr.todo-edit', data: { version: 1, edits: [{ op: 'rm', content: 'B' }], ts: 999 } },
+    ]);
+    assert.equal(svc.archiveWindowOffered, false, 'an edit after the window touches the list');
+    svc.rebuild([mkSnap(items, iso), marker([{ content: 'other', status: 'completed' }])]);
+    assert.equal(svc.archiveWindowOffered, false, 'hash mismatch never applies');
+
+    // In-process replacement clears the offer too.
+    svc.rebuild([mkSnap(items, iso), marker()]);
+    assert.equal(svc.archiveWindowOffered, true);
+    svc.replace([{ content: 'fresh', status: 'pending' }]);
+    assert.equal(svc.archiveWindowOffered, false);
   });
 });
 

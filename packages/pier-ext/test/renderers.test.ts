@@ -6,7 +6,7 @@ import {
   APPROVAL_NEEDED_CUSTOM_TYPE, ROLE_MANIFEST_CUSTOM_TYPE, installRenderers, type RenderComponent, type RenderTheme,
 } from '../src/renderers.ts';
 import { TODO_EDIT_CUSTOM_TYPE } from '../src/todo-core.ts';
-import { SUBS_CUSTOM_TYPE, PROGRESS_CUSTOM_TYPE } from '../src/subagent-core.ts';
+import { SUBS_CUSTOM_TYPE } from '../src/subagent-core.ts';
 import { DELEGATION_CUSTOM_TYPE } from '../src/delegation-core.ts';
 import { TERMINALS_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE } from '../src/terminal-core.ts';
 import { TODO_REMINDER_CUSTOM_TYPE } from '../src/todo-reminder-core.ts';
@@ -106,9 +106,6 @@ const CASES: RenderCase[] = [
   { name: 'approval needed without a tool', kind: 'entry', type: APPROVAL_NEEDED_CUSTOM_TYPE, data: {}, expect: ['⚠ approval needed · ? (?)'] },
   { name: 'todo reminder collapsed', kind: 'message', type: TODO_REMINDER_CUSTOM_TYPE, data: { content: 'Reminder 1/3: you stopped with unfinished todos\nsecond line' }, expect: ['↻ todo reminder', '  Reminder 1/3: you stopped with unfinished todos'] },
   { name: 'todo reminder expanded', kind: 'message', type: TODO_REMINDER_CUSTOM_TYPE, expanded: true, data: { content: 'Reminder 1/3: you stopped with unfinished todos\nsecond line' }, expect: ['↻ todo reminder', 'Reminder 1/3: you stopped with unfinished todos', 'second line'] },
-  { name: 'progress collapsed', kind: 'message', type: PROGRESS_CUSTOM_TYPE, data: { content: 'auth module done, tests green', details: { paneId: 'p2' } }, expect: ['⤴ progress · p2: auth module done, tests green'] },
-  { name: 'progress expanded multi-line', kind: 'message', type: PROGRESS_CUSTOM_TYPE, expanded: true, data: { content: 'first line\nsecond line', details: { paneId: 'p2' } }, expect: ['⤴ progress · p2: first line second line', 'first line', 'second line'] },
-  { name: 'progress without details', kind: 'message', type: PROGRESS_CUSTOM_TYPE, data: { content: 'x' }, expect: ['⤴ progress · ?: x'] },
   { name: 'terminal nudge with empty content', kind: 'message', type: TERM_REMINDER_CUSTOM_TYPE, data: {}, expect: ['↻ terminal nudge', '  terminal nudge'] },
 ];
 
@@ -135,6 +132,6 @@ test('installRenderers: a missing API registers nothing, a throwing host is cont
     registerEntryRenderer: () => { calls += 1; throw new Error('boom'); },
     registerMessageRenderer: () => { calls += 1; },
   });
-  assert.equal(calls, 9, 'one throwing registration must not skip the rest');
-  assert.deepEqual(registered, [PROGRESS_CUSTOM_TYPE, TODO_REMINDER_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE]);
+  assert.equal(calls, 8, 'one throwing registration must not skip the rest');
+  assert.deepEqual(registered, [TODO_REMINDER_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE]);
 });

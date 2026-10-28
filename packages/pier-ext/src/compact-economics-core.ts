@@ -8,7 +8,6 @@ import { findCutPoint, sessionEntryToContextMessages, type SessionEntry } from '
 
 interface CompactionEconomics {
   readonly remainingRequestScale: number;
-  readonly remainingRequestStddevK: number;
   readonly windowReserveTokens: number;
   readonly firstCompactionRequestScale: number;
   readonly subsequentCompactionMargin: number;
@@ -16,7 +15,6 @@ interface CompactionEconomics {
 
 export const DEFAULT_COMPACTION_ECONOMICS: CompactionEconomics = Object.freeze({
   remainingRequestScale: 1.0,
-  remainingRequestStddevK: 0.0,
   windowReserveTokens: 16_384,
   firstCompactionRequestScale: 2.0,
   subsequentCompactionMargin: 1.5,
@@ -51,8 +49,7 @@ type CompactionReason =
 
 interface RequestHorizonEstimate {
   readonly requestsPerBoundaryMean: number;
-  readonly requestsPerBoundaryLowerBound: number;
-  readonly unboundedExpectedRemainingRequests: number;
+  readonly requestsPerBoundaryEstimate: number;
   readonly windowRequestUpperBound: number | null;
   readonly expectedRemainingRequests: number;
 }
@@ -68,6 +65,13 @@ export interface CompactionDecision {
   readonly remainingBoundaries: number;
   readonly cacheWriteReadRatio: number | null;
   readonly incrementalCacheCostRatio: number | null;
+  /** Observed fraction of the reusable prefix served from cache (1 = every request a hit). */
+  readonly prefixCacheHitRate: number;
+  /**
+   * Expected per-request saving in cache-read-token units: a missed request bills the archived
+   * prefix at the write/input price, so it saves `cacheWriteReadRatio` times more than a hit.
+   */
+  readonly savingTokensPerRequest: number;
   readonly priorCompactionCount: number;
   readonly carriedDebtTokens: number;
   readonly cacheDebtRepaymentTokens: number;
@@ -75,8 +79,19 @@ export interface CompactionDecision {
   readonly reason: CompactionReason;
 }
 
-const MINIMUM_VARIANCE_SAMPLES = 3;
-const SMALL_SAMPLE_SCALE = 0.5;
+/**
+ * Sparse boundary samples are noisy: a single 127-request boundary extrapolated over ten todos once
+ * predicted 509 remaining requests where 16 were left. Shrink each mean toward a small prior (a todo
+ * completion typically lands after a handful of model/tool steps) so one or two samples cannot
+ * dominate; after a few samples the prior fades out.
+ */
+const SAMPLE_PRIOR_REQUESTS_PER_BOUNDARY = 5;
+const SAMPLE_PRIOR_WEIGHT = 2;
+/**
+ * Hard ceiling on any projected horizon. Compaction must pay for itself, and no observed boundary is
+ * evidence for an arbitrarily long remaining stretch.
+ */
+export const MAX_HORIZON_REQUESTS = 100;
 /** Retained boundary-request sample cap so the mean tracks recent pacing. */
 export const MAX_BOUNDARY_SAMPLES = 16;
 
@@ -84,26 +99,31 @@ export function estimateRemainingRequests(input: {
   readonly completedBoundaryRequestCounts: readonly number[];
   readonly remainingBoundaries: number;
   readonly scale: number;
-  readonly standardDeviationK: number;
   readonly contextTokens: number;
   readonly contextWindowTokens: number | null;
   readonly averageContextTokenIncrement: number | null;
+  /**
+   * Requests already spent since the last completed boundary or compaction. While work is visibly
+   * continuing the horizon must not collapse to 1 just because the todo list is momentarily empty.
+   */
+  readonly observedRequestsSinceBoundary?: number;
 }): RequestHorizonEstimate {
   const counts = input.completedBoundaryRequestCounts;
   const mean = counts.reduce((total, count) => total + count, 0) / Math.max(1, counts.length);
-  let lowerBound = mean;
-  if (input.standardDeviationK !== 0) {
-    if (counts.length < MINIMUM_VARIANCE_SAMPLES) {
-      lowerBound *= SMALL_SAMPLE_SCALE;
-    } else {
-      const variance = counts.reduce((total, count) => total + (count - mean) ** 2, 0);
-      const deviation = Math.sqrt(variance / (counts.length - 1));
-      lowerBound = Math.max(0, mean - input.standardDeviationK * deviation);
-    }
-  }
+  const estimatePerBoundary =
+    counts.length === 0
+      ? 0
+      : (mean * counts.length + SAMPLE_PRIOR_REQUESTS_PER_BOUNDARY * SAMPLE_PRIOR_WEIGHT)
+        / (counts.length + SAMPLE_PRIOR_WEIGHT);
 
-  const unboundedExpectedRemainingRequests =
-    1 + Math.floor(lowerBound * Math.max(0, input.remainingBoundaries) * input.scale);
+  const observedWorkFloor = Math.min(
+    MAX_HORIZON_REQUESTS,
+    Math.max(0, input.observedRequestsSinceBoundary ?? 0),
+  );
+  const requestEstimate = Math.max(
+    1 + Math.floor(estimatePerBoundary * Math.max(0, input.remainingBoundaries) * input.scale),
+    observedWorkFloor,
+  );
   const windowRequestUpperBound =
     input.contextWindowTokens === null ||
     input.averageContextTokenIncrement === null ||
@@ -116,13 +136,13 @@ export function estimateRemainingRequests(input: {
 
   return {
     requestsPerBoundaryMean: mean,
-    requestsPerBoundaryLowerBound: lowerBound,
-    unboundedExpectedRemainingRequests,
+    requestsPerBoundaryEstimate: estimatePerBoundary,
     windowRequestUpperBound,
-    expectedRemainingRequests:
-      windowRequestUpperBound === null
-        ? unboundedExpectedRemainingRequests
-        : Math.min(unboundedExpectedRemainingRequests, windowRequestUpperBound),
+    expectedRemainingRequests: Math.min(
+      MAX_HORIZON_REQUESTS,
+      requestEstimate,
+      windowRequestUpperBound ?? Number.POSITIVE_INFINITY,
+    ),
   };
 }
 
@@ -139,6 +159,10 @@ export function decideCompaction(input: {
   readonly carriedDebtTokens: number;
   readonly cacheDebtRepaymentTokens: number;
   readonly cacheWriteReadRatio: number | null;
+  /** Observed prefix cache hit rate in [0, 1]; omitted = every request priced as a hit. */
+  readonly prefixCacheHitRate?: number;
+  /** Requests observed since the last boundary/compaction; a floor on the remaining horizon. */
+  readonly observedRequestsSinceBoundary?: number;
   readonly economics?: CompactionEconomics;
 }): CompactionDecision {
   const economics = input.economics ?? DEFAULT_COMPACTION_ECONOMICS;
@@ -146,10 +170,10 @@ export function decideCompaction(input: {
     completedBoundaryRequestCounts: input.completedBoundaryRequestCounts,
     remainingBoundaries: input.remainingBoundaries,
     scale: economics.remainingRequestScale,
-    standardDeviationK: economics.remainingRequestStddevK,
     contextTokens: input.contextTokens,
     contextWindowTokens: input.contextWindowTokens,
     averageContextTokenIncrement: input.averageContextTokenIncrement,
+    observedRequestsSinceBoundary: input.observedRequestsSinceBoundary,
   });
 
   const savingTokens = input.archiveTokens - input.memoTokens;
@@ -159,12 +183,19 @@ export function decideCompaction(input: {
   const incrementalWriteCost = incrementalCacheCostRatio === null
     ? null
     : input.writeTokens * incrementalCacheCostRatio;
+  // Pricing every request as a cache hit undervalues compaction: 1.4% of requests miss the prefix
+  // cache (TTL expiry) and bill it at the input price — 50x cache-read on deepseek, ~1.7x the
+  // expected saving. The ratio never drops below 1, so the scaled saving never shrinks.
+  const prefixCacheHitRate = Math.min(1, Math.max(0, input.prefixCacheHitRate ?? 1));
+  const missPriceRatio = Math.max(1, input.cacheWriteReadRatio ?? 1);
+  const savingTokensPerRequest = Math.max(0, savingTokens)
+    * (prefixCacheHitRate + (1 - prefixCacheHitRate) * missPriceRatio);
 
   const breakevenRequests = compressible && incrementalWriteCost !== null
-    ? incrementalWriteCost / savingTokens
+    ? incrementalWriteCost / savingTokensPerRequest
     : null;
   const combinedBreakevenRequests = compressible && incrementalWriteCost !== null
-    ? (input.carriedDebtTokens + incrementalWriteCost) / savingTokens
+    ? (input.carriedDebtTokens + incrementalWriteCost) / savingTokensPerRequest
     : null;
 
   const firstCompaction = input.priorCompactionCount === 0;
@@ -232,6 +263,8 @@ export function decideCompaction(input: {
     remainingBoundaries: input.remainingBoundaries,
     cacheWriteReadRatio: input.cacheWriteReadRatio,
     incrementalCacheCostRatio,
+    prefixCacheHitRate,
+    savingTokensPerRequest,
     priorCompactionCount: input.priorCompactionCount,
     carriedDebtTokens: input.carriedDebtTokens,
     cacheDebtRepaymentTokens: input.cacheDebtRepaymentTokens,
@@ -312,7 +345,7 @@ export function nativeCompactionFeasible(entries: readonly SessionEntry[], keepR
   for (let index = path.length - 1; index >= 0; index--) {
     const entry = path[index];
     if (entry?.type !== 'compaction') continue;
-    const keptIndex = path.findIndex((item) => item.id === (entry as { firstKeptEntryId?: string }).firstKeptEntryId);
+    const keptIndex = path.findIndex((item) => item.id === entry.firstKeptEntryId);
     startIndex = keptIndex >= 0 ? keptIndex : index + 1;
     break;
   }

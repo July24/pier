@@ -16,7 +16,7 @@ import {
   type SessionEntryLike,
   type SubSessionState,
 } from './session-tail.ts';
-import { idParam, sleep, type AliveProbe, type SubEntry } from './subagent-core.ts';
+import { idParam, reportFingerprint, sleep, type AliveProbe, type SubEntry } from './subagent-core.ts';
 import { toolError } from './tool-error.ts';
 
 /* ── subagent output delta (pure) ───────────────────────────────── */
@@ -25,6 +25,61 @@ export const OUTPUT_DEFAULT_MAX_CHARS = 6000;
 export const OUTPUT_HARD_CAP_CHARS = 16000;
 const OUTPUT_MIN_OVERLAP = 16;
 const OUTPUT_TAIL_CHARS = 500;
+
+const BOX_CHARS = '│┃║╭╮╰╯┌┐└┘├┤┬┴┼─━═╌╍';
+const FRAME_ONLY_LINE = new RegExp(`^[\\s${BOX_CHARS}]*[${BOX_CHARS}][\\s${BOX_CHARS}]*$`);
+const SIDE_BORDER = /^\s*[│┃║] ?|\s*[│┃║]\s*$/g;
+/** pi's status footer: `↑43k ↓13k R820k CH99.1% $0.017 …`, preceded by a `~/cwd (branch)` line. */
+const PI_FOOTER_LINE = /^↑[\d.]+[kKmM]?\s+↓[\d.]+[kKmM]?\s/;
+const PI_FOOTER_CWD_LINE = /^~?\/\S*( \([^)]*\))?$/;
+
+/**
+ * Strip TUI chrome from a worker pane read: frame-only box-drawing rows, side borders, right-padding,
+ * pi's footer, and blank-line runs. A real read was ~20% whitespace, box glyphs and footer. Applied
+ * before the delta, so the cursor tracks the same cleaned text on every call.
+ */
+export function cleanPaneChrome(text: string): string {
+  // Frame rows are judged before border stripping, which would otherwise leave them as blank lines.
+  const lines = text.split('\n')
+    .filter((line) => !FRAME_ONLY_LINE.test(line))
+    .map((line) => line.replace(SIDE_BORDER, '').trimEnd());
+  const kept: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (PI_FOOTER_LINE.test(line)) continue;
+    if (PI_FOOTER_CWD_LINE.test(line) && PI_FOOTER_LINE.test(lines[i + 1] ?? '')) continue;
+    if (line === '' && kept[kept.length - 1] === '') continue;
+    kept.push(line);
+  }
+  return kept.join('\n');
+}
+
+/** Normalized-text length of the report opening that identifies the pane's rendered copy. */
+const REPORT_KEY_CHARS = 24;
+
+/**
+ * The pane shows the final report rendered (markdown stripped, long lines cut at pane width), so it
+ * is a lossy copy of the transcript text. When the transcript report is attached, cut the pane delta
+ * where the report's opening appears (whitespace and markdown markers ignored). Null: no copy found.
+ */
+export function cutPaneReportCopy(delta: string, report: string): string | null {
+  const isNoise = (ch: string): boolean => /[\s`*_#>]/.test(ch);
+  const key = [...report].filter((ch) => !isNoise(ch)).slice(0, REPORT_KEY_CHARS).join('');
+  if (key.length < REPORT_KEY_CHARS) return null;
+  let normalized = '';
+  const origin: number[] = [];
+  for (let i = 0; i < delta.length; i++) {
+    if (isNoise(delta[i]!)) continue;
+    normalized += delta[i];
+    origin.push(i);
+  }
+  const at = normalized.indexOf(key);
+  if (at < 0) return null;
+  const lineStart = delta.lastIndexOf('\n', origin[at]!) + 1;
+  const before = delta.slice(0, lineStart).trimEnd();
+  const marker = '(the pane\'s rendered copy of the final report is omitted — full text in the Subagent Report section below)';
+  return before ? `${before}\n${marker}` : marker;
+}
 
 export type SubagentStatus = 'running' | 'idle' | 'blocked' | 'settled';
 
@@ -440,6 +495,8 @@ export async function executeSubagentOutput(
     /** Last finalized assistant text from the worker's transcript: the pane read alone cannot
      * recover it when the fullscreen TUI shows only the status overlay. Optional for tests. */
     readFinalReport?: (paneId: string, entryCwd: string) => Promise<string | null>;
+    /** Persists `entry.reportDelivered` so the settlement notice can skip a report already shown. */
+    persistSubs?: () => void;
   },
 ) {
   const rawId = idParam(params, 'agentId', 'taskId');
@@ -472,8 +529,9 @@ export async function executeSubagentOutput(
   const maxChars = typeof params?.max_chars === 'number'
     ? params.max_chars
     : typeof params?.maxChars === 'number' ? params.maxChars : undefined;
-  const deltaResult = computeSubagentOutputDelta(prevCursor, rawRead.text, { maxChars });
-  deltaResult.nextCursor.reportTail ??= prevCursor?.reportTail;
+  const deltaResult = computeSubagentOutputDelta(prevCursor, cleanPaneChrome(rawRead.text), { maxChars });
+  // A resumed process has no cursor; the durable delivery record keeps the report from repeating.
+  deltaResult.nextCursor.reportTail ??= prevCursor?.reportTail ?? entry.reportDelivered?.fingerprint;
 
   // Transcript fallback: the terminal delta can be empty (or footer-only) while the finished
   // report exists only in the session file. Surface it once per distinct report.
@@ -481,11 +539,16 @@ export async function executeSubagentOutput(
   if ((status === 'settled' || status === 'idle') && deps.readFinalReport) {
     try {
       const report = await deps.readFinalReport(entry.paneId, entry.cwd);
-      const fingerprint = report ? report.slice(-64) : '';
+      const fingerprint = report ? reportFingerprint(report) : '';
       if (report && fingerprint && fingerprint !== deltaResult.nextCursor.reportTail) {
         const bounded = boundText(report, Math.max(1, Math.min(maxChars ?? OUTPUT_DEFAULT_MAX_CHARS, OUTPUT_HARD_CAP_CHARS)));
         reportSection = `[Subagent Report | latest finalized message from session transcript${bounded.truncated ? ' | truncated' : ''}]\n${bounded.text}`;
         deltaResult.nextCursor.reportTail = fingerprint;
+        deltaResult.delta = cutPaneReportCopy(deltaResult.delta, report) ?? deltaResult.delta;
+        if (!bounded.truncated) {
+          entry.reportDelivered = { fingerprint, at: Date.now() };
+          deps.persistSubs?.();
+        }
       }
     } catch {
     }

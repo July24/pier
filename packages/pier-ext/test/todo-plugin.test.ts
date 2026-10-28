@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { Context } from '@deepseek-ai/cordis';
 import { cordisProvide } from '../src/cordis-services.ts';
 import todoPlugin, { widgetLines } from '../src/plugins/todo.ts';
+import { TODO_ARCHIVE_WINDOW_CUSTOM_TYPE, todoListHash } from '../src/todo-core.ts';
 import type { WorkerWidgetRow } from '../src/tree-view.ts';
 import { BLOCKED_LABEL_KEY, formatBlockedLabel, formatPaneTitle, sidebarTodoTokens, staleTokenClearance } from '../src/pane-title.ts';
 import { PiSurface } from '../src/pi-surface.ts';
@@ -18,6 +19,7 @@ interface TodoDepsOverrides {
   getBlockedDepth?: () => number;
   getWorkers?: () => readonly WorkerWidgetRow[];
   stopReminder?: { getBlockedDepth: () => number; getRunningSubs: () => number };
+  mirrorTodos?: () => void;
 }
 
 /** One mount fixture for every test: real service + surface, individual deps overridable. */
@@ -100,22 +102,54 @@ test('core/todo：/todos unblock 端到端（blocked → pending + 权威 append
   assert.equal(pi.entries.length, 1, 'no-op 不追加权威条目'); assert.ok(notes.some((n) => n.includes('no change')));
   await ctx.fiber.dispose();
 });
-test('core/todo：R1 归档清空执行链——窗口拍不清，终态拍 rm 全量落盘 + 内存清空 → 空守卫接管', async () => {
+test('core/todo：R1 归档链——窗口落盘标记；下一轮立即终态 rm + 标题/widget 刷新；空守卫接管', async () => {
   const pi = fakePi();
-  const { ctx, todos } = await mount(pi);
+  let mirrored = 0;
+  const widgets: string[][] = [];
+  const { ctx, todos } = await mount(pi, { mirrorTodos: () => { mirrored += 1; } });
   const hook = pi.listeners.get('before_agent_start')?.[0];
-  todos.replace([{ content: '探查代码', status: 'completed' }, { content: '写文档', status: 'completed' }]);
-  todos.lastWriteAt = Date.now() - 2 * 3_600_000; // all done + 2h idle → archived
-  const win = (await hook?.()) as { message?: { content: string } } | undefined;
+  const eventCtx = { ui: { setWidget: (_id: string, lines: string[]) => { widgets.push(lines); } } };
+  const items = [{ content: '探查代码', status: 'completed' }, { content: '写文档', status: 'completed' }] as const;
+  todos.replace(items);
+  const writtenAt = Date.now() - 2 * 3_600_000; // all done + 2h idle → archived
+  todos.lastWriteAt = writtenAt;
+  const win = (await hook?.(eventCtx)) as { message?: { content: string } } | undefined;
   assert.match(win?.message?.content ?? '', /rewrite window/i); assert.equal(todos.items.length, 2, '窗口不清空');
-  assert.ok(!pi.entries.some(([t]) => t === 'pi-herdr.todo-edit'), '窗口不落盘');
-  // Same cadence as the empty guard (4 turns), so the terminal notice lands on the 5th pass.
-  for (let i = 0; i < 4; i++) await hook?.();
+  const marker = pi.entries.find(([t]) => t === TODO_ARCHIVE_WINDOW_CUSTOM_TYPE)?.[1] as
+    | { version: number; itemsHash: string }
+    | undefined;
+  assert.ok(marker, '窗口期落盘标记：/resume 后不再重复警告');
+  assert.equal(marker.version, 1);
+  assert.equal(marker.itemsHash, todoListHash(items));
+  assert.equal(todos.archiveWindowOffered, true);
+
+  // The very next run clears: the empty-guard cadence must not delay the terminal notice.
+  const mirroredBefore = mirrored;
+  const term = (await hook?.(eventCtx)) as { message?: { content: string } } | undefined;
+  assert.match(term?.message?.content ?? '', /archived and cleared from tracking/);
+  assert.doesNotMatch(term?.message?.content ?? '', /rewrite window/i);
   assert.equal(todos.items.length, 0, 'R1：内存列表已清空');
+  assert.equal(mirrored, mirroredBefore + 1, 'clear refreshes the pane title/sidebar mirror');
+  assert.deepEqual(widgets.at(-1), [], 'clear refreshes the resident widget');
   const rmEntry = pi.entries.find(([t]) => t === 'pi-herdr.todo-edit') as [string, { edits: Array<{ op: string }> }] | undefined;
   assert.deepEqual(rmEntry?.[1].edits.map((e) => e.op), ['rm', 'rm'], 'rm 全量落盘（rebuild 折叠得空表）');
-  for (let i = 0; i < 3; i++) await hook?.();
-  const empty = (await hook?.()) as { message?: { content: string } } | undefined;
+
+  // Resume: the same branch folds the marker on rebuild and goes straight to the terminal clear.
+  todos.rebuild([
+    {
+      type: 'message',
+      timestamp: new Date(writtenAt).toISOString(),
+      message: { role: 'toolResult', toolName: 'todo_write', details: { 'pi-herdr.todo': { version: 1, items } } },
+    },
+    { type: 'custom', customType: TODO_ARCHIVE_WINDOW_CUSTOM_TYPE, data: marker },
+  ]);
+  assert.equal(todos.archiveWindowOffered, true, 'resume folds the persisted window offer');
+  const resumed = (await hook?.(eventCtx)) as { message?: { content: string } } | undefined;
+  assert.match(resumed?.message?.content ?? '', /archived and cleared from tracking/, 'resumed session reaches the clear, not the window again');
+  assert.equal(todos.items.length, 0);
+
+  for (let i = 0; i < 3; i++) await hook?.(eventCtx);
+  const empty = (await hook?.(eventCtx)) as { message?: { content: string } } | undefined;
   assert.match(empty?.message?.content ?? '', /todo list is empty/i, '空守卫接管');
   await ctx.fiber.dispose();
 });
@@ -206,6 +240,40 @@ test('D41 stop 提醒：投递即计数，封顶 3 次后不再注入（pi.sendM
     mock.timers.tick(60_000);
     await flush();
     assert.equal(pi.sent.length, 3, 'the third reminder is the last one');
+  } finally {
+    mock.timers.reset();
+    await ctx.fiber.dispose();
+  }
+});
+
+test('D41 stop 提醒：provider error / agent_settled.aborted / 重试的 turn_start 都不催', async () => {
+  const pi = fakePi();
+  const { ctx, todos } = await mount(pi, { stopReminder: { getBlockedDepth: () => 0, getRunningSubs: () => 0 } });
+  const flush = async (): Promise<void> => { for (let i = 0; i < 4; i++) await Promise.resolve(); };
+  todos.replace([{ content: 'finish the migration', status: 'in_progress' }]);
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    // An upstream/provider error is retried by pi: a triggerTurn reminder would join the failing window.
+    await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'error' } });
+    await fire(pi, 'agent_settled', {});
+    mock.timers.tick(60_000);
+    await flush();
+    assert.equal(pi.sent.length, 0, 'no reminder after an error stop');
+
+    // A scheduled reminder is cancelled when the retry starts a turn (agent_start is not guaranteed).
+    await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'end_turn' } });
+    await fire(pi, 'agent_settled', {});
+    await fire(pi, 'turn_start');
+    mock.timers.tick(60_000);
+    await flush();
+    assert.equal(pi.sent.length, 0, 'the retry turn cancels the pending reminder');
+
+    // agent_settled.aborted is authoritative for ESC mid-tool even when stopReason looks natural.
+    await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'end_turn' } });
+    await fire(pi, 'agent_settled', { aborted: true });
+    mock.timers.tick(60_000);
+    await flush();
+    assert.equal(pi.sent.length, 0, 'a cancelled settle never schedules a reminder');
   } finally {
     mock.timers.reset();
     await ctx.fiber.dispose();

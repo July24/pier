@@ -14,6 +14,10 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
+/** pi's thinking levels in ascending order, plus `inherit` (summarize at the session's own level). */
+export const SUMMARY_THINKING_LEVELS = ['inherit', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type SummaryThinkingLevel = (typeof SUMMARY_THINKING_LEVELS)[number];
+
 export interface OnlineContextCompactConfig {
   enabled: boolean;
   logEnabled: boolean;
@@ -21,6 +25,8 @@ export interface OnlineContextCompactConfig {
   keepRecentTokens?: number;
   firstCompactionRequestScale: number;
   subsequentCompactionMargin: number;
+  /** Cap on the summary request's thinking level (never raised above the session's). */
+  summaryThinkingLevel: SummaryThinkingLevel;
 }
 
 export interface ObservationPackConfig {
@@ -74,7 +80,7 @@ export const DEFAULT_EFFICIENCY_CONFIG: EfficiencyConfig = Object.freeze({
   version: 1,
   onlineContextCompact: Object.freeze({
     enabled: false, logEnabled: false, cacheWriteReadRatio: 'auto', keepRecentTokens: 20000,
-    firstCompactionRequestScale: 2.0, subsequentCompactionMargin: 1.5,
+    firstCompactionRequestScale: 2.0, subsequentCompactionMargin: 1.5, summaryThinkingLevel: 'low',
   }),
   observationPack: Object.freeze({
     enabled: false, logEnabled: false, thresholdBytes: 10240, fullSends: 2,
@@ -87,7 +93,7 @@ export const DEFAULT_EFFICIENCY_CONFIG: EfficiencyConfig = Object.freeze({
   jev: Object.freeze({ enabled: false, logEnabled: false, model: 'jev-1.13.0', timeoutMs: 2000, minConfidence: 0.6 }),
 });
 
-type FieldKind = 'bool' | 'int' | 'number' | 'ratio' | 'string' | 'optionalString';
+type FieldKind = 'bool' | 'int' | 'number' | 'ratio' | 'string' | 'optionalString' | 'enum';
 
 interface FieldSpec {
   readonly key: string;
@@ -97,6 +103,8 @@ interface FieldSpec {
   readonly max?: number;
   /** Issue text for a bound that must not be printed as a plain JS number ("1.0"). */
   readonly minText?: string;
+  /** Accepted values for `enum`. */
+  readonly values?: readonly string[];
 }
 
 /** A section is `{enabled, ...fields}`; field order fixes the order of reported issues. */
@@ -113,6 +121,7 @@ const SECTIONS: readonly SectionSpec[] = [
     { key: 'keepRecentTokens', kind: 'int', min: 1000 },
     { key: 'firstCompactionRequestScale', kind: 'number', min: 1, minText: '1.0' },
     { key: 'subsequentCompactionMargin', kind: 'number', min: 1, minText: '1.0' },
+    { key: 'summaryThinkingLevel', kind: 'enum', values: SUMMARY_THINKING_LEVELS },
   ] },
   { name: 'observationPack', fields: [
     { key: 'enabled', kind: 'bool' },
@@ -156,6 +165,8 @@ function issueFor(section: string, field: FieldSpec): string {
         : `${path} 必须是 ${field.min} 到 ${field.max} 之间的数字`;
     case 'ratio':
       return `${path} 必须是 "auto" 或非负有限数`;
+    case 'enum':
+      return `${path} 必须是 ${(field.values ?? []).join(' | ')} 之一`;
     default:
       return `${path} 必须是非空字符串`;
   }
@@ -190,6 +201,9 @@ function applyField(target: Record<string, unknown>, field: FieldSpec, raw: unkn
       if (typeof raw !== 'string' || !raw.trim()) return false;
       target[field.key] = raw.trim();
       return true;
+    case 'enum':
+      if (typeof raw !== 'string' || !(field.values ?? []).includes(raw)) return false;
+      break;
   }
   target[field.key] = raw;
   return true;

@@ -5,7 +5,7 @@
  */
 
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, readdir, realpath, rename, rm, stat } from 'node:fs/promises';
+import { lstat, mkdir, open, readdir, realpath, rename, rm, stat, type FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
@@ -50,6 +50,21 @@ export function resolveSessionRoot(
 
 export function observationObjectPath(root: string, obsId: string): string {
   return join(root, 'observation-pack', 'objects', `${obsId}.txt`);
+}
+
+/** Cross-process idempotence probe: a resumed process has no memo but the content-addressed object
+ *  is still on disk. A wrong-sized file is treated as absent so the writer re-verifies it. */
+export async function observationObjectExists(
+  root: string,
+  obsId: string,
+  expectedBytes?: number,
+): Promise<boolean> {
+  try {
+    const stats = await lstat(observationObjectPath(root, obsId));
+    return stats.isFile() && (expectedBytes === undefined || stats.size === expectedBytes);
+  } catch {
+    return false;
+  }
 }
 
 export function reducerObjectPath(root: string, sha256: string): string {
@@ -202,6 +217,27 @@ export async function storeContentAddressedObject(
   };
 }
 
+const ALIGN_SCAN_BYTES = 64 * 1024;
+
+/** Advance a mid-line offset to the next line start so a recall page never opens inside a line.
+ *  A single-line tail (no newline left) keeps the requested offset: skipping to EOF would make the
+ *  rest of the object unreadable. */
+async function alignOffsetToLineStart(handle: FileHandle, offset: number, size: number): Promise<number> {
+  if (offset <= 0 || offset >= size) return offset;
+  const prev = Buffer.alloc(1);
+  const { bytesRead: prevRead } = await handle.read(prev, 0, 1, offset - 1);
+  if (prevRead === 0 || prev[0] === 0x0a) return offset;
+
+  const scan = Buffer.alloc(Math.min(ALIGN_SCAN_BYTES, size - offset));
+  for (let pos = offset; pos < size; pos += scan.length) {
+    const { bytesRead } = await handle.read(scan, 0, Math.min(scan.length, size - pos), pos);
+    if (bytesRead === 0) break;
+    const newline = scan.subarray(0, bytesRead).indexOf(0x0a);
+    if (newline !== -1) return pos + newline + 1;
+  }
+  return offset;
+}
+
 export async function readStoredObjectChunk(
   filePath: string,
   offset: number,
@@ -218,14 +254,15 @@ export async function readStoredObjectChunk(
       throw new Error(`Offset ${offset} exceeds object size ${fileStat.size}`);
     }
 
-    const available = Math.max(0, fileStat.size - offset);
+    const start = await alignOffsetToLineStart(handle, offset, fileStat.size);
+    const available = Math.max(0, fileStat.size - start);
     const buffer = Buffer.alloc(Math.min(available, limits.maxBytes + 4));
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
     const sliced = sliceBufferChunk(buffer.subarray(0, bytesRead), 0, limits);
     // sliceBufferChunk's nextOffset is relative to the window it was given (offset 0). Callers page
     // with the absolute file offset from the header, so add the seek back.
-    const nextOffset = offset + sliced.nextOffset;
-    return { ...sliced, nextOffset, eof: nextOffset >= fileStat.size };
+    const nextOffset = start + sliced.nextOffset;
+    return { ...sliced, offset: start, nextOffset, eof: nextOffset >= fileStat.size };
   } finally {
     await handle?.close();
   }

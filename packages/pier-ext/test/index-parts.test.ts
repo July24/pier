@@ -33,7 +33,6 @@ function pipeSession(over: Partial<PipeHandlerSession> = {}): PipeHandlerSession
     abort: () => {},
     setPendingMachineRequest: () => {},
     applyRoleSwitch: async () => ({ ok: true, message: 'stub' }),
-    deliverProgress: async () => {},
     applyWorkerTodos: () => {},
     ...over,
   };
@@ -167,6 +166,25 @@ test('createNoticeBuffer: busy queues; flush steer collapses and clears GC exemp
   assert.equal(sent[0].mode, 'steer');
   assert.match(sent[0].content, /a/);
   assert.match(sent[0].content, /b/);
+  assert.equal(buf.noticePending().size, 0);
+});
+
+test('createNoticeBuffer: a settlement landing during compaction is buffered and flushed after it settles', async () => {
+  // Mirrors index.ts: the agent is idle while compaction runs, so isBusy also covers compactionInFlight.
+  const sent: Array<{ content: string; mode: string }> = [];
+  let agentActive = false;
+  let compactionInFlight = true;
+  const buf = createNoticeBuffer({
+    isBusy: () => agentActive || compactionInFlight,
+    send: async (content, mode) => { sent.push({ content, mode }); },
+  });
+  await buf.deliverNotice('wA:p5F finished: report attached', 'wA:p5F');
+  assert.equal(sent.length, 0, 'nothing is sent into a compacting session');
+  assert.deepEqual([...buf.noticePending()], ['wA:p5F'], 'the pane stays GC-exempt while its notice is buffered');
+  // The continuation run starts and ends; agent_settled flushes the buffer.
+  compactionInFlight = false;
+  await buf.flush('followUp');
+  assert.deepEqual(sent, [{ content: 'wA:p5F finished: report attached', mode: 'followUp' }]);
   assert.equal(buf.noticePending().size, 0);
 });
 
@@ -490,16 +508,6 @@ test('role runtime: D93 sidebar identity is reported through the herdr client', 
   assert.equal(result.ok, true, result.message);
   assert.deepEqual(switchedTo, ['worker', 'master'], 'the switch reports the new role through the same transport');
 }));
-
-test('handlePipeRequest: progress routes to deliverProgress with the worker pane', async () => {
-  const seen: Array<{ paneId: string; text: string }> = [];
-  const res = await handlePipeRequest(
-    { type: 'progress', id: 'prog-1', paneId: 'p2', text: 'auth module done, tests green' },
-    pipeSession({ deliverProgress: async (paneId, text) => { seen.push({ paneId, text }); } }),
-  );
-  assert.deepEqual(res, { type: 'ok', id: 'prog-1' });
-  assert.deepEqual(seen, [{ paneId: 'p2', text: 'auth module done, tests green' }]);
-});
 
 test('handlePipeRequest: todo_sync routes the full worker list into the widget cache', async () => {
   const seen: Array<{ paneId: string; items: unknown[]; summary: string }> = [];

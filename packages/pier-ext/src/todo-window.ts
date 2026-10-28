@@ -20,6 +20,13 @@ export function formatTodoSummary(items: readonly TodoItem[]): string {
   return `todo: ${c.inProgress}▶ ${c.pending}○ ${c.blocked}■ ${c.completed}✓`;
 }
 
+/** One item line shared by the widget/tree renderer and the read-hook recitation: the blocker text is
+ *  part of the item (D43), not a widget-only decoration, so a resumed model keeps the reason. */
+export function todoLine(it: TodoItem): string {
+  const suffix = it.status === 'blocked' && it.blocker ? ` — ${it.blocker}` : '';
+  return `${todoMark(it.status)} ${it.content}${suffix}`;
+}
+
 /** Shared phase rendering so widget and overlay order entries identically. */
 export function renderTodoGroups(items: readonly TodoItem[]): string[] {
   const groups = new Map<string, TodoItem[]>();
@@ -32,10 +39,7 @@ export function renderTodoGroups(items: readonly TodoItem[]): string[] {
   const lines: string[] = [];
   for (const [phase, list] of groups) {
     if (phase) lines.push(`  [${phase}]`);
-    for (const it of list) {
-      const suffix = it.status === 'blocked' && it.blocker ? ` — ${it.blocker}` : '';
-      lines.push(`  ${todoMark(it.status)} ${it.content}${suffix}`);
-    }
+    for (const it of list) lines.push(`  ${todoLine(it)}`);
   }
   return lines;
 }

@@ -65,7 +65,8 @@ PI_HERDR_COMPACT_ENABLE=1 PI_HERDR_COMPACT_LOG=1 PI_HERDR_CACHE_RATIO=auto pi
     "cacheWriteReadRatio": "auto",
     "firstCompactionRequestScale": 2.0,
     "subsequentCompactionMargin": 1.5,
-    "keepRecentTokens": 20000
+    "keepRecentTokens": 20000,
+    "summaryThinkingLevel": "low"
   },
   "observationPack": {
     "enabled": true,
@@ -102,6 +103,7 @@ PI_HERDR_COMPACT_ENABLE=1 PI_HERDR_COMPACT_LOG=1 PI_HERDR_CACHE_RATIO=auto pi
 2. **工作区配置是整体覆盖**，不与用户配置深合并（"工作区只写一行 `enabled:false` 就能关掉"是可预期的）。
 3. **未知键 / 类型非法 → 该机制强制 `enabled:false`**（一次收集全部问题，打印单行 stderr 警告，不会中断会话）。所以"写了配置但没生效"时请先看 stderr 的 `[pi-herdr] efficiency config warning`。
 4. `onlineContextCompact.keepRecentTokens` 缺省会**继承 pi 的 `compaction.keepRecentTokens`**；若 pi 里设了 `compaction.enabled=false`，OCC 会同步禁用（除非 `PI_HERDR_COMPACT_ENABLE=1` 强制）。
+5. `onlineContextCompact.summaryThinkingLevel`（默认 `low`）是压缩摘要请求的 thinking 等级**上限**：会话等级更高时仅在摘要期间降到该值，结束（成功或失败）后恢复；会话等级本就更低时不升。`inherit` 表示沿用会话等级。
 
 ---
 
@@ -150,7 +152,7 @@ PI_HERDR_COMPACT_ENABLE=1 PI_HERDR_COMPACT_LOG=1 PI_HERDR_CACHE_RATIO=auto pi
 |---|---|---|
 | OBS | `grossSavedTokens` 累计 vs `recall` 次数 | 命中多、召回少 = 省；若模型频繁 recall 同一 id，说明 `excerptBytes`/`thresholdBytes` 需要调 |
 | EPR | `action:"applied"` 占比、`compressionRatio`、`reason` 分布 | applied 多且 `truncated-source`/`likely-secret`/`hash-failure` 少 = 稳；若多为 `hash-failure`，考虑换更听话的 reducer 模型 |
-| OCC | `breakevenRequests` vs `expectedRemainingRequests`、压缩后是否续跑 | breakeven 明显小于预期剩余请求 = 值得；频繁 `deferred_economic` = 样本还不足（多跑几个 todo 边界会自动校准） |
+| OCC | `breakevenRequests` vs `expectedRemainingRequests`、压缩后是否续跑 | breakeven 明显小于预期剩余请求 = 值得；`deferred_economic` 后在 agent 仍在调工具时每 10 次请求复评，horizon 以已观察工作量为下限、上限 100（blocked todo 不计入剩余边界）。breakeven 已计入实测前缀缓存未命中：`prefixCacheHitRate` 越低，`savingTokensPerRequest` 越高（miss 按 write/input 价计） |
 
 > 注意：OBS 的 `grossSavedTokens` 是**毛收益**（未扣打包造成的缓存重写代价）；真正的判定请结合是否"压缩点/里程碑边界"发生。
 
@@ -197,17 +199,18 @@ PI_HERDR_COMPACT_ENABLE=1 PI_HERDR_COMPACT_LOG=1 PI_HERDR_CACHE_RATIO=auto pi
 ## 8. jev 决策层(P0-1/2/3,2026-09-18)
 
 设计全文见 `docs/rfc-jev-integration.md`。与上面三机制同住一个配置平面,
-但性质不同:它**不做任何 I/O 语义**,只给三处判断供给模型裁决(2026-09-19 起
-P0-1/P0-3 为 **jev 优先、纯代码兜底**;P0-2 本就 jev 优先),
-且**逐点 fail-open**——关掉、没 key、超时、429、低置信度,行为都与从前逐字节一致。
+但性质不同:它**不做任何 I/O 语义**,只给三处判断供给模型裁决(P0-3 为 **jev 优先、纯代码兜底**;
+P0-2 本就 jev 优先;P0-1 自 2026-10-28 起改回**正则优先、jev 只否决**,见 D122),
+且**逐点 fail-open**——关掉、没 key、超时、429、低置信度、熔断打开,行为都与从前逐字节一致。
+连续 2 次传输失败(超时/网络/5xx)后熔断 60s:期间所有接入点本地回退、不发请求不写行,触发行带 `breakerOpenedMs`;网络错误行带 `errorCode`。
 
 | 接入点 | **前置(不开则零调用)** | 触发条件 | jev 问什么 | 回退 |
 |---|---|---|---|---|
-| EPR 诊断命令门 | **EPR 开启**(`evidencePreservingReducer.enabled`) | 输出达提炼前置门(截断或预览 ≥ minBytes,默认 4KB)的候选 bash 命令(**每个候选都问**;小输出零调用;正则清单降级为兜底) | 命令类型 Choice + 是否诊断输出 Noul,1.5s 预算 | jev 不可用/失败/低置信 → 回退正则清单判定;确信拒绝则不提炼(权威) |
+| EPR 诊断命令门 | **EPR 开启**(`evidencePreservingReducer.enabled`) | 输出达提炼前置门(截断或预览 ≥ minBytes,默认 4KB)**且命中正则清单**的 bash 命令(清单外零调用) | 命令类型 Choice + 是否诊断输出 Noul,2.5s 预算 | jev 不可用/失败/低置信 → 保留正则命中;确信拒绝则不提炼(否决) |
 | 结算通知排序 | 无(独立于三机制,只需 jev 可用) | 折叠批量 **>3 条**时(≤3 不调)——需并行子代理结算攒批 | 每条一个相关性 Score + 失败 Noul,一次调用;阈值 0.7(CJK 折扣) | 到达序前 3(现行为) |
-| OBS 摘录选窗 | **OBS 开启**(`observationPack.enabled`) | 大输出已打包(**中段候选窗恒在**,不再要求失败信号行——CJK 日志同样覆盖) | 头/尾/首信号窗/最密窗/中段窗 哪个最有信息量 Choice | 头尾对半劈半(现行为) |
+| OBS 摘录选窗 | **OBS 开启**(`observationPack.enabled`) | 大输出已打包**且有失败信号窗**(只有中段窗的输出不问:一周 10 次中 8 次保留头尾或失败,见 D123);压缩批量打包合成**一次请求**(`outputs[i]` ↔ `excerpt_${i}_window`) | 头/尾/首信号窗/最密窗/中段窗 哪个最有信息量 Choice;行带 `items[{obsId, windows[{id,startLine}]}]` 与逐条 `picked` | 头尾对半劈半(现行为) |
 
-> **后台 usage=0?先对这张表。** jev 层自己不产生调用——调用仍由宿主机制与触发条件门住(2026-09-19 翻转后,jev 在 EPR 门/摘录选窗是**优先判断**,失败/不可用才回退纯代码逻辑)。
+> **后台 usage=0?先对这张表。** jev 层自己不产生调用——调用仍由宿主机制与触发条件门住(EPR 门只对正则命中的命令问 jev;摘录选窗是**优先判断**,失败/不可用才回退纯代码逻辑)。
 > 只开 `jev.enabled` 而 EPR/OBS 都关着时,唯一可能触发的是结算排序,而它要求一次
 > flush 攒下 **>3 条**结算;普通单代理会话一条都不会发,后台 usage=0 属**预期**而非故障。
 > 本地以 `jev.jsonl` 为准(开 `logEnabled`),比后台面板更即时。
@@ -216,8 +219,7 @@ P0-1/P0-3 为 **jev 优先、纯代码兜底**;P0-2 本就 jev 优先),
 (用户级)或 `<repo>/.pi-herdr/config.json`(受信工作区,整体覆盖不深合并),
 填上 `apiKey`,**并开启想要点亮的宿主机制(EPR / OBS)**,重开 pi 会话即可;
 `PIER_JEV_ENABLE=1` 可临时开。最快点亮路径:同时开 EPR,跑任一条输出 ≥4KB 的
-bash 命令(2026-09-19 翻转后正则清单内外都会先问 jev),第一次工具结果即产生一条
-`epr-diagnostic-gate` 调用。
+正则清单内命令(如 `mvn test`),第一次工具结果即产生一条 `epr-diagnostic-gate` 调用。
 
 **看什么**:`/pier-config show efficiency` 会列出 `jev.*` 全部键的生效值与来源;
 日志在 `<sessionDir>/herdr-pi/<sessionId>/efficiency-logs/jev.jsonl`
@@ -225,10 +227,9 @@ bash 命令(2026-09-19 翻转后正则清单内外都会先问 jev),第一次工
 代替明文——排查时对不上内容属预期)。
 
 **隐私边界**(2026-09-19 翻转后实情):发给 TypeSafe 的 state 只有——
-候选命令的**命令行字符串**(P0-1。翻转前外发的恰是**清单外**命令——正则命中即短路
-从不外发;且旧门在尺寸检查之前,`ls` 这类小输出也会发。翻转后改为**清单内外都发**,
-但仅限越过提炼前置门的候选,小输出零外发)、结算摘要 + master 当前 in_progress todo
+候选命令的**命令行字符串**(P0-1。仅正则清单内、越过提炼前置门的命令;2026-09-19 至 10-28
+曾改为清单内外都发,一周 437 次调用 0 次改变判定,已撤回,见 D122)、结算摘要 + master 当前 in_progress todo
 文本(P0-2,D1 决策:直接发送,不设开关)、被打包输出的头/中/尾**摘录窗文本**(P0-3,
-翻转前仅含英文失败信号行的输出才外发,现在所有被打包输出都发)。**P0-1/P0-3 出网前
+仅含失败信号窗的被打包输出才外发,见 D123)。**P0-1/P0-3 出网前
 各跑一次本地 `LIKELY_SECRET` 门,凭据形字符串不出现在这两条路径的任何请求里**;
 P0-2 按上述 D1 决策无此门。官方声明不用客户数据训练(企业版 ZDR,见 Legal)。

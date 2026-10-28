@@ -26,7 +26,7 @@ export interface DelegationContext {
   readonly description: string;
   /** Role manifest name active at spawn. */
   readonly role: string;
-  /** Phase 2: the master's pipe name — report_progress dials it directly (D49 reply-address
+  /** The master's pipe name — the worker's `todo_sync` push dials it directly (D49 reply-address
    * semantics, precomputed because the worker cannot derive the master's session cwd). */
   readonly parentPipe?: string;
 }

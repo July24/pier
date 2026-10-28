@@ -78,7 +78,8 @@ export interface TerminalEntry {
   readRevision?: number | null;
   readLen?: number;
   readTail?: string;
-  readEoTail?: string;
+  readTextLen?: number;
+  readTextHash?: number;
   initialized?: boolean;
 }
 
@@ -132,7 +133,8 @@ export function registerTerminal(
     readRevision: null,
     readLen: 0,
     readTail: '',
-    readEoTail: '',
+    readTextLen: 0,
+    readTextHash: 0,
   };
   return { ok: true, entries: [...entries, entry], entry };
 }
@@ -203,12 +205,61 @@ export function validateSignal(key: string): { ok: true; key: SignalKey } | { ok
   return { ok: true, key: k };
 }
 
+/** Compile a wait pattern with line semantics: herdr matches per line, so `^`/`$` anchors must bind
+ *  to line starts/ends, not only the start/end of the whole pane buffer. */
+export function compilePattern(pattern: string): RegExp {
+  return new RegExp(pattern, 'm');
+}
+
+/** The literal prefix of a regex source (leading `^` ignored, stops at the first metacharacter).
+ *  Lets the echo guard notice `DONE_[0-9]` in a command that echoes `DONE_$?`, which the full regex
+ *  cannot match even though the sentinel is plainly present in the typed text. */
+export function regexLiteralPrefix(pattern: string): string {
+  let prefix = '';
+  for (let i = 0; i < pattern.length; i += 1) {
+    const ch = pattern[i]!;
+    if (ch === '^' && prefix.length === 0) continue;
+    if (ch === '\\') {
+      const next = pattern[i + 1];
+      if (next == null || /[dDwWsSbBAZzG]/.test(next)) break;
+      prefix += next;
+      i += 1;
+      continue;
+    }
+    if ('.*+?^${}()|[]'.includes(ch)) break;
+    prefix += ch;
+  }
+  return prefix;
+}
+
+/** A concrete, echo-safe wait pattern derived from the literal prefix: anchored at a line start and
+ *  expecting the numeric sentinel suffix (`APN_BUILD2_EXIT_$?` → `^APN_BUILD2_EXIT_[0-9]`). Trailing
+ *  digits after a separator are dropped so a literal `..._0` still derives `..._[0-9]`; digits glued
+ *  to a name (`step2`) stay, because they are part of the marker. */
+export function echoSafeWaitSuggestion(literal: string): string | null {
+  const base = literal.replace(/([^A-Za-z0-9])\d+$/, '$1');
+  if (!base) return null;
+  return `^${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[0-9]`;
+}
+
+/**
+ * A `cmd; echo RUN_EXIT_$? >> /tmp/run.log` sentinel lands in the log file, never in the pane a
+ * plain wait watches: one session slept 240-420 s at a time polling such a log with bash. Returns
+ * the sentinel's literal prefix and the file it is redirected into, or null.
+ */
+export function redirectedSentinel(text: string): { prefix: string; file: string } | null {
+  const m = /\becho\s+["']?([A-Za-z][A-Za-z0-9_]*?)\$\?["']?\s*>>?\s*(["']?)([^\s;&|"']+)\2/.exec(text);
+  return m ? { prefix: m[1]!, file: m[3]! } : null;
+}
+
 /**
  * Whether a wait pattern would match the terminal's own echoed input: the shell echoes typed
  * commands into the pane, so a pattern contained in the last sent text (`…; echo TERM_DONE_$?`
  * waited on as literal `TERM_DONE_`) matches its own echo and returns "matched" before the job
- * has produced anything. Detection is per terminal and best-effort: no send in this process
- * lifetime → no hazard known → the wait proceeds unchanged.
+ * has produced anything. A regex whose literal prefix occurs in the echo is also a hazard: the
+ * sentinel `DONE_$?` becomes `DONE_<status>` only after the command runs.
+ * Detection is per terminal and best-effort: no send in this process lifetime → no hazard known →
+ * the wait proceeds unchanged.
  */
 export function sentinelEchoHazard(opts: {
   pattern: string;
@@ -219,7 +270,13 @@ export function sentinelEchoHazard(opts: {
   if (!sent) return false;
   if (opts.regex) {
     try {
-      return new RegExp(opts.pattern).test(sent);
+      const re = compilePattern(opts.pattern);
+      if (re.test(sent)) return true;
+      // An anchored pattern is already safe when the echo cannot start a line with its literal
+      // prefix (`^DONE_[0-9]` vs `cmd; echo DONE_$?`); only unanchored patterns need the substring check.
+      const prefix = regexLiteralPrefix(opts.pattern);
+      if (!opts.pattern.startsWith('^') && prefix.length >= 3 && sent.includes(prefix)) return true;
+      return sent.includes('$?') && re.test(sent.replace(/\$\?/g, '0'));
     } catch {
       return false; // invalid regex is rejected by the caller before this runs
     }
@@ -242,11 +299,29 @@ export function stripAnsi(raw: string): string {
     .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
 }
 
+/** Secondary prompts (`dquote>`, `heredoc>`, `cmdand>`, …) mean the shell is still collecting input:
+ *  the command was incomplete (unbalanced quote, open block, …) and every later line types into it.
+ *  Only the last non-empty line is inspected, so `>` in ordinary output cannot trip the check. */
+const CONTINUATION_PROMPT_RE = /^(?:quote|dquote|bquote|heredoc|cmdand|cmdor|cmdsubst|subsh|then|else|elif|do|done|for|while|if|fi|case|esac|select|repeat|function|math|brace|foreach|cond)>$/i;
+
+export function detectContinuationPrompt(text: string): string | null {
+  const lines = text.split('\n');
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i]!.trim();
+    if (!line) continue;
+    return CONTINUATION_PROMPT_RE.test(line) ? line : null;
+  }
+  return null;
+}
+
 export interface ReadCursor {
   revision: number;
   len: number;
   tail: string;
-  eoTail: string;
+  /** Full pane-text length and FNV-1a hash: herdr's screen window can rewrite earlier lines while
+   *  the last characters stay identical, so a tail comparison alone is not a change detector. */
+  textLen: number;
+  textHash: number;
 }
 
 export interface ReadIncrement {
@@ -258,24 +333,36 @@ export interface ReadIncrement {
 
 const CURSOR_TAIL_CHARS = 64;
 
+/** FNV-1a 32-bit: change detection for the read cursor, not a security primitive. */
+export function hashPaneText(text: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
 export function computeIncrement(
   prev: ReadCursor | null,
   next: { text: string; revision: number },
   maxChars: number,
 ): ReadIncrement {
   const stableLen = next.text.lastIndexOf('\n') + 1;
+  const textHash = hashPaneText(next.text);
   const cursor: ReadCursor = {
     revision: next.revision,
     len: stableLen,
     tail: next.text.slice(Math.max(0, stableLen - CURSOR_TAIL_CHARS), stableLen),
-    eoTail: next.text.slice(-CURSOR_TAIL_CHARS).trimEnd(),
+    textLen: next.text.length,
+    textHash,
   };
-  if (prev && next.text.slice(-CURSOR_TAIL_CHARS).trimEnd() === prev.eoTail) {
+  if (prev && prev.textLen === next.text.length && prev.textHash === textHash) {
     return { mode: 'none', text: '', cursor: prev, hardCapped: false };
   }
   if (
     prev &&
-    next.text.length >= prev.len &&
+    next.text.length > prev.textLen &&
     next.text.slice(Math.max(0, prev.len - prev.tail.length), prev.len).trimEnd() === prev.tail.trimEnd()
   ) {
     const suffix = next.text.slice(prev.len);
@@ -293,7 +380,7 @@ export function excerptAroundMatch(text: string, pattern: string, regex: boolean
   let index = -1;
   let hitLen = pattern.length;
   if (regex) {
-    const found = new RegExp(pattern).exec(text);
+    const found = compilePattern(pattern).exec(text);
     index = found?.index ?? -1;
     hitLen = found?.[0].length ?? pattern.length;
   } else {
@@ -315,7 +402,7 @@ export function classifyWaitMatch(
   pattern: string,
   regex: boolean,
 ): { kind: 'fresh'; excerpt: string } | { kind: 'stale' } | { kind: 'absent' } {
-  const match = (text: string) => regex ? new RegExp(pattern).test(text) : text.includes(pattern);
+  const match = (text: string) => regex ? compilePattern(pattern).test(text) : text.includes(pattern);
   const inc = computeIncrement(prev, { text: paneText, revision: prev?.revision ?? 0 }, paneText.length + 1);
   const unread = inc.mode === 'append' ? inc.text : inc.mode === 'reset' ? paneText : '';
   if (match(unread)) return { kind: 'fresh', excerpt: excerptAroundMatch(unread, pattern, regex) };
@@ -378,10 +465,15 @@ export interface ShellInitPlan {
   readonly command: string | null;
 }
 
+/** History expansion off in both managed shells: bash honours `set +H`, zsh requires
+ *  `setopt NO_BANG_HIST` (`set +H` leaves `!` expansion on and an unbalanced `"…$!"` wedges the
+ *  shell at `dquote>`). Both shells parse this one-liner; only the matching branch runs. */
+export const SHELL_INIT_COMMAND = 'if [ -n "$ZSH_VERSION" ]; then setopt NO_BANG_HIST; else set +H; fi';
+
 /**
- * Plan the shell init command: `set +H` disables history expansion in managed bash/zsh shells, where `!`
- * in ordinary commands (`!|`, `if [ ! -f ... ]`, `!$`) otherwise triggers `zsh: event not found: \|` and
- * wedges the shell. PowerShell rejects the syntax and has no `!` history expansion, so it is skipped.
+ * Plan the shell init command: disable history expansion, where `!` in ordinary commands (`!|`,
+ * `if [ ! -f ... ]`, `!$`) otherwise triggers `zsh: event not found: \|` and wedges the shell.
+ * PowerShell rejects the syntax and has no `!` history expansion, so it is skipped.
  * Limit: the top-level shell only — a nested `bash -i` re-enables its own defaults; init is only worth
  * sending once the shell is at its prompt and has not been initialized yet.
  */
@@ -395,7 +487,7 @@ export function planShellInit(opts: {
   if (opts.readiness !== undefined && opts.readiness !== 'prompt') {
     return { shouldInit: false, command: null };
   }
-  return { shouldInit: true, command: 'set +H' };
+  return { shouldInit: true, command: SHELL_INIT_COMMAND };
 }
 
 export function foldTerminalsRegistry(
@@ -425,7 +517,8 @@ export function foldTerminalsRegistry(
         readRevision: typeof t.readRevision === 'number' ? t.readRevision : null,
         readLen: typeof t.readLen === 'number' ? t.readLen : 0,
         readTail: typeof t.readTail === 'string' ? t.readTail : '',
-        readEoTail: typeof t.readEoTail === 'string' ? t.readEoTail : '',
+        readTextLen: typeof t.readTextLen === 'number' ? t.readTextLen : 0,
+        readTextHash: typeof t.readTextHash === 'number' ? t.readTextHash : 0,
         initialized: t.initialized === true,
       }));
   }
@@ -470,7 +563,8 @@ export interface TerminalNudgeInput {
 export interface TerminalReminderPlan {
   due: boolean;
   content: string | null;
-  /** Terminals covered by this notice; the caller bumps each one's `nudges` at schedule time. */
+  /** Terminals covered by this notice; the caller bumps each one's `nudges` when the notice is
+   *  actually delivered (a cancelled grace timer must not consume a nudge). */
   ids: string[];
 }
 

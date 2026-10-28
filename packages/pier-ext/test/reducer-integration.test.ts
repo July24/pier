@@ -103,6 +103,33 @@ test('EPR: fails open on a model error or an unverifiable quote', withCleanup(as
   assert.equal(await handleReducerToolResult(bashEvent('npm test', rawLog), hallucinating.ctx, CONFIG), undefined);
 }));
 
+test('EPR: every fail-open exit after archival leaves a reason row', withCleanup(async (cleanup) => {
+  const dir = cleanup.tempDir('reducer').path;
+  const rawLog = 'Running test suite...\nfailure at line 10\n'.repeat(50);
+  const logging = { ...CONFIG, logEnabled: true };
+  const reasonOf = async (sessionId: string): Promise<Record<string, unknown>> => JSON.parse((await readRows(dir, sessionId))[0]!);
+  // pi's complete() reports a provider failure as an empty `error` message instead of throwing.
+  const errored = mockContext({ sessionDir: dir, sessionId: 'sess_stop_err', completeResponse: { content: [], stopReason: 'error', errorMessage: '502 upstream' } });
+  assert.equal(await handleReducerToolResult(bashEvent('npm test', rawLog), errored.ctx, logging), undefined);
+  assert.deepEqual(
+    (({ reason, stopReason, error }) => ({ reason, stopReason, error }))(await reasonOf('sess_stop_err')),
+    { reason: 'invoke-failed', stopReason: 'error', error: '502 upstream' },
+  );
+  const empty = mockContext({ sessionDir: dir, sessionId: 'sess_empty', completeResponse: { content: [{ type: 'text', text: '  ' }], stopReason: 'stop' } });
+  assert.equal(await handleReducerToolResult(bashEvent('npm test', rawLog), empty.ctx, logging), undefined);
+  assert.equal((await reasonOf('sess_empty')).reason, 'empty-output');
+  const noModel = mockContext({ sessionDir: dir, sessionId: 'sess_no_model' });
+  (noModel.ctx as unknown as { modelRegistry: unknown }).modelRegistry = {};
+  assert.equal(await handleReducerToolResult(bashEvent('npm test', rawLog), noModel.ctx, logging), undefined);
+  assert.equal((await reasonOf('sess_no_model')).reason, 'no-reducer-model');
+  // A receipt as large as the source is refused; the row records both sizes.
+  const small = 'FAILED x\n'.repeat(70);
+  const bloated = mockContext({ sessionDir: dir, sessionId: 'sess_big', completeResponse: receiptResponse(small, 'FAILED x') });
+  assert.equal(await handleReducerToolResult({ ...bashEvent('npm test', small), isError: true }, bloated.ctx, logging), undefined);
+  const big = await reasonOf('sess_big');
+  assert.equal(big.reason, 'receipt-not-smaller'); assert.equal(typeof big.receiptBytes, 'number');
+}));
+
 test('EPR: localOnly archives the log and never calls the model', withCleanup(async (cleanup) => {
   const dir = cleanup.tempDir('reducer').path;
   const rawLog = 'Diagnostic build log line...\n'.repeat(60);
@@ -116,13 +143,15 @@ test('EPR: evidence rows exist only for commands that reached the reduction path
   const logging = { ...CONFIG, logEnabled: true };
   const truncated = (command: string): ToolResultEventLike => ({ ...bashEvent(command), details: { truncation: { truncated: true } } });
   const { ctx, completeCalls } = mockContext({ sessionDir: dir });
-  // Rejected by the gate (off-list, no jev): the output is never parsed and no row is written.
-  assert.equal(await handleReducerToolResult(truncated('deno test --allow-read'), ctx, logging, {}), undefined);
+  // Off-list: the regex list is the candidate set, so jev is never asked and no row is written.
+  const offList = makeGate('hit');
+  assert.equal(await handleReducerToolResult(truncated('deno test --allow-read'), ctx, logging, { jev: offList.dep }), undefined);
+  assert.equal(offList.asks.length, 0, 'unlisted commands never reach the third-party gate');
   await assert.rejects(() => readRows(dir), 'gate-rejected commands must not produce evidence rows');
-  // Off-list but jev-approved: the row must exist (the flip's core benefit); a truncated result with
-  // no recoverable full log is skipped without paying for the model call.
+  // Listed and jev-approved: a truncated result with no recoverable full log is skipped without
+  // paying for the model call, but the row exists.
   const jevHit = makeGate('hit');
-  assert.equal(await handleReducerToolResult(truncated('deno test --allow-read'), ctx, logging, { jev: jevHit.dep }), undefined);
+  assert.equal(await handleReducerToolResult(truncated('cargo test'), ctx, logging, { jev: jevHit.dep }), undefined);
   assert.deepEqual(jevHit.asks, ['epr-diagnostic-gate']);
   assert.equal(completeCalls.length, 0);
   const row = (await readRows(dir))[0]!;
@@ -139,9 +168,9 @@ test('EPR: evidence rows exist only for commands that reached the reduction path
   assert.equal(completeCalls.length, 0);
   const rows = await readRows(dir);
   assert.equal(rows.length, 3); assert.ok(rows[2]!.includes('"reason":"likely-secret"')); assert.ok(!rows[2]!.includes('sk-supersecretkey1234567890'));
-  // A gate-rejected command never reaches the secret scan.
+  // A jev-vetoed command never reaches the secret scan.
   const rejected = makeGate('reject-kind');
-  assert.equal(await handleReducerToolResult(bashEvent('deno test --allow-read', secretBody), ctx, logging, { jev: rejected.dep }), undefined);
+  assert.equal(await handleReducerToolResult(bashEvent('cargo test', secretBody), ctx, logging, { jev: rejected.dep }), undefined);
   assert.equal((await readRows(dir)).length, 3, 'gate-rejected commands never reach the secret scan');
 }));
 
@@ -205,15 +234,13 @@ test('gate: the trust boundary precedes everything, and tool/size gates precede 
 }));
 
 /** [case, command, gate (undefined = no jev dependency), gate is asked, reaches the reduction path] */
-const GATE_CASES: Array<{ name: string; command: string; gate?: GateOutcome; ask: boolean; gated: boolean; regexHit?: boolean }> = [
-  { name: 'an off-list command approved by jev is gated', command: 'deno test --allow-read', gate: 'hit', ask: true, gated: true, regexHit: false },
-  { name: 'a listed command approved by jev is gated', command: 'cargo test', gate: 'hit', ask: true, gated: true, regexHit: true },
-  // A confident rejection is authoritative even for a regex-listed command.
-  { name: 'a confident rejection outranks a regex hit', command: 'cargo test', gate: 'reject-kind', ask: true, gated: false, regexHit: true },
-  { name: 'low confidence falls back to the regex hit', command: 'cargo test', gate: 'low-confidence', ask: true, gated: true, regexHit: true },
-  { name: 'low confidence on an off-list command falls back to the regex miss', command: 'deno test --allow-read', gate: 'low-confidence', ask: true, gated: false, regexHit: false },
-  { name: 'a failed gate call falls back to the regex miss', command: 'mix test', gate: 'fail', ask: true, gated: false, regexHit: false },
-  { name: 'a failed gate call falls back to the regex hit', command: 'cargo test', gate: 'fail', ask: true, gated: true, regexHit: true },
+const GATE_CASES: Array<{ name: string; command: string; gate?: GateOutcome; ask: boolean; gated: boolean }> = [
+  { name: 'an off-list command never asks jev, even one jev would approve', command: 'deno test --allow-read', gate: 'hit', ask: false, gated: false },
+  { name: 'a listed command approved by jev is gated', command: 'cargo test', gate: 'hit', ask: true, gated: true },
+  // A confident rejection vetoes a regex-listed command.
+  { name: 'a confident rejection vetoes a regex hit', command: 'cargo test', gate: 'reject-kind', ask: true, gated: false },
+  { name: 'low confidence keeps the regex hit', command: 'cargo test', gate: 'low-confidence', ask: true, gated: true },
+  { name: 'a failed gate call keeps the regex hit', command: 'cargo test', gate: 'fail', ask: true, gated: true },
   { name: 'without a gate the regex list decides alone (hit)', command: 'cargo test', ask: false, gated: true },
   { name: 'without a gate the regex list decides alone (miss)', command: 'deno test --allow-read', ask: false, gated: false },
   // Credential-shaped command lines stay local: no third-party call, the regex list alone decides.
@@ -221,7 +248,7 @@ const GATE_CASES: Array<{ name: string; command: string; gate?: GateOutcome; ask
   { name: 'a credential-shaped command stays local (regex hit)', command: 'pytest --api-key=sk-abcdefghijklmnop12', gate: 'reject-kind', ask: false, gated: true },
 ];
 
-test('gate: the jev outcome matrix decides reduction, with the regex list as the fallback', async (t) => {
+test('gate: the regex list is the candidate set and jev can only veto it', async (t) => {
   for (const c of GATE_CASES) {
     await t.test(c.name, withCleanup(async (cleanup) => {
       const dir = cleanup.tempDir('reducer').path;
@@ -230,10 +257,7 @@ test('gate: the jev outcome matrix decides reduction, with the regex list as the
       const gate = c.gate ? makeGate(c.gate) : undefined;
       assert.equal(await handleReducerToolResult(bashEvent(c.command, body), ctx, CONFIG, gate ? { jev: gate.dep } : {}), undefined);
       assert.equal(gate?.asks.length ?? 0, c.ask ? 1 : 0, 'third-party calls');
-      if (gate && c.ask) {
-        assert.deepEqual(gate.asks, ['epr-diagnostic-gate']);
-        assert.equal(gate.extras[0]!.regexHit, c.regexHit, 'the override direction stays observable in telemetry');
-      }
+      if (gate && c.ask) assert.deepEqual(gate.asks, ['epr-diagnostic-gate']);
       assert.equal(await archiveExists(dir, body), c.gated, 'archival is how a passed gate is observed');
     }));
   }

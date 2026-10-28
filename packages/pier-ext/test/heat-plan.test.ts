@@ -38,6 +38,16 @@ test('planSpawnSplitRatio: 焦点留在原格 = T^(1/depth)，移到新格 = 1-T
   }
 });
 
+test('planSpawnSplitRatio: splitting a shell pane keeps the shell at the 0.25 floor, like the workbench reflow', () => {
+  // depth 2, focus on the new agent pane: 1 - 0.72^(1/2) ≈ 0.15 would leave the shell a sliver
+  const root = split('right', pane('master'), pane('sh'));
+  const statuses = { master: 'idle', sh: 'unknown' };
+  const opts = { root, targetPaneId: 'sh', focusPaneId: '__pier_new__', direction: 'down' as const, statuses };
+  assert.equal(planSpawnSplitRatio(opts), 0.25);
+  // agent panes on both sides are untouched by the floor
+  assert.equal(planSpawnSplitRatio({ ...opts, statuses: { master: 'idle', sh: 'idle' } }), 1 - FOCUS_SHARE ** (1 / 2));
+});
+
 /* ── grid shape ── */
 test('parseShapeTree: nested pane leaves from layout.export, null for junk', () => {
   const raw = {

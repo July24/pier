@@ -109,7 +109,7 @@ test('validateEfficiencyConfig: unknown keys are rejected (typo guard) and fail 
 test('validateEfficiencyConfig: a fully customized config passes and keeps every value', () => {
   const custom = {
     version: 1 as const,
-    onlineContextCompact: { enabled: true, logEnabled: true, cacheWriteReadRatio: 12.5, keepRecentTokens: 30000, firstCompactionRequestScale: 2.5, subsequentCompactionMargin: 1.8 },
+    onlineContextCompact: { enabled: true, logEnabled: true, cacheWriteReadRatio: 12.5, keepRecentTokens: 30000, firstCompactionRequestScale: 2.5, subsequentCompactionMargin: 1.8, summaryThinkingLevel: 'inherit' as const },
     observationPack: { enabled: true, logEnabled: true, thresholdBytes: 20480, fullSends: 3, recallChunkBytes: 32768, excerptBytes: 512 },
     evidencePreservingReducer: { enabled: true, logEnabled: true, model: 'cliproxy/gemini-3.8-flash-high', minBytes: 8192, maxChars: 500000, maxOutputTokens: 1024, timeoutMs: 4000, localOnly: true },
     jev: { enabled: true, logEnabled: true, baseUrl: 'https://relay.example/v1', model: 'jev-1.13.1', timeoutMs: 3000, minConfidence: 0.75, apiKey: 'k' },

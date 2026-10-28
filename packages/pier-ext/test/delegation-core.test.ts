@@ -92,7 +92,7 @@ test('foldDelegation: last branch entry wins; foreign/torn entries are skipped',
   assert.equal(foldDelegation([{ type: 'custom', customType: DELEGATION_CUSTOM_TYPE, data: { broken: true } }]), null);
 });
 
-test('parseDelegationContext: parentPipe roundtrips; absent stays absent (Phase 2 report_progress dial-home)', () => {
+test('parseDelegationContext: parentPipe roundtrips; absent stays absent (todo_sync dial-home)', () => {
   const withPipe = delegationEnv({ ...CTX, parentPipe: 'pi-herdr--proj--p1' });
   assert.equal(parseDelegationContext(withPipe[DELEGATION_ENV])?.parentPipe, 'pi-herdr--proj--p1');
   const withoutPipe = delegationEnv(CTX);

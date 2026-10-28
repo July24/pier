@@ -12,6 +12,10 @@ import { parseJevAnswers, type JevAnswer, type JevQuestion, type JevUsage } from
 import type { JevConfig } from './efficiency-config-core.ts';
 
 const JEV_DEFAULT_BASE_URL = 'https://api.typesafe.ai';
+/** Consecutive transport failures (timeout / network / 5xx) that open the breaker. */
+export const JEV_BREAKER_FAILURES = 2;
+/** While open, asks fail open locally without a request or a telemetry row; the tripping row says so. */
+export const JEV_BREAKER_OPEN_MS = 60_000;
 
 export interface JevAskMeta {
   /** Stable question-set id for telemetry rows (e.g. 'epr-diagnostic-gate'). */
@@ -23,7 +27,7 @@ export interface JevAskMeta {
   extra?: Record<string, unknown>;
   /**
    * Post-answer decision fields for telemetry (choices/scores/final verdicts — what threshold tuning
-   * needs; still never request bodies). Called exactly once per ask.
+   * needs; still never request bodies). Called exactly once per ask, with null answers on failure.
    */
   enrich?: (outcome: { ok: boolean; answers: Record<string, JevAnswer> | null }) => Record<string, unknown>;
 }
@@ -49,11 +53,14 @@ export interface JevRuntime {
 export function createJevRuntime(getConfig: () => JevConfig, deps: JevRuntimeDeps = {}): JevRuntime {
   const doFetch = deps.fetchImpl ?? ((input, init) => globalThis.fetch(input, init));
   const now = deps.now ?? Date.now;
-
+  // A run of 12 back-to-back network failures and 2.5s timeout stalls showed every site paying
+  // the full budget during an outage; the breaker makes an outage cost one tripping ask.
+  let transportFailures = 0;
+  let breakerOpenUntil = 0;
   async function logAsk(
     config: JevConfig,
     meta: JevAskMeta,
-    outcome: { ok: true; model: string; usage: JevUsage } | { ok: false; reason: string },
+    outcome: { ok: true; model: string; usage: JevUsage } | { ok: false; reason: string; extra?: Record<string, unknown> },
     latencyMs: number,
     state: unknown,
     enriched: Record<string, unknown>,
@@ -77,6 +84,7 @@ export function createJevRuntime(getConfig: () => JevConfig, deps: JevRuntimeDep
       stateHash: sha256Hex(serialized),
       ...(outcome.ok ? { usage: { input_tokens: outcome.usage.inputTokens, output_tokens: outcome.usage.outputTokens } } : {}),
       ...(meta.extra ?? {}),
+      ...(outcome.ok ? {} : outcome.extra ?? {}),
       ...enriched,
     };
     try {
@@ -95,14 +103,25 @@ export function createJevRuntime(getConfig: () => JevConfig, deps: JevRuntimeDep
     async ask(request, meta): Promise<JevAskResult> {
       const startedAt = now();
       const config = getConfig();
-      const fail = async (reason: string): Promise<JevAskResult> => {
+      const fail = async (reason: string, extra?: Record<string, unknown>): Promise<JevAskResult> => {
         const latencyMs = now() - startedAt;
         const enriched = meta.enrich?.({ ok: false, answers: null }) ?? {};
-        await logAsk(config, meta, { ok: false, reason }, latencyMs, request.state, enriched);
+        await logAsk(config, meta, { ok: false, reason, extra }, latencyMs, request.state, enriched);
         return { ok: false, reason, latencyMs };
+      };
+      const transportFail = (reason: string, extra: Record<string, unknown> = {}): Promise<JevAskResult> => {
+        transportFailures += 1;
+        if (transportFailures < JEV_BREAKER_FAILURES) return fail(reason, extra);
+        transportFailures = 0;
+        breakerOpenUntil = now() + JEV_BREAKER_OPEN_MS;
+        return fail(reason, { ...extra, breakerOpenedMs: JEV_BREAKER_OPEN_MS });
       };
       if (!config.enabled) return fail('disabled');
       if (!config.apiKey) return fail('no-api-key');
+      if (now() < breakerOpenUntil) {
+        meta.enrich?.({ ok: false, answers: null });
+        return { ok: false, reason: 'breaker-open', latencyMs: 0 };
+      }
 
       const timeoutMs = meta.timeoutMs ?? config.timeoutMs;
       const controller = new AbortController();
@@ -121,8 +140,11 @@ export function createJevRuntime(getConfig: () => JevConfig, deps: JevRuntimeDep
         if (!response.ok) {
           // 429 (and everything else) fails open immediately: limits are
           // dynamically adjusted upstream and every pier call is droppable.
+          if (response.status >= 500) return transportFail(`http-${response.status}`);
+          transportFailures = 0;
           return fail(response.status === 429 ? 'rate-limited' : `http-${response.status}`);
         }
+        transportFailures = 0;
         const raw: unknown = await response.json();
         const parsed = parseJevAnswers(raw, Object.keys(request.questions));
         if (!parsed.ok) return fail(parsed.reason);
@@ -131,8 +153,11 @@ export function createJevRuntime(getConfig: () => JevConfig, deps: JevRuntimeDep
         await logAsk(config, meta, { ok: true, model: parsed.model, usage: parsed.usage }, latencyMs, request.state, enriched);
         return { ok: true, answers: parsed.answers, model: parsed.model, usage: parsed.usage, latencyMs };
       } catch (error) {
-        const aborted = error instanceof Error && error.name === 'AbortError';
-        return fail(aborted ? 'timeout' : 'network-error');
+        if (error instanceof Error && error.name === 'AbortError') return transportFail('timeout');
+        // fetch wraps the socket error in `cause`; its code (ECONNRESET, ENOTFOUND, ...) is the diagnosis.
+        const source = error instanceof Error && error.cause instanceof Error ? error.cause : error;
+        const code = source instanceof Error && 'code' in source && typeof source.code === 'string' ? source.code : undefined;
+        return transportFail('network-error', code ? { errorCode: code } : {});
       } finally {
         clearTimeout(timer);
       }

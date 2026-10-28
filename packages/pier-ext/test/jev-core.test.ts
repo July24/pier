@@ -7,9 +7,9 @@ import assert from 'node:assert/strict';
 import {
   DIAGNOSTIC_OUTPUT_MIN_NOUL, NOTICE_RANK_MIN_CONFIDENCE, buildExcerptWindows, composeNoticeRanking,
   diagnosticGateRequest, evaluateDiagnosticGate, evaluateSettleVerdict, evaluateExcerptPick, excerptAskIsSafe,
-  excerptPickRequest, isDiagnosticGateUnanswered, noticeRankRequest, parseJevAnswers, type JevAnswer, type JevQuestion,
+  excerptPickRequest, isDiagnosticGateUnanswered, noticeRankRequest, parseJevAnswers, planExcerptAsks, type JevAnswer, type JevQuestion,
 } from '../src/jev-core.ts';
-import { createJevRuntime } from '../src/jev-client.ts';
+import { createJevRuntime, JEV_BREAKER_OPEN_MS } from '../src/jev-client.ts';
 import type { JevConfig } from '../src/efficiency-config-core.ts';
 import { formatObservationPlaceholder } from '../src/observation-core.ts';
 import { withCleanup } from './test-utils.ts';
@@ -64,6 +64,8 @@ const GATE_CASES: Array<[string, Record<string, JevAnswer>, { hit: boolean; reas
   ['a diagnostic command with diagnostic output hits', gateAnswers('build_test_run', 0.9, 0.95), { hit: true, reason: 'hit' }],
   ['a non-target command kind does not hit', gateAnswers('install_deps', 0.99, 0.99), { hit: false, reason: 'not-build-test:install_deps' }],
   ['confidence below the gate does not hit', gateAnswers('build_test_run', 0.5, 0.99), { hit: false, reason: 'low-confidence' }],
+  // Regression: an unconfident rejection must not outrank the regex list (jev.jsonl showed 0.37).
+  ['an unconfident non-target kind falls open instead of rejecting', gateAnswers('install_deps', 0.37, 0.99), { hit: false, reason: 'low-confidence' }],
   ['non-diagnostic output does not hit', gateAnswers('build_test_run', 0.9, DIAGNOSTIC_OUTPUT_MIN_NOUL - 0.01), { hit: false, reason: 'non-diagnostic-output' }],
   ['no answers at all does not hit', {}, { hit: false, reason: 'missing-answer' }],
 ];
@@ -83,6 +85,7 @@ test('evaluateDiagnosticGate: hit / not-build-test / low-confidence / non-diagno
 const UNANSWERED_CASES: Array<[string, Record<string, JevAnswer>, boolean]> = [
   ['no answers', {}, true],
   ['low confidence', gateAnswers('build_test_run', 0.5, 0.99), true],
+  ['an unconfident rejection', gateAnswers('install_deps', 0.37, 0.99), true],
   ['a confident rejection', gateAnswers('install_deps', 0.99, 0.99), false],
   ['a confident hit with non-diagnostic output', gateAnswers('build_test_run', 0.9, 0.2), false],
   ['a confident hit', gateAnswers('build_test_run', 0.9, 0.95), false],
@@ -140,17 +143,28 @@ function logWithMiddleFailure(): string {
   return `${head}\n${middle}\n${tail}`;
 }
 
-test('buildExcerptWindows: the first signal line gets a window; signal-free logs still get the mid window', () => {
+test('buildExcerptWindows: the first signal line gets a window; signal-free logs get only the mid window', () => {
   const windows = buildExcerptWindows(logWithMiddleFailure(), 512);
   assert.ok(windows.length >= 1);
   assert.equal(windows[0]!.id, 'first_signal');
   assert.ok(windows[0]!.text.includes('Error: assertion failed'));
-  // No failure-signal lines (e.g. CJK logs the English regex cannot see): the always-on mid window
-  // keeps jev in the loop instead of skipping the call.
+  assert.equal(windows[0]!.startLine, 60, 'window offsets point two lines above the first signal line');
   const plain = Array.from({ length: 100 }, (_, i) => `plain ${i}`).join('\n');
   const midOnly = buildExcerptWindows(plain, 512);
   assert.deepEqual(midOnly.map((w) => w.id), ['mid']);
   assert.ok(midOnly[0]!.text.startsWith('plain 50'), 'mid window anchors at the middle line');
+  assert.equal(midOnly[0]!.startLine, 50);
+});
+
+test('planExcerptAsks: only outputs with a failure-signal window are asked, credential shapes stay local, indexes survive', () => {
+  const plain = Array.from({ length: 100 }, (_, i) => `plain ${i}`).join('\n');
+  const secret = `${logWithMiddleFailure()}\napi_key=sk-abcdefghij123456`;
+  const asks = planExcerptAsks([
+    { obsId: 'obs_plain', text: plain },
+    { obsId: 'obs_fail', text: logWithMiddleFailure() },
+    { obsId: 'obs_secret', text: secret },
+  ], 1024);
+  assert.deepEqual(asks.map((a) => [a.index, a.obsId]), [[1, 'obs_fail']]);
 });
 
 /** [case, model choice, confidence, expected pick (null = keep the mechanical excerpt)] */
@@ -161,17 +175,26 @@ const PICK_CASES: Array<[string, string, number, string | null]> = [
   ['low confidence means no pick', 'first_signal', 0.4, null],
 ];
 
-test('excerptPickRequest/evaluateExcerptPick: candidates become options; keep_head_tail and low confidence yield null', () => {
+test('excerptPickRequest/evaluateExcerptPick: one question per output; keep_head_tail and low confidence yield null', () => {
   const windows = buildExcerptWindows(logWithMiddleFailure(), 512);
-  const request = excerptPickRequest(windows, 'head', 'tail');
+  const midOnly = buildExcerptWindows(Array.from({ length: 100 }, (_, i) => `plain ${i}`).join('\n'), 512);
+  const request = excerptPickRequest([
+    { windows, headExcerpt: 'head', tailExcerpt: 'tail' },
+    { windows: midOnly, headExcerpt: 'h2', tailExcerpt: 't2' },
+  ]);
   assert.ok(request !== null);
-  const criteria = (request!.questions.window as { criteria: Record<string, string> }).criteria;
-  assert.ok('keep_head_tail' in criteria && 'first_signal' in criteria);
+  assert.deepEqual(Object.keys(request!.questions), ['excerpt_0_window', 'excerpt_1_window']);
+  const criteriaOf = (key: string) => (request!.questions[key] as { criteria: Record<string, string> }).criteria;
+  assert.ok('keep_head_tail' in criteriaOf('excerpt_0_window') && 'first_signal' in criteriaOf('excerpt_0_window'));
+  assert.ok(!('first_signal' in criteriaOf('excerpt_1_window')), 'each output offers only its own windows');
+  const outputs = (request!.state as { outputs: Array<Record<string, string>> }).outputs;
+  assert.deepEqual(outputs.map((o) => o.head_excerpt), ['head', 'h2']);
   for (const [name, choice, confidence, expected] of PICK_CASES) {
-    const answers: Record<string, JevAnswer> = { window: { type: 'choice', choice, probabilities: {}, confidence } };
-    assert.equal(evaluateExcerptPick(answers, 0.6), expected, name);
+    const answers: Record<string, JevAnswer> = { excerpt_1_window: { type: 'choice', choice, probabilities: {}, confidence } };
+    assert.equal(evaluateExcerptPick(answers, 1, 0.6), expected, name);
+    assert.equal(evaluateExcerptPick(answers, 0, 0.6), null, `${name}: another output's answer is not used`);
   }
-  assert.equal(excerptPickRequest([], 'h', 't'), null);
+  assert.equal(excerptPickRequest([]), null);
 });
 
 /** [case, head excerpt, tail excerpt, safe] — every pack is sent out, so the key never leaves the machine. */
@@ -185,7 +208,7 @@ test('excerptAskIsSafe: a credential shape in any part of the state stays local'
   const clean = buildExcerptWindows(Array.from({ length: 100 }, (_, i) => `plain ${i}`).join('\n'), 256);
   assert.equal(clean.length > 0, true);
   for (const [name, head, tail, expected] of ASK_SAFE_CASES) assert.equal(excerptAskIsSafe(clean, head, tail), expected, name);
-  const secretWindow = [{ id: 'mid' as const, label: 'm', text: 'password: sk-abcdefghij123456789012' }];
+  const secretWindow = [{ id: 'mid' as const, label: 'm', text: 'password: sk-abcdefghij123456789012', startLine: 0 }];
   assert.equal(excerptAskIsSafe(secretWindow, 'head', 'tail'), false);
 });
 
@@ -327,6 +350,37 @@ test('telemetry sessionId: meta wins, the runtime dep is the fallback (obs-excer
   const rows = (await readLog(root)).trim().split('\n').map((line) => JSON.parse(line) as { sessionId: string; mechanism: string });
   assert.ok(rows.every((r) => r.mechanism === 'jev'), 'every row keeps its mechanism tag');
   assert.deepEqual(rows.map((r) => r.sessionId), ['sess-dep', 'sess-meta', 'unknown']);
+}));
+
+test('breaker: two transport failures in a row skip jev for the open window, then it is retried', withCleanup(async (cleanup) => {
+  const root = cleanup.tempDir('jev').path;
+  let clock = 1_000;
+  let fetchCalls = 0;
+  let healthy = false;
+  const runtime = createJevRuntime(() => config(), {
+    now: () => clock,
+    getSessionRoot: () => root,
+    fetchImpl: async () => {
+      fetchCalls++;
+      if (healthy) return new Response(JSON.stringify(okBody()), { status: 200 });
+      throw new Error('fetch failed', { cause: Object.assign(new Error('reset'), { code: 'ECONNRESET' }) });
+    },
+  });
+  const ask = () => runtime.ask({ state: 's', questions: QUESTIONS }, { questionId: 'q' });
+  assert.equal((await ask()).ok, false);
+  // A non-transport answer in between would reset the run; here the second failure trips it.
+  assert.equal((await ask()).ok, false);
+  const skipped = await ask();
+  assert.deepEqual(skipped, { ok: false, reason: 'breaker-open', latencyMs: 0 });
+  assert.equal(fetchCalls, 2, 'an open breaker sends no request');
+  const rows = (await readLog(root)).trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+  assert.equal(rows.length, 2, 'skipped asks write no rows; the tripping row carries the window');
+  assert.equal(rows[0]!.errorCode, 'ECONNRESET');
+  assert.equal(rows[1]!.breakerOpenedMs, JEV_BREAKER_OPEN_MS);
+  clock += JEV_BREAKER_OPEN_MS;
+  healthy = true;
+  assert.equal((await ask()).ok, true, 'the window elapsed: jev is asked again');
+  assert.equal(fetchCalls, 3);
 }));
 
 /** [case, fetch impl, reason the ask fails open with] */

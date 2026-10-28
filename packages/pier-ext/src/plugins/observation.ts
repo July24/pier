@@ -11,7 +11,7 @@ import type {
 } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { containsReducerReceipt, countLines, deriveObservationId, estimateTokens, formatObservationPlaceholder, isObservationId, sha256Hex, shouldPackForCache } from '../observation-core.ts';
-import { appendEfficiencyLog, efficiencyLogPath, observationObjectPath, readStoredObjectChunk, resolveSessionRoot, storeContentAddressedObject } from '../efficiency-store.ts';
+import { appendEfficiencyLog, efficiencyLogPath, observationObjectExists, observationObjectPath, readStoredObjectChunk, resolveSessionRoot, storeContentAddressedObject } from '../efficiency-store.ts';
 import { resolveEfficiencyConfig, type EfficiencyConfig, type ObservationPackConfig } from '../efficiency-config-core.ts';
 import { resolveCacheRatioFromCost } from '../compact-economics-core.ts';
 import { planToolGate, type RuntimeRoleManifest } from '../tool-gate.ts';
@@ -51,14 +51,13 @@ function buildPlaceholder(
   toolCallId: string,
   text: string,
   textBytes: number,
+  contentHash: string,
   obsConfig: ObservationPackConfig,
   middle?: ExcerptMiddlePick,
-): { id: string; placeholder: string; contentHash: string } {
-  const contentHash = sha256Hex(text);
+): { id: string; placeholder: string } {
   const id = deriveObservationId(toolName, toolCallId, contentHash);
   return {
     id,
-    contentHash,
     placeholder: formatObservationPlaceholder({
       id,
       toolName,
@@ -75,6 +74,20 @@ function buildPlaceholder(
 
 function memoKeyFor(sessionRoot: string, toolCallId: string, charLength: number): string {
   return `${sessionRoot}:${toolCallId}:${charLength}`;
+}
+
+function rememberPlaceholder(
+  sessionRoot: string,
+  toolCallId: string,
+  charLength: number,
+  placeholder: string,
+  obsId: string,
+): void {
+  if (placeholderMemo.size >= MAX_MEMO_ENTRIES) {
+    const oldest = placeholderMemo.keys().next().value;
+    if (oldest) placeholderMemo.delete(oldest);
+  }
+  placeholderMemo.set(memoKeyFor(sessionRoot, toolCallId, charLength), { placeholder, obsId });
 }
 
 /** Append one observation.jsonl record; telemetry is always best-effort. */
@@ -100,8 +113,12 @@ interface ExcerptMiddlePick {
   label: string;
 }
 
-/** P0-3 seam: async middle-window picker (jev-backed); null keeps the legacy head+tail halves. */
-export type PickMiddleExcerpt = (text: string, excerptBudgetBytes: number) => Promise<ExcerptMiddlePick | null>;
+/** P0-3 seam: batched middle-window picker (jev-backed), one result per item in order; null keeps
+ *  the legacy head+tail halves. A whole compaction batch is one call. */
+export type PickMiddleExcerpts = (
+  items: ReadonlyArray<{ obsId: string; text: string }>,
+  excerptBudgetBytes: number,
+) => Promise<ReadonlyArray<ExcerptMiddlePick | null>>;
 
 /** Build the OCC `onBeforeCompact` hook: role-gated, config-gated batch packing of the branch's
  * large tool results before `ctx.compact()` rewrites the prefix. Exported so the gate behaviour is
@@ -110,7 +127,7 @@ export function createCompactionBatchPackHook(deps: {
   getObsConfig: () => ObservationPackConfig;
   getManifest?: () => RuntimeRoleManifest | null;
   getSessionId?: () => string | undefined;
-  pickMiddleExcerpt?: PickMiddleExcerpt;
+  pickMiddleExcerpts?: PickMiddleExcerpts;
 }): (sessionRoot: string, ctx: unknown) => Promise<void> {
   return async (sessionRoot: string, ctx: unknown): Promise<void> => {
     const obsConfig = deps.getObsConfig();
@@ -133,7 +150,7 @@ export function createCompactionBatchPackHook(deps: {
       sessionId: deps.getSessionId?.(),
       messages,
       obsConfig,
-      pickMiddleExcerpt: deps.pickMiddleExcerpt,
+      pickMiddleExcerpts: deps.pickMiddleExcerpts,
     });
   };
 }
@@ -147,20 +164,22 @@ async function packOneMessage(opts: {
   text: string;
   textBytes: number;
   charLength: number;
+  contentHash: string;
+  obsId: string;
   obsConfig: ObservationPackConfig;
   /** `extra` carries audit fields such as `source: 'compaction'`, `sendCount`, `tailTokensAfter`. */
   log?: { logEnabled: boolean; event: 'packed' | 'packed-batch'; sessionId?: string; extra?: Record<string, unknown> };
-  pickMiddleExcerpt?: PickMiddleExcerpt;
-  /** Prefetched middle excerpt (the batch path runs picks concurrently); null/undefined = none. */
+  pickMiddleExcerpts?: PickMiddleExcerpts;
+  /** Prefetched middle excerpt (the batch path picks for all items in one call); null/undefined = none. */
   middle?: ExcerptMiddlePick | null;
 }): Promise<string | null> {
-  const { sessionRoot, toolName, toolCallId, text, textBytes, charLength, obsConfig, log, pickMiddleExcerpt } = opts;
+  const { sessionRoot, toolName, toolCallId, text, textBytes, charLength, contentHash, obsConfig, log, pickMiddleExcerpts } = opts;
   const middle = opts.middle !== undefined
     ? (opts.middle ?? undefined)
-    : pickMiddleExcerpt
-      ? (await pickMiddleExcerpt(text, obsConfig.excerptBytes)) ?? undefined
+    : pickMiddleExcerpts
+      ? (await pickMiddleExcerpts([{ obsId: opts.obsId, text }], obsConfig.excerptBytes))[0] ?? undefined
       : undefined;
-  const { id: obsId, placeholder, contentHash } = buildPlaceholder(toolName, toolCallId, text, textBytes, obsConfig, middle);
+  const { id: obsId, placeholder } = buildPlaceholder(toolName, toolCallId, text, textBytes, contentHash, obsConfig, middle);
   const originalTokens = estimateTokens(text);
   const placeholderTokens = estimateTokens(placeholder);
 
@@ -174,11 +193,7 @@ async function packOneMessage(opts: {
     return null;
   }
 
-  if (placeholderMemo.size >= MAX_MEMO_ENTRIES) {
-    const oldest = placeholderMemo.keys().next().value;
-    if (oldest) placeholderMemo.delete(oldest);
-  }
-  placeholderMemo.set(memoKeyFor(sessionRoot, toolCallId, charLength), { placeholder, obsId });
+  rememberPlaceholder(sessionRoot, toolCallId, charLength, placeholder, obsId);
 
   if (log?.logEnabled && !loggedPackedObsIds.has(obsId)) {
     loggedPackedObsIds.add(obsId);
@@ -198,20 +213,65 @@ async function packOneMessage(opts: {
   return placeholder;
 }
 
-/** One packable message: a non-error tool result with text-only content that is not yet packed. */
-interface PackCandidate { toolName: string; toolCallId: string; text: string; textBytes: number; charLength: number }
+/** One packable message: a non-error, text-only tool result over the size threshold. */
+interface PackCandidate {
+  toolName: string;
+  toolCallId: string;
+  text: string;
+  textBytes: number;
+  charLength: number;
+  contentHash: string;
+  obsId: string;
+}
 
-function packCandidateAt(messages: readonly unknown[], index: number, sessionRoot: string): PackCandidate | null {
+function packCandidateAt(
+  messages: readonly unknown[],
+  index: number,
+  sessionRoot: string,
+  minBytes: number,
+): PackCandidate | null {
   const msg = messages[index] as ContextMessage | undefined;
   const content = toolResultContent(msg);
   if (!content) return null;
   const { texts, charLength } = content;
   const text = texts.join('\n');
+  const textBytes = Buffer.byteLength(text, 'utf8');
+  if (textBytes < minBytes) return null;
   const toolName = typeof msg?.toolName === 'string' ? msg.toolName : 'tool';
   const toolCallId = typeof msg?.toolCallId === 'string' ? msg.toolCallId : `call_${index}`;
   if (placeholderMemo.has(memoKeyFor(sessionRoot, toolCallId, charLength))) return null;
   if (containsReducerReceipt(text)) return null;
-  return { toolName, toolCallId, text, textBytes: Buffer.byteLength(text, 'utf8'), charLength };
+  const contentHash = sha256Hex(text);
+  return {
+    toolName,
+    toolCallId,
+    text,
+    textBytes,
+    charLength,
+    contentHash,
+    obsId: deriveObservationId(toolName, toolCallId, contentHash),
+  };
+}
+
+/** A resumed process starts with an empty memo, but the content-addressed object is still on disk.
+ *  Rebuild the deterministic placeholder from it instead of asking jev again, rewriting the object,
+ *  and logging the same saving twice. Returns null when the object is not (verifiably) there. */
+async function reusePackedObservation(
+  candidate: PackCandidate,
+  sessionRoot: string,
+  obsConfig: ObservationPackConfig,
+): Promise<string | null> {
+  if (!(await observationObjectExists(sessionRoot, candidate.obsId, candidate.textBytes))) return null;
+  const { placeholder } = buildPlaceholder(
+    candidate.toolName,
+    candidate.toolCallId,
+    candidate.text,
+    candidate.textBytes,
+    candidate.contentHash,
+    obsConfig,
+  );
+  rememberPlaceholder(sessionRoot, candidate.toolCallId, candidate.charLength, placeholder, candidate.obsId);
+  return placeholder;
 }
 
 export async function batchPackObservations(opts: {
@@ -220,7 +280,7 @@ export async function batchPackObservations(opts: {
   messages: readonly unknown[];
   obsConfig: ObservationPackConfig;
   limits?: { maxItems?: number; maxBytes?: number };
-  pickMiddleExcerpt?: PickMiddleExcerpt;
+  pickMiddleExcerpts?: PickMiddleExcerpts;
 }): Promise<number> {
   const { sessionRoot, sessionId, messages, obsConfig } = opts;
   if (!obsConfig.enabled || !sessionRoot || !Array.isArray(messages)) return 0;
@@ -228,24 +288,25 @@ export async function batchPackObservations(opts: {
   const maxItems = opts.limits?.maxItems ?? MAX_BATCH_PACK_ITEMS;
   const maxBytes = opts.limits?.maxBytes ?? MAX_BATCH_PACK_BYTES;
 
-  // Pass 1 — select with the deterministic checks (memo, receipt, size, soft byte cap). Selection is
-  // optimistic on bytes: a later store failure can only pack fewer items, never more than the caps.
+  // Pass 1 — select with the deterministic checks (memo, receipt, size, existing store object, soft
+  // byte cap). A reused object is memoized here, so no jev ask, write, or telemetry follows for it.
   const candidates: PackCandidate[] = [];
   let selectedBytes = 0;
   for (let i = 0; i < messages.length && candidates.length < maxItems; i++) {
-    const candidate = packCandidateAt(messages, i, sessionRoot);
-    if (!candidate || candidate.textBytes < obsConfig.thresholdBytes) continue;
+    const candidate = packCandidateAt(messages, i, sessionRoot, obsConfig.thresholdBytes);
+    if (!candidate) continue;
+    if (await reusePackedObservation(candidate, sessionRoot, obsConfig)) continue;
     if (selectedBytes + candidate.textBytes > maxBytes && candidates.length > 0) break;
     selectedBytes += candidate.textBytes;
     candidates.push(candidate);
   }
   if (candidates.length === 0) return 0;
 
-  // Pass 2 — prefetch middle excerpts concurrently: every packed output asks jev, so a serial loop
-  // would block onBeforeCompact for maxItems × (0.25–0.77s) per compaction.
-  const picker = opts.pickMiddleExcerpt;
+  // Pass 2 — one batched pick for every selected output: per-item asks were a 6-20-way burst that
+  // all failed together when jev was down.
+  const picker = opts.pickMiddleExcerpts;
   const middles = picker
-    ? await Promise.all(candidates.map((c) => picker(c.text, obsConfig.excerptBytes)))
+    ? await picker(candidates.map((c) => ({ obsId: c.obsId, text: c.text })), obsConfig.excerptBytes)
     : [];
 
   let packedCount = 0;
@@ -274,7 +335,11 @@ async function runRecall(
     return toolError(`invalid observation id format: "${String(rawId)}"`);
   }
   const id = rawId;
-  const offset = typeof params?.offset === 'number' ? params.offset : 0;
+  const rawOffset = params?.offset;
+  if (rawOffset !== undefined && (typeof rawOffset !== 'number' || !Number.isInteger(rawOffset) || rawOffset < 0)) {
+    return toolError(`invalid observation offset: "${String(rawOffset)}"`);
+  }
+  const offset = rawOffset ?? 0;
 
   const sessionDir = ctx?.sessionManager?.getSessionDir?.();
   const sessionId = ctx?.sessionManager?.getSessionId?.();
@@ -288,9 +353,12 @@ async function runRecall(
       maxBytes: effConfig.observationPack.recallChunkBytes ?? RECALL_MAX_BYTES,
       maxLines: RECALL_MAX_LINES,
     });
+    // Mid-line offsets are advanced to the next line start by the reader; the header and telemetry
+    // report the offset the returned chunk actually starts at.
+    const alignedOffset = chunk.offset;
 
     const header = [
-      `[obs_recall id=${id} offset=${offset} next_offset=${chunk.nextOffset} eof=${chunk.eof}]`,
+      `[obs_recall id=${id} offset=${alignedOffset} next_offset=${chunk.nextOffset} eof=${chunk.eof}]`,
       `[chunk_bytes=${chunk.bytes} chunk_lines=${chunk.lines}; use next_offset to continue]`,
     ].join('\n');
 
@@ -299,7 +367,7 @@ async function runRecall(
         event: 'recall',
         sessionId: sessionId ?? 'unknown',
         obsId: id,
-        offset,
+        offset: alignedOffset,
         chunkBytes: chunk.bytes,
         lines: chunk.lines,
         nextOffset: chunk.nextOffset,
@@ -312,7 +380,7 @@ async function runRecall(
       content: [{ type: 'text', text: `${header}\n${chunk.text}` }],
       details: {
         id,
-        offset,
+        offset: alignedOffset,
         bytes: chunk.bytes,
         lines: chunk.lines,
         nextOffset: chunk.nextOffset,
@@ -341,7 +409,7 @@ interface ObservationPackDeps {
   getConfig?: (ctx: ExtensionContext) => EfficiencyConfig;
   getRuntimeManifest?: () => RuntimeRoleManifest | null;
   getRemainingHorizon?: () => number;
-  pickMiddleExcerpt?: PickMiddleExcerpt;
+  pickMiddleExcerpts?: PickMiddleExcerpts;
 }
 
 async function projectPlaceholders(
@@ -395,8 +463,16 @@ async function projectPlaceholders(
     const sendCount = priorAssistantCounts[i] ?? 0;
     if (sendCount < obsConfig.fullSends) continue;
 
-    const candidate = packCandidateAt(projected, i, sessionRoot);
-    if (!candidate || candidate.textBytes < obsConfig.thresholdBytes) continue;
+    const candidate = packCandidateAt(projected, i, sessionRoot, obsConfig.thresholdBytes);
+    if (!candidate) continue;
+
+    // Resume: the object survived the restart even though the memo did not. Project the same
+    // deterministic placeholder without re-asking jev or re-logging the saving.
+    const reused = await reusePackedObservation(candidate, sessionRoot, obsConfig);
+    if (reused) {
+      projected[i] = { ...msg, content: [{ type: 'text', text: reused }] };
+      continue;
+    }
 
     let tailTokensAfter = 0;
     for (let j = i + 1; j < len; j++) {
@@ -410,7 +486,7 @@ async function projectPlaceholders(
     // Projected saving of the legacy placeholder drives the economic decision; packOneMessage
     // recomputes the same placeholder when the answer is yes.
     const originalTokens = estimateTokens(candidate.text);
-    const estimate = buildPlaceholder(candidate.toolName, candidate.toolCallId, candidate.text, candidate.textBytes, obsConfig);
+    const estimate = buildPlaceholder(candidate.toolName, candidate.toolCallId, candidate.text, candidate.textBytes, candidate.contentHash, obsConfig);
     const removedTokens = Math.max(0, originalTokens - estimateTokens(estimate.placeholder));
     // Same resolution as OCC (provider family / token-account fallback): passing a raw 'auto' would
     // let shouldPackForCache fall back on its own hardcoded ratio and diverge from compaction.
@@ -437,7 +513,7 @@ async function projectPlaceholders(
         sessionId,
         extra: { sendCount, tailTokensAfter },
       },
-      pickMiddleExcerpt: deps.pickMiddleExcerpt,
+      pickMiddleExcerpts: deps.pickMiddleExcerpts,
     });
     if (!packed) continue;
     projected[i] = { ...msg, content: [{ type: 'text', text: packed }] };
@@ -454,11 +530,7 @@ export function registerObservationPack(deps: ObservationPackDeps & { pi: Extens
     name: RECALL_TOOL_NAME,
     label: 'Recall Observation',
     description:
-      'Recall a paged slice of a previously replaced large tool result by observation id and byte offset.',
-    promptGuidelines: [
-      'Call obs_recall with id and offset to inspect specific parts of large tool outputs.',
-      'Check the returned next_offset and eof to page through long logs.',
-    ],
+      'Recall a paged slice of a previously replaced large tool result by observation id and byte offset; page on with the returned next_offset until eof.',
     parameters: Type.Object({
       id: Type.String({ description: 'Observation ID from placeholder (e.g. obs_...)' }),
       offset: Type.Optional(

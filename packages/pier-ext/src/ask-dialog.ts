@@ -25,6 +25,8 @@ export interface DialogConfig {
   recommended?: number;
   /** true = toggle list (space toggles, enter confirms the set); false = pick-one (enter/space takes the cursor row). */
   multi: boolean;
+  /** Multi mode only: toggles to restore when the dialog reopens (an empty Other answer does not lose them). */
+  initialSelected?: readonly boolean[];
 }
 
 export interface DialogState {
@@ -38,7 +40,8 @@ type DialogKey = 'up' | 'down' | 'toggle' | 'confirm' | 'cancel' | 'all' | 'igno
 
 export type DialogOutcome =
   | { kind: 'selected'; labels: string[] }
-  | { kind: 'other' }
+  /** `labels` are the toggled rows at the moment Other was taken, so a custom answer keeps them. */
+  | { kind: 'other'; labels: string[] }
   | { kind: 'cancel' };
 
 export interface DialogStep {
@@ -94,7 +97,7 @@ export function stepDialog(state: DialogState, key: DialogKey, config: DialogCon
     }
     case 'toggle':
     case 'confirm': {
-      if (isOtherRow(state, config)) return { state, outcome: { kind: 'other' } };
+      if (isOtherRow(state, config)) return { state, outcome: { kind: 'other', labels: selectedLabels(state, config) } };
       if (!config.multi) {
         // Pick-one: enter and space both take the cursor row.
         return { state, outcome: { kind: 'selected', labels: [config.options[state.cursor]!.label] } };
@@ -234,7 +237,11 @@ export function dialogFooter(
 }
 
 export function createDialogComponent(opts: DialogUiOptions): DialogComponent {
+  const initial = opts.config.initialSelected;
   let state = createDialogState(opts.config);
+  if (initial && initial.length === opts.config.options.length) {
+    state = { ...state, selected: opts.config.options.map((_, i) => initial[i] === true) };
+  }
   let finished = false;
   const onAbort = (): void => finish({ kind: 'cancel' });
   function finish(outcome: DialogOutcome): void {

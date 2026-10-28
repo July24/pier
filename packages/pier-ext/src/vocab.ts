@@ -98,13 +98,19 @@ const NULL_CLOSING_SENTENCE: Record<SettlementNullReason, string> = {
   silent: 'It left no closing message.',
 };
 
-/** Subagent settlement notice (aligned with DSH). */
+/** Subagent settlement notice (aligned with DSH). `reportDeliveredAt`: the master already received
+ *  this exact closing message through `subagent output`, so the notice points there instead. */
 export function formatSettlementNotice(
   agentId: string,
   closingMessage: string | null,
   nullReason: SettlementNullReason = 'silent',
+  reportDeliveredAt: number | null = null,
 ): string {
   const head = `Background subagent ${agentId} finished and will do no further work unless you send it more.`;
+  if (closingMessage && reportDeliveredAt !== null) {
+    const at = new Date(reportDeliveredAt).toTimeString().slice(0, 8);
+    return `${head} Its closing message is the report subagent(action:"output") already returned at ${at}; it is not repeated here.`;
+  }
   return closingMessage
     ? `${head} Its closing message: ${closingMessage}`
     : `${head} ${NULL_CLOSING_SENTENCE[nullReason]}`;

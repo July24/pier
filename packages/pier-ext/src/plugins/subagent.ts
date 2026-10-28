@@ -84,23 +84,34 @@ export interface SubagentDeps {
   logRouting?: (row: RoutingTelemetryRecord) => void;
 }
 
+/** Sent with every request: what a call needs. Details live in SUBAGENT_MANUAL (`action: "help"`). */
 const SUBAGENT_DESCRIPTION = [
-  'Delegate a self-contained subtask to an isolated subagent that runs in its own herdr pane as an interactive pi session (separate context window; it does NOT see this conversation). A human can also open that pane and talk to the subagent directly.',
-  '`action` (optional, default "spawn"): spawn | resume | list | send | interrupt | output | role.',
-  '[spawn] `description`: short display label for the pane; `prompt`: the COMPLETE task — include all needed context, since only the prompt reaches the subagent. The description also doubles as the todo-reconcile key: when delegating a todo entry, use the entry content WITHOUT its ` <sub>` marker as the description, and the entry is auto-completed when this subagent settles.',
-  '[spawn] The subagent shares this workspace and works independently; the result is its final text answer.',
-  '[spawn] Concurrent delegation is supported: several spawn calls in one message run in parallel (at most 4 at once). Use this for well-scoped, independent subtasks; do not delegate the current step itself.',
-  '[spawn] `run_in_background` (default false): when true, the call returns immediately with an agentId; the subagent keeps running in its pane. Use action list to see its state, action send to give it follow-up work, action interrupt to stop it. When it settles, you receive a notification message with its closing output.',
-  '[spawn] `tab` (optional): name of a task tab to place the subagent into (join if a tab with this name exists, otherwise create it). Overrides the default placement. Default placement groups by git worktree: a subagent working in your checkout shares your tab; one working in a separate worktree (pass its path via `cwd`; create worktrees with `git worktree add`) gets its own tab named after the worktree directory.',
-  '[spawn] `role` + `allowed_tools`: when role matches a profile (searched: workspace .pi-herdr/roles/ → user-global ~/.pi/agent/herdr-pi/roles/ → builtin), the worker toolset becomes the composed manifest — baseline ∪ allowed_tools minus role-deny tools (deny always wins). Custom roles: drop a JSON profile into .pi-herdr/roles/ (master/worker-default reserved). Unknown role names remain display labels only.',
-  '[spawn] `isolate` (default false): creates a FRESH git worktree for this subagent and runs it there (branch pier/<slug> from your HEAD under ~/.herdr/worktrees/<repo>/). Three-way choice: heavy independent writing in parallel with your own edits or other workers, or work needing its own clean reviewable diff → isolate; read-mostly or sequential helper work → omit (shared checkout, writes guarded by the write-lock); targeting an existing directory/worktree → cwd. In isolate mode the subagent\'s writes cannot conflict with your checkout; its panes group into a tab named after the worktree; its prompt is prefixed with commit discipline (commit to its own branch, NEVER push); when it settles you get a diff summary (commits since base, files changed, uncommitted count). Review with git log/diff HEAD..<branch>, merge with git merge --no-ff <branch>; once merged and clean the worktree auto-removes (branch kept). Mutually exclusive with cwd.',
-  '[resume] `taskId`: revive a finished (collected) subagent from the delegation ledger — opens its saved conversation in a new pane (pi --session), then use action send to give it new work. The ledger is an append-only JSONL file, one row per status change (same taskId rows = generations, latest row is current): fields taskId, description, status (running|settled|consumed|closed), outcome (closing text), paneId, sessionFile, launchCommand, createdAt. Ledgers are per-checkout at ~/.pi/agent/herdr-pi/history/<flattened-cwd>/history.jsonl, but resume searches every checkout this master has spawned into, not only the current cwd. A still-running task is not resumed — use action send or output. Use action list for live panes.',
-  '[list] no extra parameters: list background subagents with live state (running / idle), pane ids, last activity, role, and descriptions. Foreground one-shot panes are not listed.',
-  '[output] `agentId` (required, the subagent pane id): view incremental output of a running or background subagent since the last output call. Text returned to the model is bounded (default 6000 chars) with status metadata (running/idle/blocked/settled), revision, and a truncated flag. When the delta cannot be computed the full text is returned with a "buffer scrolled or reset" note — that is normal for fullscreen TUI panes, not a crash indicator. Use this to observe subagent progress before settlement.',
-  '[interrupt] `agentId`: abort the current turn (fire-and-return). The pane stays; you can send again.',
-  '[role] `agentId` + `role`: switch that worker\'s role profile mid-session (pi 0.86 transcript tool delta — the new toolset applies on its next request and survives resume). Same role resolution as spawn; the reply reports the tool diff. Use when a task outgrew its delegation (needs more tools) or should be narrowed.',
-  '[send] `agentId` + `message`: follow-up to a background subagent. If working, delivered at next tool-call gap (steer, seconds); if idle, wakes a new turn. After settle, send to wake it; do not spawn a duplicate.',
+  'Delegate a self-contained task to a subagent: an isolated pi session in its own herdr pane (separate context — it does NOT see this conversation; a human can talk to it in that pane).',
+  'Actions (default spawn): spawn | send | output | list | interrupt | resume | role | help.',
+  'spawn: `prompt` is the COMPLETE task, since only the prompt reaches it; `description` labels the pane and is the todo-reconcile key — when delegating a todo entry, pass its content without the ` <sub>` marker and the entry auto-completes on settle. Several spawns in one message run in parallel (max 4).',
+  'A foreground spawn BLOCKS this call for up to ~5 minutes; pass run_in_background: true for long tasks. A background (or timed-out foreground) worker\'s settlement notice arrives automatically at your next tool boundary — no need to sleep or poll.',
+  'send: follow-up to a running or settled worker (steered between its tool calls). output: what it printed since your last check, plus its final report once done. resume: revive a collected task by taskId. role: switch a worker\'s role profile mid-session.',
+  'help: the full manual (isolate/cwd/tab placement, role profiles, the delegation ledger).',
 ].join(' ');
+
+/** Returned by `action: "help"`: the reference text that used to ride every request. */
+const SUBAGENT_MANUAL = [
+  'subagent manual',
+  '',
+  'spawn — the subagent shares this workspace and works independently; its result is its final text answer. Do not delegate the current step itself. Placement: by default panes group by git worktree — a subagent in your checkout shares your tab, one in a separate worktree gets its own tab named after the worktree directory. `tab` joins or creates a named task tab instead. `cwd` targets an existing directory or worktree (create worktrees with git worktree add).',
+  '',
+  'isolate (default false) — creates a FRESH git worktree (branch pier/<slug> from your HEAD under ~/.herdr/worktrees/<repo>/). Choose it for heavy independent writing in parallel with your own edits or other workers, or work needing its own clean reviewable diff; omit it for read-mostly or sequential helper work (shared checkout, writes guarded by the write-lock); use cwd for an existing directory/worktree. Its writes cannot conflict with your checkout, its prompt is prefixed with commit discipline (commit to its own branch, never push), and on settle you get a diff summary (commits since base, files changed, uncommitted count). Review with git log/diff HEAD..<branch>, merge with git merge --no-ff <branch>; once merged and clean the worktree auto-removes (branch kept). Mutually exclusive with cwd.',
+  '',
+  'role + allowed_tools — when role matches a profile (searched: workspace .pi-herdr/roles/ → user-global ~/.pi/agent/herdr-pi/roles/ → builtin), the worker toolset becomes baseline ∪ allowed_tools minus role-deny tools (deny always wins). Custom roles: drop a JSON profile into .pi-herdr/roles/ (master/worker-default reserved). Unknown role names stay display labels. action role switches a live worker (pi transcript tool delta: applies on its next request, survives resume); the reply reports the tool diff.',
+  '',
+  'list — background subagents with live state (running / idle), pane ids, last activity, role and description; foreground one-shot panes are not listed.',
+  '',
+  'output — `agentId` required; returns the delta since your last output call (default 6000 chars, max_chars 100-16000) with status (running/idle/blocked/settled), revision and a truncated flag. TUI chrome is stripped; once the worker has finished, the complete transcript report is attached. A "buffer scrolled or reset" note means the full text was returned — normal for fullscreen TUI panes.',
+  '',
+  'send — `agentId` + `message`: if working, delivered at its next tool-call gap (seconds); if idle or settled, wakes a new turn. Do not spawn a duplicate for the same task. interrupt — aborts its current turn; the pane stays and you can send again.',
+  '',
+  'resume — `taskId`: revives a collected subagent from the delegation ledger in a new pane (pi --session); then use send. The ledger is append-only JSONL, one row per status change (taskId, description, status running|settled|consumed|closed, outcome, paneId, sessionFile, launchCommand, createdAt), per checkout at ~/.pi/agent/herdr-pi/history/<flattened-cwd>/history.jsonl; resume searches every checkout this master spawned into. A still-running task is not resumed — use send or output.',
+].join('\n');
 
 const SUBAGENT_CONCURRENCY = 4;
 
@@ -224,8 +235,8 @@ export default function subagentPlugin(ctx: Context): void {
     if (port.current === boundPort) port.current = null;
   }, 'subagent-port');
 
-  const injectNotice = (content: string): Promise<void> => {
-    if (d.deliverNotice) return d.deliverNotice(content);
+  const injectNotice = (content: string, paneId?: string): Promise<void> => {
+    if (d.deliverNotice) return d.deliverNotice(content, paneId);
     pi.sendUserMessage?.(content, { deliverAs: 'followUp' });
     return Promise.resolve();
   };
@@ -353,7 +364,7 @@ export default function subagentPlugin(ctx: Context): void {
         [DELEGATION_ENV]: JSON.stringify({
           parentPaneId: env?.paneId ?? '',
           parentSessionId: bareSessionId(d.getSessionId()),
-          // Phase 2: report_progress needs the master's pipe; kind 'task' maps to the composed default.
+          // todo_sync needs the master's pipe; kind 'task' maps to the composed default.
           parentPipe: pipeNameFor(process.cwd(), env?.paneId ?? ''),
           taskId: entry.taskId,
           description: entry.description,
@@ -638,7 +649,9 @@ export default function subagentPlugin(ctx: Context): void {
     const lines: string[] = [];
     for (const sub of byTask.values()) {
       const tabTag = sub.tabName ? ` [tab: ${sub.tabName}]` : '';
-      const wtTag = sub.isolate ? ` [wt: ${sub.isolate.branch}]` : '';
+      // The branch (`pier/<slug>`) is not a directory; printing it made masters cd into
+      // `<repo>/pier/<slug>`. Always print the absolute worktree path they can actually enter.
+      const wtTag = sub.isolate ? ` [wt: ${sub.isolate.worktreePath}]` : '';
       if (sub.status === 'closed') {
         lines.push(`${sub.taskId.slice(0, 8)} [idle] (${sub.kind}, closed; action send revives)${tabTag}${wtTag} ${sub.description}`);
         continue;
@@ -692,6 +705,7 @@ export default function subagentPlugin(ctx: Context): void {
     // carry the final report. No preferred file — start from herdr's per-pane report, not a stale registry value.
     readFinalReport: async (paneId: string, entryCwd: string) =>
       (await session.subSessionState(paneId, entryCwd, 0)).text,
+    persistSubs,
   };
 
   const ACTIONS: Record<string, (params: ToolParams, toolCtx: unknown, onUpdate?: (u: unknown) => void) => Promise<unknown>> = {
@@ -702,6 +716,7 @@ export default function subagentPlugin(ctx: Context): void {
     interrupt: (params, toolCtx) => executeSubagentInterrupt(params, toolCtx),
     output: (params, toolCtx) => executeSubagentOutput(params, toolCtx, outputActionDeps),
     role: (params, toolCtx) => executeSubagentRole(params, toolCtx),
+    help: async () => ({ content: [{ type: 'text', text: SUBAGENT_MANUAL }], details: {} }),
   };
 
   scoped.registerTool({
@@ -709,15 +724,12 @@ export default function subagentPlugin(ctx: Context): void {
     label: 'Subagent',
     // B4: the model picks tools from the system prompt's snippet/guideline surface; delegation
     // decisions are made here, so state them rather than hoping for recall.
-    promptSnippet: 'subagent: delegate a self-contained task to a pi worker pane (spawn/isolate/background/send/output/interrupt/resume/list/role).',
+    promptSnippet: 'subagent: delegate a self-contained task to a pi worker pane (spawn/isolate/background/send/output/interrupt/resume/list/role/help).',
     promptGuidelines: [
-      'Use subagent when the work is self-contained and the result is what matters: pipelines that would flood this context, long builds/test runs, or independent parts of a bigger change that can proceed in parallel.',
-      'Prefer run_in_background: true for work that will not finish in a few tool calls, then collect with action: "output" — a foreground subagent blocks this turn.',
-      'Use isolate: true when the worker will write files for a task you (or another worker) are editing at the same time, or when you want its own reviewable branch; use cwd to send work into an existing worktree (create it with git worktree add first).',
-      'Keep the prompt complete and self-contained: the worker does not see this conversation, so include paths, acceptance criteria, the test command, and what to report back.',
-      'Do not poll with action: "output" in a tight loop: the pane pushes a settlement notice when it finishes. Check once, then continue other work.',
-      'Send follow-up instructions with action: "send" (delivered as a steer between tool calls) instead of spawning a second worker for the same task.',
-      'Pass agentId, taskId, message, and max_chars as top-level arguments. Do not wrap them in a parameters object.',
+      'Use subagent for self-contained work whose result is what matters: output that would flood this context, long builds/test runs, or independent parts of a bigger change that can run in parallel.',
+      'The worker does not see this conversation: put paths, acceptance criteria, the test command and what to report back into the prompt.',
+      'Use isolate: true when the worker writes files you or another worker edit at the same time, or when its work needs its own reviewable branch.',
+      'Pass agentId, taskId, message and max_chars as top-level arguments, not inside a parameters object.',
     ],
     description: SUBAGENT_DESCRIPTION,
     parameters: Type.Object({
@@ -729,19 +741,20 @@ export default function subagentPlugin(ctx: Context): void {
         Type.Literal('interrupt'),
         Type.Literal('output'),
         Type.Literal('role'),
-      ], { description: 'Operation to perform (default: spawn)' })),
-      description: Type.Optional(Type.String({ description: '[spawn] Short label for this subtask (pane title)' })),
-      prompt: Type.Optional(Type.String({ description: '[spawn] The complete self-contained task for the subagent' })),
-      run_in_background: Type.Optional(Type.Boolean({ description: '[spawn] Return immediately with an agentId; the subagent keeps running in its own pane (default false)' })),
-      cwd: Type.Optional(Type.String({ description: '[spawn] Working directory for the subagent (absolute, or relative to this workspace). Use it to delegate into a git worktree: panes group by worktree — same checkout as you share your tab; a separate worktree gets its own tab named after the worktree directory. Create worktrees yourself with git worktree add. Use isolate:true instead when you want a FRESH worktree created for this task rather than targeting an existing one' })),
-      isolate: Type.Optional(Type.Boolean({ description: '[spawn] Create a fresh git worktree and run the subagent there. Use when the task writes files heavily and independently — in parallel with your own edits or other workers\' — or needs its own clean, reviewable diff. For read-mostly or sequential helper work omit it (shared checkout, writes guarded by the write-lock); use `cwd` only to target an existing directory/worktree (e.g. a retained pier worktree). Mechanics: branch pier/<slug> from your HEAD under ~/.herdr/worktrees/<repo>/; its writes cannot conflict with your checkout; panes group into a tab named after the worktree; the prompt is prefixed with commit discipline (commit to its branch, never push); on settle you get a diff summary. Review with git log/diff HEAD..<branch>, merge with git merge --no-ff <branch>; once merged and clean the worktree auto-removes (branch kept). Mutually exclusive with cwd' })),
-      role: Type.Optional(Type.String({ description: '[spawn|role] Role label or profile name. [spawn] When role matches a profile (searched: workspace .pi-herdr/roles/ → user-global ~/.pi/agent/herdr-pi/roles/ → builtin), the worker toolset becomes the composed manifest. Unknown role names remain display labels only. [role] Target profile for the mid-session switch' })),
-      tab: Type.Optional(Type.String({ description: '[spawn] Name of a task tab to place the subagent into (join if exists, otherwise create). Default placement groups by git worktree.' })),
-      allowed_tools: Type.Optional(Type.Array(Type.String(), { description: '[spawn] Additional tools for role composition (union with role baseline)' })),
-      taskId: Type.Optional(Type.String({ description: '[resume] The task id to revive from the delegation ledger' })),
-      agentId: Type.Optional(Type.String({ description: '[send|interrupt|output|role] The subagent reference: task slug (e.g. "fix-auth"), herdr pane id, or "slug@paneId" as printed by spawn/list' })),
-      message: Type.Optional(Type.String({ description: '[send] The follow-up message' })),
-      max_chars: Type.Optional(Type.Integer({ description: '[output] Maximum characters of output delta to return (default 6000, 100-16000)' })),
+        Type.Literal('help'),
+      ], { description: 'Default spawn' })),
+      description: Type.Optional(Type.String({ description: '[spawn] Pane label; also the todo-reconcile key' })),
+      prompt: Type.Optional(Type.String({ description: '[spawn] The complete self-contained task' })),
+      run_in_background: Type.Optional(Type.Boolean({ description: '[spawn] Return at once; the settlement notice arrives later (default false)' })),
+      cwd: Type.Optional(Type.String({ description: '[spawn] Existing directory or worktree to run in (absolute or workspace-relative); exclusive with isolate' })),
+      isolate: Type.Optional(Type.Boolean({ description: '[spawn] Run in a fresh git worktree (branch pier/<slug>) for heavy parallel writes or a reviewable diff; settle reports a diff summary (see help)' })),
+      role: Type.Optional(Type.String({ description: '[spawn|role] Role profile name; unknown names are display labels only' })),
+      tab: Type.Optional(Type.String({ description: '[spawn] Task tab to join or create (default: grouped by worktree)' })),
+      allowed_tools: Type.Optional(Type.Array(Type.String(), { description: '[spawn] Extra tools on top of the role baseline' })),
+      taskId: Type.Optional(Type.String({ description: '[resume] Task id from the delegation ledger' })),
+      agentId: Type.Optional(Type.String({ description: '[send|interrupt|output|role] Slug, pane id, or slug@paneId as printed by spawn/list' })),
+      message: Type.Optional(Type.String({ description: '[send] Follow-up message' })),
+      max_chars: Type.Optional(Type.Integer({ description: '[output] Output cap (default 6000, 100-16000)' })),
     }),
     outputSchema: SUBAGENT_OUTPUT_SCHEMA,
     // B2: `action` is optional in the schema; normalize it so the validated arguments and the

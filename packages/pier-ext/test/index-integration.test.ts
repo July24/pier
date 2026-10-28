@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import pier from '../src/index.ts';
 import { pipeNameFor, pipeRequestTo, startPipeServer, type PipeRequest } from '../src/pipe-channel.ts';
 import { sessionDirName } from '../src/storage-layout.ts';
-import { fakePi, fire, jsonl, transcriptMessage, withCleanup, type CleanupContext, type FakePi } from './test-utils.ts';
+import { fakePi, fire, jsonl, subEntry, transcriptMessage, withCleanup, type CleanupContext, type FakePi } from './test-utils.ts';
 import { readWorkerMarker, writeWorkerMarker } from '../src/worker-marker.ts';
 
 type IndexMode = 'worker' | 'bare' | 'master';
@@ -434,6 +434,13 @@ test('settle fast-path (D49): an aborted settle keeps the machine request armed;
     await fire(pi, 'agent_settled', {}, ctx);
     assert.equal(replies.length, 0, 'an aborted settle must not answer the machine request');
 
+    // A provider error is retried by pi: it is not a settlement either, and answering would consume
+    // the one-shot request with a null-text reply before the retry delivers the real closing message.
+    await fire(pi, 'turn_start');
+    await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'error' } }, ctx);
+    await fire(pi, 'agent_settled', {}, ctx);
+    assert.equal(replies.length, 0, 'an error stop must keep the machine request armed');
+
     // The continuation run genuinely settles: the still-armed request now carries the real text.
     await fire(pi, 'turn_start');
     await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'stop' } }, ctx);
@@ -663,60 +670,39 @@ test('tool_execution_end.durationMs (pi ≥ 1.1) lands in the tools efficiency l
   await fire(pi, 'session_shutdown');
 }));
 
-test('report_progress: worker dials the master pipe; the master gets a display-less, turn-less custom message', withCleanup(async (cleanup) => {
-  const dir = cleanup.tempDir('progress-e2e');
-  // Master: real composition root, its pipe server binds pipeNameFor(master cwd, own pane).
-  const master = await mountIndex(cleanup, 'master', { HERDR_SOCKET_PATH: '/tmp/pier-test-sock' });
+test('F6 reconcile: a pipe settlement auto-completes the todo and refreshes the resident widget', withCleanup(async (cleanup) => {
+  const cwd = cleanup.tempDir('pier-reconcile-ws').path;
+  const items = [
+    { content: 'harden pipe channel', status: 'in_progress' },
+    { content: 'collect results', status: 'pending' },
+  ];
+  const branch = [
+    { type: 'custom', customType: 'pi-herdr.subs', data: { version: 2, subs: [subEntry({
+      paneId: 'w2', slug: 'harden-pipe', description: 'harden pipe channel',
+    })] } },
+  ];
+  const widgets: string[][] = [];
+  const pi = await mountIndex(cleanup, 'master', {
+    HERDR_SOCKET_PATH: '/tmp/pier-test-sock-reconcile', HERDR_PANE_ID: 'p1',
+  });
   try {
-    const masterCwd = dir.path;
-    await fire(master, 'session_start', { reason: 'new' }, {
-      cwd: masterCwd,
-      sessionManager: { getBranch: () => [], getSessionFile: () => join(masterCwd, '2026-10-14T01-00-00Z_m1m1m1m1.jsonl'), getSessionDir: () => masterCwd },
-    });
-    const parentPipe = pipeNameFor(masterCwd, 'p1');
-
-    // Worker: delegation env carries the master's pipe (exactly what spawn hands over now).
-    const delegation = {
-      parentPaneId: 'p1', parentSessionId: 'm1m1m1m1', parentPipe,
-      taskId: 't-77', description: 'harden pipe channel', role: 'worker-default',
+    const ctx = {
+      cwd,
+      ui: { setWidget: (_id: string, lines: string[]) => { widgets.push(lines); } },
+      sessionManager: { getBranch: () => branch },
     };
-    const worker = await mountIndex(cleanup, 'worker', {
-      PI_HERDR_DELEGATION: JSON.stringify(delegation),
-    });
-    try {
-      const exec = worker.tools.get('report_progress')?.execute;
-      assert.ok(exec, 'report_progress registers on worker panes only');
-      assert.equal(master.tools.has('report_progress'), false, 'master never grows the reporting tool');
+    await fire(pi, 'session_start', { reason: 'new' }, ctx);
+    // Seed through the real tool so the widget has a line to refresh (session_start renders before rebuild).
+    const todoWrite = pi.tools.get('todo_write')!.execute!;
+    await todoWrite('c1', { todos: items }, undefined, undefined, ctx);
+    assert.deepEqual(widgets.at(-1)?.slice(0, 1), ['▶ harden pipe channel ✓0/2'], 'widget starts on the open item');
 
-      const missing = await exec('t0', {}, undefined, undefined, {}) as { content: Array<{ text: string }> };
-      assert.match(missing.content[0]!.text, /`message` is required/);
-
-      const res = await exec('t0', { message: 'auth module done, tests green' }, undefined, undefined, {}) as { content: Array<{ text: string }> };
-      assert.match(res.content[0]!.text, /Progress delivered to the master/);
-
-      // The master's sendMessage received ONE display-less, turn-less custom message.
-      const sent = master.sent.filter((s) => (s.msg as { customType?: string }).customType === 'pi-herdr.progress');
-      assert.equal(sent.length, 1);
-      assert.equal((sent[0]!.msg as { content: string }).content, 'auth module done, tests green');
-      assert.equal((sent[0]!.msg as { display: boolean }).display, false);
-      assert.equal(sent[0]!.opts?.triggerTurn, false);
-      assert.equal((sent[0]!.msg as { details: { paneId?: string } }).details?.paneId, '', 'worker without a herdr pane reports an empty id');
-    } finally {
-      await fire(worker, 'session_shutdown');
-    }
+    const res = await pipeRequestTo(cwd, 'p1', { type: 'reply', id: 'reply-1', paneId: 'w2', text: 'done', sessionFile: null });
+    assert.equal(res.type, 'ok');
+    assert.deepEqual(widgets.at(-1)?.slice(0, 1), ['▶ collect results ✓1/2'],
+      'M17 reconcile must re-render the widget, not leave the stale pre-settle line');
   } finally {
-    await fire(master, 'session_shutdown');
-  }
-}));
-
-test('report_progress: no delegation (or no pipe) fails with a modeling error, never a throw', withCleanup(async (cleanup) => {
-  const worker = await mountIndex(cleanup, 'worker');
-  try {
-    const exec = worker.tools.get('report_progress')?.execute!;
-    const res = await exec('t0', { message: 'orphan update' }, undefined, undefined, {}) as { content: Array<{ text: string }> };
-    assert.match(res.content[0]!.text, /no delegating master pipe/);
-  } finally {
-    await fire(worker, 'session_shutdown');
+    await fire(pi, 'session_shutdown');
   }
 }));
 

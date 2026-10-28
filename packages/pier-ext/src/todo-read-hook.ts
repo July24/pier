@@ -1,15 +1,15 @@
 /**
  * Plan the todo read hook (before_agent_start + display:false). Stale-core keeps a fully completed list
  * from being recited forever: stale (turn-based) warns with the old entries as rewrite references,
- * rate-limited and capped; archived (wall-clock) treats the list as absent, sharing the guard cadence
- * with empty lists.
+ * rate-limited and capped; archived (wall-clock) treats the list as absent — one rewrite window (its
+ * offer persisted per list identity so a resume skips it), then the terminal clear on the next run.
  */
 import { boundedView, currentActivity, type TodoItem } from './todo-core.ts';
 import { countTodos } from './vocab.ts';
 import { STALE_NOTICE_MAX, evaluateStaleness, formatAge } from './stale-core.ts';
-import { todoMark } from './todo-window.ts';
+import { todoLine } from './todo-window.ts';
 
-/** Cadence shared by empty-list guards, stale warnings, and archive notices. */
+/** Cadence shared by empty-list guards, stale warnings, and the archive rewrite window. */
 const EMPTY_GUARD_EVERY_N = 4;
 const TODO_READ_CUSTOM_TYPE = 'pi-herdr.todo-read';
 
@@ -51,6 +51,8 @@ interface TodoReadPlan {
   /** Clear the in-memory list when injecting the archive notice (the caller persists the empty JSONL);
    * a kept dead list would suppress the empty guard that resumes tracking after an idle gap. */
   clearArchived: boolean;
+  /** This injection is the one-window rewrite offer; the caller persists the marker so a resume skips it. */
+  offerArchiveWindow: boolean;
   message: {
     customType: string;
     content: string;
@@ -68,6 +70,9 @@ export function planTodoReadHook(opts: {
   now: number;
   staleNotices: number;
   lastStaleGuardTurn: number | null;
+  /** Whether the near-archive rewrite window was already offered for this exact list (in-process or
+   *  folded from the persisted marker). The terminal clear no longer waits for the shared cadence. */
+  archiveWindowOffered: boolean;
 }): TodoReadPlan {
   const msg = (content: string) => ({
     customType: TODO_READ_CUSTOM_TYPE,
@@ -83,6 +88,7 @@ export function planTodoReadHook(opts: {
       effect: 'empty-guard',
       clearArchived: false,
       archived: false,
+      offerArchiveWindow: false,
       message: msg(
         guardDue
           ? 'Your todo list is empty. If the current work needs tracking, call todo_write before stopping.'
@@ -102,30 +108,36 @@ export function planTodoReadHook(opts: {
     const c = countTodos(opts.items);
     const age = st.ageMs == null ? '' : ` ${formatAge(st.ageMs)} ago`;
     // Idle periods do not consume turns, so give one rewrite window with the old entries as reference
-    // before the terminal notice.
-    if (opts.staleNotices === 0 && guardDue) {
-      const lines = opts.items.map((it) => `  ${todoMark(it.status)} ${it.content}`);
+    // before the terminal notice. The offer is keyed to the list identity and persisted (in-process it
+    // rides TodosService.archiveWindowOffered), so a resumed session goes straight to the clear.
+    if (!opts.archiveWindowOffered) {
+      if (!guardDue) {
+        return { inject: false, effect: 'none', archived: true, clearArchived: false, offerArchiveWindow: false, message: msg('') };
+      }
+      const lines = opts.items.map((it) => `  ${todoLine(it)}`);
       const head = `todos ✓${c.completed} (all completed, last updated${age}) — about to be archived`;
-      const warn = 'One rewrite window before archiving: if the work you are doing now is multi-step, rewrite the full list with todo_write to track it (old entries below as reference — reuse what still applies). Single-step Q&A may skip tracking. If the list stays untouched, it will be archived and cleared on the next reminder.';
+      const warn = 'One rewrite window before archiving: if the work you are doing now is multi-step, rewrite the full list with todo_write to track it (old entries below as reference — reuse what still applies). Single-step Q&A may skip tracking. If the list stays untouched, it will be archived and cleared on your next message.';
       return {
         inject: true,
         effect: 'stale-notice',
         archived: true,
         clearArchived: false,
+        offerArchiveWindow: true,
         message: msg([head, ...lines, warn].join('\n')),
       };
     }
     // The terminal notice carries no details and no "skip tracking" escape hatch — multi-step work
-    // must get a fresh list, single-step Q&A may proceed untracked.
+    // must get a fresh list, single-step Q&A may proceed untracked. It fires on the very next run:
+    // the near-archive already consumed the shared cadence tick, and waiting 4 more runs leaves the
+    // dead list authoritative with no todo guidance at all.
     return {
-      inject: guardDue,
+      inject: true,
       effect: 'archive-notice',
       archived: true,
-      clearArchived: guardDue,
+      clearArchived: true,
+      offerArchiveWindow: false,
       message: msg(
-        guardDue
-          ? `Your previous todo list (${c.completed} completed entries, last updated${age}) has been archived and cleared from tracking; the list is now empty. If the current work is multi-step, call todo_write with a fresh list now — multi-step work must be tracked. Single-step answers may proceed without a list.`
-          : '',
+        `Your previous todo list (${c.completed} completed entries, last updated${age}) has been archived and cleared from tracking; the list is now empty. If the current work is multi-step, call todo_write with a fresh list now — multi-step work must be tracked. Single-step answers may proceed without a list.`,
       ),
     };
   }
@@ -134,18 +146,19 @@ export function planTodoReadHook(opts: {
     const staleDue = opts.lastStaleGuardTurn == null
       || opts.turn - opts.lastStaleGuardTurn >= EMPTY_GUARD_EVERY_N;
     if (!staleDue || opts.staleNotices >= STALE_NOTICE_MAX) {
-      return { inject: false, effect: 'none', archived: false, clearArchived: false, message: msg('') };
+      return { inject: false, effect: 'none', archived: false, clearArchived: false, offerArchiveWindow: false, message: msg('') };
     }
     const c = countTodos(opts.items);
     const head = `todos ▶${c.inProgress} ○${c.pending} ■${c.blocked} ✓${c.completed}`
       + ` · unchanged for ${opts.turnsSinceWrite} turns, nothing open`;
-    const lines = opts.items.map((it) => `  ${todoMark(it.status)} ${it.content}`);
+    const lines = opts.items.map((it) => `  ${todoLine(it)}`);
     const warn = 'This list no longer reflects the work you are doing. Rewrite the full list with todo_write to match current work, or send [] to clear it.';
     return {
       inject: true,
       effect: 'stale-notice',
       clearArchived: false,
       archived: false,
+      offerArchiveWindow: false,
       message: msg([head, ...lines, warn].join('\n')),
     };
   }
@@ -153,7 +166,7 @@ export function planTodoReadHook(opts: {
   // Fresh lists are recited every turn to keep current work visible.
   const c = countTodos(opts.items);
   const view = boundedView(opts.items, 6);
-  const lines = view.visible.map((it) => `${todoMark(it.status)} ${it.content}`);
+  const lines = view.visible.map((it) => todoLine(it));
   const activity = currentActivity(opts.items);
   const head = `todos ▶${c.inProgress} ○${c.pending} ■${c.blocked} ✓${c.completed}`
     + (activity ? ` · ${activity}` : '');
@@ -162,6 +175,7 @@ export function planTodoReadHook(opts: {
     effect: 'recite',
     clearArchived: false,
     archived: false,
+    offerArchiveWindow: false,
     message: msg([head, ...lines].join('\n')),
   };
 }

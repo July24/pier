@@ -7,7 +7,9 @@ import { join } from 'node:path';
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import {
   batchPackObservations, clearObservationMemoForTest, createCompactionBatchPackHook, RECALL_TOOL_NAME, registerObservationPack,
+  type PickMiddleExcerpts,
 } from '../src/plugins/observation.ts';
+import { resolveSessionRoot } from '../src/efficiency-store.ts';
 import { DEFAULT_EFFICIENCY_CONFIG, type EfficiencyConfig } from '../src/efficiency-config-core.ts';
 import {
   completeLineExcerpt, deriveObservationId, isObservationId,
@@ -43,13 +45,23 @@ test('sliceBufferChunk: pages by line limit and reports eof', () => {
   assert.deepEqual([chunk2.text, chunk2.lines, chunk2.eof], ['Row 3\nRow 4\n', 2, false]);
   const chunk3 = sliceBufferChunk(buf, chunk2.nextOffset, { maxBytes: 1024, maxLines: 2 });
   assert.deepEqual([chunk3.text, chunk3.lines, chunk3.eof], ['Row 5\n', 1, true]);
-  assert.deepEqual(sliceBufferChunk(buf, buf.length, { maxBytes: 1024, maxLines: 2 }), { text: '', bytes: 0, lines: 0, nextOffset: buf.length, eof: true });
+  assert.deepEqual(sliceBufferChunk(buf, buf.length, { maxBytes: 1024, maxLines: 2 }), { text: '', bytes: 0, lines: 0, offset: buf.length, nextOffset: buf.length, eof: true });
 });
 
 test('sliceBufferChunk: never splits a multi-byte character at the byte limit', () => {
   // '中' is 3 bytes (E4 B8 AD); a 4-byte budget would cut the second one in half.
   const chunk = sliceBufferChunk(Buffer.from('中中', 'utf8'), 0, { maxBytes: 4, maxLines: 10 });
   assert.deepEqual([chunk.text, chunk.bytes, chunk.eof], ['中', 3, false]);
+});
+
+test('sliceBufferChunk: a byte-capped page ends on a line boundary so paging loses no text', () => {
+  const buf = Buffer.from('aaaa\nbbbb\ncccc\n', 'utf8');
+  const first = sliceBufferChunk(buf, 0, { maxBytes: 7, maxLines: 10 });
+  assert.equal(first.text, 'aaaa\n');
+  const second = sliceBufferChunk(buf, first.nextOffset, { maxBytes: 7, maxLines: 10 });
+  assert.equal(second.text, 'bbbb\n');
+  const third = sliceBufferChunk(buf, second.nextOffset, { maxBytes: 7, maxLines: 10 });
+  assert.equal(first.text + second.text + third.text, buf.toString('utf8'));
 });
 
 test('shouldPackForCache: balances read savings against prefix rewrite cost', () => {
@@ -88,7 +100,7 @@ interface MountDeps {
   getConfig?: () => EfficiencyConfig;
   getRuntimeManifest?: () => RuntimeRoleManifest | null;
   getRemainingHorizon?: () => number;
-  pickMiddleExcerpt?: (text: string, budgetBytes: number) => Promise<{ text: string; label: string } | null>;
+  pickMiddleExcerpts?: PickMiddleExcerpts;
 }
 
 /** Registers the plugin on a fake pi and exposes its two seams: the `context` projection and `obs_recall`. */
@@ -131,6 +143,15 @@ test('ObservationPack: 注册 obs_recall；活跃窗口内原样，超窗后投�
     const recalled = await recall({ id: obsId, offset: 0 }, ctx);
     assert.ok(recalled.content[0].text.includes('[obs_recall id=')); assert.ok(recalled.content[0].text.includes('INFO: step processing'), '召回原文');
     assert.equal(recalled.details.id, obsId); assert.equal(recalled.details.offset, 0);
+
+    // A non-numeric offset is an input error, never silently coerced to a head read.
+    await assert.rejects(async () => { await recall({ id: obsId, offset: '7000' }, ctx); }, /invalid observation offset/);
+
+    // Mid-line offsets advance to the next line start (each log line is 22 bytes) and say so.
+    const aligned = await recall({ id: obsId, offset: 5 }, ctx);
+    assert.equal(aligned.details.offset, 22);
+    assert.ok(aligned.content[0].text.includes('[obs_recall id=') && aligned.content[0].text.includes('offset=22'), '头部报告对齐后的 offset');
+    assert.equal(aligned.content[0].text.split('\n')[2], 'INFO: step processing', '分页从整行开始');
 
     // Storage gone → an error result instead of a throw, so the model can see the handle went stale
     const missing = await recall({ id: 'obs_000000000000000000000000' }, ctx);
@@ -201,37 +222,71 @@ test('ObservationPack: 批打包遵守条数上限并写 packed-batch 遥测', a
   });
 });
 
-test('ObservationPack: 批打包并发预取 middle 窗口，每条候选只 pick 一次', async () => {
+test('ObservationPack: a compaction batch asks the picker once for every candidate and uses each pick in order', async () => {
   await inSession(async (sessionDir) => {
-    const messages = [1, 2, 3].map((n) => toolResult(`PARALLEL ${n}: long line...\n`.repeat(50), `tc_parallel_${n}`));
-    // Deterministic concurrency probe: every pick parks on `release`, so only parallel prefetch can
-    // have three in flight at once (no real timers involved).
-    let inFlight = 0;
-    let maxInFlight = 0;
-    let calls = 0;
-    const release = Promise.withResolvers<void>();
-    const tick = async (): Promise<void> => {
-      const { promise, resolve } = Promise.withResolvers<void>(); setImmediate(resolve); await promise;
+    const messages = [1, 2, 3].map((n) => toolResult(`BATCH ${n}: long line...\n`.repeat(50), `tc_batch_${n}`));
+    const seen: string[][] = [];
+    const pickMiddleExcerpts: PickMiddleExcerpts = async (items) => {
+      seen.push(items.map((item) => item.obsId));
+      return items.map((_, i) => (i === 1 ? { text: 'PICKED MIDDLE 2\nsecond line\n', label: 'test window' } : null));
     };
-    const pickMiddleExcerpt = async () => {
-      calls++; inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
-      await release.promise;
-      inFlight--;
-      return { text: 'mid window', label: 'test window' };
-    };
-
-    const batch = batchPackObservations({
-      sessionRoot: sessionDir,
-      sessionId: 'session_parallel',
+    // The projection resolves its root from the ctx; pack under the same root so the memo is shared.
+    const sessionRoot = resolveSessionRoot(sessionDir, 'session_batch')!;
+    assert.equal(await batchPackObservations({
+      sessionRoot,
+      sessionId: 'session_batch',
       messages,
       obsConfig: obsConfig(),
-      pickMiddleExcerpt,
-    });
-    for (let i = 0; i < 10; i++) await tick();
-    release.resolve();
-    assert.equal(await batch, 3);
-    assert.equal(maxInFlight, 3, '预取必须并发，否则 onBeforeCompact 会被 jev 延迟线性拖住');
-    assert.equal(calls, 3, '预取结果被消费，打包阶段不得重挑');
+      pickMiddleExcerpts,
+    }), 3);
+    assert.equal(seen.length, 1, 'one picker call (one jev request) for the whole batch');
+    assert.equal(seen[0]!.length, 3);
+    assert.ok(seen[0]!.every((id) => /^obs_/.test(id)), 'items carry their obsIds for telemetry');
+    const { project } = mountObservation();
+    const texts = (await project([...messages, assistant()], ctxFor(sessionDir, 'session_batch'))).messages
+      .slice(0, 3).map((m) => m.content[0]!.text);
+    assert.deepEqual(texts.map((t) => t.includes('PICKED MIDDLE 2')), [false, true, false], 'pick i lands on candidate i');
+  });
+});
+
+test('ObservationPack: a resumed process reuses stored objects without re-packing, re-logging or re-asking jev', async () => {
+  await inSession(async (sessionDir) => {
+    const ctx = ctxFor(sessionDir, 'session_resume');
+    const log = longLog('RESUME: step processing');
+    const event = [toolResult(log, 'tc_resume_1'), assistant()];
+    const { project } = mountObservation();
+    const logPath = join(sessionDir, 'efficiency-logs', 'observation.jsonl');
+    const objectsDir = join(sessionDir, 'observation-pack', 'objects');
+
+    assert.equal(await batchPackObservations({
+      sessionRoot: sessionDir,
+      sessionId: 'session_resume',
+      messages: [toolResult(log, 'tc_resume_1')],
+      obsConfig: obsConfig({ logEnabled: true }),
+    }), 1);
+    const packedText = (await project(event, ctx)).messages[0]!.content[0]!.text;
+    assert.match(packedText, /\[large tool result replaced/);
+    const logged = await readFile(logPath, 'utf8');
+
+    clearObservationMemoForTest(); // fresh process: only the on-disk object and log survive
+    let asks = 0;
+    const pickMiddleExcerpts: PickMiddleExcerpts = async (items) => { asks += 1; return items.map(() => ({ text: 'mid window', label: 'test window' })); };
+
+    assert.equal(await batchPackObservations({
+      sessionRoot: sessionDir,
+      sessionId: 'session_resume',
+      messages: [toolResult(log, 'tc_resume_1')],
+      obsConfig: obsConfig({ logEnabled: true }),
+      pickMiddleExcerpts,
+    }), 0, 'already stored → not counted as a new pack');
+    assert.equal(asks, 0, 'no jev ask for an existing object');
+    assert.equal(await readFile(logPath, 'utf8'), logged, 'no duplicate telemetry / savings');
+    assert.equal((await readdir(objectsDir)).length, 1, 'no redundant object write');
+
+    const resumed = await project(event, ctx);
+    assert.equal(resumed.messages[0]!.content[0]!.text, packedText, 'the placeholder is rebuilt from the stored object');
+    assert.equal(asks, 0);
+    assert.equal(await readFile(logPath, 'utf8'), logged);
   });
 });
 

@@ -12,7 +12,7 @@ import {
 } from '../src/ask-dialog.ts';
 import {
   DECLINE_TEXT, formatAskContent, gateLabel, hasAskUi, noUiResult, optionLines, parseChoice,
-  prepareAsk, runAsk, type AskAnswer, type AskQuestion, type AskSpec, type AskUi,
+  prepareAsk, prepareAskArguments, runAsk, type AskAnswer, type AskQuestion, type AskSpec, type AskUi,
 } from '../src/ask-user.ts';
 
 const plain: MinimalTheme = { fg: (_c, t) => t, bold: (t) => t };
@@ -92,8 +92,9 @@ type GrammarCase = { name: string; config: DialogConfig; keys: Key[]; outcome?: 
 const GRAMMAR_CASES: GrammarCase[] = [
   { name: 'multi: space toggles only the cursor row and keeps selection order', config: multi(), keys: ['down', 'down', 'toggle', 'up', 'up', 'toggle'], labels: ['alpha', 'gamma'] },
   { name: 'multi: space untoggles the cursor row', config: multi(), keys: ['down', 'down', 'toggle', 'up', 'up', 'toggle', 'toggle'], labels: ['gamma'] },
-  { name: 'multi: space on the Other row opens free text like enter', config: multi(), keys: ['up', 'toggle'], outcome: { kind: 'other' } },
-  { name: 'multi: enter on the Other row opens free text', config: multi(), keys: ['up', 'confirm'], outcome: { kind: 'other' } },
+  { name: 'multi: space on the Other row opens free text like enter', config: multi(), keys: ['up', 'toggle'], outcome: { kind: 'other', labels: [] } },
+  { name: 'multi: enter on the Other row opens free text', config: multi(), keys: ['up', 'confirm'], outcome: { kind: 'other', labels: [] } },
+  { name: 'multi: Other carries the rows toggled before it', config: multi(), keys: ['toggle', 'up', 'confirm'], outcome: { kind: 'other', labels: ['alpha'] } },
   { name: 'multi: a toggles everything on', config: multi(), keys: ['all'], labels: ['alpha', 'beta', 'gamma'] },
   { name: 'multi: a toggles everything off again', config: multi(), keys: ['all', 'all'], labels: [] },
   { name: 'pick-one: a is a no-op', config: single(), keys: ['all'], labels: [], cursor: 0 },
@@ -102,8 +103,8 @@ const GRAMMAR_CASES: GrammarCase[] = [
   { name: 'multi: a single-option confirm returns that option', config: multi({ options: [{ label: 'only' }] }), keys: ['confirm'], outcome: { kind: 'selected', labels: ['only'] } },
   { name: 'pick-one: enter returns the cursor row, never the toggle set', config: single(), keys: ['down', 'down', 'confirm'], outcome: { kind: 'selected', labels: ['gamma'] } },
   { name: 'pick-one: space is an alias for enter', config: single(), keys: ['toggle'], outcome: { kind: 'selected', labels: ['alpha'] } },
-  { name: 'pick-one: enter on the Other row opens free text', config: single(), keys: ['up', 'confirm'], outcome: { kind: 'other' } },
-  { name: 'pick-one: space on the Other row opens free text', config: single(), keys: ['up', 'toggle'], outcome: { kind: 'other' } },
+  { name: 'pick-one: enter on the Other row opens free text', config: single(), keys: ['up', 'confirm'], outcome: { kind: 'other', labels: [] } },
+  { name: 'pick-one: space on the Other row opens free text', config: single(), keys: ['up', 'toggle'], outcome: { kind: 'other', labels: [] } },
 ];
 
 test('stepDialog key grammar', async (t) => {
@@ -201,7 +202,7 @@ test('component: long titles and descriptions wrap inside the frame instead of c
 const KEY_SEQUENCE_CASES: Array<{ name: string; keys: string[]; outcomes: DialogOutcome[] }> = [
   { name: 'toggles two rows, confirms, then ignores further keys', keys: ['x', ' ', '\x1b[B', ' ', '\r', ' '],
     outcomes: [{ kind: 'selected', labels: ['alpha', 'beta'] }] },
-  { name: 'wraps to the Other row and finishes with the other outcome', keys: ['\x1b[A', '\r'], outcomes: [{ kind: 'other' }] },
+  { name: 'wraps to the Other row and finishes with the other outcome', keys: ['\x1b[A', '\r'], outcomes: [{ kind: 'other', labels: [] }] },
 ];
 
 test('component: key sequences drive the state machine and finish once', async (t) => {
@@ -274,6 +275,20 @@ function dialogUi(keys: string[], input = 'typed by hand'): AskUi {
       let outcome: DialogOutcome | undefined;
       const component = (factory as ComponentFactory)({}, plain, kb, (o) => { outcome = o; });
       for (const key of keys) component.handleInput(key);
+      return outcome;
+    },
+  };
+}
+
+/** Same bridge, but each `ui.custom` call (a reopened dialog) gets its own key sequence. */
+function attemptUi(attempts: string[][], input: () => string | undefined): AskUi {
+  let attempt = 0;
+  return {
+    input: async () => input(),
+    custom: async (factory) => {
+      let outcome: DialogOutcome | undefined;
+      const component = (factory as ComponentFactory)({}, plain, kb, (o) => { outcome = o; });
+      for (const key of attempts[attempt++] ?? []) component.handleInput(key);
       return outcome;
     },
   };
@@ -406,6 +421,8 @@ test('formatAskContent: option / Other notes / empty multi / decline', () => {
   assert.match(formatted({ question: 'Which database?', kind: 'option', answer: 'Redis' }), /"Which database\?"="Redis"/);
   assert.match(formatted({ question: 'Which database?', kind: 'custom', answer: 'Other', customInput: 'SQLite' }), /"Which database\?"="Other" user notes: SQLite/);
   assert.match(formatted({ question: 'Which database?', kind: 'multi', answer: null, selected: [] }), /"Which database\?"="\(none\)"/);
+  assert.match(formatted({ question: 'Which database?', kind: 'multi', answer: null, selected: ['Redis', 'Postgres'], customInput: 'and a sidecar' }),
+    /"Which database\?"="Redis, Postgres" user notes: and a sidecar/);
   assert.equal(formatAskContent({ answers: [], cancelled: true }), DECLINE_TEXT);
 });
 
@@ -465,12 +482,75 @@ test('runAsk multi: comma-separated numbers dedupe; non-numeric is custom; an em
   assert.match(empty.content[0]?.text ?? '', /\(none\)/);
 });
 
-test('runAsk: Esc on the second question declines the whole call and keeps the first answer', async () => {
+test('runAsk: declining the second question keeps the first answer and says the rest were declined', async () => {
   let n = 0;
   const ui: AskUi = { select: async (_title, options) => { n += 1; return n === 1 ? options[0] : undefined; }, input: async () => 'unused' };
   const result = await runAsk({ mode: 'questionnaire', questions: [q(), q({ question: 'SQL?' })] }, ui);
   assert.equal(result.details.cancelled, true);
-  assert.equal(result.content[0]?.text, DECLINE_TEXT);
   assert.equal(result.details.answers.length, 1);
   assert.equal(result.details.answers[0]?.answer, 'Redis');
+  const text = result.content[0]?.text ?? '';
+  assert.match(text, /"Which database\?"="Redis"/);
+  assert.match(text, /declined the remaining/);
+  assert.notEqual(text, DECLINE_TEXT);
+});
+
+test('ask failures set isError; answered results do not', async () => {
+  const invalid = prepareAsk({ question: 'Which database?', options: [REDIS] });
+  assert.equal(invalid.ok, false);
+  if (!invalid.ok) assert.equal(invalid.result.isError, true);
+  assert.equal(noUiResult().isError, true);
+  const answered = await runAsk({ mode: 'freeform', question: 'deploy staging?' }, { input: async () => 'ok' });
+  assert.equal(answered.isError, undefined);
+});
+
+test('prepareAskArguments: stringified options and questions are parsed before validation', () => {
+  const flat = prepareAsk(prepareAskArguments({
+    question: 'Which database?',
+    options: JSON.stringify([REDIS, POSTGRES]),
+    recommended: 1,
+  }));
+  if (!flat.ok) assert.fail(flat.result.content[0]?.text);
+  const flatQuestion = flat.spec.mode === 'questionnaire' ? flat.spec.questions[0] : undefined;
+  assert.deepEqual(flatQuestion?.options.map((option) => option.label), ['Redis', 'Postgres']);
+  assert.equal(flatQuestion?.recommended, 1);
+
+  const batched = prepareAsk(prepareAskArguments({
+    questions: JSON.stringify([{ question: 'Cache?', options: JSON.stringify([REDIS, POSTGRES]) }]),
+  }));
+  if (!batched.ok) assert.fail(batched.result.content[0]?.text);
+  const questions = batched.spec.mode === 'questionnaire' ? batched.spec.questions : [];
+  assert.deepEqual(questions[0]?.options.map((option) => option.label), ['Redis', 'Postgres']);
+
+  // A string that is not a JSON array is left alone and fails with the array message.
+  const notAnArray = failOf(prepareAskArguments({ question: 'Q?', options: '{"label":"Redis"}' }));
+  assert.equal(notAnArray.code, 'empty_options');
+  assert.match(notAnArray.text, /must be an array/);
+  const broken = failOf(prepareAskArguments({ question: 'Q?', options: '[{"label":"Redis"' }));
+  assert.equal(broken.code, 'empty_options');
+});
+
+test('runAsk: a blank Other answer returns to the choices and keeps the toggles', async () => {
+  const dialog = await askOne(q(), attemptUi([['\x1b[A', '\r'], ['\r']], () => ''));
+  assert.deepEqual(dialog.details.answers[0], { question: 'Which database?', kind: 'option', answer: 'Redis' });
+  assert.equal(dialog.details.cancelled, false);
+
+  let selectCalls = 0;
+  const typed = await askOne(q(), {
+    input: async () => '',
+    select: async (_title, options) => { selectCalls += 1; return selectCalls === 1 ? options[2]! : options[0]!; },
+  });
+  assert.deepEqual(typed.details.answers[0], { question: 'Which database?', kind: 'option', answer: 'Redis' });
+
+  const kept = await askOne(q({ multi: true }), attemptUi([[' ', '\x1b[A', '\r'], ['\r']], () => ''));
+  assert.deepEqual(kept.details.answers[0]?.selected, ['Redis']);
+});
+
+test('runAsk: multi-select + Other keeps the toggled labels alongside the custom text', async () => {
+  const result = await askOne(q({ multi: true }), attemptUi([[' ', '\x1b[B', ' ', '\x1b[A', '\x1b[A', '\r']], () => 'and a sidecar'));
+  const answer = result.details.answers[0]!;
+  assert.equal(answer.kind, 'multi');
+  assert.deepEqual(answer.selected, ['Redis', 'Postgres']);
+  assert.equal(answer.customInput, 'and a sidecar');
+  assert.match(result.content[0]?.text ?? '', /"Which database\?"="Redis, Postgres" user notes: and a sidecar/);
 });

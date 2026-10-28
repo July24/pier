@@ -10,7 +10,7 @@ import { runtimePolicy, type RuntimePolicy } from './runtime-policy.ts';
 import type { JevRuntime } from './jev-client.ts';
 import { evaluateSettleVerdict, settleAskIsSafe, settleVerdictRequest } from './jev-core.ts';
 import { formatSettlementNotice, type SettlementNullReason } from './vocab.ts';
-import { buildBlockedGateNotice, sleep, type SubEntry } from './subagent-core.ts';
+import { buildBlockedGateNotice, reportFingerprint, sleep, type SubEntry } from './subagent-core.ts';
 import type { SessionIo } from './subagent-session.ts';
 import type { GitIo } from './subagent-spawn.ts';
 
@@ -70,8 +70,17 @@ export function planObservationTick(input: {
   agentStatus: string | null;
   machineInjectAgoMs: number;
   machineInjectGraceMs: number;
+  /** The transcript already holds a finalized answer (stopReason 'stop', no pending tool call). */
+  finalized?: boolean;
 }): ObservationTickPlan {
-  if (!input.observationStartedAt) return { kind: 'start-observation' };
+  if (!input.observationStartedAt) {
+    // A finalized answer on a pane that is not working settles on the detecting tick: the window
+    // would only delay the result, and the transcript cannot grow under an idle pane. A working or
+    // blocked pane keeps the window path — that is the human-takeover guard.
+    const paneBusy = input.agentStatus === 'working' || input.agentStatus === 'blocked';
+    if (input.finalized && !paneBusy) return { kind: 'settle' };
+    return { kind: 'start-observation' };
+  }
   if (input.agentStatus === 'working') {
     if (input.machineInjectAgoMs > input.machineInjectGraceMs) return { kind: 'user-takeover' };
     return { kind: 'machine-inject-reset' };
@@ -118,8 +127,9 @@ export function buildSettlementNoticeText(
   closing: string | null,
   statLine: string | null,
   nullReason: SettlementNullReason = 'silent',
+  reportDeliveredAt: number | null = null,
 ): string {
-  const base = formatSettlementNotice(agentLabel, closing, nullReason);
+  const base = formatSettlementNotice(agentLabel, closing, nullReason, reportDeliveredAt);
   return statLine ? `${base}\n${statLine}` : base;
 }
 
@@ -183,7 +193,7 @@ export interface PollerHost {
   lastMachineInjectAt: Map<string, number>;
   session: SessionIo;
   git: GitIo;
-  injectNotice(content: string): Promise<void>;
+  injectNotice(content: string, paneId?: string): Promise<void>;
   reconcileOnSettlement(description: string, outcome: 'settled' | 'failed'): string[];
   withReconcileNotes(base: string, notes: readonly string[]): string;
   claimSettleNotice(key: string): boolean;
@@ -222,6 +232,9 @@ export function createPoller(h: PollerHost): Poller {
   ): Promise<void> {
     const startedAt = now();
     let lastActivityAt = now();
+    /** Claimed settle key: on a rejected injection the claim stays ours, so the next tick retries
+     *  the notice instead of suppressing it as someone else's. */
+    let claimedKey: string | null = null;
     /** Stop watching this pane: persist + ledger first, or a restart replays a ghost running row. */
     const consume = (outcome: string | null, via: string, at: number): void => {
       const row = h.subs.get(paneId);
@@ -323,13 +336,6 @@ export function createPoller(h: PollerHost): Poller {
 
           if (isSettlementCandidate(s)) {
             const closing = s.text;
-            if (!entry.observationStartedAt) {
-              entry.observationStartedAt = now();
-              entry.lastAgentStatus = 'idle';
-              h.persistSubs();
-              await doSleep(OBSERVATION_TICK_MS);
-              continue;
-            }
             let agentStatus: string | null = null;
             try {
               agentStatus = (await h.client.listAgents()).find((a) => a.paneId === paneId)?.status ?? null;
@@ -342,7 +348,15 @@ export function createPoller(h: PollerHost): Poller {
               agentStatus,
               machineInjectAgoMs: now() - (h.lastMachineInjectAt.get(paneId) ?? 0),
               machineInjectGraceMs,
+              finalized: closing != null && !s.pendingTool,
             });
+            if (obs.kind === 'start-observation') {
+              entry.observationStartedAt = now();
+              entry.lastAgentStatus = 'idle';
+              h.persistSubs();
+              await doSleep(OBSERVATION_TICK_MS);
+              continue;
+            }
             if (obs.kind === 'user-takeover') {
               entry.userTakeover = true;
               entry.observationStartedAt = now();
@@ -409,19 +423,39 @@ export function createPoller(h: PollerHost): Poller {
                 await h.session.resolveSessionFile(paneId, cwd, undefined, { minMtimeMs: current.injectTs - 2_000 }),
               );
             }
-            consume(closing, 'poll-settle', now());
+            // Claim before delivering: the pipe fast-path may already own this settlement's notice.
+            // The row is consumed only after the notice is accepted, and a claim we own is retried
+            // on the next tick — a rejected injection must not strand a finished worker as 'running'
+            // with no notice, nor consume the row while the result is still undelivered.
+            const claimKey = `${paneId}:${current.requestId}`;
+            if (claimedKey !== claimKey) {
+              if (!h.claimSettleNotice(claimKey)) {
+                consume(closing, 'poll-settle', now());
+                return;
+              }
+              claimedKey = claimKey;
+            }
             const notes = h.reconcileOnSettlement(current.description, 'settled');
             const statLine = await h.git.worktreeStatLine(entry);
+            // `subagent output` may already have returned this exact report: point there, don't repeat it.
+            const delivered = closing && entry.reportDelivered?.fingerprint === reportFingerprint(closing)
+              ? entry.reportDelivered.at
+              : null;
             const notice = h.withReconcileNotes(
-              buildSettlementNoticeText(`${paneId} (${current.description})`, closing, statLine, nullReason),
+              buildSettlementNoticeText(`${paneId} (${current.description})`, closing, statLine, nullReason, delivered),
               notes,
             );
-            if (h.claimSettleNotice(`${paneId}:${current.requestId}`)) {
-              try {
-                await h.injectNotice(notice);
-              } catch {
-              }
+            try {
+              // Tag the pane: a notice buffered during compaction must keep its row GC-exempt
+              // until the post-compaction flush actually delivers it.
+              await h.injectNotice(notice, paneId);
+            } catch {
+              // Notification refused (e.g. the master is compacting): leave the row running and
+              // re-detect the same closing text on the next tick.
+              await pace();
+              continue;
             }
+            consume(closing, 'poll-settle', now());
             return;
           }
         }

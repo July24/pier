@@ -147,9 +147,20 @@ export function herdrUnavailableHint(err: unknown): string | null {
 /** Wire protocol this client is written against (herdr 0.9.5, contract fixture regenerated 2026-10-20). */
 export const HERDR_PROTOCOL_EXPECTED = 22;
 
+export type WaitFailureReason = 'timeout' | 'unavailable';
+
 export type WaitForOutputResult =
   | { matched: true }
-  | { matched: false; reason: 'timeout' | 'unavailable' };
+  | { matched: false; reason: WaitFailureReason };
+
+/** Classify a failed `pane.wait_for_output`: null means the error is not a wait outcome and should
+ *  surface. herdr may report its own server-side timeout under an `unavailable` code or as
+ *  "timed out"; a wait that consumed its budget is a timeout regardless of the label it chose. */
+export function classifyWaitFailure(message: string, elapsedMs: number, timeoutMs: number): WaitFailureReason | null {
+  if (/timeout|timed out|deadline exceeded/i.test(message) || elapsedMs >= timeoutMs * 0.95) return 'timeout';
+  if (/not supported|not implemented|unknown method|unavailable|method not found/i.test(message)) return 'unavailable';
+  return null;
+}
 
 /** pane.read / agent.read selection: `recent` keeps ANSI so T6 fullscreen detection still sees it. */
 export interface ReadOptions {
@@ -783,6 +794,7 @@ export class HerdrClient implements HerdrClientLike {
   }
 
   async waitForOutput(paneId: string, match: { type: 'substring' | 'regex'; value: string }, timeoutMs: number): Promise<WaitForOutputResult> {
+    const started = Date.now();
     try {
       await this.request('pane.wait_for_output', {
         pane_id: paneId,
@@ -793,10 +805,8 @@ export class HerdrClient implements HerdrClientLike {
       return { matched: true };
     } catch (err) {
       const msg = String((err as Error)?.message ?? err);
-      if (/timeout/i.test(msg)) return { matched: false, reason: 'timeout' };
-      if (/not supported|not implemented|unknown method|unavailable|method not found/i.test(msg)) {
-        return { matched: false, reason: 'unavailable' };
-      }
+      const reason = classifyWaitFailure(msg, Date.now() - started, timeoutMs);
+      if (reason != null) return { matched: false, reason };
       throw err;
     }
   }

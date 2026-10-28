@@ -10,6 +10,7 @@
  */
 import { isPlainObject } from './guards.ts';
 import { containsLikelySecret, FAILURE_SIGNAL } from './reducer-core.ts';
+import { completeLineExcerpt } from './observation-core.ts';
 
 /* ── Request/response shapes (closed set) ── */
 
@@ -153,6 +154,8 @@ export interface DiagnosticGateVerdict {
   readonly choice: string | null;
   readonly noul: number | null;
 }
+/** Confidence is checked before the choice: an unconfident rejection is not authoritative, so the
+ *  caller's regex list must decide (same fail-open path as a typed `low-confidence` answer). */
 export function evaluateDiagnosticGate(
   answers: Record<string, JevAnswer>,
   minConfidence: number,
@@ -162,11 +165,11 @@ export function evaluateDiagnosticGate(
   if (kind === undefined || output === undefined) {
     return { hit: false, reason: 'missing-answer', confidence: null, choice: null, noul: null };
   }
-  if (kind.choice !== 'build_test_run') {
-    return { hit: false, reason: `not-build-test:${kind.choice}`, confidence: kind.confidence, choice: kind.choice, noul: output.noul };
-  }
   if (kind.confidence < minConfidence) {
     return { hit: false, reason: 'low-confidence', confidence: kind.confidence, choice: kind.choice, noul: output.noul };
+  }
+  if (kind.choice !== 'build_test_run') {
+    return { hit: false, reason: `not-build-test:${kind.choice}`, confidence: kind.confidence, choice: kind.choice, noul: output.noul };
   }
   if (output.noul < DIAGNOSTIC_OUTPUT_MIN_NOUL) {
     return { hit: false, reason: 'non-diagnostic-output', confidence: kind.confidence, choice: kind.choice, noul: output.noul };
@@ -262,9 +265,12 @@ export interface ExcerptWindow {
   readonly id: ExcerptWindowId;
   readonly label: string;
   readonly text: string;
+  /** 0-based first line of the window in the packed output (telemetry joins picks to objects). */
+  readonly startLine: number;
 }
 
 interface LineWindow {
+  readonly start: number;
   readonly text: string;
   readonly bytes: number;
   readonly signalCount: number;
@@ -286,12 +292,12 @@ function buildLineWindow(lines: readonly string[], start: number, budgetBytes: n
     if (signalLines.has(i)) signalCount++;
   }
   if (selected.length === 0) return null;
-  return { text: selected.join('\n'), bytes, signalCount };
+  return { start, text: selected.join('\n'), bytes, signalCount };
 }
 
 /** Code-owned middle-window candidates for a packed observation: failure-signal windows (first hit,
- * densest cluster) when present, plus a plain mid-output window ALWAYS offered, so jev judges every
- * packed output — including logs whose failure lines the English FAILURE_SIGNAL regex cannot see. */
+ * densest cluster) when present, plus a plain mid-output window. The picker asks jev only when a
+ * signal window exists; a mid-only set kept head/tail or failed in 8 of 10 asks (D123). */
 export function buildExcerptWindows(text: string, halfBudgetBytes: number): ExcerptWindow[] {
   if (halfBudgetBytes <= 0) return [];
   const lines = text.split('\n');
@@ -308,7 +314,7 @@ export function buildExcerptWindows(text: string, halfBudgetBytes: number): Exce
     const firstWindow = buildLineWindow(lines, Math.max(0, first - 2), halfBudgetBytes, signalLines);
     if (firstWindow !== null && !seen.has(firstWindow.text)) {
       seen.add(firstWindow.text);
-      out.push({ id: 'first_signal', label: 'first failure-signal region', text: firstWindow.text });
+      out.push({ id: 'first_signal', label: 'first failure-signal region', text: firstWindow.text, startLine: firstWindow.start });
     }
 
     let best: LineWindow | null = null;
@@ -319,49 +325,80 @@ export function buildExcerptWindows(text: string, halfBudgetBytes: number): Exce
     }
     if (best !== null && !seen.has(best.text)) {
       seen.add(best.text);
-      out.push({ id: 'densest', label: 'densest failure-signal region', text: best.text });
+      out.push({ id: 'densest', label: 'densest failure-signal region', text: best.text, startLine: best.start });
     }
   }
 
   const midAnchor = Math.min(Math.floor(lines.length / 2), Math.max(0, lines.length - 1));
   const midWindow = buildLineWindow(lines, midAnchor, halfBudgetBytes, signalLines);
   if (midWindow !== null && !seen.has(midWindow.text)) {
-    out.push({ id: 'mid', label: 'middle region of the output', text: midWindow.text });
+    out.push({ id: 'mid', label: 'middle region of the output', text: midWindow.text, startLine: midWindow.start });
   }
   return out;
 }
 
-export function excerptPickRequest(
-  middleWindows: readonly ExcerptWindow[],
-  headExcerpt: string,
-  tailExcerpt: string,
-): JevRequest | null {
-  if (middleWindows.length === 0) return null;
-  const criteria: Record<string, string> = {
-    keep_head_tail: 'The existing head and tail excerpts are already the most informative; keep them',
-  };
-  const excerpts: Record<string, string> = { head_excerpt: headExcerpt, tail_excerpt: tailExcerpt };
-  for (const window of middleWindows) {
-    criteria[window.id] = `${window.label}: excerpt from the middle of the output`;
-    excerpts[window.id] = window.text;
+/**
+ * Which packed outputs are worth an excerpt ask, keeping each item's index into `items`. Skipped:
+ * outputs without a failure-signal window (only `mid` competes with head/tail; that lost in 8 of 10
+ * asks, D123) and outputs whose excerpts carry a credential shape (§8 privacy boundary).
+ */
+export function planExcerptAsks(
+  items: ReadonlyArray<{ obsId: string; text: string }>,
+  excerptBudgetBytes: number,
+): Array<{ index: number; obsId: string } & ExcerptPickItem> {
+  const halfBudget = Math.floor(excerptBudgetBytes / 2);
+  const asks: Array<{ index: number; obsId: string } & ExcerptPickItem> = [];
+  for (let index = 0; index < items.length; index++) {
+    const { obsId, text } = items[index]!;
+    const windows = buildExcerptWindows(text, halfBudget);
+    if (!windows.some((w) => w.id !== 'mid')) continue;
+    const headExcerpt = completeLineExcerpt(text, halfBudget, false);
+    const tailExcerpt = completeLineExcerpt(text, excerptBudgetBytes - halfBudget, true);
+    if (!excerptAskIsSafe(windows, headExcerpt, tailExcerpt)) continue;
+    asks.push({ index, obsId, windows, headExcerpt, tailExcerpt });
   }
-  return {
-    state: { excerpts },
-    questions: {
-      window: {
-        type: 'choice',
-        instructions: 'A large tool output was replaced by a placeholder keeping two short excerpts. Which excerpt set would most help a coding agent locate the problem without recalling the full text?',
-        criteria,
-      },
-    },
-  };
+  return asks;
+}
+
+export interface ExcerptPickItem {
+  readonly windows: readonly ExcerptWindow[];
+  readonly headExcerpt: string;
+  readonly tailExcerpt: string;
+}
+
+/** One request for every packed output (a compaction batch packs up to 20): one round trip instead of
+ *  a 20-way burst. `outputs[i]` carries item i's excerpts; its question is `excerpt_${i}_window`. */
+export function excerptPickRequest(items: readonly ExcerptPickItem[]): JevRequest | null {
+  if (items.length === 0) return null;
+  const questions: Record<string, JevQuestion> = {};
+  const outputs: Array<Record<string, string>> = [];
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i]!;
+    const criteria: Record<string, string> = {
+      keep_head_tail: 'The existing head and tail excerpts are already the most informative; keep them',
+    };
+    const excerpts: Record<string, string> = { head_excerpt: item.headExcerpt, tail_excerpt: item.tailExcerpt };
+    for (const window of item.windows) {
+      criteria[window.id] = `${window.label}: excerpt from the middle of the output`;
+      excerpts[window.id] = window.text;
+    }
+    outputs.push(excerpts);
+    // Question keys are NOT sent to the model, so the instruction names its output index.
+    questions[`excerpt_${i}_window`] = {
+      type: 'choice',
+      instructions: `A large tool output (outputs[${i}]) was replaced by a placeholder keeping two short excerpts. Which excerpt set would most help a coding agent locate the problem without recalling the full text?`,
+      criteria,
+    };
+  }
+  return { state: { outputs }, questions };
 }
 
 export function evaluateExcerptPick(
   answers: Record<string, JevAnswer>,
+  index: number,
   minConfidence: number,
 ): ExcerptWindowId | null {
-  const picked = answerOf(answers, 'window', 'choice');
+  const picked = answerOf(answers, `excerpt_${index}_window`, 'choice');
   if (picked === undefined) return null;
   if (picked.confidence < minConfidence) return null;
   return picked.choice === 'first_signal' || picked.choice === 'densest' || picked.choice === 'mid'

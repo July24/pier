@@ -21,8 +21,6 @@ export interface PipeHandlerSession {
   setPendingMachineRequest: (req: MachineRequest | null) => void;
   /** P0 (RFC §4.4): apply a role switch requested over the pipe (master → worker). */
   applyRoleSwitch: (role: string, switchedBy: string) => Promise<{ ok: boolean; message: string }>;
-  /** Phase 2 (RFC rfc-delegation-identity §3.2): worker → master progress note (display-less custom message). */
-  deliverProgress: (workerPaneId: string, text: string) => Promise<void>;
   /** D113 (RFC rfc-unified-widget): worker → master full todo push; updates the widget cache. */
   applyWorkerTodos: (workerPaneId: string, items: Array<{ content: string; status: string; blocker?: string }>, summary: string) => void;
 }
@@ -57,12 +55,6 @@ export async function handlePipeRequest(
       return res.ok
         ? { type: 'ok', id: req.id, detail: res.message }
         : { type: 'error', id: req.id, message: res.message };
-    }
-    case 'progress': {
-      // Never triggers a master turn and never floods the visible chat (RFC §3.2); the
-      // display-less custom message rides context only, rendered as a compact card.
-      await s.deliverProgress(req.paneId, req.text);
-      return { type: 'ok', id: req.id };
     }
     case 'todo_sync': {
       s.applyWorkerTodos(req.paneId, req.items, req.summary);

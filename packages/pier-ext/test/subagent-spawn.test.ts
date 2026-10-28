@@ -308,7 +308,7 @@ test('spawn env: worker panes silence pi 1.1 OSC 7501 (pier is the single state 
     assert.equal(delegation.description, '探查');
     assert.equal(typeof delegation.taskId, 'string');
     assert.equal(delegation.role, 'worker-default');
-    assert.equal(delegation.parentPipe, pipeNameFor(env.cwd, 'p0'), 'Phase 2: the worker can dial the master pipe for report_progress');
+    assert.equal(delegation.parentPipe, pipeNameFor(env.cwd, 'p0'), 'the worker can dial the master pipe for todo_sync');
   });
 });
 

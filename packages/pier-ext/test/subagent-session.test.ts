@@ -9,7 +9,8 @@ import type { AgentInfo, HerdrClientLike } from '../src/herdr-client.ts';
 import { SUBS_CUSTOM_TYPE, type SubEntry } from '../src/subagent-core.ts';
 import { sessionDirName } from '../src/session-tail.ts';
 import {
-  computeSubagentOutputDelta, createSessionIo, formatSubagentOutput, resolveSubagentStatus, type SubagentOutputCursor,
+  cleanPaneChrome, computeSubagentOutputDelta, createSessionIo, cutPaneReportCopy, formatSubagentOutput, resolveSubagentStatus,
+  type SubagentOutputCursor,
 } from '../src/subagent-session.ts';
 import { appendHistory } from '../src/history-store.ts';
 import { preferredHistoryFile } from '../src/storage-layout.ts';
@@ -405,6 +406,58 @@ test('output action: an idle pane showing only its overlay still surfaces the tr
     assert.equal(second.details!.reportDelivered, false, 'an unchanged report is not re-delivered');
     assert.doesNotMatch(second.content[0]!.text, /Subagent Report/);
   }, outputPane(() => 'todo: 0▶ 0○ 0■ 7✓\n   +3 hidden (7✓) · /todos\n', { status: 'idle', session: report }));
+  home.dispose();
+});
+
+/** Shape of a real worker pane read (01a17b50): padded frame rows, the rendered report with its
+ *  markdown stripped and long lines cut at pane width, then pi's cwd + token footer. */
+const RENDERED_PANE = [
+  '                                       │',
+  ' Fix committed to bugfix/zentao-20718-apn (commit bbde792a72, not pushed).              ',
+  '',
+  '',
+  ' - extractTalentToMq(ids, region) routes the index by the normalized reg',
+  '──────────────────────────────────────────',
+  '~/IdeaProjects/wt-apn-bug20718 (bugfix/zentao-20718-apn)',
+  '↑43k ↓13k R820k CH99.1% $0.017 4.2%/1.0M (auto)            ',
+].join('\n');
+const TRANSCRIPT_REPORT = 'Fix committed to `bugfix/zentao-20718-apn` (commit `bbde792a72`, not pushed).\n\n- `extractTalentToMq(ids, region)` routes the index by the normalized region; `_source.region` stays.';
+
+test('cleanPaneChrome: frame rows, side borders, padding, blank runs and the pi footer go; content stays', () => {
+  assert.equal(
+    cleanPaneChrome(RENDERED_PANE),
+    ' Fix committed to bugfix/zentao-20718-apn (commit bbde792a72, not pushed).\n\n - extractTalentToMq(ids, region) routes the index by the normalized reg',
+  );
+  // A path line is only footer chrome directly above the token line.
+  assert.equal(cleanPaneChrome('~/repo (main)\nbuild ok'), '~/repo (main)\nbuild ok');
+  assert.equal(cleanPaneChrome('│ boxed line │'), 'boxed line');
+});
+
+test('cutPaneReportCopy: the lossy rendered copy is cut at its opening; text before it survives', () => {
+  const pane = `$ mvn test\nBUILD SUCCESS\n${cleanPaneChrome(RENDERED_PANE)}`;
+  const cut = cutPaneReportCopy(pane, TRANSCRIPT_REPORT);
+  assert.ok(cut?.startsWith('$ mvn test\nBUILD SUCCESS\n(the pane'), cut ?? 'null');
+  assert.doesNotMatch(cut!, /extractTalentToMq/);
+  assert.equal(cutPaneReportCopy('unrelated output only\n', TRANSCRIPT_REPORT), null);
+  assert.equal(cutPaneReportCopy(pane, 'tiny'), null, 'a too-short report never matches by accident');
+});
+
+test('output action: the transcript report replaces the pane copy and the delivery is persisted', async () => {
+  const home = new TempHome('pier-out-dedupe-');
+  const dir = home.dir('sessions', 'sub-dedupe');
+  const session = join(dir, '2026-10-27T05-12-00-000Z_66666666-6666-4777-8888-999999999999.jsonl');
+  writeSession(session, [transcriptMessage('assistant', TRANSCRIPT_REPORT, Date.now())]);
+  await withWorker(async (pi) => {
+    const res = await runSubagent(pi, { action: 'output', agentId: 'pWorker' });
+    const text = res.content[0]!.text;
+    assert.equal(res.details!.reportDelivered, true);
+    assert.match(text, /rendered copy of the final report is omitted/);
+    assert.equal(text.match(/extractTalentToMq/g)?.length, 1, 'the report appears once, from the transcript');
+    assert.doesNotMatch(text, /↑43k|R820k|──/, 'TUI chrome is stripped');
+    assert.match(text, /`_source\.region` stays/, 'the complete transcript text, not the cut pane line');
+    const row = subsSnapshot(pi)?.subs.find((s) => s.paneId === 'pWorker');
+    assert.equal(row?.reportDelivered?.fingerprint, TRANSCRIPT_REPORT.slice(-64), 'the delivery survives a resume');
+  }, outputPane(() => RENDERED_PANE, { status: 'idle', session }));
   home.dispose();
 });
 
