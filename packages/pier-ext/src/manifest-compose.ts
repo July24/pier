@@ -36,7 +36,7 @@ export function composeManifest(sources: ManifestSources): ComposedManifest {
   if (baseline.length === 0) {
     throw new ManifestError(
       'INVALID_ROLE_CONFIG',
-      'INVALID_ROLE_CONFIG: 基线工具不能为空，至少需包含 todo_write 和 ask_user_question',
+      'INVALID_ROLE_CONFIG: baseline tools must not be empty; todo_write and ask_user_question are required',
     );
   }
   const candidates = new Set<string>([
@@ -62,9 +62,9 @@ export function composeManifest(sources: ManifestSources): ComposedManifest {
   if (tools.length === 0) {
     throw new ManifestError(
       'EMPTY_MANIFEST',
-      `裁剪后 manifest 为空（deny-all trap？）。基线: ${baseline.join(', ') || '(空)'}；` +
-        `模型建议: ${sources.modelSuggested.join(', ') || '(无)'}；` +
-        `规则: ${JSON.stringify(rules)}`,
+      `Trimmed manifest is empty (deny-all trap?). Baseline: ${baseline.join(', ') || '(empty)'}; ` +
+        `model suggestions: ${sources.modelSuggested.join(', ') || '(none)'}; ` +
+        `rules: ${JSON.stringify(rules)}`,
     );
   }
 

@@ -13,7 +13,7 @@
 id = "pier.workbench"
 name = "pier-workbench"
 version = "0.1.0"
-description = "pier × herdr 工作台融合：blocked 通知、焦点热力布局、运维面板与侧边栏视图"
+description = "pier × herdr workbench fusion: blocked notifications, focus heat layout, ops panel and sidebar view"
 min_herdr_version = "0.9.5"
 platforms = ["linux", "macos", "windows"]
 

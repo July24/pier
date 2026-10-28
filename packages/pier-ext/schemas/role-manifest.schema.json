@@ -1,19 +1,19 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://herdr-pi.local/schemas/role-manifest.schema.json",
-  "title": "herdr-pi role manifest（D76 v2）",
-  "description": "档2 role 档案契约：version（P2 语义版本）+ roleType（P3 planner/executor/hybrid）+ 三态 rules（P1 allow/ask/deny）。运行时校验为 src/role-manifest.ts 手写零依赖实现，本文件是合同文档。",
+  "title": "herdr-pi role manifest (D76 v2)",
+  "description": "Tier-2 role manifest contract: version (P2 semantic version) + roleType (P3 planner/executor/hybrid) + tri-state rules (P1 allow/ask/deny). Runtime validation is the hand-written zero-dependency implementation in src/role-manifest.ts; this file is the contract document.",
   "type": "object",
   "properties": {
-    "role": { "type": "string", "pattern": "^[a-z0-9-]+$", "description": "角色名，须与文件名一致" },
-    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$", "description": "语义版本 x.y.z" },
-    "model": { "type": "string", "pattern": "^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", "description": "按角色路由模型 provider/model（WS-D10；可省略 = 进程默认）" },
+    "role": { "type": "string", "pattern": "^[a-z0-9-]+$", "description": "Role name; must match the file name" },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$", "description": "Semantic version x.y.z" },
+    "model": { "type": "string", "pattern": "^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", "description": "Per-role model routing, provider/model (WS-D10; optional = process default)" },
     "guidelines": {
       "type": "array",
       "minItems": 1,
       "maxItems": 20,
       "items": { "type": "string", "minLength": 1 },
-      "description": "P0 per-role 行为约束（RFC §4.6）：工具集表达不了的“怎么用”约束，每轮作为 pier-role prompt section 注入；空数组请省略"
+      "description": "P0 per-role behavior constraints (RFC §4.6): constraints on \"how to use\" tools that the tool set cannot express, injected each turn as the pier-role prompt section; omit instead of passing an empty array"
     },
     "manifest": {
       "type": "object",
@@ -23,17 +23,17 @@
           "minItems": 1,
           "items": { "type": "string", "pattern": "^[a-z0-9_-]+$" },
           "uniqueItems": true,
-          "description": "基线工具；必含 todo_write 与 ask_user_question（协调工具，运行时校验强制）"
+          "description": "Baseline tools; must include todo_write and ask_user_question (coordination tools, enforced by runtime validation)"
         },
         "rules": {
           "type": "object",
           "propertyNames": { "pattern": "^[a-z0-9_*-]+$" },
           "additionalProperties": { "enum": ["allow", "ask", "deny"] },
-          "description": "三态权限；* 为通配符默认；可省略 = {\"*\":\"allow\"}"
+          "description": "Tri-state permissions; * is the wildcard default; optional = {\"*\":\"allow\"}"
         },
         "unknownTools": {
           "enum": ["allow", "deny"],
-          "description": "D82 未知工具姿态（缺省 deny）：allow = 用户安装的扩展默认可见可用（master/worker）；deny = 清单外一律不可见。与 rules 的 * 通配分属两轴（可见性 vs 强制力）"
+          "description": "D82 unknown-tool stance (default deny): allow = user-installed extensions are visible and usable by default (master/worker); deny = anything outside the list is invisible. Orthogonal to the rules * wildcard (visibility vs enforcement)"
         }
       },
       "required": ["tools"],

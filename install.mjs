@@ -127,13 +127,16 @@ function cmpSemver(a, b) {
   return 0;
 }
 
-function readPkgVersion(dir) {
+function readPkgJson(dir) {
   try {
-    return JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version ?? null;
+    return JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
   } catch {
     return null;
   }
 }
+
+const readPkgVersion = (dir) => readPkgJson(dir)?.version ?? null;
+const readPkgName = (dir) => readPkgJson(dir)?.name ?? null;
 
 function npmLatest(name) {
   try {
@@ -181,12 +184,56 @@ function registeredPiPackages() {
   } catch { return []; }
 }
 
-/** Clean up legacy git-mode registration before install/update; if --pi-spec explicitly specifies that git source, treat it as target and keep it. */
-function removeLegacyGitRegistration() {
-  if (piSource() === LEGACY_GIT_SPEC) return;
-  if (!registeredPiPackages().includes(LEGACY_GIT_SPEC)) return;
-  if (tryRun('pi', ['remove', LEGACY_GIT_SPEC])) log(`✓ removed legacy git-mode registration (${LEGACY_GIT_SPEC}); using ${piSource()}`);
-  else { console.error('✗ failed to remove legacy git-mode registration'); log(`  manual: pi remove ${LEGACY_GIT_SPEC}`); process.exitCode = 1; }
+/** A `packages` entry is a string spec or `{ source }`; local paths are relative to the agent dir. */
+function packageSource(entry) {
+  return typeof entry === 'string' ? entry : (typeof entry?.source === 'string' ? entry.source : null);
+}
+
+function localPackageDir(src) {
+  if (/^(npm|git|https?|ssh):/.test(src)) return null;
+  return resolve(piAgentDir(), src.startsWith('~/') ? join(homedir(), src.slice(2)) : src);
+}
+
+/** Registered sources that load pier's extension (npm, git, or a local checkout of pi-pier). */
+function registeredPierSources() {
+  return registeredPiPackages().map(packageSource).filter((src) => {
+    if (!src) return false;
+    if (npmNameFromSpec(src) === 'pi-pier' || /^git:.*july24\/pier/i.test(src)) return true;
+    const dir = localPackageDir(src);
+    return dir !== null && readPkgName(dir) === 'pi-pier';
+  });
+}
+
+function sameSource(registered, target) {
+  const dir = localPackageDir(registered);
+  if (dir !== null) return localPackageDir(target) === dir;
+  const name = npmNameFromSpec(registered);
+  return name !== null ? npmNameFromSpec(target) === name : registered === target;
+}
+
+/** Human/CLI form of a registered source: local entries become absolute (`pi remove` takes them). */
+function displaySource(src) {
+  const dir = localPackageDir(src);
+  return dir !== null ? dir : src;
+}
+
+/**
+ * Before install/update: drop the legacy git-mode registration (unless it is the explicit target),
+ * and refuse when pier is registered from any other source — two registrations load every pier
+ * tool twice and pi rejects the duplicate at launch.
+ */
+function reconcilePierRegistrations() {
+  for (const src of registeredPierSources()) {
+    if (sameSource(src, piSource())) continue;
+    if (src === LEGACY_GIT_SPEC) {
+      if (tryRun('pi', ['remove', LEGACY_GIT_SPEC])) log(`✓ removed legacy git-mode registration (${LEGACY_GIT_SPEC}); using ${piSource()}`);
+      else { console.error('✗ failed to remove legacy git-mode registration'); log(`  manual: pi remove ${LEGACY_GIT_SPEC}`); process.exitCode = 1; }
+      continue;
+    }
+    const switchHint = localPackageDir(src) !== null && !dev ? ', or keep it and rerun with --dev'
+      : dev && localPackageDir(src) === null ? ', or keep it and rerun without --dev' : '';
+    die(`pier is already registered in pi from ${displaySource(src)}; adding ${piSource()} would load every pier tool twice.\n  Remove it first: pi remove ${displaySource(src)}${switchHint}`);
+  }
 }
 
 function npmNameFromSpec(spec) {
@@ -305,13 +352,20 @@ function herdrPluginInfo() {
 
 function collectStatus() {
   const installer = readPkgVersion(ROOT);
-  const extPath = dev ? (existsSync(EXT_PATH) ? EXT_PATH : null) : resolveUserExtPath();
-  const extDir = extPath ? pkgDirFromExtPath(extPath) : null;
+  // Report what pi actually loads, not the spec this run would install.
+  const registered = registeredPierSources();
+  const registeredDir = registered.map(localPackageDir).find((d) => d !== null);
+  const extDir = dev
+    ? (existsSync(EXT_PATH) ? EXT_DIR : null)
+    : registeredDir ?? (() => { const p = resolveUserExtPath(); return p ? pkgDirFromExtPath(p) : null; })();
+  const spec = registered.length > 0
+    ? registered.map((src) => (localPackageDir(src) !== null ? `local:${localPackageDir(src)}` : src)).join(', ')
+    : piSource();
   return {
     product: (extDir ? readPkgVersion(extDir) : null) || installer,
     mode: dev ? 'dev' : 'user',
     installer: { name: 'pier-setup', version: installer },
-    piExt: { spec: piSource(), version: extDir ? readPkgVersion(extDir) : null, path: extDir },
+    piExt: { spec, version: extDir ? readPkgVersion(extDir) : null, path: extDir },
     herdr: herdrPluginInfo(),
     latest: { 'pier-setup': npmLatest('pier-setup'), 'pi-pier': npmLatest('pi-pier') },
   };
@@ -362,7 +416,7 @@ function version() {
 
 function update() {
   checkEnv();
-  removeLegacyGitRegistration();
+  reconcilePierRegistrations();
   const me = readPkgVersion(ROOT);
   const latestSetup = npmLatest('pier-setup');
   if (latestSetup && me && cmpSemver(me, latestSetup) < 0) {
@@ -389,7 +443,7 @@ function update() {
 
 function install() {
   checkEnv();
-  removeLegacyGitRegistration();
+  reconcilePierRegistrations();
 
   if (dev) {
     if (tryRun('pi', ['install', piSource()])) log('✓ pi extension installed (packages/pier-ext, local)');

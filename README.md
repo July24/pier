@@ -77,6 +77,10 @@ node install.mjs update --dev    # re-check env + versions; pull the repo yourse
 ```
 
 The script verifies the environment (node / pi / herdr versions) and registers both halves.
+pier must be registered in pi from exactly one source: `install`/`update` drops the legacy
+`git:github.com/July24/pier` registration automatically, and stops (exit 1, nothing changed)
+when pier is already registered from another source - e.g. a `--dev` checkout before a user-mode
+install - printing the `pi remove …` to run. `version` reports the source pi actually loads.
 
 `update` re-runs `pi update npm:pi-pier` (falls back to `pi install`) and
 `herdr plugin install … --yes`. Override sources with

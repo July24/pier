@@ -66,7 +66,7 @@ export function workerLine(row: WorkerWidgetRow): string {
     const counts = countsOf(items);
     if (!cur) return `↳ ${ref} ${counts}`;
     if (cur.status === 'blocked') {
-      const why = cur.blocker && cur.blocker !== cur.content ? `（${clip(cur.blocker, 24)}）` : '';
+      const why = cur.blocker && cur.blocker !== cur.content ? ` (${clip(cur.blocker, 24)})` : '';
       return `↳ ${ref} ■ ${clip(cur.content, 40)}${why} ${counts}`;
     }
     return `↳ ${ref} ▶ ${clip(cur.content)} ${counts}`;
@@ -85,7 +85,7 @@ export function selfLine(items: readonly TodoItem[]): string | null {
   const cur = currentOf(items);
   if (!cur) return null;
   const counts = countsOf(items);
-  if (cur.status === 'blocked') return `■ 等人: ${clip(cur.blocker || cur.content, 40)} ${counts}`;
+  if (cur.status === 'blocked') return `■ waiting on: ${clip(cur.blocker || cur.content, 40)} ${counts}`;
   return `▶ ${clip(cur.content)} ${counts}`;
 }
 
@@ -100,8 +100,8 @@ export function unifiedWidgetLines(
   // Human gate open: the question owns the fixed area (unchanged discipline from the old widget).
   if ((opts?.blockedDepth ?? 0) > 0) {
     return workers.length === 0 || items.length === 0
-      ? [`${formatTodoSummary(items)} · /todos 全量`]
-      : [`${formatTodoSummary(items)} · ↳×${workers.length} · /todos 全量`];
+      ? [`${formatTodoSummary(items)} · /todos for all`]
+      : [`${formatTodoSummary(items)} · ↳×${workers.length} · /todos for all`];
   }
   if (items.length === 0 && workers.length === 0) return [];
   // Archived plans keep their degraded two-line form; workers stay visible underneath.
@@ -114,7 +114,7 @@ export function unifiedWidgetLines(
   const budget = WIDGET_MAX_LINES - head.length - 1;
   const shown = rows.slice(0, Math.max(budget, 0));
   const hidden = rows.length - shown.length;
-  return [...head, ...shown, ...(hidden > 0 ? [`…另 ${hidden} 个子代理 · /pier-tree`] : [])];
+  return [...head, ...shown, ...(hidden > 0 ? [`…+${hidden} more subagents · /pier-tree`] : [])];
 }
 
 /** Full delegation tree for /pier-tree: self todos in full + per-worker full lists + settled nodes. */
@@ -126,15 +126,15 @@ export function formatDelegationTree(opts: {
 }): string[] {
   const now = opts.now ?? Date.now();
   const lines: string[] = ['==================== PIER DELEGATION TREE ===================='];
-  lines.push(`● master（本 pane）· ${opts.selfItems.length} 项`);
+  lines.push(`● master (this pane) · ${opts.selfItems.length} items`);
   lines.push(...renderTodoGroups(opts.selfItems).map((l) => `  ${l}`));
   if (opts.workers.length > 0 || (opts.settled?.length ?? 0) > 0) lines.push('  │');
   for (const w of opts.workers) {
     const ref = w.slug ?? w.paneId;
     const items = w.todos?.items;
     const headSuffix = items && items.length > 0
-      ? `· ${items.length} 项`
-      : w.todos?.summary ? `· ${clip(w.todos.summary, 40)}` : '· todo 未同步';
+      ? `· ${items.length} items`
+      : w.todos?.summary ? `· ${clip(w.todos.summary, 40)}` : '· todos not synced';
     lines.push(`  ├─ ↳ ${ref} (${w.paneId} · running${w.kind && w.kind !== 'task' ? ` · ${w.kind}` : ''}) ${headSuffix}`);
     if (items && items.length > 0) {
       lines.push(...renderTodoGroups(toTodoItems(items)).map((l) => `  │    ${l}`));
@@ -143,10 +143,10 @@ export function formatDelegationTree(opts: {
   for (const s of opts.settled ?? []) {
     const ref = s.slug ?? s.paneId;
     const age = s.settledAt ? ` · settled ${formatAge(Math.max(now - s.settledAt, 0))} ago` : ' · settled';
-    lines.push(`  └─ ✓ ${ref} (${s.paneId}${age}) — 结果已注入结算通知`);
+    lines.push(`  └─ ✓ ${ref} (${s.paneId}${age}) — result delivered in the settlement notice`);
   }
   lines.push('----------------------------------------------------------------');
-  lines.push('提示: /todos 编辑自己的清单 · subagent list 交互子代理 · /dashboard ops 面板');
+  lines.push('Hint: /todos edit your own list · subagent list interact with subagents · /dashboard ops panel');
   return lines;
 }
 

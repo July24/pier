@@ -105,7 +105,7 @@ function resolveCandidate(
   if (!isTrusted) {
     if (!untrustedWarningEmitted) {
       untrustedWarningEmitted = true;
-      console.warn('[pi-herdr] EPR 提炼已在未受信任项目中被安全禁用');
+      console.warn('[pi-herdr] EPR refinement is safely disabled in untrusted projects');
     }
     return undefined;
   }

@@ -156,19 +156,19 @@ function issueFor(section: string, field: FieldSpec): string {
   const path = `${section}.${field.key}`;
   switch (field.kind) {
     case 'bool':
-      return `${path} 必须是 boolean`;
+      return `${path} must be a boolean`;
     case 'int':
-      return `${path} 必须是 >= ${field.min} 的整数`;
+      return `${path} must be an integer >= ${field.min}`;
     case 'number':
       return field.max === undefined
-        ? `${path} 必须是 >= ${field.minText ?? field.min} 的数字`
-        : `${path} 必须是 ${field.min} 到 ${field.max} 之间的数字`;
+        ? `${path} must be a number >= ${field.minText ?? field.min}`
+        : `${path} must be a number between ${field.min} and ${field.max}`;
     case 'ratio':
-      return `${path} 必须是 "auto" 或非负有限数`;
+      return `${path} must be "auto" or a non-negative finite number`;
     case 'enum':
-      return `${path} 必须是 ${(field.values ?? []).join(' | ')} 之一`;
+      return `${path} must be one of ${(field.values ?? []).join(' | ')}`;
     default:
-      return `${path} 必须是非空字符串`;
+      return `${path} must be a non-empty string`;
   }
 }
 
@@ -229,15 +229,15 @@ export function validateEfficiencyConfig(raw: unknown): ValidateConfigResult {
   const config = defaults();
   if (!isPlainObject(raw)) {
     for (const section of SECTIONS) config[section.name].enabled = false;
-    return { ok: false, config, issues: ['efficiency config 必须是 JSON 对象'] };
+    return { ok: false, config, issues: ['efficiency config must be a JSON object'] };
   }
 
   const issues: string[] = [];
   for (const key of Object.keys(raw)) {
-    if (key !== 'version' && !SECTIONS.some((s) => s.name === key)) issues.push(`未知顶层配置项: "${key}"`);
+    if (key !== 'version' && !SECTIONS.some((s) => s.name === key)) issues.push(`unknown top-level config key: "${key}"`);
   }
   if (raw.version !== undefined && raw.version !== 1) {
-    issues.push(`version 必须是 1 (当前: ${JSON.stringify(raw.version)})`);
+    issues.push(`version must be 1 (got: ${JSON.stringify(raw.version)})`);
   }
   const topLevelInvalid = issues.length > 0;
 
@@ -247,10 +247,10 @@ export function validateEfficiencyConfig(raw: unknown): ValidateConfigResult {
     const rawSection = raw[section.name];
     if (rawSection !== undefined) {
       if (!isPlainObject(rawSection)) {
-        issues.push(`${section.name} 必须是 JSON 对象`);
+        issues.push(`${section.name} must be a JSON object`);
       } else {
         for (const key of Object.keys(rawSection)) {
-          if (!section.fields.some((f) => f.key === key)) issues.push(`${section.name} 未知配置项: "${key}"`);
+          if (!section.fields.some((f) => f.key === key)) issues.push(`${section.name} unknown config key: "${key}"`);
         }
         for (const field of section.fields) {
           if (!applyField(target, field, rawSection[field.key])) issues.push(issueFor(section.name, field));
@@ -337,10 +337,10 @@ function applyEnvOverrides(
       continue;
     }
     const requirement =
-      override.kind === 'unit' ? '（需 0 到 1）'
-      : override.kind === 'int' ? `（需 >= ${override.min} 的整数）`
+      override.kind === 'unit' ? ' (must be 0 to 1)'
+      : override.kind === 'int' ? ` (must be an integer >= ${override.min})`
       : '';
-    warn(`无效环境变量 ${override.env}="${raw}"${requirement}，忽略`);
+    warn(`invalid environment variable ${override.env}="${raw}"${requirement}, ignored`);
   }
 }
 
@@ -361,13 +361,13 @@ export function resolveEfficiencyConfig(opts: ResolveConfigOptions = {}): Effici
   let baseRaw: unknown = opts.userConfig;
   if (opts.workspaceConfig !== undefined) {
     if (isTrusted) baseRaw = opts.workspaceConfig;
-    else warn('工作区能效配置未被信任（isProjectTrusted=false），已安全忽略工作区配置');
+    else warn('workspace efficiency config is not trusted (isProjectTrusted=false); workspace config safely ignored');
   }
 
   let resolved = defaults();
   if (baseRaw !== undefined) {
     const validated = validateEfficiencyConfig(baseRaw);
-    if (!validated.ok) warn(`配置存在校验问题，已安全回退默认值: ${validated.issues.join('; ')}`);
+    if (!validated.ok) warn(`config has validation issues; safely fell back to defaults: ${validated.issues.join('; ')}`);
     resolved = validated.config;
   }
 
@@ -440,8 +440,8 @@ export function loadEfficiencyConfigFromDisk(opts: {
   const warnFile = (label: string, filePath: string, error: unknown): void => {
     opts.onWarning?.(`${label} ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
   };
-  const workspaceConfig = readJsonConfig(wsPath, (error) => warnFile('无法解析工作区能效配置文件', wsPath, error));
-  const userConfig = readJsonConfig(userPath, (error) => warnFile('无法解析用户能效配置文件', userPath, error));
+  const workspaceConfig = readJsonConfig(wsPath, (error) => warnFile('cannot parse workspace efficiency config file', wsPath, error));
+  const userConfig = readJsonConfig(userPath, (error) => warnFile('cannot parse user efficiency config file', userPath, error));
   const resolved = resolveEfficiencyConfig({
     workspaceConfig,
     userConfig,

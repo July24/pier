@@ -41,12 +41,12 @@ const UNKNOWN_KEY_CASES: UnknownKeyCase[] = [
   {
     name: 'unknown top-level key disables every mechanism',
     raw: { version: 1, foo: 'bar', onlineContextCompact: { enabled: true }, observationPack: { enabled: true }, evidencePreservingReducer: { enabled: true }, jev: { enabled: true } },
-    issue: '未知顶层配置项: "foo"', disabled: SECTIONS,
+    issue: 'unknown top-level config key: "foo"', disabled: SECTIONS,
   },
   ...SECTIONS.map((section) => ({
     name: `unknown key inside ${section}`,
     raw: { version: 1, [section]: { bogus: 1 } },
-    issue: `${section} 未知配置项: "bogus"`,
+    issue: `${section} unknown config key: "bogus"`,
     disabled: [section],
   })),
 ];
@@ -71,7 +71,7 @@ test('validateEfficiencyConfig: field rejection matrix (wrong type / below bound
     await t.test(c.name, () => {
       const res = validateEfficiencyConfig({ version: 1, [c.section]: { enabled: true, [c.key]: c.bad } });
       assert.equal(res.ok, false, `${c.section}.${c.key} must reject ${JSON.stringify(c.bad)}`);
-      assert.ok(res.issues.some((i) => i.includes(`${c.section}.${c.key} 必须`)), `${c.section}.${c.key}: the issue must name the field (${res.issues.join('; ')})`);
+      assert.ok(res.issues.some((i) => i.includes(`${c.section}.${c.key} must`)), `${c.section}.${c.key}: the issue must name the field (${res.issues.join('; ')})`);
       assert.equal(enabledOf(res.config, c.section), false, `${c.section}.${c.key}: a failed validation disables the section`);
       assert.equal(sectionValue(res.config, c.section, c.key), c.expected, `${c.section}.${c.key}: the rejected value is never written`);
     });
@@ -80,7 +80,7 @@ test('validateEfficiencyConfig: field rejection matrix (wrong type / below bound
 
 test('validateEfficiencyConfig: version, upper bound and the ratio escape hatch', () => {
   assert.equal(validateEfficiencyConfig({ jev: { minConfidence: 1.5 } }).ok, false, 'max bound is enforced too');
-  assert.equal(validateEfficiencyConfig({ version: 2 }).issues.some((i) => i.includes('version 必须是 1')), true);
+  assert.equal(validateEfficiencyConfig({ version: 2 }).issues.some((i) => i.includes('version must be 1')), true);
   assert.equal(validateEfficiencyConfig({ version: 1, onlineContextCompact: { cacheWriteReadRatio: -5 } }).ok, false);
   assert.equal(validateEfficiencyConfig({ version: 1, onlineContextCompact: { cacheWriteReadRatio: 'auto' } }).ok, true);
 });
@@ -91,7 +91,7 @@ test('validateEfficiencyConfig: empty object yields the on-disk defaults, a non-
   assert.equal(res.config.jev.model, 'jev-1.13.0', 'pinned versioned id — an alias would drift silently');
 
   const notObject = validateEfficiencyConfig('not an object');
-  assert.equal(notObject.ok, false); assert.match(notObject.issues[0]!, /必须是 JSON 对象/);
+  assert.equal(notObject.ok, false); assert.match(notObject.issues[0]!, /must be a JSON object/);
   for (const section of SECTIONS) assert.equal(enabledOf(notObject.config, section), false, section);
 });
 
@@ -126,7 +126,7 @@ test('validateEfficiencyConfig: optional strings clear on ""/null and reject whi
 
   // Whitespace is neither "unset" nor a legal value.
   const blank = validateEfficiencyConfig({ version: 1, evidencePreservingReducer: { model: '   ' } });
-  assert.equal(blank.ok, false); assert.ok(blank.issues.some((i) => i.includes('evidencePreservingReducer.model 必须是非空字符串')));
+  assert.equal(blank.ok, false); assert.ok(blank.issues.some((i) => i.includes('evidencePreservingReducer.model must be a non-empty string')));
   // jev.model has no null escape hatch: a missing model id would silently fall back to an alias.
   assert.equal(validateEfficiencyConfig({ version: 1, jev: { model: null } }).ok, false);
 
@@ -162,7 +162,7 @@ test('resolveEfficiencyConfig: the workspace layer replaces the user layer only 
   });
   assert.equal(untrusted.onlineContextCompact.enabled, true, 'the user layer is used instead');
   assert.equal(untrusted.evidencePreservingReducer.enabled, false, 'the workspace layer is ignored wholesale');
-  assert.ok(warnings.some((w) => w.includes('未被信任')));
+  assert.ok(warnings.some((w) => w.includes('not trusted')));
 });
 
 test('resolveEfficiencyConfig: environment variables override file configs', () => {

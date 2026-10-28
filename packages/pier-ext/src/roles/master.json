@@ -1,7 +1,7 @@
 {
   "role": "master",
   "version": "1.4.0",
-  "description": "主控角色（WS-D7 自应用；D83 镜像源）：核心工具（todos/协调/subagent/terminal）+ pi 内建 + web_search；D82 unknownTools=allow。v1.4.0: 工具合并 terminal 6→1, subagent 5→1",
+  "description": "Master role (WS-D7 self-application; D83 mirror source): core tools (todos/coordination/subagent/terminal) + pi built-ins + web_search; D82 unknownTools=allow. v1.4.0: tool consolidation terminal 6→1, subagent 5→1",
   "manifest": {
     "unknownTools": "allow",
     "tools": [

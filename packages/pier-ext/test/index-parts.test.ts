@@ -197,9 +197,9 @@ test('collapseNotices: empty → null; ≤3 verbatim; >3 → first three + count
   const over = collapseNotices([...three, 'n4', 'n5'])!;
   assert.ok(over.startsWith(`${three.join('\n\n')}\n\n`));
   const tail = over.split('\n\n').pop()!;
-  assert.match(tail, /另有 2 条结算未逐条展示/);
-  assert.match(tail, /history 台账/);
-  assert.match(tail, /subagent list 查看/);
+  assert.match(tail, /2 more settlement\(s\) not shown individually/);
+  assert.match(tail, /history ledger/);
+  assert.match(tail, /subagent list for running agents/);
   assert.ok(!over.includes('\n\nn4') && !over.includes('\n\nn5'));
 });
 
@@ -229,7 +229,7 @@ test('createNoticeBuffer rank hook: above the cap the shown three are the rank o
 
   const out = sent[0]!;
   assert.ok(out.startsWith('d\n\nc\n\nb\n\n'), `the collapse step must be fed the rank result, got ${JSON.stringify(out)}`);
-  assert.match(out, /另有 1 条结算未逐条展示/);
+  assert.match(out, /1 more settlement\(s\) not shown individually/);
   assert.ok(!out.includes('\n\na'), 'the dropped notice is the one rank pushed past the cap, not the last arrival');
   // A second flush has nothing left: the ranked batch was drained, not re-injected.
   assert.equal(buf.noticePending().size, 0);
@@ -243,7 +243,7 @@ test('createNoticeBuffer rank hook: null falls back to arrival order (fail-open)
   await buf.flush('steer');
   const out = sent[0]!;
   assert.ok(out.startsWith('a\n\nb\n\nc\n\n'), `a refusing ranker must not eat the batch, got ${JSON.stringify(out)}`);
-  assert.match(out, /另有 1 条结算未逐条展示/, 'the tail still accounts for the batch above the cap');
+  assert.match(out, /1 more settlement\(s\) not shown individually/, 'the tail still accounts for the batch above the cap');
 });
 
 test('createNoticeBuffer: a notice buffered while rank is pending keeps its pane exempt from GC', async () => {

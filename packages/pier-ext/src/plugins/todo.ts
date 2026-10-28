@@ -376,7 +376,7 @@ export default function todoPlugin(ctx: Context): void {
       }
       const age = archivedAgeMs();
       const head = formatTodoSummary(todos.items)
-        + (age != null ? ` · archived ${formatAge(age)}（不再注入）` : '');
+        + (age != null ? ` · archived ${formatAge(age)} (no longer injected)` : '');
       ui?.notify?.([head, ...body].join('\n'), 'info');
     },
   });

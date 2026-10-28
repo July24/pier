@@ -183,7 +183,7 @@ test('CompactCoordinator: only tool-sourced boundaries are sampled, extension in
   coordinator.recordBoundaryCompleted(1, 'tool');
   assert.equal(coordinator.pendingBoundaryCompleted, true); assert.deepEqual(coordinator.state.completedBoundaryRequestCounts, [2]);
   coordinator.state.completedBoundaryRequestCounts = [5, 5]; coordinator.state.carriedDebtTokens = 10000; coordinator.pendingBoundaryCompleted = true;
-  coordinator.onInput({ text: '注意：仍有 1 个后台 subagent 在运行', source: 'extension' });
+  coordinator.onInput({ text: 'Note: 1 background subagent(s) still running', source: 'extension' });
   assert.deepEqual(coordinator.state.completedBoundaryRequestCounts, [5, 5]); assert.equal(coordinator.state.carriedDebtTokens, 10000);
   assert.equal(coordinator.pendingBoundaryCompleted, true);
   // The samples measure requests-per-boundary, which holds across human turns; clearing them would

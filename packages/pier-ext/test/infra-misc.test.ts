@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { delimiter, dirname, join, resolve } from 'node:path';
+import { delimiter, dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createCordisApp, detectExposeInternals } from '../src/bootstrap.ts';
 import { DisposeLedger } from '../src/ledger.ts';
@@ -372,6 +372,8 @@ interface NpxLayoutProbe {
   installerDir: string;
   /** The pi-installed pi-pier entry the version report resolves — never the cache path above. */
   extEntry: string;
+  /** The isolated PI_CODING_AGENT_DIR (its settings.json lists pi's registered packages). */
+  agentDir: string;
   /** Every command the installer shelled out to, in order. */
   calls(): string[][];
   run(...argv: string[]): { status: number | null; stdout: string; stderr: string };
@@ -407,7 +409,7 @@ function npxLayoutProbe(cleanup: CleanupContext): NpxLayoutProbe {
   const cli = join(installerDir, 'install.mjs');
 
   return {
-    installerDir, extEntry,
+    installerDir, extEntry, agentDir,
     calls: () => (existsSync(logFile) ? readFileSync(logFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as string[]) : []),
     run: (...argv) => spawnSync(process.execPath, [cli, ...argv], { encoding: 'utf8', env }),
   };
@@ -433,4 +435,26 @@ test('update refreshes the install in place: `pi update` runs and nothing is rem
   assert.ok(calls.some((c) => c.join(' ') === 'herdr plugin update pier.workbench --yes'), `expected \`herdr plugin update\`, got ${JSON.stringify(calls)}`);
   assert.ok(!calls.some((c) => c.join(' ') === 'herdr plugin install July24/pier/packages/pier-workbench --yes'), 'a successful plugin update must not reinstall');
   assert.deepEqual(calls.filter((c) => c.some((a) => a === 'remove' || a === 'uninstall')), [], 'update must not uninstall before updating');
+}));
+
+test('a pier registration from another source is reported as-is and blocks a second registration', withCleanup((cleanup) => {
+  const probe = npxLayoutProbe(cleanup);
+  const checkout = cleanup.tempDir('pier-checkout-').path;
+  writeFileSync(join(checkout, 'package.json'), JSON.stringify({ name: 'pi-pier', version: '9.9.9' }));
+  const settings = join(probe.agentDir, 'settings.json');
+  // pi stores a local install relative to the agent dir.
+  writeFileSync(settings, JSON.stringify({ packages: ['npm:pi-web-access', relative(probe.agentDir, checkout)] }));
+
+  const status = JSON.parse(probe.run('version', '--json').stdout);
+  assert.equal(status.piExt.spec, `local:${checkout}`);
+  assert.equal(status.piExt.version, '9.9.9');
+
+  const refused = probe.run('install');
+  assert.equal(refused.status, 1);
+  assert.ok(refused.stderr.includes(`pi remove ${checkout}`), refused.stderr);
+  assert.deepEqual(probe.calls().filter((c) => c[0] === 'pi' && c[1] !== '--version'), [], 'nothing is installed on a conflict');
+
+  // The same package at another version is the install target itself, not a conflict.
+  writeFileSync(settings, JSON.stringify({ packages: ['npm:pi-pier@0.4.1'] }));
+  assert.equal(probe.run('install').status, 0);
 }));

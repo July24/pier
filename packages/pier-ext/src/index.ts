@@ -667,8 +667,8 @@ export default async function (pi: ExtensionAPI) {
     // D96: master settled while background subagents still run → remind (worker port is unbound).
     if (plan.wake && plan.notice && !isSubagent) {
       const running = subagentPort.current?.listRunningSubs() ?? [];
-      const brief = running.map((s) => `${s.paneId} (${s.description})`).join('、');
-      const notice = `注意：仍有 ${running.length} 个后台 subagent 在运行：${brief}。若你的任务依赖它们，请等待其结算（subagent list 查看状态）；若不等待，请说明放弃原因。`;
+      const brief = running.map((s) => `${s.paneId} (${s.description})`).join(', ');
+      const notice = `Note: ${running.length} background subagent(s) still running: ${brief}. If your task depends on them, wait for their settlement (subagent list to check status); if you will not wait, state why you are abandoning them.`;
       void sendUserMessageAs(notice, 'followUp');
     }
     if (plan.compact && ctx && typeof ctx === 'object') {

@@ -8,15 +8,15 @@
     "onlineContextCompact": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean", "default": false, "description": "是否启用待办驱动的在线上下文压缩" },
-        "logEnabled": { "type": "boolean", "default": false, "description": "是否记录在线压缩的决策与节省量日志" },
+        "enabled": { "type": "boolean", "default": false, "description": "Enable todo-driven online context compaction" },
+        "logEnabled": { "type": "boolean", "default": false, "description": "Log online compaction decisions and savings" },
         "cacheWriteReadRatio": {
           "oneOf": [
             { "type": "number", "minimum": 0 },
             { "type": "string", "enum": ["auto"] }
           ],
           "default": "auto",
-          "description": "KV 缓存写入与读取成本比。auto 表示从 ctx.model.cost 自动推导"
+          "description": "KV cache write-to-read cost ratio. auto derives it from ctx.model.cost"
         },
         "firstCompactionRequestScale": { "type": "number", "default": 2.0, "minimum": 1.0 },
         "subsequentCompactionMargin": { "type": "number", "default": 1.5, "minimum": 1.0 },
@@ -24,13 +24,13 @@
           "type": "string",
           "enum": ["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"],
           "default": "low",
-          "description": "压缩摘要请求的 thinking 等级上限（只降不升，结束后恢复会话等级）。inherit 表示沿用会话等级"
+          "description": "Thinking level cap for compaction summary requests (only lowers, never raises; the session level is restored afterwards). inherit keeps the session level"
         },
         "keepRecentTokens": {
           "type": "integer",
           "default": 20000,
           "minimum": 1000,
-          "description": "原生压缩保留区大小（同时用于 archiveTokens 估算与 nativeCompactionFeasible 预检）。缺省自动继承 pi 的 compaction.keepRecentTokens 设置（默认 20000）。"
+          "description": "Native compaction keep-recent window size (also used for archiveTokens estimation and the nativeCompactionFeasible precheck). Defaults to inheriting pi's compaction.keepRecentTokens setting (20000 when unset)."
         }
       },
       "additionalProperties": false
@@ -38,8 +38,8 @@
     "observationPack": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean", "default": false, "description": "是否启用大工具输出冷热分级打包" },
-        "logEnabled": { "type": "boolean", "default": false, "description": "是否记录观察结果打包与召回日志" },
+        "enabled": { "type": "boolean", "default": false, "description": "Enable hot/cold-tiered packing of large tool outputs" },
+        "logEnabled": { "type": "boolean", "default": false, "description": "Log observation packing and recall" },
         "thresholdBytes": { "type": "integer", "default": 10240, "minimum": 1024 },
         "fullSends": { "type": "integer", "default": 2, "minimum": 1 },
         "recallChunkBytes": { "type": "integer", "default": 16384, "minimum": 1024 },
@@ -50,31 +50,31 @@
     "evidencePreservingReducer": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean", "default": false, "description": "是否启用长测试日志保真提炼" },
-        "logEnabled": { "type": "boolean", "default": false, "description": "是否记录提炼比对、耗时与回退日志" },
+        "enabled": { "type": "boolean", "default": false, "description": "Enable fidelity-preserving refinement of long test logs" },
+        "logEnabled": { "type": "boolean", "default": false, "description": "Log refinement comparisons, durations and fallbacks" },
         "model": {
           "type": "string",
-          "description": "专用的轻量 Reducer 模型 (provider/model)。缺省使用当前模型并在日志中提示经济性"
+          "description": "Dedicated lightweight Reducer model (provider/model). Defaults to the current model and logs an economy hint"
         },
         "minBytes": { "type": "integer", "default": 4096, "minimum": 512 },
         "maxChars": { "type": "integer", "default": 600000 },
         "maxOutputTokens": { "type": "integer", "default": 2048 },
-        "timeoutMs": { "type": "integer", "default": 5000, "description": "同步拦截超时上限，默认 5 秒避免阻塞" },
-        "localOnly": { "type": "boolean", "default": false, "description": "仅本地归档长日志并跳过模型提炼" }
+        "timeoutMs": { "type": "integer", "default": 5000, "description": "Upper bound for the synchronous interception timeout; defaults to 5s to avoid blocking" },
+        "localOnly": { "type": "boolean", "default": false, "description": "Archive long logs locally only and skip model refinement" }
       },
       "additionalProperties": false
     },
     "jev": {
       "type": "object",
-      "description": "jev 决策层（RFC docs/rfc-jev-integration.md）：可选的 System One 分类调用，逐点 fail-open",
+      "description": "jev decision layer (RFC docs/rfc-jev-integration.md): optional System One classification calls, fail-open at each point",
       "properties": {
-        "enabled": { "type": "boolean", "default": false, "description": "是否启用 jev 决策层（还需配置 apiKey 才会真正发起调用）" },
-        "logEnabled": { "type": "boolean", "default": false, "description": "是否写 efficiency-logs/jev.jsonl（不记录请求/响应 body）" },
-        "baseUrl": { "type": "string", "description": "API 根地址覆盖（中转/网关）；缺省 https://api.typesafe.ai" },
-        "model": { "type": "string", "default": "jev-1.13.0", "description": "钉住的版本化模型 id；别名会静默漂移导致校准阈值失真" },
-        "timeoutMs": { "type": "integer", "default": 2000, "minimum": 500, "description": "单次调用总预算（AbortController 硬杀，SDK 无总预算模式）" },
-        "minConfidence": { "type": "number", "default": 0.6, "minimum": 0, "maximum": 1, "description": "Choice/Score 答案被采纳的最低置信度，低于则按未回答处理" },
-        "apiKey": { "type": "string", "description": "API key。解析优先级：PIER_JEV_API_KEY 环境变量 > 此处 > TYPESAFE_API_KEY 环境变量" }
+        "enabled": { "type": "boolean", "default": false, "description": "Enable the jev decision layer (calls are only made once apiKey is configured)" },
+        "logEnabled": { "type": "boolean", "default": false, "description": "Write efficiency-logs/jev.jsonl (no request/response bodies)" },
+        "baseUrl": { "type": "string", "description": "API base URL override (proxy/gateway); defaults to https://api.typesafe.ai" },
+        "model": { "type": "string", "default": "jev-1.13.0", "description": "Pinned versioned model id; aliases drift silently and skew calibration thresholds" },
+        "timeoutMs": { "type": "integer", "default": 2000, "minimum": 500, "description": "Total budget per call (hard kill via AbortController; the SDK has no total-budget mode)" },
+        "minConfidence": { "type": "number", "default": 0.6, "minimum": 0, "maximum": 1, "description": "Minimum confidence for accepting a Choice/Score answer; below it the answer is treated as unanswered" },
+        "apiKey": { "type": "string", "description": "API key. Resolution order: PIER_JEV_API_KEY env var > this field > TYPESAFE_API_KEY env var" }
       },
       "additionalProperties": false
     }

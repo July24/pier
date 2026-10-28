@@ -98,7 +98,7 @@ export function listRoleNames(baseDir?: string, userDir?: string): string[] {
 
 export function loadRoleConfig(name: string, opts?: LoadRoleOptions): RoleManifest {
   if (typeof name !== 'string' || !ROLE_NAME_RE.test(name)) {
-    throw new RoleLoaderError('ROLE_NOT_FOUND', `role 不存在或名字非法（[a-z0-9-]+）: ${JSON.stringify(name)}`);
+    throw new RoleLoaderError('ROLE_NOT_FOUND', `role not found or invalid name ([a-z0-9-]+): ${JSON.stringify(name)}`);
   }
   const fileName = `${name}.json`;
 
@@ -108,7 +108,7 @@ export function loadRoleConfig(name: string, opts?: LoadRoleOptions): RoleManife
       text = opts.read(fileName);
     } catch (err) {
       const code = (err as { code?: unknown })?.code;
-      throw new RoleLoaderError('ROLE_NOT_FOUND', `role "${name}" 不存在（读 ${fileName} 失败: ${typeof code === 'string' ? code : 'error'}）`);
+      throw new RoleLoaderError('ROLE_NOT_FOUND', `role "${name}" not found (failed to read ${fileName}: ${typeof code === 'string' ? code : 'error'})`);
     }
     return parseAndValidate(name, fileName, text, 'builtin (src/roles/)');
   }
@@ -123,7 +123,7 @@ export function loadRoleConfig(name: string, opts?: LoadRoleOptions): RoleManife
       if (layerRead(layer.dir, fileName) != null) {
         throw new RoleLoaderError(
           'ROLE_RESERVED',
-          `role "${name}" 是内置保留名，不能在 ${layer.label} 层定义（内置档案优先；请删除该档案或改名）`,
+          `role "${name}" is a reserved built-in name and cannot be defined in the ${layer.label} layer (built-in manifests take precedence; delete that file or rename it)`,
         );
       }
     }
@@ -136,7 +136,7 @@ export function loadRoleConfig(name: string, opts?: LoadRoleOptions): RoleManife
   }
   throw new RoleLoaderError(
     'ROLE_NOT_FOUND',
-    `role "${name}" 不存在（查找层：${layers.map((l) => l.label).join(' → ')}）`,
+    `role "${name}" not found (searched layers: ${layers.map((l) => l.label).join(' → ')})`,
   );
 }
 
@@ -145,22 +145,22 @@ function parseAndValidate(name: string, fileName: string, text: string, layerLab
   try {
     parsed = JSON.parse(text);
   } catch (err) {
-    throw new RoleLoaderError('INVALID_ROLE_CONFIG', `role "${name}"（${layerLabel}）不是合法 JSON: ${(err as Error).message}`);
+    throw new RoleLoaderError('INVALID_ROLE_CONFIG', `role "${name}" (${layerLabel}) is not valid JSON: ${(err as Error).message}`);
   }
   const result = validateRoleManifest(parsed);
   // `ok === false` (instead of `!ok`) is required to narrow without strictNullChecks.
   if (result.ok === false) {
     throw new RoleLoaderError(
       'INVALID_ROLE_CONFIG',
-      `role "${name}"（${layerLabel}）校验失败:\n${result.issues.map((i) => `  - ${i}`).join('\n')}`,
+      `role "${name}" (${layerLabel}) failed validation:\n${result.issues.map((i) => `  - ${i}`).join('\n')}`,
       result.issues,
     );
   }
   if (result.value.role !== name) {
     throw new RoleLoaderError(
       'INVALID_ROLE_CONFIG',
-      `role 档案名不符：${layerLabel} 的 ${fileName} 内 role="${result.value.role}"`,
-      [`role 字段 "${result.value.role}" 与请求的 "${name}" 不一致`],
+      `role manifest name mismatch: role="${result.value.role}" in ${fileName} of ${layerLabel}`,
+      [`role field "${result.value.role}" does not match the requested "${name}"`],
     );
   }
   return result.value;

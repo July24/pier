@@ -1,7 +1,7 @@
 {
   "role": "worker-default",
   "version": "1.6.0",
-  "description": "默认worker角色（D83 继承制）：镜像 master.tools 减 subagent/terminal（禁嵌套、资源归属）；排除族显式 deny——在 D82 unknownTools=allow 姿态下仍持禁令；todos serial。v1.6.0: 删除 report_progress（一周 0 调用，D125）；v1.5.0: Phase 2 显式放行 report_progress；v1.4.0: 工具合并后更新 deny 列表",
+  "description": "Default worker role (D83 inheritance): mirrors master.tools minus subagent/terminal (no nesting, resource ownership); excluded families explicitly denied — still banned under the D82 unknownTools=allow stance; todos serial. v1.6.0: removed report_progress (0 calls in a week, D125); v1.5.0: Phase 2 explicitly allowed report_progress; v1.4.0: refreshed the deny list after tool consolidation",
   "manifest": {
     "unknownTools": "allow",
     "tools": [

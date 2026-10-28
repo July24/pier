@@ -77,6 +77,9 @@ node install.mjs update --dev    # 仅重新校验环境与版本；代码请自
 ```
 
 脚本自动校验环境（node / pi / herdr 版本）并注册两半区。
+pi 中 pier 只能从一个来源注册：`install`/`update` 会自动清理旧的 `git:github.com/July24/pier`
+注册；若 pier 已从其它来源注册（如先 `--dev` 装了本地 checkout 再跑用户模式），则直接退出（exit 1，
+不做任何改动）并给出要执行的 `pi remove …`。`version` 显示 pi 实际加载的来源。
 
 `update` 会跑 `pi update npm:pi-pier`（失败则 `pi install`）和
 `herdr plugin install … --yes`。发行规格可用

@@ -302,7 +302,7 @@ test('core/todo：widget 槽回填（D113 单行自态）+ 闸门折叠一行、
   depth = 1;
   state.rerenderWidget?.(); // index enterBlocked path: slot filled by the mount, last ctx reused
   assert.equal(captured.at(-1)?.length, 1, '闸门开着 → 一行摘要');
-  assert.match(captured.at(-1)![0]!, /\/todos 全量/);
+  assert.match(captured.at(-1)![0]!, /\/todos for all/);
   depth = 0;
   state.rerenderWidget?.(); // index exitBlocked path
   assert.deepEqual(captured.at(-1), ['▶ a ✓0/2'], '闸门释放 → 恢复单行');
@@ -322,7 +322,7 @@ test('core/todo：worker 行经 getWorkers 挂进统一 widget（master 挂载�
   assert.deepEqual(captured.at(-1), [
     '▶ orchestrate ✓0/1',
     '↳ fix-auth ▶ auth tests ✓1/2',
-    '↳ migration ■ confirm schema（等人） ✓0/1',
+    '↳ migration ■ confirm schema (等人) ✓0/1',
   ]);
   state.rerenderWidget?.();
   assert.equal(captured.length, 2, 'rerender re-reads getWorkers（todo_sync 到达后即刷新）');
@@ -340,12 +340,12 @@ interface WindowCase {
 const WINDOW_CASES: WindowCase[] = [
   { name: '自态单行：当前条 + done/total（phase 分组退出常驻面）', items: [it('a', 'in_progress', 'P1'), it('b', 'pending', 'P1'), it('c', 'completed', 'P2')], exact: ['▶ a ✓1/3'] },
   { name: '空列表且无 worker → 空行数组（widget 隐藏）', items: [], exact: [] },
-  { name: 'blocked 带 blocker 后缀', items: [{ content: 'x', status: 'blocked', blocker: '等审核' } as TodoItem], includes: ['■ 等人: 等审核', '✓0/1'] },
+  { name: 'blocked 带 blocker 后缀', items: [{ content: 'x', status: 'blocked', blocker: '等审核' } as TodoItem], includes: ['■ waiting on: 等审核', '✓0/1'] },
   { name: '全 completed → widget 隐藏（计数无可操作信息）', items: DONE_LIST, exact: [] },
   { name: 'worker 行：全量条目 → 当前条 + 计数；blocked → 等人', items: [it('发布 npm', 'in_progress')], opts: { workers: [
     { paneId: 'p2', slug: 'fix-auth', description: 'fix auth', todos: { items: [{ content: 'auth tests', status: 'in_progress' }, { content: 'done one', status: 'completed' }] } },
     { paneId: 'p3', slug: 'migration', description: 'migrate', todos: { items: [{ content: 'confirm schema', status: 'blocked', blocker: '等人' }] } },
-  ] }, exact: ['▶ 发布 npm ✓0/1', '↳ fix-auth ▶ auth tests ✓1/2', '↳ migration ■ confirm schema（等人） ✓0/1'] },
+  ] }, exact: ['▶ 发布 npm ✓0/1', '↳ fix-auth ▶ auth tests ✓1/2', '↳ migration ■ confirm schema (等人) ✓0/1'] },
   { name: '全 completed + worker → 自态隐藏，worker 行保留', items: DONE_LIST, opts: { workers: [
     { paneId: 'p2', slug: 'fix-auth', description: 'fix auth', todos: { items: [{ content: 'auth tests', status: 'in_progress' }] } },
   ] }, exact: ['↳ fix-auth ▶ auth tests ✓0/1'] },
@@ -353,7 +353,7 @@ const WINDOW_CASES: WindowCase[] = [
     { paneId: 'p2', slug: 'fix-auth', description: 'fix auth', todos: { summary: '▶1 ○2 ✓0 · wiring' } },
     { paneId: 'p9', description: 'legacy row', todos: null },
   ] }, exact: ['▶ a ✓0/1', '↳ fix-auth · ▶1 ○2 ✓0 · wiring', '↳ p9 · legacy row'] },
-  { name: 'worker 超预算折叠：>9 个 running 折计数行指路 /pier-tree', items: [], opts: { workers: Array.from({ length: 12 }, (_, i) => ({ paneId: `p${i}`, slug: `w${i}`, description: `d${i}`, todos: { items: [{ content: `cur${i}`, status: 'in_progress' }] } })) }, lines: 10, includes: ['…另 3 个子代理 · /pier-tree'] },
+  { name: 'worker 超预算折叠：>9 个 running 折计数行指路 /pier-tree', items: [], opts: { workers: Array.from({ length: 12 }, (_, i) => ({ paneId: `p${i}`, slug: `w${i}`, description: `d${i}`, todos: { items: [{ content: `cur${i}`, status: 'in_progress' }] } })) }, lines: 10, includes: ['…+3 more subagents · /pier-tree'] },
   { name: '反冻结：归档一行降权 + worker 仍可见', items: DONE_LIST, opts: { archivedAgeMs: 16 * 3_600_000, workers: [{ paneId: 'p2', slug: 'fix-auth', description: 'fix auth', todos: null }] }, includes: ['archived 16h', '↳ fix-auth'], excludes: ['Verify gateway'] },
   { name: '闸门开着 → 一行摘要（带 /todos 指路，worker 计数）', items: GATED_LIST, opts: { blockedDepth: 1, workers: [{ paneId: 'p2', slug: 'w', description: 'd', todos: null }] }, lines: 1, includes: ['/todos', '↳×1'] },
   { name: '闸门优先于归档', items: DONE_LIST, opts: { blockedDepth: 2, archivedAgeMs: 16 * 3_600_000 }, lines: 1 },
