@@ -413,7 +413,8 @@ test('plugins/terminal：wait file: polls the log for a later match, reports an 
   const { pi, calls } = await mountTerminal(t, { open: true });
   const sendText = `python3 run.py > ${log} 2>&1; echo RUN_EXIT_$? >> ${log}`;
   const sent = await run(pi, { action: 'send', terminal_id: 'term-1', text: sendText });
-  assert.match(sent.content[0].text, new RegExp(`wait for it with terminal\\(action: "wait", terminal_id: "term-1", file: "${log}", pattern: "\\^RUN_EXIT_\\[0-9\\]"`));
+  // Literal check: a Windows temp path's backslashes are regex escapes.
+  assert.ok(sent.content[0].text.includes(`wait for it with terminal(action: "wait", terminal_id: "term-1", file: "${log}", pattern: "^RUN_EXIT_[0-9]"`), sent.content[0].text);
   calls.waitForOutput.length = 0;
 
   // Real clock on purpose: the wait polls real file I/O, which mocked timers cannot sequence; the
