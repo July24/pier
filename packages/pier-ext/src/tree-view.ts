@@ -40,8 +40,11 @@ export interface SettledWidgetRow {
 
 const CONTENT_CLIP = 60;
 
+/** todo_write's delegation convention: a trailing ` <sub>` marks an entry handed to a subagent. */
+const SUB_MARKER = /\s*<sub>\s*$/;
+
 function clip(text: string, max = CONTENT_CLIP): string {
-  const flat = text.replace(/\s+/g, ' ').trim();
+  const flat = text.replace(SUB_MARKER, '').replace(/\s+/g, ' ').trim();
   return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
 
@@ -117,7 +120,8 @@ export function unifiedWidgetLines(
   return [...head, ...shown, ...(hidden > 0 ? [`…+${hidden} more subagents · /pier-tree`] : [])];
 }
 
-/** Full delegation tree for /pier-tree: self todos in full + per-worker full lists + settled nodes. */
+/** Full delegation tree for /pier-tree: self todos in full + per-worker full lists + settled nodes.
+ * Workers and settled nodes hang off the master node; each node's todo list is indented under it. */
 export function formatDelegationTree(opts: {
   selfItems: readonly TodoItem[];
   workers: readonly WorkerWidgetRow[];
@@ -125,29 +129,48 @@ export function formatDelegationTree(opts: {
   now?: number;
 }): string[] {
   const now = opts.now ?? Date.now();
-  const lines: string[] = ['==================== PIER DELEGATION TREE ===================='];
-  lines.push(`● master (this pane) · ${opts.selfItems.length} items`);
-  lines.push(...renderTodoGroups(opts.selfItems).map((l) => `  ${l}`));
-  if (opts.workers.length > 0 || (opts.settled?.length ?? 0) > 0) lines.push('  │');
+  const settled = opts.settled ?? [];
+  const children = opts.workers.length + settled.length;
+  const lines: string[] = [
+    `Delegation tree · ${opts.workers.length} running · ${settled.length} settled`,
+    '',
+    `● master (this pane)  ${opts.selfItems.length > 0 ? countsOf(opts.selfItems) : 'no todos'}`,
+  ];
+  const rail = children > 0 ? '│' : ' ';
+  lines.push(...treeItems(opts.selfItems).map((l) => `${rail}   ${l}`));
+
+  let index = 0;
   for (const w of opts.workers) {
+    const last = ++index === children;
     const ref = w.slug ?? w.paneId;
     const items = w.todos?.items;
-    const headSuffix = items && items.length > 0
-      ? `· ${items.length} items`
-      : w.todos?.summary ? `· ${clip(w.todos.summary, 40)}` : '· todos not synced';
-    lines.push(`  ├─ ↳ ${ref} (${w.paneId} · running${w.kind && w.kind !== 'task' ? ` · ${w.kind}` : ''}) ${headSuffix}`);
+    const meta = [w.paneId, 'running', ...(w.kind && w.kind !== 'task' ? [w.kind] : [])].join(' · ');
+    const tail = items && items.length > 0
+      ? countsOf(items)
+      : w.todos?.summary ? clip(w.todos.summary, 40) : 'todos not synced';
+    lines.push('│');
+    lines.push(`${last ? '└' : '├'}─ ↳ ${ref} (${meta})  ${tail}`);
     if (items && items.length > 0) {
-      lines.push(...renderTodoGroups(toTodoItems(items)).map((l) => `  │    ${l}`));
+      lines.push(...treeItems(toTodoItems(items)).map((l) => `${last ? ' ' : '│'}      ${l}`));
     }
   }
-  for (const s of opts.settled ?? []) {
+  for (const s of settled) {
+    const last = ++index === children;
     const ref = s.slug ?? s.paneId;
     const age = s.settledAt ? ` · settled ${formatAge(Math.max(now - s.settledAt, 0))} ago` : ' · settled';
-    lines.push(`  └─ ✓ ${ref} (${s.paneId}${age}) — result delivered in the settlement notice`);
+    lines.push('│');
+    lines.push(`${last ? '└' : '├'}─ ✓ ${ref} (${s.paneId}${age})  result delivered`);
   }
-  lines.push('----------------------------------------------------------------');
-  lines.push('Hint: /todos edit your own list · subagent list interact with subagents · /dashboard ops panel');
+  lines.push('', '/todos edit list · subagent list → workers · /dashboard ops');
   return lines;
+}
+
+/** Phase-grouped item rows without the shared renderer's leading indent; delegated entries show `↳ sub`. */
+function treeItems(items: readonly TodoItem[]): string[] {
+  return renderTodoGroups(items).map((l) => {
+    const row = l.replace(/^ {2}/, '');
+    return SUB_MARKER.test(row) ? `${row.replace(SUB_MARKER, '')}  ↳ sub` : row;
+  });
 }
 
 /** Narrow a pipe-pushed item list back to TodoItem for the shared group renderer. */

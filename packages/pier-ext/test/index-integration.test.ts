@@ -766,7 +766,7 @@ test('D113 unified widget: worker todo_write pushes todo_sync to the master pipe
       assert.equal(typeof tree!.handler, 'function');
       await (tree!.handler as (args: unknown, ctx: unknown) => Promise<void>)([], { ui: { notify: (text: string) => { notified.push(text); } } });
       const text = notified.join('\n');
-      assert.ok(text.includes('PIER DELEGATION TREE'));
+      assert.ok(text.includes('Delegation tree · 1 running'));
       assert.ok(text.includes('harden-pipe (w2 · running)'));
       assert.ok(text.includes('auth module tests'), 'worker current item reaches the tree');
       assert.ok(text.includes('extract auth middleware') && text.includes('token refresh'), 'worker FULL list is cached and rendered');

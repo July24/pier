@@ -10,7 +10,12 @@ import { readFileSync } from 'node:fs';
 import { request } from './herdr-rpc.mjs';
 import { loadSrc } from './load-src.mjs';
 
-const { clipToWidth, composeDashboardLines, fitDashboardLines } = await loadSrc('dashboard-model');
+const { clipToWidth, composeDashboardLines, displayWidth, fitDashboardLines, wrapToWidth } = await loadSrc('dashboard-model');
+
+const RESET = '\x1b[0m';
+const DIM = '\x1b[2m';
+const BOLD = '\x1b[1m';
+const INVERSE = '\x1b[7m';
 
 const onceMode = process.argv.includes('--once');
 const entrypoint = process.env.HERDR_PLUGIN_ENTRYPOINT_ID || 'panel';
@@ -36,22 +41,47 @@ if (process.env.HERDR_PLUGIN_CONTEXT_JSON) {
 
 function readTree() {
   if (!treeFile) {
-    return [
-      '==================== PIER DELEGATION TREE ====================',
-      'No tree snapshot — run /pier-tree from a pi pane.',
-    ];
+    return ['Delegation tree', '', 'No tree snapshot — run /pier-tree from a pi pane.'];
   }
   if (treeLines && Date.now() - treeAt < 1000) return treeLines;
   try {
     treeLines = readFileSync(treeFile, 'utf8').replace(/\n$/, '').split('\n');
   } catch {
-    treeLines = [
-      '==================== PIER DELEGATION TREE ====================',
-      'Waiting for the pi pane to publish a tree snapshot…',
-    ];
+    treeLines = ['Delegation tree', '', 'Waiting for the pi pane to publish a tree snapshot…'];
   }
   treeAt = Date.now();
   return treeLines;
+}
+
+/** Word-wrap tree rows with a hanging indent so a long item continues under its own text, not at column 0. */
+function wrapTree(lines, width) {
+  return lines.flatMap((line) => {
+    if (displayWidth(line) <= width) return [line];
+    // Rails/connectors, then an optional status mark: `│      ▶ ` → continuation aligns after the mark.
+    const lead = /^[│├└─↳●✓▶○■✗? ]*/u.exec(line)?.[0] ?? '';
+    const indent = displayWidth(lead);
+    if (indent === 0 || indent > width / 2) return wrapToWidth(line, width);
+    const rail = lead.startsWith('│') || lead.startsWith('├') ? '│' : ' ';
+    const pad = rail + ' '.repeat(indent - 1);
+    const rows = [];
+    let row = lead;
+    for (const word of line.slice(lead.length).split(/ +/)) {
+      const sep = row === lead || row === pad ? '' : ' ';
+      if (displayWidth(row + sep + word) <= width) {
+        row += sep + word;
+      } else if (row === lead || row === pad) {
+        // A single word wider than the row: hard-split it.
+        const parts = wrapToWidth(word, width - indent);
+        rows.push(row + parts[0], ...parts.slice(1, -1).map((p) => pad + p));
+        row = pad + parts.at(-1);
+      } else {
+        rows.push(row);
+        row = pad + word;
+      }
+    }
+    rows.push(row);
+    return rows;
+  });
 }
 
 async function dashboard(width, force = false) {
@@ -87,8 +117,15 @@ async function runLoop() {
 
   function viewport() {
     const width = Math.max(40, process.stdout.columns || 100);
-    const rows = Math.max(3, process.stdout.rows || 30);
-    return { width, rows: rows - 2 }; // one header row + one footer row
+    const rows = Math.max(4, process.stdout.rows || 30);
+    return { width, rows: rows - 3 }; // header + rule + footer
+  }
+
+  function headerLine(width) {
+    const tab = (key, label, on) => (on ? `${INVERSE}${BOLD} ${key} ${label} ${RESET}` : `${DIM} ${key} ${RESET}${label} `);
+    const plain = ` Pier   ${' 1 Dashboard '}  ${' 2 Tree '}`;
+    if (displayWidth(plain) > width) return clipToWidth(plain, width);
+    return ` ${BOLD}Pier${RESET}   ${tab('1', 'Dashboard', active === 'dashboard')}  ${tab('2', 'Tree', active === 'tree')}`;
   }
 
   async function tick(forceRefresh = false) {
@@ -98,21 +135,18 @@ async function runLoop() {
       const { width, rows } = viewport();
       const body = active === 'dashboard'
         ? await dashboard(width, forceRefresh)
-        : readTree();
+        : wrapTree(readTree(), width);
       const view = fitDashboardLines(body, { width, height: rows, offset: offsets[active] });
       offsets[active] = view.offset;
 
-      const tabs = `${active === 'dashboard' ? '▶' : ' '}1 Dashboard   ${active === 'tree' ? '▶' : ' '}2 Tree`;
-      const header = clipToWidth(` PIER PANEL  ${tabs} `, width);
       const first = view.visible > 0 ? view.offset + 1 : 0;
       const last = view.offset + view.visible;
-      const footer = clipToWidth(
-        view.total > view.visible
-          ? `lines ${first}-${last}/${view.total} · 1/2 Switch · [q] Close · [↑↓/jk] Scroll · [PgUp/PgDn] Page`
-          : '1/2 Switch · [q / Esc] Close · [r] Refresh',
-        width,
-      );
-      process.stdout.write('\x1b[2J\x1b[H' + [header, ...view.lines, footer].join('\n'));
+      const keys = view.total > view.visible
+        ? `${first}-${last}/${view.total} · ↑↓ jk scroll · PgUp/PgDn · 1/2 switch · r refresh · q close`
+        : '1/2 switch · r refresh · q close';
+      const footer = `${DIM}${clipToWidth(keys, width)}${RESET}`;
+      const rule = `${DIM}${'─'.repeat(width)}${RESET}`;
+      process.stdout.write('\x1b[2J\x1b[H' + [headerLine(width), rule, ...view.lines, footer].join('\n'));
     } finally {
       tickInFlight = false;
     }
