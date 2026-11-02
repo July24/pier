@@ -457,8 +457,15 @@ pier installed (${dev ? 'dev mode: local path, code changes are live' : 'user mo
 }
 
 async function uninstall() {
-  if (tryRun('pi', ['remove', piSource()])) log('✓ pi extension removed');
-  else { console.error('✗ pi remove failed'); log(`  manual: pi remove ${piSource()}`); process.exitCode = 1; }
+  // Every registered pier source goes, not just piSource(): switching modes (local --dev → npm)
+  // must leave pi clean, or the next install dies on the duplicate-registration guard.
+  const targets = [...new Set([...registeredPierSources().map(displaySource), piSource()])];
+  let removed = false;
+  for (const src of targets) {
+    if (tryRun('pi', ['remove', src])) { log(`✓ pi extension removed (${src})`); removed = true; }
+    else { console.error(`✗ pi remove failed (${src})`); log(`  manual: pi remove ${src}`); process.exitCode = 1; }
+  }
+  if (!removed) log('ℹ no pier registration found in pi');
   await offerLegacyRemoval();
   log('\npier uninstalled. herdr-core and the Herdr app are independent and were left untouched.');
 }
