@@ -4,31 +4,15 @@ import { basename } from 'node:path';
 export const TERMINALS_CUSTOM_TYPE = 'pi-herdr.terminals';
 export const MAX_TERMINALS = 8;
 export const READ_MAX_CHARS = 8000;
-export const READINESS_TIMEOUT_MS = 30_000;
-export const SILENCE_IDLE_MS = 2000;
-/** POSIX / PowerShell / Nushell / Zsh prompt tail.
- * sh/bash end with `$` (root `#`), macOS zsh with `%`, nushell/starship with `❯`; anchoring to the
- * line tail (\s*$) avoids matching percentage values in ordinary output (`downloaded 50%`), since
- * interactive prompts end at the prompt symbol with no trailing text.
- */
-export const PROMPT_TAIL_RE = /[$>#❯%]\s*$/;
 
+/** Shell family that determines which history-expansion init line is safe to send. */
 export interface PromptStrategy {
-  /** herdr waitForOutput regex source. */
-  readonly waitPattern: string;
-  readonly tailRe: RegExp;
+  readonly family: 'posix' | 'powershell';
 }
 
-export const POSIX_PROMPT: PromptStrategy = {
-  waitPattern: '[$>#❯%]\\s*$',
-  tailRe: PROMPT_TAIL_RE,
-};
+export const POSIX_PROMPT: PromptStrategy = { family: 'posix' };
 
-/** cmd.exe / PowerShell: `>` still matches POSIX; this also accepts `PS C:\\>` without a trailing `$`. */
-export const POWERSHELL_PROMPT: PromptStrategy = {
-  waitPattern: '(PS [^\\n>]+|>)\\s*$',
-  tailRe: /(PS [^\n>]+|>)\s*$/,
-};
+export const POWERSHELL_PROMPT: PromptStrategy = { family: 'powershell' };
 
 /** Shell name (lowercased basename from $SHELL, or a PIER_TERMINAL_PROMPT value) → strategy. */
 const PROMPT_STRATEGIES: Record<string, PromptStrategy> = {
@@ -40,8 +24,8 @@ const PROMPT_STRATEGIES: Record<string, PromptStrategy> = {
   'powershell.exe': POWERSHELL_PROMPT,
 };
 
-/** Explicit `PIER_TERMINAL_PROMPT` wins over `$SHELL`; the default stays POSIX so unconfigured panes
- *  never flip strategy. */
+/** Explicit `PIER_TERMINAL_PROMPT` wins over `$SHELL`; the default stays POSIX (bash/zsh init
+ *  syntax), so a Windows shell with no `$SHELL` needs `powershell`/`pwsh` set explicitly. */
 export function promptStrategyFor(env: NodeJS.ProcessEnv = process.env): PromptStrategy {
   // B10: canonical PIER_TERMINAL_PROMPT, legacy PI_HERDR_TERMINAL_PROMPT alias.
   const prompt = pierOption('PIER_TERMINAL_PROMPT', env)?.trim().toLowerCase();
@@ -75,7 +59,6 @@ export interface TerminalEntry {
   nudgedAt: number | null;
   status: 'open' | 'closed';
   closedAt: number | null;
-  readRevision?: number | null;
   readLen?: number;
   readTail?: string;
   readTextLen?: number;
@@ -130,7 +113,6 @@ export function registerTerminal(
     nudgedAt: null,
     status: 'open',
     closedAt: null,
-    readRevision: null,
     readLen: 0,
     readTail: '',
     readTextLen: 0,
@@ -199,14 +181,14 @@ export function validateSignal(key: string): { ok: true; key: SignalKey } | { ok
   if (!k) {
     return {
       ok: false,
-      error: `unsupported signal "${key}"; allowed: ${SIGNAL_KEYS.join(', ')} (complex key sequences are outside the terminal seam — use herdr's native pane for interactive programs)`,
+      error: `unsupported signal "${key}"; allowed: ${SIGNAL_KEYS.join(', ')} (complex key sequences are outside the terminal seam — use the Herdr app for interactive programs)`,
     };
   }
   return { ok: true, key: k };
 }
 
-/** Compile a wait pattern with line semantics: herdr matches per line, so `^`/`$` anchors must bind
- *  to line starts/ends, not only the start/end of the whole pane buffer. */
+/** Compile a wait pattern with line semantics: `^`/`$` anchors must bind to line starts/ends, not
+ *  only the start/end of the whole screen text. */
 export function compilePattern(pattern: string): RegExp {
   return new RegExp(pattern, 'm');
 }
@@ -315,10 +297,9 @@ export function detectContinuationPrompt(text: string): string | null {
 }
 
 export interface ReadCursor {
-  revision: number;
   len: number;
   tail: string;
-  /** Full pane-text length and FNV-1a hash: herdr's screen window can rewrite earlier lines while
+  /** Full screen-text length and FNV-1a hash: a terminal screen can rewrite earlier lines while
    *  the last characters stay identical, so a tail comparison alone is not a change detector. */
   textLen: number;
   textHash: number;
@@ -345,13 +326,12 @@ export function hashPaneText(text: string): number {
 
 export function computeIncrement(
   prev: ReadCursor | null,
-  next: { text: string; revision: number },
+  next: { text: string },
   maxChars: number,
 ): ReadIncrement {
   const stableLen = next.text.lastIndexOf('\n') + 1;
   const textHash = hashPaneText(next.text);
   const cursor: ReadCursor = {
-    revision: next.revision,
     len: stableLen,
     tail: next.text.slice(Math.max(0, stableLen - CURSOR_TAIL_CHARS), stableLen),
     textLen: next.text.length,
@@ -393,8 +373,8 @@ export function excerptAroundMatch(text: string, pattern: string, regex: boolean
 }
 
 /**
- * herdr waitForOutput matches the whole pane, including text a prior read already returned.
- * A hit is fresh only when it sits in the unread increment; a hit only in consumed text is stale.
+ * A wait polls the screen, including text a prior read already returned. A hit is fresh only when
+ * it sits in the unread increment; a hit only in consumed text is stale.
  */
 export function classifyWaitMatch(
   prev: ReadCursor | null,
@@ -403,7 +383,7 @@ export function classifyWaitMatch(
   regex: boolean,
 ): { kind: 'fresh'; excerpt: string } | { kind: 'stale' } | { kind: 'absent' } {
   const match = (text: string) => regex ? compilePattern(pattern).test(text) : text.includes(pattern);
-  const inc = computeIncrement(prev, { text: paneText, revision: prev?.revision ?? 0 }, paneText.length + 1);
+  const inc = computeIncrement(prev, { text: paneText }, paneText.length + 1);
   const unread = inc.mode === 'append' ? inc.text : inc.mode === 'reset' ? paneText : '';
   if (match(unread)) return { kind: 'fresh', excerpt: excerptAroundMatch(unread, pattern, regex) };
   if (inc.mode !== 'reset' && match(paneText)) return { kind: 'stale' };
@@ -413,19 +393,6 @@ export function classifyWaitMatch(
 function boundText(text: string, maxChars: number): { text: string; capped: boolean } {
   if (text.length <= maxChars) return { text, capped: false };
   return { text: `${text.slice(text.length - maxChars)}\n${TRUNCATE_MARKER}`, capped: true };
-}
-
-export type ReadinessTier = 'prompt' | 'silent' | 'busy';
-
-export function classifyReadiness(
-  rawOrStripped: string,
-  opts: { silentMs: number; silenceThresholdMs?: number; prompt?: PromptStrategy },
-): ReadinessTier {
-  const tail = rawOrStripped.trimEnd();
-  const re = opts.prompt?.tailRe ?? PROMPT_TAIL_RE;
-  if (tail.length > 0 && re.test(tail)) return 'prompt';
-  if (opts.silentMs >= (opts.silenceThresholdMs ?? SILENCE_IDLE_MS)) return 'silent';
-  return 'busy';
 }
 
 export interface TerminalSummary {
@@ -460,6 +427,28 @@ export function makeTerminalsRegistry(terminals: TerminalEntry[] = []): Terminal
   return { version: 1, terminals };
 }
 
+/** Shell names that own the PTY foreground while a persistent terminal is idle. */
+const SHELL_PROCESS_NAMES: Record<string, true> = {
+  sh: true, bash: true, zsh: true, fish: true, dash: true, ksh: true, mksh: true, tcsh: true,
+  csh: true, nu: true, login: true, pwsh: true, powershell: true, cmd: true,
+};
+
+/**
+ * Core's `foreground` is the PTY foreground process-group leader: while the shell is idle that is
+ * the shell itself, and anything else is a running job (dev server, REPL, load test) whose
+ * terminal must not be nudged. A missing foreground (probe unavailable, terminal finished) counts
+ * as idle so a nudge is at most an extra reminder.
+ */
+export function foregroundIsShell(
+  foreground: { name?: string | null; argv?: readonly string[] | null } | null | undefined,
+): boolean {
+  if (!foreground) return false;
+  return [foreground.name, foreground.argv?.[0]].some((value) => {
+    const base = String(value ?? '').replace(/\\/g, '/').split('/').pop()?.toLowerCase() ?? '';
+    return SHELL_PROCESS_NAMES[base.replace(/^-/, '').replace(/\.exe$/, '')] === true;
+  });
+}
+
 export interface ShellInitPlan {
   readonly shouldInit: boolean;
   readonly command: string | null;
@@ -474,19 +463,15 @@ export const SHELL_INIT_COMMAND = 'if [ -n "$ZSH_VERSION" ]; then setopt NO_BANG
  * Plan the shell init command: disable history expansion, where `!` in ordinary commands (`!|`,
  * `if [ ! -f ... ]`, `!$`) otherwise triggers `zsh: event not found: \|` and wedges the shell.
  * PowerShell rejects the syntax and has no `!` history expansion, so it is skipped.
- * Limit: the top-level shell only — a nested `bash -i` re-enables its own defaults; init is only worth
- * sending once the shell is at its prompt and has not been initialized yet.
+ * Limit: the top-level shell only — a nested `bash -i` re-enables its own defaults; init is sent
+ * once per terminal unless the send failed.
  */
 export function planShellInit(opts: {
   strategy?: PromptStrategy;
-  readiness?: ReadinessTier;
   initialized?: boolean;
 }): ShellInitPlan {
   if (opts.initialized) return { shouldInit: false, command: null };
-  if ((opts.strategy ?? POSIX_PROMPT) === POWERSHELL_PROMPT) return { shouldInit: false, command: null };
-  if (opts.readiness !== undefined && opts.readiness !== 'prompt') {
-    return { shouldInit: false, command: null };
-  }
+  if ((opts.strategy ?? POSIX_PROMPT).family === 'powershell') return { shouldInit: false, command: null };
   return { shouldInit: true, command: SHELL_INIT_COMMAND };
 }
 
@@ -514,7 +499,6 @@ export function foldTerminalsRegistry(
         nudgedAt: typeof t.nudgedAt === 'number' ? t.nudgedAt : null,
         status: t.status === 'closed' ? ('closed' as const) : ('open' as const),
         closedAt: typeof t.closedAt === 'number' ? t.closedAt : null,
-        readRevision: typeof t.readRevision === 'number' ? t.readRevision : null,
         readLen: typeof t.readLen === 'number' ? t.readLen : 0,
         readTail: typeof t.readTail === 'string' ? t.readTail : '',
         readTextLen: typeof t.readTextLen === 'number' ? t.readTextLen : 0,
@@ -526,7 +510,7 @@ export function foldTerminalsRegistry(
 }
 
 /* ── Terminal nudge: turn-end self-cleanup for shells the model forgot to close ──
- * Terminals persist by design, so a finished shell lingers as a dead split. Two notices per terminal:
+ * Terminals persist by design, so a finished shell lingers as a dead pane. Two notices per terminal:
  *   1. at the end of the turn that used it ("used this turn") — or the first turn that finds it idle
  *      past the threshold, for a shell nobody touched recently;
  *   2. on a later settle once it has been idle past PIER_TERM_IDLE_MS.

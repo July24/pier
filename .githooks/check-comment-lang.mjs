@@ -11,8 +11,6 @@ const COMMENT = /^\s*(\/\/|\/\*|\*)/;
 
 const TARGET_SCOPES = [
   'packages/pier-ext/src/',
-  'packages/pier-workbench/src/',
-  'packages/pier-workbench/scripts/',
   'install.mjs',
 ];
 

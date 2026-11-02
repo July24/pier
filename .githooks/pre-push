@@ -31,6 +31,8 @@ while read -r local_ref local_sha _remote_ref _remote_sha; do
   case "$local_sha" in 0000000000000000000000000000000000000000) continue ;; esac
 
   tag="${local_ref#refs/tags/}"
+  # 只校验会触发 publish.yml 的发布 tag（v* / 数字开头）；tui-final 之类的标记 tag 放行
+  case "$tag" in v*|[0-9]*) ;; *) continue ;; esac
   ver="${tag#v}"
 
   ext="$(ver_of "$tag" packages/pier-ext/package.json)" || true

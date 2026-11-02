@@ -1,10 +1,11 @@
 /**
- * Subagent board hygiene: registry projection + recovery, tab/pane collection, isolate-worktree sweep.
- * Predicates live in gc-core.ts; this adapter owns herdr close I/O, isolate git commands, and the ticker.
+ * Subagent board hygiene: registry projection + recovery, terminal collection, isolate-worktree
+ * sweep. Predicates live in gc-core.ts; this adapter owns core kill/remove I/O, isolate git
+ * commands, and the ticker.
  */
 import { appendFileSync, existsSync, rmSync } from 'node:fs';
 import type { Context } from '@deepseek-ai/cordis';
-import type { HerdrClientLike } from './herdr-client.ts';
+import type { CoreClientLike, CoreEnv, TerminalInfo } from './core-client.ts';
 import { isPathInside, planIsolateSweep, shouldClosePane, shouldCloseTaskTab } from './gc-core.ts';
 import { runtimePolicy } from './runtime-policy.ts';
 import { swallow } from './swallow.ts';
@@ -16,7 +17,7 @@ import type { TerminalStateSlot } from './plugins/terminal.ts';
 
 interface SubagentRegistryHost {
   pi: { appendEntry?: (customType: string, data: unknown) => void };
-  client: HerdrClientLike;
+  client: CoreClientLike;
   subs: Map<string, SubEntry>;
   writeHistory: (entry: SubEntry, patch?: { status?: SubEntry['status']; closedAt?: number }, via?: string) => void;
 }
@@ -58,15 +59,15 @@ export function createSubagentRegistry(host: SubagentRegistryHost): SubagentRegi
 
   async function sweepZombieRunning(): Promise<void> {
     if (!host.client.available || host.subs.size === 0) return;
-    let livePaneIds: ReadonlySet<string>;
+    let liveTerminalIds: ReadonlySet<string>;
     try {
-      livePaneIds = new Set((await host.client.listPanes()).map((pane) => pane.paneId));
+      liveTerminalIds = new Set((await host.client.listTerminals()).map((terminal) => terminal.id));
     } catch {
       return; // do not close agents when the liveness lookup itself failed
     }
     let changed = false;
     for (const [paneId, entry] of host.subs) {
-      if (entry.status !== 'running' || livePaneIds.has(paneId)) continue;
+      if (entry.status !== 'running' || liveTerminalIds.has(paneId)) continue;
       entry.status = 'closed';
       host.writeHistory(entry, { status: 'closed', closedAt: Date.now() }, 'zombie-sweep');
       changed = true;
@@ -80,8 +81,8 @@ export function createSubagentRegistry(host: SubagentRegistryHost): SubagentRegi
 /* ── GC ─────────────────────────────────────────────────────────── */
 
 interface GcHost {
-  client: HerdrClientLike;
-  env: { tabId: string; paneId?: string } | null;
+  client: CoreClientLike;
+  env: CoreEnv | null;
   subs: Map<string, SubEntry>;
   persistSubs(): void;
   writeHistory(e: SubEntry, patch?: { outcome?: string | null; status?: SubEntry['status']; closedAt?: number }, via?: string): void;
@@ -106,13 +107,14 @@ export function createGcController(h: GcHost): GcController {
     if (h.subs.size === 0) return;
     const ttlMs = runtimePolicy.sessionTtlSeconds * 1000;
     const autoCloseTabs = ttlMs > 0;
-    let panesList: Array<{ paneId: string; tabId: string; agentStatus: string }>;
-    try {
-      panesList = await h.client.listPanes();
-    } catch {
-      return;
-    }
-    const statuses = new Map(panesList.map((p) => [p.paneId, p.agentStatus]));
+    // The periodic pass reads the children snapshot instead of listing terminals every tick; a
+    // blind watch (core unreachable) skips the pass rather than closing rows on a stale view.
+    const watch = h.client.watchChildren();
+    await watch.ready();
+    if (!watch.connected) return;
+    const terminals = watch.list().filter((t) => t.state === 'live');
+    const statuses = new Map(terminals.map((t) => [t.id, t.status]));
+    const tabOf = (t: TerminalInfo): string => t.labels['herdr.tab'] ?? '';
     const termPaneIds = h.terminalState.activePaneIds();
     const pendingNoticeIds = h.noticePending?.() ?? new Set<string>();
 
@@ -123,33 +125,37 @@ export function createGcController(h: GcHost): GcController {
       arr.push(e);
       byTab.set(e.tabId, arr);
     }
-    const mainTabId = h.env?.tabId ?? '';
+    const mainTabId = (await h.client.placementLabels())['herdr.tab'] ?? '';
 
     const closeRow = (e: SubEntry): void => {
       if (e.status === 'closed') return;
       e.status = 'closed';
       h.writeHistory(e, { status: 'closed', closedAt: Date.now() }, 'gc');
     };
+    /** `terminal.kill` then `terminal.rm`: the app closes the pane, and the tab disappears with its
+     *  last terminal. A terminal that is already gone is not an error. */
+    const retire = async (id: string): Promise<void> => {
+      try { await h.client.kill(id); } catch { /* already exited */ }
+      try { await h.client.remove(id); } catch { /* core reaps finished terminals */ }
+    };
 
     for (const [tabId, entries] of byTab) {
       if (tabId === mainTabId) continue;
-      const tabPanes = panesList.filter((p) => p.tabId === tabId);
-      if (tabPanes.length === 0) {
+      const tabTerminals = terminals.filter((t) => tabOf(t) === tabId);
+      if (tabTerminals.length === 0) {
         for (const e of entries) closeRow(e);
         continue;
       }
       if (!autoCloseTabs) continue;
       if (!shouldCloseTaskTab({
         entries,
-        paneStatuses: tabPanes.map((p) => p.agentStatus),
+        paneStatuses: tabTerminals.map((t) => t.status),
         ttlMs,
         now: Date.now(),
       })) continue;
       // Live terminal panes and not-yet-delivered settlement notices keep the tab alive.
-      if (tabPanes.some((p) => termPaneIds.has(p.paneId) || pendingNoticeIds.has(p.paneId))) continue;
-      try {
-        await h.client.tabClose(tabId);
-      } catch { /* tab may already be gone */ }
+      if (tabTerminals.some((t) => termPaneIds.has(t.id) || pendingNoticeIds.has(t.id))) continue;
+      for (const t of tabTerminals) await retire(t.id);
       for (const e of entries) closeRow(e);
       await sleep(300);
     }
@@ -160,20 +166,18 @@ export function createGcController(h: GcHost): GcController {
     );
     for (const e of candidates) {
       if (termPaneIds.has(e.paneId) || pendingNoticeIds.has(e.paneId)) continue;
-      // Never collect self, whatever the registry says: a poisoned entry once closed the master's pane.
-      if (h.env?.paneId && e.paneId === h.env.paneId) continue;
+      // Never collect self, whatever the registry says: a poisoned entry once closed the master's terminal.
+      if (h.env?.terminalId && e.paneId === h.env.terminalId) continue;
       if (!shouldClosePane({
         consumedAt: e.consumedAt ?? null,
-        herdrStatus: statuses.get(e.paneId),
+        status: statuses.get(e.paneId),
         prevTurnStart,
       })) continue;
       if (statuses.get(e.paneId) === undefined) {
         closeRow(e);
         continue;
       }
-      try {
-        await h.client.closePane(e.paneId);
-      } catch { /* pane may already be gone */ }
+      await retire(e.paneId);
       closeRow(e);
       await sleep(300);
     }

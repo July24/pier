@@ -5,12 +5,10 @@ import assert from 'node:assert/strict';
 import {
   DELEGATION_CUSTOM_TYPE,
   DELEGATION_ENV,
-  DELEGATION_TASK_TOKEN,
   applyWorkerTag,
   buildDelegationSection,
   delegationEnv,
   delegationFromRecord,
-  delegationSidebarTokens,
   foldDelegation,
   parseDelegationContext,
 } from '../src/delegation-core.ts';
@@ -57,26 +55,11 @@ test('buildDelegationSection: identity, self pane, and the delivery contract are
   assert.doesNotMatch(bare, /agentId/);
 });
 
-test('delegationSidebarTokens: parent+task tokens; no parent pane → empty patch (no report)', () => {
-  assert.deepEqual(delegationSidebarTokens(CTX), { 'pi-parent': 'wD:p1', 'pi-task': 'refactor auth flow' });
-  assert.deepEqual(delegationSidebarTokens({ ...CTX, parentPaneId: '' }), {});
-});
-
-test('delegationSidebarTokens: long descriptions clip at the herdr 80-char boundary', () => {
-  const tokens = delegationSidebarTokens({ ...CTX, description: 'x'.repeat(120) });
-  assert.equal(tokens[DELEGATION_TASK_TOKEN]!.length, 80);
-});
-
 test('applyWorkerTag: prefixes a todo title, stands alone before the first todo_write, passes masters through', () => {
   assert.equal(applyWorkerTag('▶1 ○2 ■0 ✓0 (1/2) · wiring', CTX.description), '↳ ▶1 ○2 ■0 ✓0 (1/2) · wiring');
   assert.equal(applyWorkerTag(null, CTX.description), '↳ refactor auth flow');
   assert.equal(applyWorkerTag('plain title', null), 'plain title');
   assert.equal(applyWorkerTag(null, null), null);
-});
-
-test('applyWorkerTag: standalone fallback clips so the tagged title stays ≤80', () => {
-
-  assert.equal((applyWorkerTag(null, 'y'.repeat(120)) ?? '').length, 80);
 });
 
 test('foldDelegation: last branch entry wins; foreign/torn entries are skipped', () => {

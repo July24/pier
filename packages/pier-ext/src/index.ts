@@ -23,27 +23,26 @@ import {
   runAsk,
 } from './ask-user.ts';
 import { pipeNameFor, pipeRequest, startPipeServer } from './pipe-channel.ts';
-import { TODO_EDIT_CUSTOM_TYPE, currentActivity } from './todo-core.ts';
+import { TODO_EDIT_CUSTOM_TYPE } from './todo-core.ts';
 import { installRenderers } from './renderers.ts';
-import { createHerdrClient } from './herdr-client.ts';
+import { createCoreClient } from './core-client.ts';
 import { bareSessionId, lastAssistantText, readSessionFile, resolveSessionFileValue } from './session-tail.ts';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
-import { mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { platformPaths } from './platform-paths.ts';
 import { TodosService, type TodoCompletionSource } from './todos-service.ts';
 import { reconcileTodos } from './reconcile-core.ts';
 import type { TodoUiSlot } from './plugins/todo.ts';
-import { estimateEta, formatProgressSuffix, planToolBadge, progressOf } from './progress-core.ts';
+import { estimateEta, formatProgressSuffix, progressOf } from './progress-core.ts';
 import { WRITE_LOCK_ENV } from './lock-core.ts';
 import { ABORT_STOP_REASON, planSettleWake, shouldPushSettleReply } from './settle-wake-core.ts';
 import { parseRuntimeManifest } from './tool-gate.ts';
-import { formatPaneTitle } from './pane-title.ts';
+import { TODO_LABEL, formatPaneTitle } from './pane-title.ts';
 import { registerSlimFrame, updateSlimFrame } from './slim-frame.ts';
-import { applyRestoredWorkerMode, planIndexMode } from './index-runtime.ts';
-import { buildResumeArgv, emptySubagentPortBox, sleepWhileSubsRunningNote } from './subagent-core.ts';
-import { hasWorkerMarker, writeWorkerMarker, readWorkerMarker } from './worker-marker.ts';
+import { planIndexMode } from './index-runtime.ts';
+import { emptySubagentPortBox, sleepWhileSubsRunningNote } from './subagent-core.ts';
+import { writeWorkerMarker, readWorkerMarker } from './worker-marker.ts';
+import { openTreeOverlay, type TreeOverlayHandle } from './tree-overlay.ts';
 import {
   DELEGATION_CUSTOM_TYPE,
   applyWorkerTag,
@@ -56,8 +55,6 @@ import { formatDelegationTree, type WorkerTodoSnapshot, type WorkerWidgetRow } f
 import { createNoticeBuffer } from './index-notices.ts';
 import { handlePipeRequest, type MachineRequest } from './index-pipe.ts';
 import { installWriteLocks } from './index-locks.ts';
-import { installDashboardCommand } from './dashboard-command.ts';
-import { openPierPanel } from './panel-open.ts';
 import { registerObservationPack, createCompactionBatchPackHook, type PickMiddleExcerpts } from './plugins/observation.ts';
 import { createJevRuntime } from './jev-client.ts';
 import {
@@ -82,7 +79,7 @@ function agentSessionsDir(): string {
 }
 
 export default async function (pi: ExtensionAPI) {
-  const mode = applyRestoredWorkerMode(planIndexMode(), process.env.PI_SESSION_FILE ?? null, hasWorkerMarker);
+  const mode = planIndexMode();
   const isSubagent = mode.isSubagent;
   const roleBase = process.env.PI_HERDR_ROLE_BASE || process.cwd();
 
@@ -90,7 +87,7 @@ export default async function (pi: ExtensionAPI) {
   let sessionRoot: string | null = null;
   let effConfig: EfficiencyConfig = resolveEfficiencyConfig();
   const coordinator = new CompactCoordinator();
-  const { client, env } = createHerdrClient();
+  const { client, env } = createCoreClient();
   /** RFC rfc-delegation-identity §2.1: resolved env → marker → branch fold; worker panes only. */
   let delegation: DelegationContext | null = parseDelegationContext(process.env.PI_HERDR_DELEGATION);
   const initialManifest =
@@ -106,7 +103,7 @@ export default async function (pi: ExtensionAPI) {
     void appendEfficiencyLog(efficiencyLogPath(root, 'routing'), stamped).catch(() => {});
   };
 
-  const roles = createRoleRuntime({ pi, client, roleBase, initialManifest, isSubagent, todos, appendRoutingLog });
+  const roles = createRoleRuntime({ pi, roleBase, initialManifest, isSubagent, todos, appendRoutingLog });
 
   /* ── Jev decision layer (RFC docs/rfc-jev-integration.md): direct HTTP, total-budget
    * abort, fail-open at every site. Disabled or keyless → behavior identical to before. ── */
@@ -160,11 +157,9 @@ export default async function (pi: ExtensionAPI) {
   const todoUi: TodoUiSlot = { renderWidget: () => { /* filled after plugin mounting */ } };
   const gates = createGateRuntime({
     pi,
-    client,
+    writeStatus: env ? (sequence) => { process.stdout.write(sequence); } : null,
     rerenderWidget: () => todoUi.rerenderWidget?.(),
     isAgentActive: () => agentActive,
-    idleMessage: () => roles.idleBadge(),
-    workingMessage: () => currentActivity(todos.items),
   });
 
   /** Session identity: sessionManager is authoritative (env may be unset in print/RPC mode). */
@@ -195,7 +190,6 @@ export default async function (pi: ExtensionAPI) {
 
   function mirrorTodos(): void {
     if (!client.available) return;
-    const label = sessionId || (env ? `pane:${env.paneId}` : '');
     const p = progressOf(todos.items);
     const eta = estimateEta({ completedAt: completedStamps, total: p.total, now: Date.now() });
     const suffix = formatProgressSuffix({ completed: p.completed, total: p.total, eta });
@@ -204,20 +198,15 @@ export default async function (pi: ExtensionAPI) {
       delegation?.description ?? null,
     );
     updateSlimFrame({ title, items: todos.items, lastWriteAt: todos.lastWriteAt });
-    client.reportMetadata({
-      session: label,
-      items: todos.items,
-      progressSuffix: suffix,
-      lastWriteAt: todos.lastWriteAt,
-      workerTag: delegation?.description ?? null,
-    }).catch(() => {});
+    // The master's resync folds worker summaries from this label after a master resume.
+    void client.setLabels({ [TODO_LABEL]: title });
     // D113: delegated workers also push the full list to the master's pipe so its resident widget
     // and /pier-tree stay live without polling. Best effort — a lost push self-heals on the next write.
     if (isSubagent && delegation?.parentPipe) {
       void pipeRequest(delegation.parentPipe, {
         type: 'todo_sync',
         id: `tsync-${Date.now()}`,
-        paneId: env?.paneId ?? '',
+        paneId: env?.terminalId ?? '',
         items: todos.items.map((it) => ({ content: it.content, status: it.status, ...(it.blocker ? { blocker: it.blocker } : {}) })),
         summary: title ?? delegation.description,
       }, 3000).catch(() => {});
@@ -230,7 +219,7 @@ export default async function (pi: ExtensionAPI) {
     if (!workerPaneId) return;
     workerTodos.set(workerPaneId, { items, summary, ts: Date.now() });
     todoUi.rerenderWidget?.();
-    refreshTreeSnapshot();
+    treeView?.refresh();
   }
   /** Running rows joined with their cached todos — feeds the unified widget and /pier-tree. */
   function widgetWorkers(): WorkerWidgetRow[] {
@@ -240,9 +229,8 @@ export default async function (pi: ExtensionAPI) {
     }));
   }
 
-  /* ── /pier-tree panel: the pi process owns the data, the popup/overlay owns the surface. ── */
-  /** Set while a panel is open; todo/worker updates republish the snapshot it polls. */
-  let treeSnapshot: { path: string } | null = null;
+  /* ── /pier-tree overlay: rendered inside pi; open views repaint on todo/worker updates. ── */
+  let treeView: TreeOverlayHandle | null = null;
 
   function renderTreeLines(): string[] {
     const rows = subagentPort.current?.listRows() ?? [];
@@ -256,29 +244,7 @@ export default async function (pi: ExtensionAPI) {
     });
   }
 
-  function treeSnapshotPath(): string {
-    const id = (sessionId || (env ? `pane-${env.paneId}` : 'session')).replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
-    return join(tmpdir(), 'pier-tree', `${id}.txt`);
-  }
-
-  function publishTreeSnapshot(): string {
-    const path = treeSnapshotPath();
-    mkdirSync(join(tmpdir(), 'pier-tree'), { recursive: true });
-    writeFileSync(path, `${renderTreeLines().join('\n')}\n`);
-    treeSnapshot = { path };
-    return path;
-  }
-
-  function refreshTreeSnapshot(): void {
-    if (!treeSnapshot) return;
-    try {
-      writeFileSync(treeSnapshot.path, `${renderTreeLines().join('\n')}\n`);
-    } catch {
-      /* The panel may have been closed and its temp dir swept; the next command republishes. */
-    }
-  }
-
-  todos.on('todo.updated', () => refreshTreeSnapshot());
+  todos.on('todo.updated', () => treeView?.refresh());
 
   /** M17 settlement reconciliation: auto-complete settled todos / unblock on failure notes (idempotent). */
   function reconcileOnSettlement(description: string, outcome: 'settled' | 'failed'): string[] {
@@ -313,27 +279,15 @@ export default async function (pi: ExtensionAPI) {
     mirrorTodos();
   });
 
-  /* ── tool badges: parallel calls start in source order, end in completion order ── */
-  const runningTools = new Map<string, string>(); // toolCallId → toolName
-  let lastToolBadge: string | null = null;
-  function reportToolBadge(): void {
-    const badge = planToolBadge([...new Set(runningTools.values())]);
-    if (badge === lastToolBadge) return; // report only changes (M13 rendering discipline)
-    lastToolBadge = badge;
-    if (badge) gates.report('working', badge);
-    else gates.report(agentActive ? 'working' : 'idle', agentActive ? currentActivity(todos.items) : null);
-  }
+  /** Tool names by call id: the end event may omit the name the tools ledger records. */
+  const runningTools = new Map<string, string>();
   pi.on('tool_execution_start', async (event: { toolCallId?: string; toolName?: string }) => {
-    if (typeof event?.toolCallId === 'string' && typeof event?.toolName === 'string') {
-      runningTools.set(event.toolCallId, event.toolName);
-      reportToolBadge();
-    }
+    if (typeof event?.toolCallId === 'string' && typeof event?.toolName === 'string') runningTools.set(event.toolCallId, event.toolName);
   });
   pi.on('tool_execution_end', async (event: { toolCallId?: string; toolName?: string; durationMs?: number }) => {
     if (typeof event?.toolCallId !== 'string') return;
     const tool = typeof event.toolName === 'string' ? event.toolName : runningTools.get(event.toolCallId) ?? null;
     runningTools.delete(event.toolCallId);
-    reportToolBadge();
     // pi ≥ 1.1 records the real execution time on the event; the tools ledger replaces wall-clock
     // estimates in the efficiency trial with measured numbers. Absent on older pi — nothing logged.
     if (typeof event.durationMs === 'number' && sessionRoot) {
@@ -372,10 +326,7 @@ export default async function (pi: ExtensionAPI) {
     });
   }
 
-  let locksHandle = { getHeldLocks: () => [] as readonly string[] };
-  if (env) {
-    locksHandle = installWriteLocks(pi, { client, env, hard: process.env[WRITE_LOCK_ENV] === '1' });
-  }
+  if (env) installWriteLocks(pi, { client, env, hard: process.env[WRITE_LOCK_ENV] === '1' });
 
   /** pi's sendUserMessage is fire-and-forget (void); callers of this wrapper still get a promise. */
   const sendUserMessageAs = (content: string, mode: 'steer' | 'followUp'): Promise<void> => {
@@ -437,7 +388,7 @@ export default async function (pi: ExtensionAPI) {
   }
 
   function startPipeServerFor(cwd: string): void {
-    const paneId = env?.paneId ?? '';
+    const paneId = env?.terminalId ?? '';
     if (!paneId) return;
     if (pipeServerBox.current) {
       try { pipeServerBox.current.close(); } catch { /* Previous instance. */ }
@@ -487,7 +438,7 @@ export default async function (pi: ExtensionAPI) {
       await pipeRequest(req.from, {
         type: 'reply',
         id: req.id,
-        paneId: env?.paneId ?? '',
+        paneId: env?.terminalId ?? '',
         text,
         // Push the resolved PATH when readable; fall back to the bare id for the master-side mapping.
         sessionFile: ownFile ?? (sessionId || null),
@@ -514,25 +465,20 @@ export default async function (pi: ExtensionAPI) {
     // On resume pi restores widget state from the session; calling setWidget again
     // breaks the TUI '/' command-panel route (v1.3 M9).
     if ((event as { reason?: string } | undefined)?.reason !== 'resume') todoUi.renderWidget(ctx);
-    // D97: narrow-frame overlay is meaningful only inside herdr; re-register (session switching resets it).
+    // D97: narrow-frame overlay is meaningful only inside a core terminal; re-register (session switching resets it).
     if (env) registerSlimFrame(ctx);
     // P2-5: resume folds todos/compaction state from the branch like session_tree; a fresh session folds nothing.
     rebuildFromBranch(ctx);
     mirrorTodos();
     roles.syncFromBranch(ctx);
     if (mode.composeMaster && sessionRoot) roles.scanRoleUsage();
-    gates.report('idle', null);
-    // Self-healing: the ask marker lives in herdr with a 24h TTL; a session killed
-    // while a dialog was open must not keep the pane looking blocked forever.
-    void client.reportAskFlag(null).catch(() => {});
     if (isSubagent) {
-      // herdr 0.9.2 restore identity: the marker re-derives worker mode for the resumed boot
-      // (resume_argv cannot carry spawn env), and the self-reported command replays this exact
-      // session — extension, role model, approve, fullscreen — instead of a bare `pi --resume`.
+      // The worker marker keeps the delegation identity next to the session file, so a /resume of
+      // this session (which carries no spawn env) still knows who delegated it.
       const sm = typeof ctx === 'object' && ctx !== null && 'sessionManager' in ctx ? ctx.sessionManager : undefined;
       const sessionFile = (typeof sm?.getSessionFile === 'function' ? sm.getSessionFile() : undefined)
         ?? process.env.PI_SESSION_FILE ?? null;
-      // RFC rfc-delegation-identity §2.1: env (spawn) > marker (herdr restart) > branch fold (/resume).
+      // RFC rfc-delegation-identity §2.1: env (spawn) > marker > branch fold (/resume).
       if (!delegation) delegation = readWorkerMarker(sessionFile)?.delegation ?? null;
       const branchEntries = (ctx as { sessionManager?: { getBranch?: () => readonly unknown[] } })
         ?.sessionManager?.getBranch?.() ?? [];
@@ -546,18 +492,11 @@ export default async function (pi: ExtensionAPI) {
           /* Best effort; the marker already carries the identity. */
         }
       }
-      if (delegation) void client.reportDelegationTokens(delegation).catch(() => {});
-      if (sessionRoot) {
-        writeWorkerMarker(sessionFile, roles.state.manifest?.role, delegation ?? undefined);
-        const resumeArgv = buildResumeArgv(process.argv);
-        if (resumeArgv && client.available) {
-          void client.reportAgentSessionResume(sessionId, resumeArgv).catch(() => {});
-        }
-      }
+      // The master reads the worker's session file from this label.
+      if (sessionFile) void client.setLabels({ 'pier.session': sessionFile });
+      if (sessionRoot) writeWorkerMarker(sessionFile, roles.state.manifest?.role, delegation ?? undefined);
     }
 
-    // Focus heat is event-driven on herdr 0.9.5+: the workbench receives pane.focused directly,
-    // so no per-pane layout sampler is started here.
     startPipeServerFor(cwd);
   });
 
@@ -568,7 +507,7 @@ export default async function (pi: ExtensionAPI) {
       const sections = event.systemPromptOptions?.sections;
       if (!sections) return;
       if (delegation) {
-        const text = buildDelegationSection(delegation, env?.paneId ?? '');
+        const text = buildDelegationSection(delegation, env?.terminalId ?? '');
         if (sections['pier-delegation'] !== text) sections['pier-delegation'] = text;
       } else {
         delete sections['pier-delegation'];
@@ -604,7 +543,6 @@ export default async function (pi: ExtensionAPI) {
     // became startable, so it cannot latch every later decision and the settle-wake hold.
     if (!coordinator.intentionalAbort) coordinator.selectedCompaction = null;
     coordinator.intentionalAbort = false;
-    gates.report('working', currentActivity(todos.items));
   });
 
   pi.on('before_provider_request', (_event: unknown, ctx: unknown) => {
@@ -650,7 +588,6 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on('agent_settled', async (event: unknown, ctx) => {
     agentActive = false;
-    gates.report('idle', null);
     // pi ≥ 1.1 stamps cancelled runs on the event itself; stopReason tracking misses ESC mid-tool
     // (no final assistant message), so the event field is authoritative when present.
     const aborted = event !== null && typeof event === 'object' && 'aborted' in event && event.aborted === true;
@@ -712,14 +649,6 @@ export default async function (pi: ExtensionAPI) {
   });
 
   installConfigCommand({ pi });
-  installDashboardCommand({
-    pi,
-    client,
-    env,
-    getTodoItems: () => todos.items,
-    getHeldLocks: () => locksHandle.getHeldLocks(),
-    prepareTree: () => publishTreeSnapshot(),
-  });
 
   /* ── ask_user_question (v1.3 M8 human gate; master and subagents) ── */
   pi.registerTool({
@@ -736,8 +665,7 @@ export default async function (pi: ExtensionAPI) {
       const ui = ctx && typeof ctx === 'object' && 'ui' in ctx ? ctx.ui : undefined;
       if (!hasAskUi(ui)) return noUiResult();
       gates.publish(true, gateLabel(prepared.spec));
-      // The gate stays reported for the whole wait: gates.report drops
-      // working/idle while blocked, and pi's ui_prompt events keep the depth honest.
+      // pi does not report `ui.custom` dialogs, so the gate writes blocked itself for the whole wait.
       try {
         return await runAsk(prepared.spec, ui, signal instanceof AbortSignal ? signal : undefined);
       } finally {
@@ -759,15 +687,7 @@ export default async function (pi: ExtensionAPI) {
       } catch {
       }
     }
-    if (treeSnapshot) {
-      try {
-        unlinkSync(treeSnapshot.path);
-      } catch {
-        /* Already swept. */
-      }
-      treeSnapshot = null;
-    }
-    client.close();
+    treeView = null;
   });
 
   /* ── master vs worker mount (dynamic: workers never load the cordis tree, C3) ── */
@@ -800,59 +720,34 @@ export default async function (pi: ExtensionAPI) {
     /* ── /pier-tree (D113): full todo × subagent delegation tree; the resident widget is minimal ── */
     pi.registerCommand('pier-tree', {
       description: 'Show the full delegation tree: your todos plus every subagent\'s todos and settled nodes',
-      handler: async (args: unknown, ctx: unknown) => {
-        const ui = (ctx as { ui?: { notify?: (text: string, level?: string) => void } }).ui;
-        const lines = renderTreeLines();
-        const overlay = typeof args === 'string' && args.trim().toLowerCase() === 'overlay';
-
-        if (client.available && env) {
-          const treeFile = publishTreeSnapshot();
-          if (overlay) {
-            try {
-              const res = await client.openPluginPane({
-                pluginId: 'pier.workbench',
-                entrypoint: 'tree',
-                placement: 'overlay',
-                focus: true,
-                env: { PIER_PANEL: 'tree', PIER_TREE_FILE: treeFile },
-              });
-              if (res.mode === 'pane') return;
-            } catch {
-              // Plugin missing / older herdr: fall back to the in-pane notify view below.
-            }
-          } else {
-            const res = await openPierPanel({ client, env }, { panel: 'tree', treeFile });
-            if (res === 'popup') return;
-            if (res === 'tab') {
-              ui?.notify?.('Herdr < 0.9.1: Pier Tree opened in new tab', 'info');
-              return;
-            }
-            if (res === 'busy') {
-              ui?.notify?.('Another popup is already open — close it and run /pier-tree again.', 'warning');
-              return;
-            }
-          }
-          // 'unavailable' / failed overlay → the old in-pane view.
+      handler: async (_args: unknown, ctx: unknown) => {
+        const ui = (ctx as { ui?: { notify?: (text: string, level?: string) => void; custom?: (factory: unknown, options?: unknown) => Promise<unknown> } }).ui;
+        const custom = typeof ui?.custom === 'function' ? ui.custom.bind(ui) : undefined;
+        const opened = openTreeOverlay(custom, renderTreeLines, (handle) => { treeView = handle; });
+        if (opened) {
+          await opened;
+          treeView = null;
+          return;
         }
-        treeSnapshot = null;
-        ui?.notify?.(lines.join('\n'), 'info');
+        // RPC mode / no custom components: one-shot text view.
+        ui?.notify?.(renderTreeLines().join('\n'), 'info');
       },
     });
 
-    /** D113 resync: a resumed master rebuilds worker summaries from herdr pi-todo tokens until the
-     * next live push replaces them with full lists. */
+    /** D113 resync: a resumed master rebuilds worker summaries from its children's `pier.todo`
+     * labels until the next live push replaces them with full lists. */
     const resyncWorkerTodos = async (): Promise<void> => {
+      if (!env) return;
       try {
-        const agents = await client.listAgents();
-        for (const a of agents) {
-          const summary = a.tokens?.['pi-todo'];
-          if (typeof summary === 'string' && summary && !workerTodos.has(a.paneId)) {
-            workerTodos.set(a.paneId, { summary, ts: Date.now() });
+        for (const t of await client.listTerminals()) {
+          const summary = t.labels[TODO_LABEL];
+          if (t.parent === env.terminalId && summary && !workerTodos.has(t.id)) {
+            workerTodos.set(t.id, { summary, ts: Date.now() });
           }
         }
         todoUi.rerenderWidget?.();
       } catch {
-        /* herdr absent or unreachable: live pushes remain the source */
+        /* core unreachable: live pushes remain the source */
       }
     };
     pi.on('session_start', () => { void resyncWorkerTodos(); });

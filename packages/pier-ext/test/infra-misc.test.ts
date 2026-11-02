@@ -146,7 +146,7 @@ test('createPlatformPaths: overrides win; sessionsDir defaults under agentDataDi
 /* ── PIER_OPTIONS registry + RuntimePolicy ──────────────────────────────── */
 
 const POLICY_FIELDS: ReadonlyArray<keyof RuntimePolicy> = [
-  'subagentTimeoutMs', 'gcTickMs', 'pollIntervalMs', 'settlementWindowMs', 'observationWindowMs',
+  'subagentTimeoutMs', 'gcTickMs', 'pollIntervalMs', 'observationWindowMs',
   'foregroundPatienceMs', 'sessionTtlSeconds', 'gitTimeoutMs', 'readinessTimeoutMs',
 ];
 
@@ -339,14 +339,20 @@ test('installer CLI: version --json and --help', () => {
   assert.equal(ver.status, 0, ver.stderr);
   const data = JSON.parse(ver.stdout);
   assert.equal(data.installer.name, 'pier-setup'); assert.ok(data.installer.version);
-  assert.ok('piExt' in data && 'herdr' in data && 'latest' in data);
+  assert.ok('piExt' in data && 'core' in data && 'latest' in data);
+  assert.ok(!('herdr' in data), 'TUI plugin status is gone');
+  assert.ok(typeof data.core === 'object' && data.core !== null && 'version' in data.core && 'app' in data.core);
 });
 
 /* The npx cache `npx pier-setup` runs from holds install.mjs + package.json and never
  * packages/pier-ext. The guards below replay a real CLI run against exactly that layout with
- * pi / herdr / npm faked at the process boundary, so the contract is observed through the
+ * pi / hc / herdr / npm faked at the process boundary, so the contract is observed through the
  * installer's effects (exit code, the commands it shells out to) instead of
  * being locked to the installer's source text. */
+
+/** herdr plugin mutations: the installer may list plugins (legacy detection) but changes one only on consent. */
+const pluginCalls = (calls: string[][]): string[][] =>
+  calls.filter((c) => c[0] === 'herdr' && c[1] === 'plugin' && c[2] !== 'list');
 
 /** Fake CLI on PATH: records its argv in the call log, then decides its own stdout / exit code. */
 function fakeCli(name: string, dirs: { bin: string; fake: string; log: string }, decide: string): void {
@@ -379,8 +385,15 @@ interface NpxLayoutProbe {
   run(...argv: string[]): { status: number | null; stdout: string; stderr: string };
 }
 
+/** `hcVersion: null` fakes an installed-but-unusable `hc`; the default is a healthy 0.1.16.
+ *  `legacyPlugin` makes the fake herdr list the TUI-era pier.workbench plugin. */
+interface NpxLayoutProbeOptions {
+  hcVersion?: string | null;
+  legacyPlugin?: boolean;
+}
+
 /** PI_CODING_AGENT_DIR keeps the real ~/.pi out of the run; fakes keep networks out of it. */
-function npxLayoutProbe(cleanup: CleanupContext): NpxLayoutProbe {
+function npxLayoutProbe(cleanup: CleanupContext, opts: NpxLayoutProbeOptions = {}): NpxLayoutProbe {
   const dir = cleanup.tempDir('pier-npx-').path;
   const installerDir = join(dir, 'installer');
   const agentDir = join(dir, 'pi-agent');
@@ -396,11 +409,13 @@ function npxLayoutProbe(cleanup: CleanupContext): NpxLayoutProbe {
   writeFileSync(join(extPkg, 'package.json'), JSON.stringify({ name: 'pi-pier', version: '1.0.0' }));
   writeFileSync(extEntry, 'export default {};\n');
 
-  fakeCli('pi', { bin: binDir, fake: fakeDir, log: logFile }, "if (args[0] === '--version') console.log('1.3.0');");
-  fakeCli('herdr', { bin: binDir, fake: fakeDir, log: logFile }, [
-    "if (args[0] === '--version') console.log('0.9.5');",
-    "else if (args[0] === 'plugin' && args[1] === 'list' && args.includes('--json')) console.log(JSON.stringify({ result: { plugins: [{ plugin_id: 'pier.workbench', name: 'pier-workbench', version: '1.0.0', enabled: true, plugin_root: '/tmp/pier-wb', source: { kind: 'github', commit: 'abcdef1234567890' } }] } }));",
-  ].join('\n'));
+  fakeCli('pi', { bin: binDir, fake: fakeDir, log: logFile }, "if (args[0] === '--version') console.log('1.4.0');");
+  const hcDecide = opts.hcVersion === null
+    ? 'process.exit(1);'
+    : `if (args[0] === '--version') console.log('${opts.hcVersion ?? '0.1.16'}');`;
+  fakeCli('hc', { bin: binDir, fake: fakeDir, log: logFile }, hcDecide);
+  const herdrList = JSON.stringify({ result: { plugins: opts.legacyPlugin ? [{ plugin_id: 'pier.workbench', source: { kind: 'github' } }] : [] } });
+  fakeCli('herdr', { bin: binDir, fake: fakeDir, log: logFile }, `if (args[1] === 'list') console.log(${JSON.stringify(herdrList)});`);
   fakeCli('npm', { bin: binDir, fake: fakeDir, log: logFile }, "console.log('1.0.0');");
 
   const env: NodeJS.ProcessEnv = { ...process.env, PI_CODING_AGENT_DIR: agentDir };
@@ -415,14 +430,33 @@ function npxLayoutProbe(cleanup: CleanupContext): NpxLayoutProbe {
   };
 }
 
-test('npx user-mode install never needs the repo layout: install.mjs alone registers both halves', withCleanup((cleanup) => {
+test('npx user-mode install never needs the repo layout: install.mjs alone registers the extension', withCleanup((cleanup) => {
   const probe = npxLayoutProbe(cleanup);
   const r = probe.run('install');
   assert.equal(r.status, 0, r.stderr + r.stdout);
   const calls = probe.calls();
   assert.ok(calls.some((c) => c.join(' ') === 'pi install npm:pi-pier'), `expected \`pi install npm:pi-pier\`, got ${JSON.stringify(calls)}`);
-  assert.ok(calls.some((c) => c.join(' ') === 'herdr plugin install July24/pier/packages/pier-workbench --yes'), `expected herdr plugin install, got ${JSON.stringify(calls)}`);
+  assert.deepEqual(pluginCalls(calls), [], 'the installer must not drive herdr (TUI) plugins');
   assert.deepEqual(calls.filter((c) => c.some((a) => a.includes(probe.installerDir))), [], 'the npx cache path must never reach pi');
+}));
+
+test('version --json reports the core preflight without TUI plugin state', withCleanup((cleanup) => {
+  const probe = npxLayoutProbe(cleanup);
+  const r = probe.run('version', '--json');
+  assert.equal(r.status, 0, r.stderr);
+  const data = JSON.parse(r.stdout);
+  assert.equal(data.core.version, '0.1.16');
+  assert.ok(!('herdr' in data), 'no plugin status in the report');
+  assert.deepEqual(pluginCalls(probe.calls()), [], 'the installer must not drive herdr (TUI) plugins');
+}));
+
+test('installer dies with the core install hint when hc is missing or unusable', withCleanup((cleanup) => {
+  const probe = npxLayoutProbe(cleanup, { hcVersion: null });
+  const r = probe.run('install');
+  assert.equal(r.status, 1, r.stdout);
+  assert.match(r.stderr, /herdr-core \(hc\) ≥ 0\.1\.16 required/);
+  assert.match(r.stderr, /curl -fsSL https:\/\/releases\.herdr\.dev\/core\/install\.sh \| sh/);
+  assert.deepEqual(probe.calls().filter((c) => c[0] === 'pi' && c[1] !== '--version'), [], 'nothing is installed when the core preflight fails');
 }));
 
 
@@ -432,9 +466,21 @@ test('update refreshes the install in place: `pi update` runs and nothing is rem
   assert.equal(r.status, 0, r.stderr + r.stdout);
   const calls = probe.calls();
   assert.ok(calls.some((c) => c.join(' ') === 'pi update npm:pi-pier'), `expected \`pi update npm:pi-pier\`, got ${JSON.stringify(calls)}`);
-  assert.ok(calls.some((c) => c.join(' ') === 'herdr plugin update pier.workbench --yes'), `expected \`herdr plugin update\`, got ${JSON.stringify(calls)}`);
-  assert.ok(!calls.some((c) => c.join(' ') === 'herdr plugin install July24/pier/packages/pier-workbench --yes'), 'a successful plugin update must not reinstall');
+  assert.deepEqual(pluginCalls(calls), [], 'the installer must not drive herdr (TUI) plugins');
   assert.deepEqual(calls.filter((c) => c.some((a) => a === 'remove' || a === 'uninstall')), [], 'update must not uninstall before updating');
+}));
+
+test('legacy pier.workbench is removed only on consent: non-interactive keeps it, --remove-legacy uninstalls it', withCleanup((cleanup) => {
+  const kept = npxLayoutProbe(cleanup, { legacyPlugin: true });
+  const r = kept.run('install');
+  assert.equal(r.status, 0, r.stderr + r.stdout);
+  assert.deepEqual(pluginCalls(kept.calls()), [], 'no prompt answer, no removal');
+  assert.match(r.stdout, /herdr plugin uninstall pier\.workbench/, 'the manual command is printed');
+
+  const removed = npxLayoutProbe(cleanup, { legacyPlugin: true });
+  assert.equal(removed.run('update', '--remove-legacy').status, 0);
+  assert.deepEqual(pluginCalls(removed.calls()), [['herdr', 'plugin', 'uninstall', 'pier.workbench']]);
+  assert.ok(removed.calls().some((c) => c.join(' ') === 'pi update npm:pi-pier'), 'the update itself still runs');
 }));
 
 test('a pier registration from another source is reported as-is and blocks a second registration', withCleanup((cleanup) => {

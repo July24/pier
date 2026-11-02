@@ -8,8 +8,6 @@ export interface RuntimePolicy {
   readonly subagentTimeoutMs: number
   readonly gcTickMs: number
   readonly pollIntervalMs: number
-  /** Settlement notice window / machine-inject grace / takeover idle */
-  readonly settlementWindowMs: number
   /** Post-settle observation window before auto-consume */
   readonly observationWindowMs: number
   readonly foregroundPatienceMs: number

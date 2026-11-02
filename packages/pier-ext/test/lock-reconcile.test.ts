@@ -1,13 +1,13 @@
 /** lock-core (write locks) / reconcile-core (todo↔subagent) / progress-core (badges): pure planners.
- *  Lock tokens: schema-capped keys (^[A-Za-z0-9_-]{1,32}$, ≤16 per report) → key = hash, value = `paneId|path`. */
+ *  Lock beacons: terminal label `pier.lock.<hash>` → value `terminalId|path`. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  acquireTokensFor, bashWriteTargets, findLockHolders, fnv1a64, isLockTokenKey, LOCK_BATCH_LIMIT, LOCK_TOKEN_PREFIX,
+  acquireTokensFor, bashWriteTargets, findLockHolders, fnv1a64, isLockTokenKey, LOCK_TOKEN_PREFIX,
   lockTokenKey, lockTokenValue, normalizeLockPath, parseLockTokenValue, planWriteGuard, releaseTokensFor, WRITE_LOCK_ENV,
   WRITE_TOOLS, writePathsOfTool, type LockAgentView,
 } from '../src/lock-core.ts';
-import { estimateEta, formatProgressSuffix, planToolBadge } from '../src/progress-core.ts';
+import { estimateEta, formatProgressSuffix } from '../src/progress-core.ts';
 import { reconcileTodos } from '../src/reconcile-core.ts';
 import { applyTodoEdits, foldLatestTodosMeta, TODO_EDIT_CUSTOM_TYPE } from '../src/todo-core.ts';
 
@@ -31,13 +31,12 @@ test('normalizeLockPath: separators unified, lowercased, relative → absolute, 
   for (const [input, expected] of cases) assert.equal(normalizeLockPath(input, CWD), expected);
 });
 
-test('lockTokenKey: schema-safe hash key, stable per path, distinct across paths', () => {
+test('lockTokenKey: label-namespaced hash key, stable per path, distinct across paths', () => {
   const key = lockTokenKey('f:/some/long/path/to/a file.cs');
-  assert.match(key, /^[A-Za-z0-9_-]{1,32}$/); assert.ok(key.startsWith(LOCK_TOKEN_PREFIX));
-  assert.equal(isLockTokenKey(key), true); assert.equal(isLockTokenKey('pi-herdr-meta'), false);
-  assert.equal(isLockTokenKey(LOCK_TOKEN_PREFIX), false); assert.equal(lockTokenKey('f:/a.cs'), lockTokenKey('f:/a.cs'), 'all panes must derive one key per path');
+  assert.match(key, /^pier\.lock\.[0-9a-f]{16}$/); assert.ok(key.startsWith(LOCK_TOKEN_PREFIX));
+  assert.equal(isLockTokenKey(key), true); assert.equal(isLockTokenKey('pier.todo'), false);
+  assert.equal(isLockTokenKey(LOCK_TOKEN_PREFIX), false); assert.equal(lockTokenKey('f:/a.cs'), lockTokenKey('f:/a.cs'), 'all terminals must derive one key per path');
   assert.notEqual(lockTokenKey('f:/a.cs'), lockTokenKey('f:/b.cs')); assert.match(fnv1a64('f:/a.cs'), /^[0-9a-f]{16}$/);
-  assert.equal(LOCK_BATCH_LIMIT, 16, 'schema caps every report at 16 token keys');
 });
 
 test('lockTokenValue / parseLockTokenValue: round-trip; malformed value → null', () => {
@@ -87,7 +86,7 @@ test('planWriteGuard: soft mode (default) → warn naming path/holders and both 
   assert.deepEqual(g.holderPaneIds, ['pA']); assert.deepEqual(g.paths, [LOCKED], 'the normalized path is what matches the token');
   assert.match(g.warning, /pA/); assert.match(g.warning, /a\.cs/i);
   assert.match(g.warning, /conflict|locked/i); assert.match(g.warning, /by pane pA /, 'single holder is singular');
-  assert.match(g.warning, /\/locks/, 'human view'); assert.match(g.warning, /herdr agent list/, 'agent-readable view');
+  assert.match(g.warning, /\/locks/, 'human view'); assert.match(g.warning, /hc ls.*pier\.lock\./, 'agent-readable view');
 });
 
 test('planWriteGuard: hard mode → block, reason lists every holder plus the lookup hint', () => {
@@ -96,7 +95,7 @@ test('planWriteGuard: hard mode → block, reason lists every holder plus the lo
   assert.equal(g.kind, 'block');
   if (g.kind !== 'block') return;
   assert.deepEqual(g.holderPaneIds, ['pA', 'pB']); assert.match(g.reason, /panes pA, pB/);
-  assert.match(g.reason, /locked/i); assert.match(g.reason, /herdr agent list/);
+  assert.match(g.reason, /locked/i); assert.match(g.reason, /hc ls.*pier\.lock\./);
 });
 
 test('bashWriteTargets: obvious redirect / tee / sed -i / truncate targets, nothing guessed', () => {
@@ -158,11 +157,6 @@ test('formatProgressSuffix: conservative N/M, eta in <1m / ~Nm / ~Nh buckets, to
   assert.equal(formatProgressSuffix({ completed: 1, total: 9, eta: { remaining: 8, etaMs: 30_000, confidence: 'ok' } }), '1/9 <1m');
   assert.equal(formatProgressSuffix({ completed: 1, total: 9, eta: { remaining: 8, etaMs: 90_000, confidence: 'ok' } }), '1/9 ~2m');
   assert.equal(formatProgressSuffix({ completed: 1, total: 9, eta: { remaining: 8, etaMs: 3_600_000, confidence: 'ok' } }), '1/9 ~1h');
-});
-
-test('planToolBadge: single tool name; first + count; empty → null (title not overwritten)', () => {
-  assert.equal(planToolBadge([]), null); assert.equal(planToolBadge(['bash']), '🔧 bash');
-  assert.equal(planToolBadge(['bash', 'read', 'grep']), '🔧 bash +2');
 });
 
 // reconcile: D is the description a settled subagent reported; `status as never` keeps the tuple table readable.

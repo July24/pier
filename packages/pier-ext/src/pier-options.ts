@@ -2,9 +2,9 @@
  * B10 environment naming. `PIER_*` is the canonical namespace for *pier options* (timeouts, windows,
  * toggles); the historical `PI_HERDR_*` spelling stays accepted as a fallback alias.
  *
- * `PI_HERDR_SUBAGENT`, `PI_HERDR_ROLE_MANIFEST`, `PI_HERDR_TUI`, `PI_HERDR_META_KEY` stay as they are:
- * those are *contracts* handed to the child process by pier itself (or read by pi/herdr), and renaming
- * them would split running workers from their parent.
+ * `PI_HERDR_SUBAGENT`, `PI_HERDR_ROLE_MANIFEST`, `PI_HERDR_TUI` stay as they are: those are
+ * *contracts* handed to the child process by pier itself, and renaming them would split running
+ * workers from their parent.
  *
  * `pierOption()` is the single reader; this registry is also the single source of the numeric
  * bounds/defaults behind `runtimePolicy` (runtime-policy.ts) and the `/pier-config` catalog
@@ -16,7 +16,6 @@ export type PolicyField =
   | 'subagentTimeoutMs'
   | 'gcTickMs'
   | 'pollIntervalMs'
-  | 'settlementWindowMs'
   | 'observationWindowMs'
   | 'foregroundPatienceMs'
   | 'sessionTtlSeconds'
@@ -41,10 +40,9 @@ export const PIER_OPTIONS: readonly OptionSpec[] = [
   { name: 'PIER_GIT_TIMEOUT_MS', legacy: 'PI_HERDR_GIT_TIMEOUT_MS', fallback: '10000', min: 1, policy: 'gitTimeoutMs', description: 'git command timeout (worktree/status batches)' },
   { name: 'PIER_SUBAGENT_TIMEOUT_MS', legacy: 'PI_HERDR_SUBAGENT_TIMEOUT_MS', fallback: '600000', min: 1000, policy: 'subagentTimeoutMs', description: 'subagent inactivity budget before forced termination' },
   { name: 'PIER_READY_TIMEOUT_MS', legacy: 'PI_HERDR_READY_TIMEOUT_MS', fallback: '90000', min: 1000, policy: 'readinessTimeoutMs', description: 'how long to wait for a spawned pane to open its pipe (a dead pane fails fast)' },
-  { name: 'PIER_OBSERVATION_WINDOW_MS', legacy: 'PI_HERDR_OBSERVATION_WINDOW_MS', fallback: '30000', min: 0, policy: 'observationWindowMs', description: 'observation window before a subagent is called settled' },
-  { name: 'PIER_POLL_INTERVAL_MS', legacy: 'PI_HERDR_POLL_INTERVAL_MS', fallback: '30000', min: 1000, policy: 'pollIntervalMs', description: 'subagent poll cadence' },
+  { name: 'PIER_OBSERVATION_WINDOW_MS', legacy: 'PI_HERDR_OBSERVATION_WINDOW_MS', fallback: '4000', min: 0, policy: 'observationWindowMs', description: 'debounce after a subagent turn ends before it is called settled (a new turn cancels it)' },
+  { name: 'PIER_POLL_INTERVAL_MS', legacy: 'PI_HERDR_POLL_INTERVAL_MS', fallback: '30000', min: 1000, policy: 'pollIntervalMs', description: 'safety re-check of a subagent when no core event arrives (events drive settlement)' },
   { name: 'PIER_GC_TICK_MS', legacy: 'PI_HERDR_GC_TICK_MS', fallback: '30000', min: 1000, policy: 'gcTickMs', description: 'idle GC sweep cadence (panes/worktrees)' },
-  { name: 'PIER_SETTLEMENT_WINDOW_MS', legacy: 'PI_HERDR_SETTLEMENT_WINDOW_MS', fallback: '60000', min: 0, policy: 'settlementWindowMs', description: 'settlement notice window / machine-inject grace / takeover idle' },
   { name: 'PIER_FOREGROUND_PATIENCE_MS', legacy: 'PI_HERDR_FOREGROUND_PATIENCE_MS', fallback: '300000', min: 0, policy: 'foregroundPatienceMs', description: 'foreground patience before demoting a subagent to background' },
   { name: 'PIER_SESSION_TTL_SECONDS', legacy: 'PI_HERDR_SESSION_TTL_SECONDS', fallback: '600', min: 0, policy: 'sessionTtlSeconds', description: 'session retention after a subagent exits, before GC' },
   { name: 'PIER_TERMINAL_PROMPT', legacy: 'PI_HERDR_TERMINAL_PROMPT', fallback: '(auto from $SHELL)', description: 'prompt strategy for terminal readiness: bash|zsh|powershell|pwsh' },

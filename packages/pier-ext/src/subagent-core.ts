@@ -25,84 +25,20 @@ export function buildLaunchLine(parts: readonly string[], platform: NodeJS.Platf
   return (win ? '& ' : '') + quoted.join(' ');
 }
 
-/** Shells that mean a freshly split pane is at its prompt and can accept a launch line. */
-const SHELL_PROCESS_NAMES: ReadonlySet<string> = new Set([
-  'sh', 'bash', 'zsh', 'fish', 'dash', 'ksh', 'mksh', 'tcsh', 'csh', 'nu', 'login',
-  'pwsh', 'powershell', 'cmd',
-]);
+/** Tab name of the master's own tab: a worker placed there joins the master terminal's tab. */
+export const MAIN_TAB_NAME = 'main';
 
-/** Normalize `name` / `argv0` (`/bin/zsh`, `C:\\Windows\\System32\\cmd.exe`, `-zsh`) to a shell key. */
-export function shellProcessName(value: string | null | undefined): string {
-  const base = String(value ?? '').replace(/\\/g, '/').split('/').pop()?.toLowerCase() ?? '';
-  const stripped = base.replace(/^-/, '').replace(/\.exe$/, '');
-  return stripped;
-}
-
-/**
- * Decide whether a pane's foreground set means its shell is ready for input. `null`/`undefined`
- * means the probe was unavailable: return ready so an older herdr never adds spawn latency.
- * An empty set is not proof (the shell may still be starting), so callers wait for the timeout.
- */
-export function planShellReady(
-  foreground: ReadonlyArray<{ name?: string | null; argv0?: string | null }> | null | undefined,
-): 'ready' | 'wait' {
-  if (foreground == null) return 'ready';
-  if (foreground.length === 0) return 'wait';
-  return foreground.some((p) => SHELL_PROCESS_NAMES.has(shellProcessName(p.name)) || SHELL_PROCESS_NAMES.has(shellProcessName(p.argv0)))
-    ? 'ready'
-    : 'wait';
-}
-
-/** Flags pier passes at spawn (buildLaunchParts) that a herdr 0.9.2+ resume command must replay. */
-const RESUME_FLAG_ARITY: Record<string, number> = {
-  '-a': 0,
-  '-e': 1,
-  '--extension': 1,
-  '--tui-mode': 1,
-  '--provider': 1,
-  '--model': 1,
-  '--session': 1,
-};
-
-const RESUME_MAX_ARGS = 64;
-const RESUME_MAX_BYTES = 8 * 1024;
-
-/**
- * herdr 0.9.2 self-report (docs "Add Herdr support to your agent"): rebuild this worker's launch
- * line as a `resume_argv` herdr runs after a server restart. The worker's own process.argv is the
- * source of truth — interpreter and cli.js paths are dropped, whitelisted spawn flags are mirrored
- * (`--flag=value` splits), argv[0] becomes a plain PATH command name. herdr rules: argv[0] plain,
- * no apostrophes/control characters, ≤64 args, ≤8 KiB; violations (or a missing `-e`, which could
- * not restore the extension) return null and the caller skips the report — restore stays best-effort.
- */
-export function buildResumeArgv(workerArgv: readonly string[], piBin = 'pi'): string[] | null {
-  if (!/^[A-Za-z0-9._-]+$/.test(piBin)) return null;
-  const collected: string[] = [];
-  let index = 0;
-  // Skip interpreter + cli script (everything before the first flag).
-  while (index < workerArgv.length && !workerArgv[index]!.startsWith('-')) index++;
-  for (; index < workerArgv.length; index++) {
-    const raw = workerArgv[index]!;
-    if (!raw.startsWith('-')) continue; // positional (unknown flag's value) — not pier spawn shape
-    const eq = raw.indexOf('=');
-    const flag = eq > 0 ? raw.slice(0, eq) : raw;
-    const inlineValue = eq > 0 ? raw.slice(eq + 1) : null;
-    const arity = RESUME_FLAG_ARITY[flag];
-    if (arity === undefined) continue; // pi-internal flags are not replayed
-    if (arity === 0) {
-      collected.push(flag);
-    } else if (inlineValue !== null) {
-      collected.push(flag, inlineValue);
-    } else if (index + 1 < workerArgv.length) {
-      collected.push(flag, workerArgv[++index]!);
-    }
+/** App tab addresses must be stable across spawns (a named tab is joined, not recreated) and ASCII. */
+function tabIdFor(name: string): string {
+  const slug = String(name ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24);
+  if (slug) return `tbpier-${slug}`;
+  // Non-ASCII task names (CJK descriptions) sanitize to nothing: the hash keeps the id stable.
+  let hash = 0x811c9dc5;
+  for (const ch of String(name)) {
+    hash ^= ch.codePointAt(0)!;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
   }
-  if (!collected.some((f, i) => (f === '-e' || f === '--extension') && i + 1 < collected.length)) return null;
-  const argv = [piBin, ...collected];
-  if (argv.length > RESUME_MAX_ARGS) return null;
-  if (argv.some((a) => /['\u0000-\u001f\u007f]/.test(a))) return null;
-  if (argv.reduce((sum, a) => sum + a.length + 1, 0) > RESUME_MAX_BYTES) return null;
-  return argv;
+  return `tbpier-${hash.toString(16).padStart(8, '0')}`;
 }
 
 /**
@@ -191,7 +127,7 @@ export interface AliveProbe {
   paneExists: boolean;
   agentStatus: string | null;
   lastActivityMs: number | null;
-  /** Herdr 0.9.1: foreground working directory of the PTY process. */
+  /** Foreground working directory of the terminal's program. */
   foregroundCwd?: string | null;
 }
 
@@ -251,7 +187,7 @@ export function buildBlockedGateNotice(opts: { paneId: string; description: stri
     `Subagent "${description}" is BLOCKED waiting for a HUMAN decision in pane ${paneId}${q}.`,
     'It keeps running in background; once the human answers it resumes, and you will be notified when it settles.',
     'Do NOT take over its work and do NOT answer on the human\'s behalf.',
-    'Tell the user to open that pane in herdr and answer directly.',
+    'Tell the user to open that terminal in the Herdr app and answer directly.',
     'Only if the user explicitly authorizes you: relay their decision to the subagent via subagent(action: "send") — do not redo the work yourself.',
   ].join(' ');
 }
@@ -278,10 +214,8 @@ export interface SubEntry {
   launchCommand: string[];
   createdAt: number;
   revivedFrom?: string | null;
-  /** D94: the human took the pane over; observation window judges when to hand control back. */
-  userTakeover?: boolean;
+  /** Observation window start (poller state): settlement waits until the transcript settles. */
   observationStartedAt?: number | null;
-  lastAgentStatus?: string | null;
   /** The final report `subagent output` already returned (tail fingerprint + time): the settlement
    *  notice then points at that delivery instead of repeating the report. Durable across resume. */
   reportDelivered?: { fingerprint: string; at: number } | null;
@@ -392,9 +326,7 @@ export function foldSubsRegistry(entries: ReadonlyArray<{ type?: string; customT
         launchCommand: Array.isArray(s.launchCommand) ? s.launchCommand : [],
         createdAt: typeof s.createdAt === 'number' ? s.createdAt : 0,
         revivedFrom: typeof s.revivedFrom === 'string' ? s.revivedFrom : null,
-        userTakeover: s.userTakeover === true ? true : undefined,
         observationStartedAt: typeof s.observationStartedAt === 'number' ? s.observationStartedAt : null,
-        lastAgentStatus: typeof s.lastAgentStatus === 'string' ? s.lastAgentStatus : null,
         isolate: s.isolate && typeof s.isolate === 'object'
           && typeof s.isolate.worktreePath === 'string' && typeof s.isolate.branch === 'string'
           && typeof s.isolate.baseSha === 'string'
@@ -485,20 +417,10 @@ export function tabNameForTask(description: string): string {
   return truncated || 'task';
 }
 
-export function nextTaskTabName(base: string, existingNames: ReadonlySet<string>): string {
-  let name = base;
-  let n = 2;
-  while (existingNames.has(name)) {
-    const suffix = `-${n}`;
-    name = base.slice(0, TAB_NAME_MAX - suffix.length) + suffix;
-    n++;
-  }
-  return name;
-}
-
 export interface TabPlacementPlan {
-  mode: 'append' | 'new';
+  /** Display name of the task tab; `main` when the worker shares the master's tab. */
   tabName: string;
+  /** Address for the `herdr.tab` label; null = join the master terminal's tab. */
   tabId: string | null;
 }
 
@@ -530,33 +452,24 @@ export function classifyWorktreeZone(opts: {
   return { zone: 'main', tabName: null };
 }
 
-/** Explicit `tab` wins; otherwise D86 zone decides, and an unknown zone falls back to the description. */
+/** Explicit `tab` and a worktree zone get their own app tab (the id is stable per name, so repeat
+ *  spawns join instead of piling up tabs); a worker in the master's checkout joins the master tab. */
 export function planTabPlacement(opts: {
   desiredTab?: string | null;
   description: string;
-  knownTabs: ReadonlyArray<{ tabName: string; tabId: string }>;
   zone?: WorktreeZone;
-  mainTabId?: string | null;
 }): TabPlacementPlan {
-  const known = new Map<string, string>();
-  for (const t of opts.knownTabs) if (t?.tabName && t?.tabId) known.set(t.tabName, t.tabId);
-  if (opts.desiredTab != null && String(opts.desiredTab).trim() !== '') {
-    const tabName = tabNameForTask(String(opts.desiredTab));
-    const tabId = known.get(tabName) ?? null;
-    return tabId ? { mode: 'append', tabName, tabId } : { mode: 'new', tabName, tabId: null };
-  }
+  const desired = opts.desiredTab != null ? String(opts.desiredTab).replace(/\s+/g, ' ').trim() : '';
+  if (desired) return placementFor(tabNameForTask(desired));
   const zone = opts.zone;
-  if (zone?.zone === 'main' && opts.mainTabId) {
-    return { mode: 'append', tabName: 'main', tabId: opts.mainTabId };
-  }
-  if (zone?.zone === 'worktree' && zone.tabName) {
-    const base = zone.tabName;
-    const existing = [...known.keys()].find((k) => k.toLowerCase() === base.toLowerCase());
-    if (existing) return { mode: 'append', tabName: existing, tabId: known.get(existing)! };
-    return { mode: 'new', tabName: nextTaskTabName(base, new Set(known.keys())), tabId: null };
-  }
-  const base = tabNameForTask(opts.description);
-  return { mode: 'new', tabName: nextTaskTabName(base, new Set(known.keys())), tabId: null };
+  if (zone?.zone === 'worktree' && zone.tabName) return placementFor(tabNameForTask(zone.tabName));
+  if (zone?.zone === 'main') return { tabName: MAIN_TAB_NAME, tabId: null };
+  return placementFor(tabNameForTask(opts.description));
+}
+
+function placementFor(tabName: string): TabPlacementPlan {
+  if (tabName.toLowerCase() === MAIN_TAB_NAME) return { tabName: MAIN_TAB_NAME, tabId: null };
+  return { tabName, tabId: tabIdFor(tabName) };
 }
 
 /** D97: fullscreen is what makes the pane a static frame the master can read. */
@@ -689,10 +602,10 @@ export function planLaunchValidation(
     allowed_tools?: unknown;
     tab?: unknown;
   } | null | undefined,
-  herdrAvailable: boolean,
+  available: boolean,
 ): LaunchValidation {
-  if (!herdrAvailable) {
-    return { kind: 'error', text: 'Error: subagent requires pi to run inside a herdr-managed pane (HERDR_ENV not set).' };
+  if (!available) {
+    return { kind: 'error', text: 'Error: subagent requires pi to run inside a herdr-core terminal (HC_TERMINAL_ID not set).' };
   }
   const spec: SubagentSpec = {
     description: String(params?.description ?? 'subagent'),
@@ -730,13 +643,14 @@ export type ForegroundTickPlan =
   | { kind: 'collect-final' }
   | { kind: 'continue' };
 
-/** One foreground-wait iteration: only a human gate or finalized text ends the wait. */
+/** One foreground-wait iteration: only a human gate or finalized text ends the wait. `error` is a
+ *  terminal program state like `done`: the transcript decides whether text came out. */
 export function planForegroundTick(input: {
   state: string | null;
   session: { text: string | null; pendingTool: boolean; activity: boolean };
 }): ForegroundTickPlan {
   if (input.state === 'blocked') return { kind: 'blocked' };
-  if (input.state !== 'idle' && input.state !== 'done') return { kind: 'continue' };
+  if (input.state !== 'idle' && input.state !== 'done' && input.state !== 'error') return { kind: 'continue' };
   if (input.session.text) return { kind: 'settled', text: input.session.text };
   if (input.session.pendingTool || !input.session.activity) return { kind: 'wait', delayMs: FOREGROUND_POLL_MS };
   return { kind: 'collect-final' };

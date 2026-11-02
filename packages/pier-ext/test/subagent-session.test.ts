@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { AgentInfo, HerdrClientLike } from '../src/herdr-client.ts';
+import type { CoreClientLike } from '../src/core-client.ts';
 import { SUBS_CUSTOM_TYPE, type SubEntry } from '../src/subagent-core.ts';
 import { sessionDirName } from '../src/session-tail.ts';
 import {
@@ -15,7 +15,8 @@ import {
 import { appendHistory } from '../src/history-store.ts';
 import { preferredHistoryFile } from '../src/storage-layout.ts';
 import {
-  TempHome, fakeHerdr, fire, jsonl, mountSubagent, runSubagent, runSubagentRejects, subsSnapshot, subEntry, transcriptMessage,
+  TempHome, fakeCore, fire, jsonl, mountSubagent, runSubagent, runSubagentRejects, subsSnapshot, subEntry, terminalInfo,
+  transcriptMessage,
   type FakePi,
 } from './test-utils.ts';
 
@@ -23,9 +24,21 @@ const TS = 1_800_000_000_000;
 const sessions = () => mkdtempSync(join(tmpdir(), 'pier-session-'));
 const NO_STATE = { text: null, pendingTool: false, activity: false, turnEnded: false, compacting: false };
 
-/** SessionIo over a scripted herdr report; `sessionsDir` is where candidate files are scanned. */
+/** Terminal id used by the single-worker session fixtures. */
+const PANE = 'tW';
+
+/** CoreClientLike whose terminals carry `pier.session` labels — the worker's only session report. */
+const sessionClient = (sessionsByPane: Record<string, string>): CoreClientLike => fakeCore({
+  listTerminals: async () => Object.entries(sessionsByPane)
+    .map(([id, file]) => terminalInfo({ id, labels: { 'pier.session': file } })),
+  getTerminal: async (id) => (sessionsByPane[id]
+    ? terminalInfo({ id, labels: { 'pier.session': sessionsByPane[id]! } })
+    : null),
+});
+
+/** SessionIo over a scripted `pier.session` label; `sessionsDir` is where candidate files are scanned. */
 const io = (reported: string | null, sessionsDir: string, ownSession = '') => createSessionIo({
-  client: fakeHerdr({ getAgentSessionPath: async () => reported }),
+  client: sessionClient(reported ? { [PANE]: reported } : {}),
   getSessionId: () => ownSession,
   sessionsDir: () => sessionsDir,
 });
@@ -36,7 +49,7 @@ const writeSession = (file: string, lines: unknown[], append = false): void => {
 
 test('subSessionState: a reported but not-yet-created session file is skipped, not fatal', async () => {
   const dir = sessions();
-  const state = await io(join(dir, 'not-created-yet.jsonl'), dir).subSessionState('wC:p4', dir, Date.now());
+  const state = await io(join(dir, 'not-created-yet.jsonl'), dir).subSessionState(PANE, dir, Date.now());
   assert.deepEqual(state, NO_STATE);
 });
 
@@ -44,7 +57,7 @@ test('subSessionState: a readable session with terminal text settles', async () 
   const dir = sessions();
   const file = join(dir, 'child.jsonl');
   writeSession(file, [transcriptMessage('assistant', 'ok', TS + 10)]);
-  assert.deepEqual(await io(file, dir).subSessionState('wC:p4', dir, TS), { ...NO_STATE, text: 'ok', activity: true, turnEnded: true });
+  assert.deepEqual(await io(file, dir).subSessionState(PANE, dir, TS), { ...NO_STATE, text: 'ok', activity: true, turnEnded: true });
 });
 
 test('subSessionState: between tool calls the turn has NOT ended', async () => {
@@ -55,7 +68,7 @@ test('subSessionState: between tool calls the turn has NOT ended', async () => {
     { type: 'message', message: { role: 'assistant', content: [{ type: 'toolCall' }], timestamp: TS + 10, stopReason: 'toolUse' } },
     transcriptMessage('toolResult', 'ok', TS + 20),
   ]);
-  assert.deepEqual(await io(file, dir).subSessionState('wC:p4', dir, TS), { ...NO_STATE, activity: true });
+  assert.deepEqual(await io(file, dir).subSessionState(PANE, dir, TS), { ...NO_STATE, activity: true });
 });
 
 test('subSessionState: cache invalidates on append (a stale hit would hang pendingTool forever)', async () => {
@@ -63,9 +76,9 @@ test('subSessionState: cache invalidates on append (a stale hit would hang pendi
   const file = join(dir, 'child-growing.jsonl');
   writeSession(file, [{ type: 'message', message: { role: 'assistant', content: [{ type: 'toolCall' }], timestamp: TS + 10, stopReason: 'toolUse' } }]);
   const session = io(file, dir);
-  assert.deepEqual(await session.subSessionState('wC:p4', dir, TS), { ...NO_STATE, pendingTool: true, activity: true });
+  assert.deepEqual(await session.subSessionState(PANE, dir, TS), { ...NO_STATE, pendingTool: true, activity: true });
   writeSession(file, [transcriptMessage('assistant', 'finished', TS + 20)], true);
-  assert.deepEqual(await session.subSessionState('wC:p4', dir, TS), { ...NO_STATE, text: 'finished', activity: true, turnEnded: true });
+  assert.deepEqual(await session.subSessionState(PANE, dir, TS), { ...NO_STATE, text: 'finished', activity: true, turnEnded: true });
 });
 
 test('collectFinalText: a cached null must not stick after the session gains closing text', async () => {
@@ -73,23 +86,27 @@ test('collectFinalText: a cached null must not stick after the session gains clo
   const file = join(dir, 'child-late-text.jsonl');
   writeSession(file, [{ type: 'message', message: { role: 'assistant', content: [{ type: 'toolCall' }], timestamp: TS + 10, stopReason: 'toolUse' } }]);
   const session = io(file, dir);
-  assert.equal(await session.collectFinalText('wC:p4', dir, TS, 1), null);
+  assert.equal(await session.collectFinalText(PANE, dir, TS, 1), null);
   writeSession(file, [transcriptMessage('assistant', 'late result', TS + 30)], true);
-  assert.equal(await session.collectFinalText('wC:p4', dir, TS, 1), 'late result');
+  assert.equal(await session.collectFinalText(PANE, dir, TS, 1), 'late result');
 });
 
-test('probeAlive: pane.list decides liveness; an unknown shell is alive and agent.list cannot resurrect a miss', async () => {
+test('probeAlive: the terminal record decides liveness; a finished terminal is gone', async () => {
   const dir = sessions();
-  const ioFor = (over: Partial<HerdrClientLike>) => createSessionIo({ client: fakeHerdr(over), getSessionId: () => '', sessionsDir: () => dir });
+  const ioFor = (over: Partial<CoreClientLike>) => createSessionIo({ client: fakeCore(over), getSessionId: () => '', sessionsDir: () => dir });
   const probe = await ioFor({
-    listPanes: async () => [{ paneId: 'wH:p3', tabId: 'wH:t1', workspaceId: 'wH', agentStatus: 'unknown', foregroundCwd: '/tmp/work' }],
-  }).probeAlive('wH:p3', dir);
+    getTerminal: async (id) => terminalInfo({
+      id, status: 'unknown', foreground: { pid: 7, name: 'zsh', argv: ['zsh'], cwd: '/tmp/work' },
+    }),
+  }).probeAlive('tH3', dir);
   assert.equal(probe.paneExists, true);
   assert.equal(probe.agentStatus, 'unknown');
   assert.equal(probe.foregroundCwd, '/tmp/work');
 
-  const gone = ioFor({ listAgents: async () => [agentInfo({ paneId: 'wH:p3' })] });
-  assert.equal((await gone.probeAlive('wH:p3', dir)).paneExists, false);
+  const gone = ioFor({ getTerminal: async (id) => terminalInfo({ id, state: 'finished' }) });
+  assert.equal((await gone.probeAlive('tH3', dir)).paneExists, false, 'a finished terminal is not alive');
+  const missing = ioFor({});
+  assert.equal((await missing.probeAlive('tH3', dir)).paneExists, false);
 });
 
 /* ── candidate resolution: own/taken sessions are never adopted ─── */
@@ -109,11 +126,8 @@ function projectSessions(prefix: string) {
 }
 
 const MASTER_ID = '01a0bd3a-c2e5-7569-8d2c-aea4d82630cd';
-const agentInfo = (over: Partial<AgentInfo>): AgentInfo => ({
-  paneId: 'pWorker', agent: 'pi', status: 'working', session: null, stateLabels: {}, tokens: {}, ...over,
-});
 
-test('resolveSessionFile: the master transcript and sessions claimed by other panes are excluded', async () => {
+test('resolveSessionFile: the master transcript and sessions claimed by other terminals are excluded', async () => {
   const { home, cwd, file, sessionsDir } = projectSessions('pier-session-own-');
   const master = file('2026-09-20T05-12-19-942Z_01a0bd3a-c2e5-7569-8d2c-aea4d82630cd.jsonl');
   const stale = file('2026-09-20T05-05-04-206Z_01a0bd34-1ccd-73e1-a93f-e57e7f124d49.jsonl');
@@ -123,41 +137,44 @@ test('resolveSessionFile: the master transcript and sessions claimed by other pa
   utimesSync(stale, 2_000, 2_000);
   utimesSync(master, 3_000, 3_000);
 
-  const ioFor = (client: Partial<HerdrClientLike> = {}) =>
-    createSessionIo({ client: fakeHerdr(client), getSessionId: () => MASTER_ID, sessionsDir: () => sessionsDir });
-  assert.equal(await ioFor().resolveSessionFile('wA:p25', cwd), stale);
-
-  // herdr's report itself points at the master's file; another pane claims a bare id.
-  const reported = ioFor({
-    getAgentSessionPath: async () => master,
-    listAgents: async () => [
-      agentInfo({ paneId: 'wA:p1F', status: 'idle', session: master }),
-      agentInfo({ paneId: 'wA:p24', status: 'idle', session: '01a0bd34-1ccd-73e1-a93f-e57e7f124d49' }),
-    ],
+  const ioFor = (labels: Record<string, string> = {}) => createSessionIo({
+    client: sessionClient(labels), getSessionId: () => MASTER_ID, sessionsDir: () => sessionsDir,
   });
-  assert.equal(await reported.resolveSessionFile('wA:p25', cwd), sub, 'own and taken reports (paths or bare ids) are rejected');
+  assert.equal(await ioFor().resolveSessionFile('tW', cwd), stale);
+
+  // The worker's own label points at the master's file; another terminal claims a bare id.
+  const reported = ioFor({
+    'tW': master,
+    'tOther': master,
+    'tBare': '01a0bd34-1ccd-73e1-a93f-e57e7f124d49',
+  });
+  assert.equal(
+    await reported.resolveSessionFile('tW', cwd),
+    sub,
+    'own and taken labels (paths or bare ids) are rejected',
+  );
   home.dispose();
 });
 
-test('resolveSessionFile: own report returned as-is; the pipe self-report outranks a lagging herdr report', async () => {
+test('resolveSessionFile: the own label wins over the mtime order; a pipe self-report outranks a lagging label', async () => {
   const { home, cwd, file, sessionsDir } = projectSessions('pier-session-pref-');
   const sub = file('2026-09-20T05-21-01-111Z_11111111-2222-3333-4444-555555555555.jsonl');
   const preferred = file('2026-09-20T05-14-07-064Z_01a0bd3c-6557-746b-adf6-5128f2326c57.jsonl');
   const reported = file('2026-09-20T05-05-04-206Z_01a0bd34-1ccd-73e1-a93f-e57e7f124d49.jsonl');
   utimesSync(preferred, 1_000, 1_000);
   utimesSync(reported, 2_000, 2_000);
-  const ioFor = (agents: AgentInfo[] = []) => createSessionIo({
-    client: fakeHerdr({ getAgentSessionPath: async () => reported, listAgents: async () => agents }),
+  const ioFor = (labels: Record<string, string> = {}) => createSessionIo({
+    client: sessionClient(labels),
     getSessionId: () => '22222222-2222-3333-4444-555555555555',
     sessionsDir: () => sessionsDir,
   });
   assert.equal(
-    await ioFor([agentInfo({ paneId: 'wA:p25', status: 'working', session: sub })]).resolveSessionFile('wA:p25', cwd),
+    await ioFor({ 'tW': sub }).resolveSessionFile('tW', cwd),
     sub,
-    'a report naming the pane\'s own session wins',
+    'the worker\'s own `pier.session` label wins',
   );
-  assert.equal(await ioFor().resolveSessionFile('wA:p24', cwd, preferred), preferred, 'a pipe self-report wins over the lagging report');
-  assert.equal(await ioFor().resolveSessionFile('wA:p24', cwd), reported, 'without a self-report the old order holds');
+  assert.equal(await ioFor().resolveSessionFile('tOther', cwd, preferred), preferred, 'a pipe self-report wins over the lagging label');
+  assert.equal(await ioFor({ 'tOther': reported }).resolveSessionFile('tOther', cwd), reported, 'without a self-report the label order holds');
   home.dispose();
 });
 
@@ -165,13 +182,13 @@ test('readSettleTail: last assistant text of any stopReason, bounded to maxChars
   const { home, cwd, file, sessionsDir } = projectSessions('pier-session-tail-');
   const f = file('2026-09-20T05-30-00-000Z_33333333-3333-4444-5555-666666666666.jsonl');
   writeSession(f, [{ type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: '阶段性输出，未定稿'.repeat(200) }], timestamp: Date.now(), stopReason: 'toolUse' } }]);
-  const session = createSessionIo({ client: fakeHerdr({ getAgentSessionPath: async () => f }), getSessionId: () => '', sessionsDir: () => sessionsDir });
-  const tail = await session.readSettleTail('wA:p24', cwd);
+  const session = createSessionIo({ client: sessionClient({ 'tTail': f }), getSessionId: () => '', sessionsDir: () => sessionsDir });
+  const tail = await session.readSettleTail('tTail', cwd);
   assert.ok(tail && tail.length <= 1200 && tail.includes('阶段性输出'), String(tail?.length));
   home.dispose();
 });
 
-test('reattributeStaleSessionFile: repairs a stale or poisoned value from herdr, never guesses', async () => {
+test('reattributeStaleSessionFile: repairs a stale or poisoned value from the worker label, never guesses', async () => {
   const agentDir = mkdtempSync(join(tmpdir(), 'pier-session-reattr-'));
   const file = (name: string): string => {
     const path = join(agentDir, name);
@@ -185,15 +202,12 @@ test('reattributeStaleSessionFile: repairs a stale or poisoned value from herdr,
   utimesSync(stalePreferred, new Date(Date.now() - 3_600_000), new Date(Date.now() - 3_600_000));
 
   const ioFor = (reported: string) => createSessionIo({
-    client: fakeHerdr({
-      listAgents: async () => [agentInfo({ paneId: 'wA:pStale', session: reported }), agentInfo({ paneId: 'wA:pOther', session: takenFile })],
-      getAgentSessionPath: async () => reported,
-    }),
+    client: sessionClient({ 'tStale': reported, 'tOther': takenFile }),
     getSessionId: () => ownFile,
     sessionsDir: () => agentDir,
   });
   const reattribute = (reported: string, preferred: string | null) =>
-    ioFor(reported).reattributeStaleSessionFile('wA:pStale', '/tmp/proj', Date.now(), preferred);
+    ioFor(reported).reattributeStaleSessionFile('tStale', '/tmp/proj', Date.now(), preferred);
 
   assert.equal(
     await reattribute(ownFile, stalePreferred),
@@ -275,14 +289,15 @@ test('computeSubagentOutputDelta: ambiguous tails, partial scrolls and clears re
 });
 
 test('resolveSubagentStatus: blocked > working > settled > idle, running as the default', () => {
-  assert.equal(resolveSubagentStatus({ localStatus: 'running', herdrStatus: 'blocked' }), 'blocked');
-  assert.equal(resolveSubagentStatus({ localStatus: 'running', hasAskFlag: true }), 'blocked');
-  assert.equal(resolveSubagentStatus({ localStatus: 'running', herdrStatus: 'working' }), 'running');
-  assert.equal(resolveSubagentStatus({ localStatus: 'settled', herdrStatus: 'idle' }), 'settled');
-  assert.equal(resolveSubagentStatus({ localStatus: 'closed', herdrStatus: 'idle' }), 'settled');
-  assert.equal(resolveSubagentStatus({ localStatus: 'running', herdrStatus: 'done' }), 'settled');
-  assert.equal(resolveSubagentStatus({ localStatus: 'running', herdrStatus: 'idle' }), 'idle');
-  assert.equal(resolveSubagentStatus({ localStatus: 'running', herdrStatus: null }), 'running');
+  assert.equal(resolveSubagentStatus({ localStatus: 'running', status: 'blocked' }), 'blocked');
+  assert.equal(resolveSubagentStatus({ localStatus: 'running', status: 'working' }), 'running');
+  assert.equal(resolveSubagentStatus({ localStatus: 'settled', status: 'idle' }), 'settled');
+  assert.equal(resolveSubagentStatus({ localStatus: 'closed', status: 'idle' }), 'settled');
+  assert.equal(resolveSubagentStatus({ localStatus: 'running', status: 'done' }), 'settled');
+  assert.equal(resolveSubagentStatus({ localStatus: 'running', status: 'error' }), 'settled', 'an error terminal ended its turn');
+  assert.equal(resolveSubagentStatus({ localStatus: 'running', status: 'idle' }), 'idle');
+  assert.equal(resolveSubagentStatus({ localStatus: 'running', status: 'unknown' }), 'running');
+  assert.equal(resolveSubagentStatus({ localStatus: 'running', status: null }), 'running');
 });
 
 test('formatSubagentOutput: header, body, empty-delta notice and flags', () => {
@@ -309,17 +324,17 @@ test('formatSubagentOutput: header, body, empty-delta notice and flags', () => {
 const worker = (paneId: string, status: SubEntry['status'] = 'running') =>
   subEntry({ paneId, taskId: `task-${paneId}`, tabId: 't1', tabName: 'worker', status });
 
-/** A throwing pane.list stands the zombie sweep and the settlement-watch recovery down, so neither
- * can rewrite a seeded row mid-test (no poller is armed to consume it). */
-const NO_PANES = { listPanes: async (): Promise<never> => { throw new Error('pane.list unavailable in this fixture'); } };
+/** A throwing terminal list stands the zombie sweep and the settlement-watch recovery down, so
+ * neither can rewrite a seeded row mid-test (no poller is armed to consume it). */
+const NO_TERMINALS = { listTerminals: async (): Promise<never> => { throw new Error('terminal.list unavailable in this fixture'); } };
 
-/** Mounts the plugin over a scripted herdr client with one seeded worker row, then disposes it. */
+/** Mounts the plugin over a scripted core client with one seeded worker row, then disposes it. */
 async function withWorker(
   body: (pi: FakePi) => Promise<void>,
-  client: Partial<HerdrClientLike> = {},
+  client: Partial<CoreClientLike> = {},
   status: SubEntry['status'] = 'running',
 ): Promise<void> {
-  const { root, pi } = await mountSubagent({ client: { ...NO_PANES, ...client }, subs: [worker('pWorker', status)] });
+  const { root, pi } = await mountSubagent({ client: { ...NO_TERMINALS, ...client }, subs: [worker('pWorker', status)] });
   try {
     await body(pi);
   } finally {
@@ -327,10 +342,10 @@ async function withWorker(
   }
 }
 
-/** The worker pane's agent report plus the buffer `agent.read` answers with. */
-const outputPane = (text: () => string, over: Partial<AgentInfo> = {}) => ({
-  listAgents: async () => [agentInfo(over)],
-  readAgent: async () => ({ text: text(), revision: 1, truncated: false }),
+/** The worker terminal's status plus the buffer `terminal.read` answers with. */
+const outputPane = (text: () => string, over: Partial<Parameters<typeof terminalInfo>[0]> = {}) => ({
+  getTerminal: async (id: string) => terminalInfo({ id, ...over }),
+  read: async () => ({ text: text(), complete: true }),
 });
 
 test('output action: missing and unknown ids fail with actionable messages', async () => {
@@ -355,19 +370,14 @@ test('output action: incremental reads return only the delta since the last call
   }, outputPane(() => output));
 });
 
-test('output action: older herdr without agent.read still observes through pane.read', async () => {
-  let readPaneCalled = false;
+test('output action: an incomplete terminal read is reported as truncated', async () => {
   await withWorker(async (pi) => {
     const res = await runSubagent(pi, { action: 'output', agentId: 'pWorker' });
-    assert.equal(readPaneCalled, true);
-    assert.match(res.content[0]!.text, /fallback text from readPane/);
+    assert.match(res.content[0]!.text, /partial screen/);
+    assert.equal(res.details!.truncated, true);
   }, {
     ...outputPane(() => ''),
-    readAgent: async () => { throw new Error('unknown method: agent.read'); },
-    readPane: async () => {
-      readPaneCalled = true;
-      return { text: 'fallback text from readPane\n', revision: 0, truncated: false };
-    },
+    read: async () => ({ text: 'partial screen\n', complete: false }),
   });
 });
 
@@ -376,7 +386,7 @@ test('output action: a human gate is reported with its question', async () => {
     const res = await runSubagent(pi, { action: 'output', agentId: 'pWorker' });
     assert.equal(res.details!.status, 'blocked');
     assert.match(res.content[0]!.text, /status: blocked \(question: "Should we delete existing tables\?"\)/);
-  }, outputPane(() => 'waiting\n', { status: 'blocked', tokens: { 'pi-ask': 'Should we delete existing tables?' } }));
+  }, outputPane(() => 'waiting\n', { status: 'blocked', statusMsg: 'Should we delete existing tables?' }));
 });
 
 test('output action: a settled row reports settled even while the pane is idle', async () => {
@@ -405,7 +415,7 @@ test('output action: an idle pane showing only its overlay still surfaces the tr
     assert.equal(second.details!.deltaLength, 0);
     assert.equal(second.details!.reportDelivered, false, 'an unchanged report is not re-delivered');
     assert.doesNotMatch(second.content[0]!.text, /Subagent Report/);
-  }, outputPane(() => 'todo: 0▶ 0○ 0■ 7✓\n   +3 hidden (7✓) · /todos\n', { status: 'idle', session: report }));
+  }, outputPane(() => 'todo: 0▶ 0○ 0■ 7✓\n   +3 hidden (7✓) · /todos\n', { status: 'idle', labels: { 'pier.session': report } }));
   home.dispose();
 });
 
@@ -457,7 +467,7 @@ test('output action: the transcript report replaces the pane copy and the delive
     assert.match(text, /`_source\.region` stays/, 'the complete transcript text, not the cut pane line');
     const row = subsSnapshot(pi)?.subs.find((s) => s.paneId === 'pWorker');
     assert.equal(row?.reportDelivered?.fingerprint, TRANSCRIPT_REPORT.slice(-64), 'the delivery survives a resume');
-  }, outputPane(() => RENDERED_PANE, { status: 'idle', session }));
+  }, outputPane(() => RENDERED_PANE, { status: 'idle', labels: { 'pier.session': session } }));
   home.dispose();
 });
 
@@ -474,15 +484,16 @@ test('resume: a ledger row pointing at the master session is refused; another pa
   writeFileSync(otherFile, '{}\n');
 
   const { root, pi } = await mountSubagent({
+    env: { terminalId: 'p0' },
     client: {
-      listPanes: async () => [
-        { paneId: 'p0', tabId: 't0', workspaceId: 'w1', agentStatus: 'idle' },
-        { paneId: 'p2', tabId: 't0', workspaceId: 'w1', agentStatus: 'idle' },
+      listTerminals: async () => [
+        terminalInfo({ id: 'p0', labels: { 'pier.session': masterFile } }),
+        terminalInfo({ id: 'p2', labels: { 'pier.session': otherFile } }),
       ],
-      listAgents: async () => [
-        agentInfo({ paneId: 'p0', status: 'idle', session: masterFile }),
-        agentInfo({ paneId: 'p2', status: 'idle', session: otherFile }),
-      ],
+      getTerminal: async (id) => terminalInfo({
+        id,
+        labels: { 'pier.session': id === 'p0' ? masterFile : otherFile },
+      }),
     },
   });
   try {
@@ -516,7 +527,7 @@ test('applyReplySession: a bare session id self-report repairs a poisoned sessio
   writeFileSync(poisoned, '{}\n');
 
   const { root, pi, port } = await mountSubagent({
-    client: { getAgentSessionPath: async () => realFile },
+    client: { getTerminal: async (id) => terminalInfo({ id, labels: { 'pier.session': realFile } }) },
     deps: { getSessionId: () => '99999999-9999-4999-8999-999999999999' },
   });
   try {
@@ -547,10 +558,8 @@ test('session recovery: a still-running subagent gets its settlement watch re-ar
   const notices: string[] = [];
   const { root, pi } = await mountSubagent({
     client: {
-      listPanes: async () => [{ paneId: 'pAlive', tabId: 't0', workspaceId: 'w1', agentStatus: 'idle' }],
-      listAgents: async () => [agentInfo({ paneId: 'pAlive', status: 'idle', session: workerFile })],
-      waitAgent: async () => 'idle',
-      getAgentSessionPath: async () => workerFile,
+      listTerminals: async () => [terminalInfo({ id: 'pAlive', status: 'idle', labels: { 'pier.session': workerFile } })],
+      getTerminal: async (id) => terminalInfo({ id, status: 'idle', labels: { 'pier.session': workerFile } }),
     },
     deps: {
       getSessionId: () => 'bbbb2222-3333-4444-8555-666666666666',

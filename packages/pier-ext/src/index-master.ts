@@ -10,7 +10,7 @@ import { disposeSessionRoot } from './subagent-poller.ts';
 import terminalPlugin from './plugins/terminal.ts';
 import todoPlugin from './plugins/todo.ts';
 import subagentPlugin from './plugins/subagent.ts';
-import type { HerdrClientLike, HerdrEnv } from './herdr-client.ts';
+import type { CoreClientLike, CoreEnv } from './core-client.ts';
 import type { JevRuntime } from './jev-client.ts';
 import type { RoutingTelemetryRecord } from './routing-telemetry.ts';
 import type { TodosService } from './todos-service.ts';
@@ -20,8 +20,8 @@ import type { WorkerWidgetRow } from './tree-view.ts';
 
 export interface MasterPluginMount {
   pi: ExtensionAPI;
-  client: HerdrClientLike;
-  env: HerdrEnv | null;
+  client: CoreClientLike;
+  env: CoreEnv | null;
   todos: TodosService;
   todoUi: TodoUiSlot;
   mirrorTodos: () => void;

@@ -1,38 +1,16 @@
-/** Projects the pane todo snapshot into a herdr pane header/sidebar (M22, D62/D68); the pi session
- *  JSONL stays authoritative and herdr truncates title/state_label at 80 chars, so truncate locally
- *  to avoid cutting an emoji in half. */
-import { countTodos, PI_HERDR_META_KEY, type TodoItem } from './vocab.ts';
+/** Projects the todo snapshot into a one-line summary (M22, D62/D68): the slim frame title, the
+ *  worker's todo_sync summary, and the `pier.todo` label a resumed master folds worker summaries from.
+ *  The pi session JSONL stays authoritative. */
+import { countTodos, type TodoItem } from './vocab.ts';
 import { formatAge, isArchived } from './stale-core.ts';
 
-/** herdr's character limit for title/state_label (from official documentation and schema measurements). */
-const TITLE_MAX = 80;
-/** Valid state_labels keys are only idle|working|blocked|done|unknown (herdr socket-api). */
-export const BLOCKED_LABEL_KEY = 'blocked';
-
-/** D93: custom sidebar token for the todo summary, referenced as `$pi-todo` by herdr
- *  `[ui.sidebar.agents]`; its value keeps the pane-title format (`▶i ○p ■b ✓c (N/M) · activity`). */
-const SIDEBAR_TODO_TOKEN = 'pi-todo';
-/** D95: token marking an ask_user_question wait (the workbench heat scale uses it to distinguish ask from block). */
-export const SIDEBAR_ASK_TOKEN = 'pi-ask';
-
-/** D93: build the pi-todo token patch for report_metadata (no todo = an empty string, because herdr's
- *  patch semantics remove empty keys). D96: never merge the stale cleanup in here — stale(16) +
- *  pi-todo(1) exceeds herdr's tokens maxProperties=16 and the rejected request would drop both the
- *  title and the tokens. */
-export function sidebarTodoTokens(title: string | null): Record<string, string> {
-  return { [SIDEBAR_TODO_TOKEN]: title ?? '' };
-}
-
-const STALE_CHUNK_COUNT = 15;
-
-function clipTitle(s: string): string {
-  return s.length <= TITLE_MAX ? s : s.slice(0, TITLE_MAX);
-}
+/** Terminal label carrying the todo summary; read back by the master's resync (index.ts). */
+export const TODO_LABEL = 'pier.todo';
 
 /**
  * `▶i ○p ■b ✓c (N/M [~eta]) · <activity>` (D91 unifies the four status glyphs). activity is the
  * first in_progress item, then fallbackDescription, then only the counts. Empty list → null, which
- * callers translate into clear_title; progressSuffix (M16) comes from formatProgressSuffix.
+ * callers translate into removing the label; progressSuffix (M16) comes from formatProgressSuffix.
  * Anti-freeze (stale-core D): once all work completed and the wall clock expired (archived), the
  * dead list degrades to `✓N done <age>` instead of presenting itself as a current-state view.
  */
@@ -46,7 +24,7 @@ export function formatPaneTitle(
   const now = opts?.now ?? Date.now();
   if (isArchived(items, opts?.lastWriteAt ?? null, now)) {
     const age = formatAge(now - (opts?.lastWriteAt as number));
-    return clipTitle(`✓${c.completed} done ${age}`);
+    return `✓${c.completed} done ${age}`;
   }
   const activity =
     items.find((it) => it.status === 'in_progress')?.content
@@ -54,22 +32,5 @@ export function formatPaneTitle(
   const head = `▶${c.inProgress} ○${c.pending} ■${c.blocked} ✓${c.completed}`;
   const suffix = opts?.progressSuffix?.trim();
   const withProgress = suffix ? `${head} (${suffix})` : head;
-  return clipTitle(activity ? `${withProgress} · ${activity}` : withProgress);
-}
-
-/** First blocked item's blocker (fall back to content); no blocked item → null. */
-export function formatBlockedLabel(items: readonly TodoItem[]): string | null {
-  const blocked = items.find((it) => it.status === 'blocked');
-  if (!blocked) return null;
-  const text = blocked.blocker?.trim() || blocked.content;
-  return clipTitle(text);
-}
-
-/** The first post-upgrade report clears the old 16-key chunks (herdr merges tokens by key, so omitted nulls would otherwise remain — M13b). */
-export function staleTokenClearance(): Record<string, null> {
-  const tokens: Record<string, null> = { [PI_HERDR_META_KEY]: null };
-  for (let i = 0; i < STALE_CHUNK_COUNT; i++) {
-    tokens[`${PI_HERDR_META_KEY}-${i}`] = null;
-  }
-  return tokens;
+  return activity ? `${withProgress} · ${activity}` : withProgress;
 }

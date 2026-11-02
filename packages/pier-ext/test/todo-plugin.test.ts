@@ -7,7 +7,7 @@ import { cordisProvide } from '../src/cordis-services.ts';
 import todoPlugin, { widgetLines } from '../src/plugins/todo.ts';
 import { TODO_ARCHIVE_WINDOW_CUSTOM_TYPE, todoListHash } from '../src/todo-core.ts';
 import type { WorkerWidgetRow } from '../src/tree-view.ts';
-import { BLOCKED_LABEL_KEY, formatBlockedLabel, formatPaneTitle, sidebarTodoTokens, staleTokenClearance } from '../src/pane-title.ts';
+import { formatPaneTitle } from '../src/pane-title.ts';
 import { PiSurface } from '../src/pi-surface.ts';
 import { DisposeLedger } from '../src/ledger.ts';
 import { TodosService } from '../src/todos-service.ts';
@@ -405,11 +405,6 @@ test('formatPaneTitle: M16 progressSuffix 拼进计数后（保守/ETA/空）；
   assert.equal(formatPaneTitle(items, null, { progressSuffix: '1/3' }), '▶1 ○1 ■0 ✓1 (1/3) · a');
   assert.equal(formatPaneTitle(items, null, { progressSuffix: '1/3 ~4m' }), '▶1 ○1 ■0 ✓1 (1/3 ~4m) · a');
   assert.equal(formatPaneTitle(items, null, {}), '▶1 ○1 ■0 ✓1 · a'); assert.equal(formatPaneTitle(items, null, { progressSuffix: '' }), '▶1 ○1 ■0 ✓1 · a');
-
-  // herdr truncates title/state_label at 80 characters, so the clip has to happen locally first
-  const title = formatPaneTitle([{ content: 'x'.repeat(200), status: 'in_progress' }]);
-  assert.ok(title); assert.equal(title.length, 80);
-  assert.equal(title.slice(0, 8), '▶1 ○0 ■0');
 });
 
 test('formatPaneTitle: 反冻结（stale-core D）——归档列表降权为 ✓N done <age>', () => {
@@ -428,27 +423,4 @@ test('formatPaneTitle: 反冻结（stale-core D）——归档列表降权为 �
   // any open item → never archived, however old the list is
   const withOpen = [...done3, { content: 'next', status: 'in_progress' as const }];
   assert.equal(formatPaneTitle(withOpen, null, { lastWriteAt: t0, now: t0 + 48 * 3_600_000 }), '▶1 ○0 ■0 ✓3 · next');
-});
-
-test('formatBlockedLabel: 取第一条 blocked 的 blocker；无 blocked → null', () => {
-  assert.equal(formatBlockedLabel([{ content: 'a', status: 'pending' }]), null);
-  assert.equal(formatBlockedLabel([{ content: '等文档', status: 'blocked', blocker: '人类确认范围' }]), '人类确认范围');
-  assert.equal(formatBlockedLabel([{ content: '卡住了', status: 'blocked' }]), '卡住了');
-});
-
-test('herdr token maps: stale 清理为 16 个 null 键；侧栏日报只带 pi-todo', () => {
-  const tokens = staleTokenClearance();
-  assert.equal(Object.keys(tokens).length, 16); assert.equal(tokens['pi-herdr'], null);
-  for (let i = 0; i < 15; i += 1) assert.equal(tokens[`pi-herdr-${i}`], null);
-  // the blocked state_label key herdr accepts (anything else is rejected as invalid_state_label)
-  assert.equal(BLOCKED_LABEL_KEY, 'blocked');
-
-  const withTodo = sidebarTodoTokens('▶1 ○0 ■0 ✓0 · a');
-  assert.equal(withTodo['pi-todo'], '▶1 ○0 ■0 ✓0 · a'); assert.equal(Object.keys(withTodo).length, 1);
-  // no todo: an empty string (herdr patch semantics delete the key instead of keeping a stale summary)
-  assert.equal(sidebarTodoTokens(null)['pi-todo'], '');
-  // D96: the stale cleanup is never merged into the daily report (stale 16 + pi-todo 1 = 17 > herdr's
-  // tokens maxProperties=16, which rejects the whole request and drops title and tokens alike).
-  const daily = sidebarTodoTokens('t');
-  assert.ok(!('pi-herdr' in daily), 'the daily report carries pi-todo only, never the stale chunks'); assert.deepEqual(Object.keys(daily), ['pi-todo']);
 });

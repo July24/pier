@@ -34,7 +34,7 @@ import {
 import { RESERVED_ROLE_NAMES, listRoleNames, loadRoleConfig, roleLayers } from './role-loader.ts';
 import { formatOptionRows } from './pier-options.ts';
 import { formatSwallowedErrors } from './swallow.ts';
-import { HERDR_PROTOCOL_EXPECTED } from './herdr-client.ts';
+import { CORE_VERSION_PINNED } from './core-client.ts';
 
 export const CONFIG_GUIDANCE_PROMPT = [
   '[PIER-CONFIG] The user wants to inspect or change pier configuration. Follow this workflow strictly:',
@@ -352,7 +352,7 @@ export function installConfigCommand(deps: ConfigCommandDeps): void {
         emit([
           'pier doctor',
           '',
-          `wire: herdr protocol ${HERDR_PROTOCOL_EXPECTED} (pinned by test/fixtures/herdr-contract.json)`,
+          `wire: herdr-core ${CORE_VERSION_PINNED} (pinned by test/fixtures/hc-contract.json)`,
           '',
           'options (canonical PIER_*, legacy PI_HERDR_* alias accepted):',
           ...formatOptionRows(),

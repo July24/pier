@@ -32,12 +32,6 @@ export interface TodoCounts {
   blocked: number;
 }
 
-/** Source name for pane.report-agent. */
-export const REPORT_AGENT_SOURCE = 'pi-herdr';
-
-/** First-upgrade key used to clear the old 16-key chunked tokens (M13b). */
-export const PI_HERDR_META_KEY = 'pi-herdr';
-
 export const TODO_TOOL_NAME = 'todo_write';
 
 /** Snapshot key in tool-result details (persisted in session JSONL). */

@@ -1,11 +1,11 @@
 /**
  * Child-session transcript I/O + pane-output observation for subagents. Path resolution, settlement
- * text and liveness probes share one candidate order (reported path/id before recent-file fallback,
- * excluding the master's own session and sessions claimed by other live panes), so settlement text
- * can never cross sessions.
+ * text and liveness probes share one candidate order (the worker's own `pier.session` label before
+ * recent-file fallback, excluding the master's own session and sessions claimed by other live
+ * terminals), so settlement text can never cross sessions.
  */
 import { accessSync, constants, statSync } from 'node:fs';
-import type { HerdrAgentState, HerdrClientLike } from './herdr-client.ts';
+import type { CoreClientLike, CoreStatus } from './core-client.ts';
 import {
   bareSessionId,
   deriveSubSessionState,
@@ -147,14 +147,15 @@ export function computeSubagentOutputDelta(
   return carry(currText, true);
 }
 
-type StatusInput = { localStatus: SubEntry['status']; herdrStatus?: HerdrAgentState | null; hasAskFlag?: boolean };
+type StatusInput = { localStatus: SubEntry['status']; status?: CoreStatus | null };
 
-/** First matching rule wins; a worker with no other signal is running. */
+/** First matching rule wins; a worker with no other signal is running. An `error` terminal ended
+ *  its turn like `done`, so the transcript decides what came out. */
 const STATUS_RULES: ReadonlyArray<{ status: SubagentStatus; match: (i: StatusInput) => boolean }> = [
-  { status: 'blocked', match: (i) => i.hasAskFlag === true || i.herdrStatus === 'blocked' },
-  { status: 'running', match: (i) => i.herdrStatus === 'working' },
-  { status: 'settled', match: (i) => i.localStatus === 'settled' || i.localStatus === 'closed' || i.herdrStatus === 'done' },
-  { status: 'idle', match: (i) => i.herdrStatus === 'idle' },
+  { status: 'blocked', match: (i) => i.status === 'blocked' },
+  { status: 'running', match: (i) => i.status === 'working' },
+  { status: 'settled', match: (i) => i.localStatus === 'settled' || i.localStatus === 'closed' || i.status === 'done' || i.status === 'error' },
+  { status: 'idle', match: (i) => i.status === 'idle' },
 ];
 
 export function resolveSubagentStatus(input: StatusInput): SubagentStatus {
@@ -189,7 +190,7 @@ export function formatSubagentOutput(opts: FormatSubagentOutputOpts): string {
 /* ── session file resolution + liveness probes ──────────────────── */
 
 export interface SessionIoHost {
-  client: HerdrClientLike;
+  client: CoreClientLike;
   getSessionId: () => string;
   sessionsDir: () => string;
 }
@@ -258,23 +259,26 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
   const stateCache = new DerivedCache<SubSessionState>();
   const finalTextCache = new DerivedCache<string | null>();
 
-  /** herdr's report for this pane plus the sessions claimed by other panes; one `agent.list`
-   *  serves both, so the poll hot paths pay a single RPC. */
+  /** This terminal's `pier.session` label plus the sessions claimed by other terminals; one
+   *  `terminal.list` serves both, so the poll hot paths pay a single RPC. */
   async function reportedAndTaken(paneId: string): Promise<{ reported: string | null; taken: Set<string> }> {
     const taken = new Set<string>();
     let reported: string | null = null;
     try {
-      for (const a of await h.client.listAgents()) {
-        if (!a.session) continue;
-        if (a.paneId === paneId) reported = a.session;
-        else taken.add(bareSessionId(a.session));
+      for (const terminal of await h.client.listTerminals({ all: true })) {
+        const sessionFile = terminal.labels['pier.session'];
+        if (!sessionFile) continue;
+        if (terminal.id === paneId) reported = sessionFile;
+        else taken.add(bareSessionId(sessionFile));
       }
-      // agent.list is authoritative, but a fresh pane can be absent during report lag while
-      // stub clients expose only the per-pane report.
-      if (!reported) reported = await h.client.getAgentSessionPath(paneId);
+      // list may not include a terminal created moments ago: ask for it directly before giving up.
+      if (!reported) {
+        const own = await h.client.getTerminal(paneId);
+        reported = own?.labels['pier.session'] ?? null;
+      }
     } catch {
       try {
-        reported = await h.client.getAgentSessionPath(paneId);
+        reported = (await h.client.getTerminal(paneId))?.labels['pier.session'] ?? null;
       } catch {
         /* both unavailable → no report, own/taken exclusions still hold */
       }
@@ -282,7 +286,7 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     return { reported, taken };
   }
 
-  /** Ordered candidates: pipe self-report (authoritative), herdr's report, then the newest session files. */
+  /** Ordered candidates: pipe self-report (authoritative), the worker's own label, then the newest session files. */
   async function resolveSessionFileCandidates(paneId: string, cwd: string, preferred?: string | null): Promise<string[]> {
     // A sub's sessionFile must never resolve to the master's own transcript (compare via
     // bareSessionId: herdr reports ids and paths interchangeably).
@@ -373,36 +377,20 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     return null;
   }
 
+  /** The blocked question text: pi's OSC 7501 reporter carries it as the status message. */
   async function readAskFlag(paneId: string): Promise<string | null> {
-    try {
-      const a = (await h.client.listAgents()).find((x) => x.paneId === paneId);
-      const v = a?.tokens?.['pi-ask'];
-      return typeof v === 'string' && v ? v : null;
-    } catch {
-      return null;
-    }
+    return readBlockedQuestion(h.client, paneId);
   }
 
   async function probeAlive(paneId: string, cwd: string): Promise<AliveProbe> {
     const probe: AliveProbe = { paneExists: false, agentStatus: null, lastActivityMs: null };
-    let listed = false;
     try {
-      const pane = (await h.client.listPanes()).find((p) => p.paneId === paneId);
-      listed = true;
-      probe.paneExists = pane != null;
-      probe.agentStatus = pane?.agentStatus ?? null;
-      if (pane?.foregroundCwd) probe.foregroundCwd = pane.foregroundCwd;
+      const terminal = await h.client.getTerminal(paneId);
+      probe.paneExists = terminal != null && terminal.state !== 'finished';
+      probe.agentStatus = terminal?.status ?? null;
+      if (terminal?.foreground?.cwd) probe.foregroundCwd = terminal.foreground.cwd;
     } catch {
-      /* pane.list unavailable — agent.list is a degraded fallback, not a death signal */
-    }
-    try {
-      const a = (await h.client.listAgents()).find((x) => x.paneId === paneId);
-      if (a) {
-        if (!listed) probe.paneExists = true;
-        probe.agentStatus = a.status ?? probe.agentStatus;
-        if (a.foregroundCwd) probe.foregroundCwd = a.foregroundCwd;
-      }
-    } catch {
+      /* core unavailable: liveness stays unknown (false), never a guessed death */
     }
     for await (const { stamp } of readableCandidates(paneId, cwd)) {
       if (probe.lastActivityMs == null || stamp.mtimeMs > probe.lastActivityMs) probe.lastActivityMs = stamp.mtimeMs;
@@ -469,29 +457,32 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
 
 interface SubagentOutputRead {
   text: string;
-  revision: number;
-  truncated: boolean;
+  /** False when part of what was asked for may be missing (a full-screen app read while working). */
+  complete: boolean;
 }
 
-/** Newer herdr exposes agent.read; older only pane.read. Prefer the semantic endpoint. */
-async function readSubagentOutput(client: HerdrClientLike, paneId: string): Promise<SubagentOutputRead> {
-  if (typeof client.readAgent === 'function') {
-    try {
-      return await client.readAgent(paneId, { source: 'recent', stripAnsi: true });
-    } catch {
-    }
+/** Blocked question text: pi's OSC 7501 reporter carries it as the status message. */
+async function readBlockedQuestion(client: CoreClientLike, paneId: string): Promise<string | null> {
+  try {
+    const terminal = await client.getTerminal(paneId);
+    if (!terminal || terminal.status !== 'blocked') return null;
+    const msg = terminal.statusMsg?.trim();
+    return msg ? msg : null;
+  } catch {
+    return null;
   }
-  return await client.readPane(paneId, { source: 'recent', stripAnsi: true });
 }
 
 export async function executeSubagentOutput(
   params: Record<string, unknown> | undefined,
   toolCtx: unknown,
   deps: {
-    client: HerdrClientLike;
+    client: CoreClientLike;
     resolveEntry: (rawId: string, cwd: string) => { entry: SubEntry } | { error: string };
     outputCursors: Map<string, SubagentOutputCursor>;
     getCwd: (toolCtx: unknown) => string;
+    /** Monotonic per-pane read counter shown in the header. */
+    nextRevision: (paneId: string) => number;
     /** Last finalized assistant text from the worker's transcript: the pane read alone cannot
      * recover it when the fullscreen TUI shows only the status overlay. Optional for tests. */
     readFinalReport?: (paneId: string, entryCwd: string) => Promise<string | null>;
@@ -507,20 +498,19 @@ export async function executeSubagentOutput(
   if ('error' in resolved) return toolError(resolved.error);
 
   const entry = resolved.entry;
-  let agentState: HerdrAgentState | null = null;
-  let askFlag: string | null = null;
+  let terminalStatus: CoreStatus | null = null;
   try {
-    const agent = (await deps.client.listAgents()).find((candidate) => candidate.paneId === entry.paneId);
-    agentState = agent?.status ?? null;
-    askFlag = agent?.tokens?.['pi-ask'] ?? null;
+    terminalStatus = (await deps.client.getTerminal(entry.paneId))?.status ?? null;
   } catch {
   }
 
-  const status = resolveSubagentStatus({ localStatus: entry.status, herdrStatus: agentState, hasAskFlag: Boolean(askFlag) });
+  const status = resolveSubagentStatus({ localStatus: entry.status, status: terminalStatus });
+  const askQuestion = terminalStatus === 'blocked' ? await readBlockedQuestion(deps.client, entry.paneId) : null;
 
   let rawRead: SubagentOutputRead;
   try {
-    rawRead = await readSubagentOutput(deps.client, entry.paneId);
+    const read = await deps.client.read(entry.paneId);
+    rawRead = { text: read.text, complete: read.complete };
   } catch (err) {
     return toolError(`Error: failed to read output for subagent ${entry.paneId}: ${(err as Error).message}`);
   }
@@ -554,14 +544,15 @@ export async function executeSubagentOutput(
     }
   }
   deps.outputCursors.set(entry.paneId, deltaResult.nextCursor);
+  const revision = deps.nextRevision(entry.paneId);
 
   const formatted = formatSubagentOutput({
     paneId: entry.paneId,
     status,
-    revision: rawRead.revision,
-    bufferTruncated: rawRead.truncated,
+    revision,
+    bufferTruncated: !rawRead.complete,
     deltaResult,
-    askQuestion: askFlag,
+    askQuestion,
   });
 
   return {
@@ -569,8 +560,8 @@ export async function executeSubagentOutput(
     details: {
       paneId: entry.paneId,
       status,
-      revision: rawRead.revision,
-      truncated: rawRead.truncated || deltaResult.truncated,
+      revision,
+      truncated: !rawRead.complete || deltaResult.truncated,
       restart: deltaResult.restart,
       deltaLength: deltaResult.delta.length,
       reportDelivered: Boolean(reportSection),

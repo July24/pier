@@ -1,14 +1,12 @@
 /**
- * Worker identity marker: a herdr 0.9.2 server restart reopens a worker pane by running pier's
- * self-reported resume_argv — WITHOUT the spawn env (`PI_HERDR_SUBAGENT`, role manifest env). The
- * marker file lets the restored boot re-derive worker mode from the session itself, so it mounts
- * todo-only instead of the master composition (no subagent pipe, no stop reminders) and replays its
- * role from the transcript as usual. Masters never write a marker; a stale marker for a dead session
- * is inert (it is only consulted when pi boots with that exact session file).
+ * Worker identity marker: the delegation identity (parent terminal/session, task, role) is written
+ * beside the session transcript so a `/resume` replay of that exact session keeps learning who
+ * delegated it, even when the spawn env is gone. Masters never write a marker; a stale marker for a
+ * dead session is inert (it is only consulted when pi boots with that exact session file).
  */
 import type { DelegationContext } from './delegation-core.ts';
 import { delegationFromRecord } from './delegation-core.ts';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { bareSessionId } from './session-tail.ts';
 import { isValidSessionId } from './efficiency-store.ts';
@@ -48,7 +46,7 @@ export function readWorkerMarker(sessionFile: string | null | undefined): Worker
   return null;
 }
 
-/** Idempotent; best-effort — a failed write only loses server-restart worker detection. */
+/** Idempotent; best-effort — a failed write only loses delegation replay on /resume. */
 export function writeWorkerMarker(
   sessionFile: string | null | undefined,
   role?: string,
@@ -67,10 +65,4 @@ export function writeWorkerMarker(
   } catch {
     /* read-only checkout or full disk: the live session is unaffected */
   }
-}
-
-/** Boot-time probe over env.PI_SESSION_FILE; false negatives simply keep today's behavior. */
-export function hasWorkerMarker(sessionFile: string | null | undefined): boolean {
-  const file = workerMarkerPath(sessionFile);
-  return file !== null && existsSync(file);
 }

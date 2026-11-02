@@ -1,10 +1,10 @@
-/** Shared fixtures: temp/env lifecycle, the pi surface and herdr fakes, the subagent plugin mount. */
+/** Shared fixtures: temp/env lifecycle, the pi surface and client fakes, the subagent plugin mount. */
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
 import { cordisProvide } from '../src/cordis-services.ts';
-import type { HerdrClientLike } from '../src/herdr-client.ts';
+import type { CoreClientLike, CoreEnv, TerminalInfo, WorkerWatch } from '../src/core-client.ts';
 import { PiSurface } from '../src/pi-surface.ts';
 import type { DisposeLedger } from '../src/ledger.ts';
 import subagentPlugin from '../src/plugins/subagent.ts';
@@ -200,38 +200,76 @@ export async function fire(pi: FakePi, event: string, ...args: unknown[]): Promi
   for (const handler of pi.listeners.get(event) ?? []) await handler(...args);
 }
 
-/** HerdrClientLike with inert defaults; pass only the methods a test cares about. */
-export function fakeHerdr(over: Partial<HerdrClientLike> = {}): HerdrClientLike {
+/** A TerminalInfo record with inert defaults. */
+export function terminalInfo(over: Partial<TerminalInfo> = {}): TerminalInfo {
+  return {
+    id: 't2',
+    name: null,
+    state: 'live',
+    status: 'unknown',
+    statusKind: null,
+    statusMsg: null,
+    statusApp: null,
+    labels: {},
+    parent: null,
+    cwd: '/test/cwd',
+    foreground: null,
+    exitCode: null,
+    reason: null,
+    turn: 0,
+    title: '',
+    ...over,
+  };
+}
+
+/**
+ * WorkerWatch over test-controlled terminals. `park(ms)` stands in for waiting on an event: it decides
+ * whether the wait ends by a change (true) or by its timeout (false); the default is a timeout, so a
+ * loop under test advances only as far as the test's own clock does.
+ */
+export function fakeWatch(opts: {
+  terminals?: () => readonly TerminalInfo[];
+  connected?: boolean;
+  park?: (ms: number) => boolean | Promise<boolean>;
+} = {}): WorkerWatch & { parks: number[] } {
+  const parks: number[] = [];
+  let version = 0;
+  return {
+    parks,
+    connected: opts.connected ?? true,
+    ready: async () => opts.connected ?? true,
+    get: (id) => opts.terminals?.().find((t) => t.id === id),
+    list: () => [...(opts.terminals?.() ?? [])],
+    version: () => version,
+    changed: async (_id, _since, ms) => {
+      parks.push(ms);
+      const woke = await (opts.park?.(ms) ?? false);
+      version += 1;
+      return woke;
+    },
+    close: () => {},
+  };
+}
+
+/** CoreClientLike with inert defaults; pass only the methods a test cares about. */
+export function fakeCore(over: Partial<CoreClientLike> = {}): CoreClientLike {
   const noop = async () => undefined;
   return {
     available: true,
-    reportAgent: noop,
-    reportAgentSessionResume: noop,
-    reportMetadata: noop,
-    reportLockTokens: noop,
-    reportDisplayAgent: noop,
-    reportAskFlag: noop,
-    reportDelegationTokens: noop,
-    sendPaneText: noop,
-    closePane: noop,
-    tabClose: noop,
-    sendPaneKeys: noop,
-    listAgents: async () => [],
-    waitAgent: async () => null,
-    getAgentSessionPath: async () => null,
-    splitPane: async () => 'p2',
-    createTab: async () => ({ tabId: 't9', paneId: 'p9' }),
-    listPanes: async () => [],
-    processInfo: async () => null,
-    exportLayout: async () => null,
-    paneLayout: async () => null,
-    tabList: async () => [],
-    openPluginPane: async () => ({ mode: 'popup', ok: true }),
-    agentExplain: async () => null,
-    readPane: async () => ({ text: '', revision: 0, truncated: false }),
-    readAgent: async () => ({ text: '', revision: 0, truncated: false }),
+    setLabels: noop,
+    placementLabels: async () => ({ 'herdr.space': 'sp0', 'herdr.tab': 'tb0' }),
+    getTerminal: async () => null,
+    listTerminals: async () => [],
+    run: async (opts) => terminalInfo({ id: 't2', cwd: opts.cwd ?? '/test/cwd', labels: { ...opts.labels } }),
+    send: noop,
+    keys: noop,
+    interrupt: async () => 'unknown',
+    read: async () => ({ text: '', complete: true }),
+    watchChildren: () => fakeWatch(),
     waitForOutput: async () => ({ matched: false, reason: 'timeout' }),
-    close: () => undefined,
+    kill: noop,
+    remove: noop,
+    serverVersion: async () => '0.1.16',
     ...over,
   };
 }
@@ -240,8 +278,8 @@ export function subEntry(over: Partial<SubEntry> = {}): SubEntry {
   return {
     taskId: 'task-1',
     kind: 'task',
-    paneId: 'w1:p2',
-    tabId: 't0',
+    paneId: 't2',
+    tabId: 'tb0',
     tabName: 'main',
     cwd: '/test/cwd',
     description: 'test worker subagent',
@@ -268,27 +306,27 @@ export function subsSnapshot(pi: FakePi): { subs: SubEntry[] } | undefined {
 
 export interface SubagentMountOptions {
   pi?: FakePi;
-  client?: Partial<HerdrClientLike>;
+  client?: Partial<CoreClientLike>;
   ledger?: DisposeLedger;
   /** Seeds the registry through a session_start branch lookup. */
   subs?: SubEntry[];
-  env?: { paneId?: string; tabId?: string; workspaceId?: string };
+  env?: Partial<CoreEnv>;
   extPath?: string;
   deps?: Partial<SubagentDeps>;
 }
 
-export type SubagentMount = { root: Context; pi: FakePi; port: SubagentPortBox; client: HerdrClientLike };
+export type SubagentMount = { root: Context; pi: FakePi; port: SubagentPortBox; client: CoreClientLike };
 
 /** Mounts the subagent plugin against fakes, wiring the same deps index.ts provides. */
 export async function mountSubagent(opts: SubagentMountOptions = {}): Promise<SubagentMount> {
   const pi = opts.pi ?? fakePi();
-  const client = fakeHerdr(opts.client);
+  const client = fakeCore(opts.client);
   const port = emptySubagentPortBox();
   const root = new Context();
   cordisProvide(root, 'pi-herdr.surface', new PiSurface(pi as unknown as object, opts.ledger));
   cordisProvide(root, 'pi-herdr.subagent-deps', {
     client,
-    env: { paneId: 'p0', tabId: 't0', workspaceId: 'w1', ...opts.env },
+    env: { socketPath: '/tmp/hc-test.sock', terminalId: 't0', ...opts.env },
     extPath: opts.extPath ?? new URL('../src/index.ts', import.meta.url).pathname,
     sessionRoot: root,
     port,

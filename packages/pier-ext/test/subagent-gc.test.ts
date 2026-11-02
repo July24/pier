@@ -1,12 +1,13 @@
-/** Board hygiene: gc-core decision tables (task tabs, panes, isolate sweep, path containment) and
- * the plugin-level GC pass. */
+/** Board hygiene: gc-core decision tables (task tabs, terminals, isolate sweep, path containment)
+ * and the plugin-level GC pass. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fire, fakeHerdr, mountSubagent, subEntry, subsSnapshot } from './test-utils.ts';
+import { fakeWatch, fire, mountSubagent, subEntry, subsSnapshot, terminalInfo } from './test-utils.ts';
 import type { SubEntry } from '../src/subagent-core.ts';
+import type { TerminalInfo } from '../src/core-client.ts';
 import { isPathInside, planIsolateSweep, shouldClosePane, shouldCloseTaskTab, type GcEntryLike } from '../src/gc-core.ts';
 
 const NOW = 1_000_000;
@@ -37,17 +38,18 @@ test('shouldCloseTaskTab: closes only when every work pane finished and the grac
   assert.equal(tab({}, ['working']), false);
 });
 
-test('shouldClosePane: explicit status gate, previous-turn grace, vanished pane recorded closed', () => {
+test('shouldClosePane: explicit status gate, previous-turn grace, vanished terminal recorded closed', () => {
   const pane = (over: Partial<Parameters<typeof shouldClosePane>[0]> = {}) =>
-    shouldClosePane({ prevTurnStart: NOW, consumedAt: NOW - 1000, herdrStatus: 'idle', ...over });
+    shouldClosePane({ prevTurnStart: NOW, consumedAt: NOW - 1000, status: 'idle', ...over });
   assert.equal(pane(), true);
-  assert.equal(pane({ herdrStatus: 'done' }), true);
-  assert.equal(pane({ herdrStatus: 'working' }), false);
-  assert.equal(pane({ herdrStatus: 'blocked' }), false);
-  assert.equal(pane({ herdrStatus: 'unknown' }), false);
+  assert.equal(pane({ status: 'done' }), true);
+  assert.equal(pane({ status: 'error' }), true);
+  assert.equal(pane({ status: 'working' }), false);
+  assert.equal(pane({ status: 'blocked' }), false);
+  assert.equal(pane({ status: 'unknown' }), false);
   assert.equal(pane({ consumedAt: NOW + 500 }), false, 'consumed this turn keeps the notice visible');
   assert.equal(pane({ consumedAt: null }), false);
-  assert.equal(pane({ consumedAt: null, herdrStatus: undefined }), true, 'a vanished pane is recorded closed');
+  assert.equal(pane({ consumedAt: null, status: undefined }), true, 'a vanished terminal is recorded closed');
 });
 
 test('planIsolateSweep: untracked pier/* branches need an explicit opt-in', () => {
@@ -102,19 +104,23 @@ test('isPathInside: equal paths and real children match; siblings and name prefi
 
 /* ── plugin-level GC ────────────────────────────────────────────── */
 
-const pane = (id: string) => ({ paneId: id, tabId: 'tMAIN', workspaceId: 'w1', agentStatus: 'idle' });
+const pane = (id: string): TerminalInfo => terminalInfo({ id, status: 'idle', labels: { 'herdr.tab': 'tMAIN' } });
 const consumed = (paneId: string, cwd: string) => subEntry({
   paneId, taskId: `task-${paneId}`, tabId: 'tMAIN', tabName: 'main', cwd, description: 'pane-gc 回归',
   status: 'consumed', consumedAt: Date.now() - 120_000, createdAt: Date.now() - 150_000,
 });
 
-/** Seeds `subs`, runs one GC pass with `livePanes` listed by herdr, then reports the closePane
- * targets and the registry snapshot. */
-async function gcPass(livePanes: string[], subs: SubEntry[]): Promise<{ closed: string[]; subs: SubEntry[] }> {
+/** Seeds `subs`, runs one GC pass with `liveTerminals` in the children watch (and core's list),
+ * then reports the retired terminal ids and the registry snapshot. */
+async function gcPass(liveTerminals: string[], subs: SubEntry[]): Promise<{ closed: string[]; subs: SubEntry[] }> {
   const closed: string[] = [];
   const { root, pi } = await mountSubagent({
-    env: { tabId: 'tMAIN' },
-    client: { listPanes: async () => livePanes.map(pane), closePane: async (paneId) => { closed.push(paneId); } },
+    client: {
+      placementLabels: async () => ({ 'herdr.tab': 'tMAIN' }),
+      listTerminals: async () => liveTerminals.map(pane),
+      watchChildren: () => fakeWatch({ terminals: () => liveTerminals.map(pane) }),
+      kill: async (id) => { closed.push(id); },
+    },
     subs,
   });
   try {
@@ -125,7 +131,7 @@ async function gcPass(livePanes: string[], subs: SubEntry[]): Promise<{ closed: 
   }
 }
 
-test('GC pass: a live consumed pane is closed, a vanished pane is only recorded closed', async () => {
+test('GC pass: a live consumed terminal is retired, a vanished one is only recorded closed', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'pane-gc-'));
   const { closed, subs } = await gcPass(['pAlive'], [consumed('pAlive', cwd), consumed('pGone', cwd)]);
   assert.deepEqual(closed, ['pAlive']);
@@ -134,18 +140,17 @@ test('GC pass: a live consumed pane is closed, a vanished pane is only recorded 
   assert.equal(byId.get('pGone'), 'closed');
 });
 
-test('GC pass: the master pane is never collected, whatever the registry claims', async () => {
+test('GC pass: the master terminal is never collected, whatever the registry claims', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'pane-gc-self-'));
-  const { closed, subs } = await gcPass(['p0'], [consumed('p0', cwd)]); // p0 is the master itself
-  assert.deepEqual(closed, [], 'closePane must never target the master');
-  assert.equal(subs.find((s) => s.paneId === 'p0')!.status, 'consumed', 'the row is left alone');
+  const { closed, subs } = await gcPass(['t0'], [consumed('t0', cwd)]); // t0 is the master itself
+  assert.deepEqual(closed, [], 'kill must never target the master');
+  assert.equal(subs.find((s) => s.paneId === 't0')!.status, 'consumed', 'the row is left alone');
 });
 
-test('registry: startup sweeps zombie running rows whose pane herdr no longer lists', async () => {
+test('registry: startup sweeps zombie running rows whose terminal core no longer lists', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'pane-gc-zombie-'));
   const { root, pi } = await mountSubagent({
-    env: { tabId: 'tMAIN' },
-    client: fakeHerdr({ listPanes: async () => [] }),
+    client: { listTerminals: async () => [] },
     subs: [{ ...consumed('pZombie', cwd), status: 'running', consumedAt: null }],
   });
   try {

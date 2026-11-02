@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import type { Server, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { HerdrClientLike } from '../src/herdr-client.ts';
+import type { CoreClientLike } from '../src/core-client.ts';
 import { pipeNameFor, startPipeServer, type PipeRequest } from '../src/pipe-channel.ts';
 import { appendHistory } from '../src/history-store.ts';
 import { preferredHistoryFile } from '../src/storage-layout.ts';
@@ -16,7 +16,7 @@ import {
 } from '../src/subagent-core.ts';
 import { NodeGitAdapter, createSpawner, type GitExecFile } from '../src/subagent-spawn.ts';
 import {
-  TempHome, jsonl, mountSubagent, runSubagent, runSubagentRejects, subsSnapshot, transcriptMessage, type FakePi,
+  TempHome, fakeCore, fakeWatch, jsonl, mountSubagent, runSubagent, runSubagentRejects, subsSnapshot, terminalInfo, transcriptMessage, type FakePi,
 } from './test-utils.ts';
 
 /* ── isolate/worktree planning (pure) ──────────────────────────── */
@@ -120,55 +120,40 @@ test('parseWorktreePorcelain: multi-block POSIX output, Windows CRLF, detached a
 
 /* ── readiness failures ─────────────────────────────────────────── */
 
-const spawnerFor = (client: Record<string, unknown>, over: Record<string, unknown> = {}) => createSpawner({
-  client: client as unknown as HerdrClientLike,
-  env: { paneId: 'p0', tabId: 't0', workspaceId: 'w1' },
+const spawnerFor = (client: Partial<CoreClientLike>, over: Record<string, unknown> = {}) => createSpawner({
+  client: fakeCore(client),
+  env: { socketPath: '/tmp/hc-test.sock', terminalId: 't0' },
   runtime: { nodePath: '/usr/bin/node', cliPath: '/cli.js', extPath: '/ext.ts' },
   git: { listWorktrees: async () => [], runGit: async () => null, worktreeStatLine: async () => null, invalidateWorktreesCache: () => undefined },
   ...over,
 } as Parameters<typeof createSpawner>[0]);
 
-test('waitSubReady: gone pane, herdr diagnosis and an unknown shell are distinguished', async (t) => {
-  await t.test('a gone pane fails fast with its last output instead of waiting out the timeout', async () => {
+test('waitSubReady: a gone terminal and a live-but-unregistered one are distinguished', async (t) => {
+  await t.test('a gone terminal fails fast with its last output instead of waiting out the timeout', async () => {
     const spawner = spawnerFor({
-      listPanes: async () => [],
-      readPane: async () => ({ text: 'TypeError: boom at footer.render', revision: 1, truncated: false }),
+      getTerminal: async () => null,
+      read: async () => ({ text: 'TypeError: boom at footer.render', complete: true }),
     });
     const started = Date.now();
-    const out = await spawner.waitSubReady('/tmp/pier-a14-nonexistent', 'wA14:p404');
+    const out = await spawner.waitSubReady('/tmp/pier-a14-nonexistent', 'tA14');
     assert.equal(out.ok, false);
     if (out.ok) return;
     assert.match(out.message, /exited before its pipe became ready/);
     assert.match(out.message, /TypeError: boom at footer\.render/);
-    assert.ok(Date.now() - started < 10_000, 'pane-gone must not wait for the readiness timeout');
+    assert.ok(Date.now() - started < 10_000, 'a gone terminal must not wait for the readiness timeout');
   });
 
-  await t.test('herdr detection diagnostics are attached to the failure', async () => {
+  await t.test('a live terminal that never opened its pipe is alive-but-not-ready, not gone', async () => {
+    const terminalId = 'tH';
     const spawner = spawnerFor({
-      available: true,
-      listPanes: async () => [],
-      readPane: async () => ({ text: 'SyntaxError: unexpected token', revision: 1, truncated: false }),
-      agentExplain: async () => ({ matched_rule: 'pi-worker', skip_state_reason: 'process_crashed' }),
-    });
-    const out = await spawner.waitSubReady('/tmp/pier-091-explain', 'wA14:p405');
-    assert.equal(out.ok, false);
-    if (out.ok) return;
-    assert.match(out.message, /Herdr detection diagnosis:/);
-    assert.match(out.message, /matched rule: pi-worker/);
-    assert.match(out.message, /skip reason: process_crashed/);
-  });
-
-  await t.test('an unknown shell is alive-but-not-ready, not pane-gone', async () => {
-    const paneId = 'wH:p3';
-    const spawner = spawnerFor({
-      listPanes: async () => [{ paneId, agentStatus: 'unknown' }],
-      readPane: async () => ({ text: 'booting', revision: 0, truncated: false }),
+      getTerminal: async (id) => terminalInfo({ id, status: 'unknown' }),
+      read: async () => ({ text: 'booting', complete: true }),
     }, { readinessTimeoutMs: 50 });
-    const out = await spawner.waitSubReady('/tmp/pier-unknown-shell', paneId);
+    const out = await spawner.waitSubReady('/tmp/pier-unknown-shell', terminalId);
     assert.equal(out.ok, false);
     if (out.ok) return;
     assert.match(out.message, /pipe not ready within/);
-    assert.match(out.message, /never registered its pipe/, 'an unknown shell means "still booting", not "gone"');
+    assert.match(out.message, /never registered its pipe/, 'a live terminal means "still booting", not "gone"');
   });
 });
 
@@ -183,18 +168,19 @@ interface PipeEnv {
   pi: FakePi;
   port: SubagentPortBox;
   frames: PipeRequest[];
-  closePaneCalls: string[];
-  /** env blocks handed to herdr pane creation (splitPane/createTab) in spawn order. */
+  /** Terminals retired after a failed spawn (kill), in call order. */
+  retired: string[];
+  /** env blocks handed to `terminal.run` in spawn order. */
   spawnEnvs: Array<Record<string, string>>;
-  /** Uncancellable poll loop: park it on a `waitAgent` that never resolves so a row it holds stays
-   * `running` for the rest of the test. */
+  /** `herdr.*` label blocks handed to `terminal.run` in spawn order. */
+  spawnLabels: Array<Record<string, string>>;
+  /** Uncancellable poll loop: make the children watch's `changed` never resolve, so a row it holds
+   *  stays `running` for the rest of the test. */
   parkPollers(): void;
   /** Flipped per subtest: the next prompt frame is answered with an error. */
   rejectPrompt: boolean;
 }
 
-/** Mounts the plugin with a loopback pipe server standing in for the worker pane (p2): it records
- * the frames pier sends and answers ok, so the real `pipeRequestTo` path is exercised end to end. */
 /** Mounts the plugin with a loopback pipe server standing in for the worker pane (p2): it records
  * the frames pier sends and answers ok, so the real `pipeRequestTo` path is exercised end to end.
  * `paneSeq` hands out p2, p3, … (one pipe server per id) for multi-worker tests. */
@@ -207,7 +193,7 @@ async function withPipeEnv(
   const sessionFile = join(cwd, 'sub-session.jsonl');
   let parked = false;
   const env: PipeEnv = {
-    cwd, home, pi: undefined as never, port: undefined as never, frames: [], closePaneCalls: [], spawnEnvs: [],
+    cwd, home, pi: undefined as never, port: undefined as never, frames: [], retired: [], spawnEnvs: [], spawnLabels: [],
     parkPollers: () => { parked = true; }, rejectPrompt: false,
   };
   let paneCounter = 0;
@@ -236,15 +222,27 @@ async function withPipeEnv(
   await Promise.all(servers.map((s) => new Promise<void>((resolve) => s.once('listening', resolve))));
   const { root, pi, port } = await mountSubagent({
     client: {
-      tabList: async () => [{ tabId: 't0', workspaceId: 'w1', label: 'main', paneCount: 1, agentStatus: 'idle' }],
-      listPanes: async () => [
-        { paneId: 'p0', tabId: 't0', workspaceId: 'w1', agentStatus: 'working' },
-        { paneId: 'p2', tabId: 't0', workspaceId: 'w1', agentStatus: 'idle' },
-      ],
-      waitAgent: async () => (parked ? new Promise<never>(() => {}) : 'idle'),
-      splitPane: async (o) => { env.spawnEnvs.push(o.env ?? {}); return nextPaneId(); },
-      getAgentSessionPath: async () => sessionFile,
-      closePane: async (paneId) => { env.closePaneCalls.push(paneId); },
+      getTerminal: async (id: string) => terminalInfo({
+        id,
+        labels: ['p2', 'p3', 'p4'].includes(id) ? { 'pier.session': sessionFile } : {},
+      }),
+      // The poller parks on the children watch: while parked, `changed` never resolves and the
+      // snapshot reports the worker as working, so the row stays running with no polling.
+      watchChildren: () => fakeWatch({
+        terminals: () => ['p2', 'p3', 'p4'].map((id) => terminalInfo({
+          id,
+          status: parked ? 'working' : 'idle',
+          labels: { 'pier.session': sessionFile },
+        })),
+        park: () => (parked ? new Promise<never>(() => {}) : false),
+      }),
+      read: async () => ({ text: '', complete: true }),
+      run: async (o) => {
+        env.spawnEnvs.push(o.env ?? {});
+        env.spawnLabels.push(o.labels ?? {});
+        return terminalInfo({ id: nextPaneId(), cwd: o.cwd, labels: o.labels });
+      },
+      kill: async (id) => { env.retired.push(id); },
     },
   });
   env.pi = pi;
@@ -284,31 +282,34 @@ test('spawn action: piped prompt injection, settlement and rollback', async (t) 
       assert.equal(running[0]!.description, '后台探查');
     });
 
-    await t.test('a rejected prompt injection rolls back the ledger and closes the pane', async () => {
+    await t.test('a rejected prompt injection rolls back the ledger and retires its terminal', async () => {
       env.rejectPrompt = true;
       const text = (await runSubagent(env.pi, { description: '探查', prompt: PROMPT }, env.cwd)).content[0]!.text;
       assert.match(text, /failed to spawn/);
       assert.match(text, /sim rejected/);
-      assert.deepEqual(env.closePaneCalls, ['p2'], 'the failed pane is closed');
+      assert.deepEqual(env.retired, ['p2'], 'the failed terminal is killed');
       assert.ok(!(env.port.current?.listRunningSubs() ?? []).some((s) => s.paneId === 'p2'), 'no ghost running row in the ledger');
       assert.ok(!subsSnapshot(env.pi)?.subs.some((s) => s.paneId === 'p2'), 'the final snapshot no longer lists the pane');
     });
   });
 });
 
-test('spawn env: worker panes silence pi 1.1 OSC 7501 (pier is the single state reporter)', async () => {
+test('spawn env: the worker gets the spawn contract on top of the caller environment', async () => {
   await withPipeEnv(async (env) => {
     await runSubagent(env.pi, { description: '探查', prompt: PROMPT }, env.cwd);
-    assert.equal(env.spawnEnvs.length, 1, 'one pane created for the worker');
-    assert.equal(env.spawnEnvs[0]!.PI_PROGRAM_STATUS, '0', 'pi program-status emission off — report_agent owns the pane state');
+    assert.equal(env.spawnEnvs.length, 1, 'one terminal created for the worker');
+    assert.equal('PI_PROGRAM_STATUS' in env.spawnEnvs[0]!, false, 'pier never writes or silences the status source');
     assert.equal(env.spawnEnvs[0]!.PI_HERDR_SUBAGENT, '1');
     // Delegation identity (RFC rfc-delegation-identity §2.1): the worker learns parent/task/role.
     const delegation = JSON.parse(env.spawnEnvs[0]!.PI_HERDR_DELEGATION ?? 'null') as Record<string, unknown>;
-    assert.equal(delegation.parentPaneId, 'p0', 'parent pane is the master pane');
+    assert.equal(delegation.parentPaneId, 't0', 'parent terminal is the master terminal');
     assert.equal(delegation.description, '探查');
     assert.equal(typeof delegation.taskId, 'string');
     assert.equal(delegation.role, 'worker-default');
-    assert.equal(delegation.parentPipe, pipeNameFor(env.cwd, 'p0'), 'the worker can dial the master pipe for todo_sync');
+    assert.equal(delegation.parentPipe, pipeNameFor(env.cwd, 't0'), 'the worker can dial the master pipe for todo_sync');
+    // A worker in the master's checkout joins the master's app tab instead of creating one.
+    assert.equal(env.spawnLabels[0]!['herdr.tab'], 'tb0');
+    assert.equal(env.spawnLabels[0]!['herdr.space'], 'sp0');
   });
 });
 
@@ -318,9 +319,9 @@ test('spawn/send: the reply pipe is scoped by the master session cwd, not the wo
     env.parkPollers();
     const spawned = await runSubagent(env.pi, { description: '跨仓库任务', prompt: PROMPT, run_in_background: true, cwd: other }, env.cwd);
     assert.match(spawned.content[0]!.text, /^started subagent [a-z0-9-]+@p2 /);
-    const expected = pipeNameFor(env.cwd, 'p0');
+    const expected = pipeNameFor(env.cwd, 't0');
     assert.equal((env.frames[0] as { from?: string }).from, expected, 'spawn replies to the master session pipe');
-    assert.notEqual((env.frames[0] as { from?: string }).from, pipeNameFor(other, 'p0'));
+    assert.notEqual((env.frames[0] as { from?: string }).from, pipeNameFor(other, 't0'));
 
     const sent = await runSubagent(env.pi, { action: 'send', agentId: 'p2', message: 'wrap up and report' }, env.cwd);
     assert.match(sent.content[0]!.text, /Message sent to subagent [a-z0-9-]+@p2/);

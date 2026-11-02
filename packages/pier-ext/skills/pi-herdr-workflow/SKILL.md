@@ -1,21 +1,22 @@
 ---
 name: pi-herdr-workflow
 description: >-
-  How to use the pi-herdr workbench fusion: todo_write discipline, subagent
-  delegation (foreground/parallel/background via action spawn/list/send/
-  interrupt/resume), terminal persistent shells, and how the human watches
-  everything in herdr panes.
+  How to use the pier workflow: todo_write discipline, subagent delegation
+  (foreground/parallel/background via action spawn/list/send/interrupt/resume),
+  persistent terminal shells, and how the human watches everything in the
+  Herdr app.
   Load when the user asks about multi-step plans, delegating subtasks,
   background work, or checking on running subagents.
 license: MIT
 ---
 
-# pi-herdr workbench workflow
+# pier workflow
 
-You run inside a herdr terminal pane. This skill is how to use `todo_write` and
-`subagent` well. The human watches live in herdr: each pane header shows
-`▶x ○y ■b ✓z · current task`, and semantic state (working / blocked / idle)
-rolls up to the sidebar.
+You run inside a herdr-core terminal shown by the Herdr app. This skill is how
+to use `todo_write` and `subagent` well. The app displays each terminal as a
+pane/tab and shows pi's native OSC 7501 status (working / blocked / idle); pier
+does not project a pane title and does not maintain its own sidebar rows.
+There is no `/dashboard`; the delegation tree is `/pier-tree` (an in-pi overlay).
 
 ## 1. Todo discipline (full-replace semantics)
 
@@ -30,28 +31,30 @@ rolls up to the sidebar.
 - If you forget an item's exact wording, copy it from the previous `todo_write` result. **Do not invent from memory** (phantom items).
 - **Do not** put work you already delegated to a subagent on *your* todo list — that is the subagent's job. Your list tracks *your* work. Accept and archive after the result comes back.
 - When several subagents collaborate, put **file ownership** in `content` (e.g. "refactor auth (only src/auth/)") so two agents do not fight over the same file.
-- When **you** are a delegated worker pane (`PI_HERDR_SUBAGENT=1`), this plugin enforces strict mode: **at most one `in_progress`** at a time (extras are normalized), and finishing the current item auto-promotes the next `pending`. The master pane keeps parallel semantics; this section is the discipline.
+- When **you** are a delegated worker (`PI_HERDR_SUBAGENT=1`), this plugin enforces strict mode: **at most one `in_progress`** at a time (extras are normalized), and finishing the current item auto-promotes the next `pending`. The master keeps parallel semantics; this section is the discipline.
 
 ## 2. Subagent delegation
 
-A subagent pane is an **interactive pi TUI** (independent session). A human can enter that pane and talk to it at any time. Your delegation prompt appears as a message in its conversation.
+A subagent is an **interactive pi session in its own herdr-core terminal**, shown
+by the Herdr app as a pane. A human can attach to that terminal and talk to it
+at any time. Your delegation prompt appears as a message in its conversation.
 
 The `subagent` tool has 5 operations controlled by the `action` parameter (default: `spawn`):
 
 ### spawn (default action)
 
-Create a subagent in a new pane:
+Create a subagent in a new terminal (shown as a pane):
 - **Foreground** (default): the call waits for a result. Use when the next step depends on it.
-- **Background** (`run_in_background: true`): returns `agentId` immediately; the subagent keeps running in its own pane. Use for long / parallel work. It **persists** (own session). On settle you get a "Background subagent <id> finished..." notice.
+- **Background** (`run_in_background: true`): returns `agentId` immediately; the subagent keeps running in its own terminal. Use for long / parallel work. It **persists** (own session). On settle you get a "Background subagent <id> finished..." notice.
 - Multiple `subagent` calls (with `action: "spawn"`) in one message run in parallel (cap 4).
 - Optional `role` (e.g. `advisor`) matches a profile when found; unknown names are labels only.
 
 **Task-tab grouping** (`tab`):
 - Each delegation defaults to a **new tab named from `description`**.
-- Related subtasks share one `tab` name (e.g. web research + status probe both `tab: "research"`) so the human sees every related pane in one herdr tab.
+- Related subtasks share one `tab` name (e.g. web research + status probe both `tab: "research"`) so the human sees every related terminal in one tab.
 - Keep names short (≤20 chars) and obvious; the tab bar *is* the task board.
 - Do not cram unrelated work into one tab to "save tabs". One tab = one goal.
-- **Task tabs are temporary**: after every subagent in the tab has settled (default grace ~10 minutes) the tab closes. Do not assume those panes last. To review or continue, use `action: "resume"` from history — do not cite a closed pane.
+- The app creates the tab when it first sees the `herdr.tab` label; pier does no placement math.
 
 **Prompt discipline**:
 - The prompt must be **self-contained**: the subagent cannot see your conversation, only this prompt.
@@ -82,9 +85,9 @@ Call: `subagent(action: "interrupt", agentId: "<id>")`
 
 ### resume
 
-Revive finished subagent from ledger by `taskId`. Opens saved conversation in new pane; then `send` work.
+Revive finished subagent from ledger by `taskId`. Opens the saved conversation in a new terminal; then `send` work.
 
-The ledger is an append-only JSONL file at `~/.pi/agent/herdr-pi/history/<flattened-cwd>/history.jsonl`, one row per status change. Use `list` for live panes from this session; for tasks from earlier sessions or closed panes, read/grep the ledger for the `taskId`.
+The ledger is an append-only JSONL file at `~/.pi/agent/herdr-pi/history/<flattened-cwd>/history.jsonl`, one row per status change. Use `list` for live terminals from this session; for tasks from earlier sessions or closed ones, read/grep the ledger for the `taskId`.
 
 Call: `subagent(action: "resume", taskId: "<uuid>")`
 
@@ -101,8 +104,8 @@ diff before writing. Overview: `docs/configuration.md`.
 
 ## 3. Human gate
 
-- For a human decision (approval, tradeoff, direction), use `ask_user_question` (this plugin). Prefer 2-5 options with short labels and tradeoffs in `description`. Do **not** author an "Other" option — the UI appends "Other (type your own)". Use `recommended` (0-based) for the default and `questions` to batch related decisions (max 4). While waiting, your pane is **blocked** in herdr so the human can see and intervene. The answer comes back as the tool result, then you continue.
-- A human can enter a subagent pane directly. Write the delegation `description` (pane label) so a human understands it at a glance.
+- For a human decision (approval, tradeoff, direction), use `ask_user_question` (this plugin). Prefer 2-5 options with short labels and tradeoffs in `description`. Do **not** author an "Other" option — the UI appends "Other (type your own)". Use `recommended` (0-based) for the default and `questions` to batch related decisions (max 4). While waiting, your terminal is reported **blocked** (pi's native OSC 7501), so the Herdr app shows it and the human can intervene. The answer comes back as the tool result, then you continue.
+- A human can attach to a subagent terminal directly. Write the delegation `description` (pane label) so a human understands it at a glance.
 
 ## 4. Multi-agent engineering rules
 
@@ -117,7 +120,7 @@ The `terminal` tool has 6 operations for persistent shell sessions (dev servers,
 
 ### open
 
-Create a persistent interactive terminal (resident shell in its own herdr pane) and return its `terminal_id`.
+Create a persistent interactive terminal (resident shell in its own herdr-core terminal) and return its `terminal_id`.
 
 The shell keeps its cwd, environment variables, and background processes across `terminal` calls — use it for dev servers, REPLs, or multi-step shell work instead of one-shot bash calls.
 
@@ -137,7 +140,7 @@ Call: `terminal(action: "send", terminal_id: "<id>", text: "npm run dev")`
 Read new output from a persistent terminal since your last read (cursor-based increment; the first read returns the recent buffer).
 
 Parameters:
-- `terminal_id`: your terminal from `open`. Alternatively `pane_id`: a pane in this session's own tab (narrow scope by design).
+- `terminal_id`: your terminal from `open`. Alternatively `pane_id`: a terminal in this session's own tab (narrow scope by design).
 - `max_chars`: output cap for this read.
 
 Output is ANSI-stripped and bounded; if the buffer scrolled past your last read you get a reset marker plus the current tail. Detecting a fullscreen TUI program (vim/less/top) returns an error with suggestions instead of garbage.
@@ -154,7 +157,7 @@ Call: `terminal(action: "signal", terminal_id: "<id>", key: "ctrl+c")`
 
 ### close
 
-Close a persistent terminal (kills its shell process tree and removes the pane).
+Close a persistent terminal (kills its shell process tree and removes the terminal).
 
 Terminal state does not survive close — persist anything you need to files first.
 
@@ -162,8 +165,8 @@ Call: `terminal(action: "close", terminal_id: "<id>")`
 
 ### list
 
-List this session's persistent terminals with open/closed and pane-liveness status.
+List this session's persistent terminals with open/closed and liveness status.
 
-Entries whose pane is gone (human closed it, restart) are marked closed — terminal sessions do not survive pane closure or restarts; persist state to files instead of relying on terminal reuse.
+Entries whose terminal is gone (human closed it, core restart) are marked closed — terminal sessions do not survive terminal closure or core restarts; persist state to files instead of relying on terminal reuse.
 
 Call: `terminal(action: "list")`

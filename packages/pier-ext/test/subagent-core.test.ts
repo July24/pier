@@ -3,12 +3,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DisposeLedger } from '../src/ledger.ts';
-import { mountSubagent, runSubagent, subEntry } from './test-utils.ts';
+import { mountSubagent, runSubagent, subEntry, terminalInfo } from './test-utils.ts';
 import {
-  FOREGROUND_POLL_MS, SUBS_CUSTOM_TYPE, TAB_NAME_MAX, Semaphore, agoText, buildAliveNotice, buildBlockedGateNotice,
+  FOREGROUND_POLL_MS, MAIN_TAB_NAME, SUBS_CUSTOM_TYPE, TAB_NAME_MAX, Semaphore, agoText, buildAliveNotice, buildBlockedGateNotice,
   allocateSubSlug, slugifyTask, subRef,
-  attachSubagentStructuredContent, buildLaunchLine, buildLaunchParts, buildResumeArgv, classifyWorktreeZone, foldSubsRegistry, formatIsolateLocation, formatSubagentResult, isAlive,
-  makeProgressUpdate, nextTaskTabName, rekeySub, planForegroundTick, planLaunchValidation, planShellReady, planTabPlacement, resolveTaskIdPrefix, shellProcessName,
+  attachSubagentStructuredContent, buildLaunchLine, buildLaunchParts, classifyWorktreeZone, foldSubsRegistry, formatIsolateLocation, formatSubagentResult, isAlive,
+  makeProgressUpdate, rekeySub, planForegroundTick, planLaunchValidation, planTabPlacement, resolveTaskIdPrefix,
   flattenToolParams, idParam, sleepWhileSubsRunningNote, tabNameForTask, type AliveProbe, type SubEntry,
 } from '../src/subagent-core.ts';
 import { planReadyAttempt, readyBackoffMs, readyFailureText } from '../src/subagent-spawn.ts';
@@ -40,17 +40,6 @@ test('foldSubsRegistry: a persisted report delivery survives the fold; a malform
   const row = (reportDelivered: unknown) => ({ type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { subs: [{ paneId: 'p1', reportDelivered }] } });
   assert.deepEqual(foldSubsRegistry([row({ fingerprint: 'tail', at: 5 })]).subs[0]!.reportDelivered, { fingerprint: 'tail', at: 5 });
   assert.equal(foldSubsRegistry([row({ fingerprint: 3 })]).subs[0]!.reportDelivered, undefined);
-});
-
-test('planShellReady: only a shell foreground means a fresh pane can take the launch line', () => {
-  assert.equal(shellProcessName('/bin/zsh'), 'zsh');
-  assert.equal(shellProcessName('C:\\Windows\\System32\\cmd.exe'), 'cmd');
-  assert.equal(shellProcessName('-bash'), 'bash');
-  assert.equal(planShellReady(null), 'ready', 'unsupported probe must not stall spawn');
-  assert.equal(planShellReady([]), 'wait', 'empty foreground is not proof of readiness');
-  assert.equal(planShellReady([{ name: 'zsh', argv0: '/bin/zsh' }]), 'ready');
-  assert.equal(planShellReady([{ name: 'node', argv0: 'pwsh.exe' }]), 'ready', 'either field may carry the shell');
-  assert.equal(planShellReady([{ name: 'pi', argv0: 'node' }]), 'wait', 'an already-running agent is not a shell prompt');
 });
 
 test('buildLaunchLine: win32 uses PowerShell & syntax, POSIX starts via sh', () => {
@@ -91,33 +80,6 @@ test('buildLaunchParts: the provider is split off at the first "/" only', () => 
   assert.deepEqual(modelArgs('openrouter/moonshotai/kimi-k2'), ['--provider', 'openrouter', '--model', 'moonshotai/kimi-k2']);
   assert.deepEqual(modelArgs('glm-5.3'), ['--model', 'glm-5.3'], 'a bare model id is not also passed as the provider');
   assert.deepEqual(modelArgs('/odd'), ['--model', '/odd']);
-});
-
-test('buildResumeArgv: mirrors the spawn flags onto a plain `pi`, dropping interpreter and cli.js', () => {
-  const workerArgv = [
-    '/usr/local/bin/node', '/opt/pi/dist/cli.js', '-a', '-e', '/ext/index.ts',
-    '--tui-mode', 'fullscreen', '--provider', 'zai', '--model', 'glm-4.7', '--session', '/s/2026-10-08T01-00-00Z_a1b2c3.jsonl',
-  ];
-  assert.deepEqual(buildResumeArgv(workerArgv), [
-    'pi', '-a', '-e', '/ext/index.ts', '--tui-mode', 'fullscreen',
-    '--provider', 'zai', '--model', 'glm-4.7', '--session', '/s/2026-10-08T01-00-00Z_a1b2c3.jsonl',
-  ]);
-  assert.deepEqual(buildResumeArgv(['/x/node', '/x/cli.js', '--extension=/ext/index.ts']), ['pi', '--extension', '/ext/index.ts'], '--flag=value splits');
-  assert.deepEqual(
-    buildResumeArgv(['/x/node', '/x/cli.js', '--print-mode', 'json', '-e', '/ext/index.ts']),
-    ['pi', '-e', '/ext/index.ts'],
-    'pi-internal flags are not replayed',
-  );
-});
-
-test('buildResumeArgv: herdr argv rules — plain bin, no quotes/control chars, ≤64 args, ≤8 KiB, must carry -e', () => {
-  assert.equal(buildResumeArgv(['/x/node', '/x/cli.js']), null, 'no extension flag → nothing pier-shaped to restore');
-  assert.equal(buildResumeArgv(['/x/node', '/x/cli.js', '-e', '/e.ts'], '/usr/local/bin/pi'), null, 'argv[0] must be a plain PATH name');
-  assert.equal(buildResumeArgv(['/x/node', '/x/cli.js', '-e', "/e'.ts"]), null, 'apostrophes are rejected by herdr');
-  assert.equal(buildResumeArgv(['/x/node', '/x/cli.js', '-e', '/e.ts', '--model', 'a\rb']), null, 'control characters are rejected');
-  const many = ['/x/node', '/x/cli.js', '-e', '/e.ts', ...Array.from({ length: 70 }, () => '-a')];
-  assert.equal(buildResumeArgv(many), null, 'over 64 args is rejected');
-  assert.equal(buildResumeArgv(['/x/node', '/x/cli.js', '-e', '/e.ts', '--model', 'x'.repeat(9_000)]), null, 'over 8 KiB total is rejected');
 });
 
 test('attachSubagentStructuredContent: stamps the action onto details; non-objects pass through', () => {
@@ -185,25 +147,19 @@ test('foldSubsRegistry: last snapshot wins; legacy kinds normalize; v1 rows migr
   assert.deepEqual(foldSubsRegistry([{ type: 'session' }] as never), { version: 2, subs: [] });
 });
 
-test('foldSubsRegistry: takeover fields survive a persist/rebuild round-trip; malformed isolate falls back to none', () => {
+test('foldSubsRegistry: the observation window survives a persist/rebuild round-trip; malformed isolate falls back to none', () => {
   const isolate = { worktreePath: '/wt/pier-x', branch: 'pier/x', baseSha: 'abc', releasedAt: null, retainNotified: false };
   const row = entryFrom(mkSub({
     paneId: 'w1:p1',
     status: 'running',
-    userTakeover: true,
     observationStartedAt: 1234567890,
-    lastAgentStatus: 'working',
     isolate,
   }));
-  assert.equal(row.userTakeover, true);
   assert.equal(row.observationStartedAt, 1234567890);
-  assert.equal(row.lastAgentStatus, 'working');
   assert.deepEqual(row.isolate, isolate);
 
   const legacy = entryFrom(mkSub({ paneId: 'w1:p1', status: 'settled' }));
-  assert.equal(legacy.userTakeover, undefined);
   assert.equal(legacy.observationStartedAt, null);
-  assert.equal(legacy.lastAgentStatus, null);
   assert.equal(legacy.tabName, '', 'rows without a tab name fall back to empty');
   assert.equal(entryFrom(mkSub({ isolate: { branch: 'pier/y' } })).isolate, undefined);
 });
@@ -309,15 +265,15 @@ test('buildBlockedGateNotice: the master must not take over or answer for the hu
   assert.match(text, /BLOCKED waiting for a HUMAN decision in pane wB:p3/);
   assert.match(text, /question: "用哪个数据源？"/);
   assert.match(text, /Do NOT take over its work/);
-  assert.match(text, /Tell the user to open that pane/);
+  assert.match(text, /Tell the user to open that terminal in the Herdr app/);
   assert.match(text, /subagent\(action: "send"\)/);
   assert.match(text, /do not redo the work yourself/);
   assert.ok(!buildBlockedGateNotice({ paneId: 'wB:p4', description: 'X', question: null }).includes('question:'));
 });
 
-test('planLaunchValidation: herdr, prompt, isolate/cwd and role/kind normalization', () => {
+test('planLaunchValidation: core availability, prompt, isolate/cwd and role/kind normalization', () => {
   const errorText = (result: { kind: string; text?: string }): string => (result.kind === 'error' ? result.text! : '');
-  assert.match(errorText(planLaunchValidation({ prompt: 'x' }, false)), /HERDR_ENV/);
+  assert.match(errorText(planLaunchValidation({ prompt: 'x' }, false)), /herdr-core terminal/);
   assert.match(errorText(planLaunchValidation({ prompt: '   ' }, true)), /prompt/);
   assert.match(errorText(planLaunchValidation({ prompt: 'x', isolate: true, cwd: '/tmp' }, true)), /mutually exclusive/);
 
@@ -418,34 +374,35 @@ test('resolveTaskIdPrefix: exact beats length, prefixes need four chars and repo
   assert.equal(exact.kind === 'resolved' && exact.taskId, 'p2');
 });
 
-test('tabNameForTask/nextTaskTabName: collapse, truncate, and suffix within the limit', () => {
+test('tabNameForTask: collapse, truncate, fall back', () => {
   assert.equal(tabNameForTask('  网络调研   现状  '), '网络调研 现状');
   assert.equal(tabNameForTask('a'.repeat(30)), 'a'.repeat(TAB_NAME_MAX));
   assert.equal(tabNameForTask('   '), 'task');
-  assert.equal(nextTaskTabName('调研', new Set(['spike'])), '调研');
-  assert.equal(nextTaskTabName('调研', new Set(['调研'])), '调研-2');
-  assert.equal(nextTaskTabName('调研', new Set(['调研', '调研-2'])), '调研-3');
-  const long = 'a'.repeat(TAB_NAME_MAX);
-  const next = nextTaskTabName(long, new Set([long]));
-  assert.equal(next, 'a'.repeat(TAB_NAME_MAX - 2) + '-2');
-  assert.ok(next.length <= TAB_NAME_MAX);
 });
 
-test('planTabPlacement: explicit tab joins or creates; D86 zone decides otherwise', () => {
-  const knownTabs = [{ tabName: '调研', tabId: 'w1:t9' }, { tabName: 'spike', tabId: 'w1:t10' }];
-  const main = { zone: 'main' as const, tabName: null };
+test('planTabPlacement: a named tab or a worktree gets its own stable app tab; the main checkout joins the master', () => {
   const cases: Array<[string, Parameters<typeof planTabPlacement>[0], unknown]> = [
-    ['an existing tab name joins it', { desiredTab: '调研', description: 'x', knownTabs }, { mode: 'append', tabName: '调研', tabId: 'w1:t9' }],
-    ['an unknown tab name creates one', { desiredTab: '新任务', description: 'x', knownTabs }, { mode: 'new', tabName: '新任务', tabId: null }],
-    ['without a tab name the zone decides', { description: '现状', knownTabs, zone: main, mainTabId: 'w1:t0' }, { mode: 'append', tabName: 'main', tabId: 'w1:t0' }],
-    ['a whitespace-only tab name counts as absent', { desiredTab: '   ', description: 'spike', knownTabs, zone: main, mainTabId: 'w1:t0' }, { mode: 'append', tabName: 'main', tabId: 'w1:t0' }],
-    ['a worktree zone with a live tab joins it', { description: 'bug#2', knownTabs: [{ tabName: 'hotfix-2', tabId: 'w1:t5' }], zone: { zone: 'worktree', tabName: 'hotfix-2' }, mainTabId: 'w1:t0' }, { mode: 'append', tabName: 'hotfix-2', tabId: 'w1:t5' }],
-    ['a worktree zone without one creates it', { description: 'bug#3', knownTabs: [{ tabName: 'hotfix-2', tabId: 'w1:t5' }], zone: { zone: 'worktree', tabName: 'hotfix-3' }, mainTabId: 'w1:t0' }, { mode: 'new', tabName: 'hotfix-3', tabId: null }],
-    // No zone information → derive from the description and always create.
-    ['no zone derives the name and creates', { description: '网络调研现状', knownTabs: [{ tabName: '网络调研现状', tabId: 'w1:t9' }] }, { mode: 'new', tabName: '网络调研现状-2', tabId: null }],
+    ['an explicit tab is its own tab', { desiredTab: '调研', description: 'x' }, { tabName: '调研', tabId: 'tbpier-' + fnvSlug('调研') }],
+    ['the same tab name always maps to the same app tab', { desiredTab: 'Spike Two', description: 'x' }, { tabName: 'Spike Two', tabId: 'tbpier-spike-two' }],
+    ['a whitespace-only tab name counts as absent', { desiredTab: '   ', description: 'spike', zone: { zone: 'main', tabName: null } }, { tabName: MAIN_TAB_NAME, tabId: null }],
+    ['the main checkout joins the master tab', { description: '现状', zone: { zone: 'main', tabName: null } }, { tabName: MAIN_TAB_NAME, tabId: null }],
+    ['a worktree gets a tab named after its directory', { description: 'bug#2', zone: { zone: 'worktree', tabName: 'hotfix-2' } }, { tabName: 'hotfix-2', tabId: 'tbpier-hotfix-2' }],
+    ['no zone derives the name from the description', { description: '网络调研现状' }, { tabName: '网络调研现状', tabId: 'tbpier-' + fnvSlug('网络调研现状') }],
+    ['a tab literally named main joins the master tab', { desiredTab: 'main', description: 'x' }, { tabName: MAIN_TAB_NAME, tabId: null }],
   ];
   for (const [name, input, expected] of cases) assert.deepEqual(planTabPlacement(input), expected, name);
+  assert.equal(planTabPlacement({ desiredTab: '调研', description: 'x' }).tabId, planTabPlacement({ desiredTab: '调研', description: 'y' }).tabId, 'repeat spawns join one tab');
 });
+
+/** Mirrors the id derivation in subagent-core for non-ASCII names (FNV-1a over code points). */
+function fnvSlug(name: string): string {
+  let hash = 0x811c9dc5;
+  for (const ch of name) {
+    hash ^= ch.codePointAt(0)!;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
 
 test('classifyWorktreeZone: main checkout, sibling worktree, unrelated dir, prefix trap', () => {
   const worktrees = ['F:/repo', 'F:/wt/hotfix-2', 'F:/wt/hotfix-3'];
@@ -525,10 +482,9 @@ test('subagent plugin: list shows live state, activity and a foreign cwd only wh
   const { root, pi } = await mountSubagent({
     client: {
       available: false, // keeps the session-recovery pollers out of a rendering-only test
-      listPanes: async () => [
-        { paneId: 'p-1', tabId: 't-1', workspaceId: 'w1', agentStatus: 'working', foregroundCwd: '/workspace/repo/packages/sub' },
-        { paneId: 'p-2', tabId: 't-1', workspaceId: 'w1', agentStatus: 'working', foregroundCwd: '/workspace/repo' },
-      ],
+      getTerminal: async (id) => (id === 'p-1'
+        ? terminalInfo({ id: 'p-1', status: 'working', labels: { 'herdr.tab': 't-1' }, foreground: { pid: 1, name: 'pi', argv: [], cwd: '/workspace/repo/packages/sub' } })
+        : terminalInfo({ id: 'p-2', status: 'working', labels: { 'herdr.tab': 't-1' }, foreground: { pid: 2, name: 'pi', argv: [], cwd: '/workspace/repo' } })),
     },
     subs: [worker('p-1', 'task-1', 'Worker 1'), worker('p-2', 'task-2', 'Worker 2')],
   });
@@ -552,7 +508,7 @@ test('subagent plugin: list prints the isolate worktree path, not the branch', a
   const { root, pi } = await mountSubagent({
     client: {
       available: false,
-      listPanes: async () => [{ paneId: 'wA:p5D', tabId: 't-1', workspaceId: 'w1', agentStatus: 'idle' }],
+      getTerminal: async () => terminalInfo({ id: 'wA:p5D', status: 'idle', labels: { 'herdr.tab': 't-1' } }),
     },
     subs: [subEntry({
       paneId: 'wA:p5D', taskId: 'task-iso', tabId: 't-1', tabName: 'pier-implement-20680',

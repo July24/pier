@@ -20,7 +20,6 @@ import { RESERVED_ROLE_NAMES, listRoleNames, roleLayers } from './role-loader.ts
 import { TodosService } from './todos-service.ts';
 import { APPROVAL_NEEDED_CUSTOM_TYPE, ROLE_MANIFEST_CUSTOM_TYPE } from './renderers.ts';
 import { planDenyHitRow, scanRoleAxisUsage, type RoutingTelemetryRecord } from './routing-telemetry.ts';
-import type { HerdrClientLike } from './herdr-client.ts';
 
 /**
  * WS-D7: the master pane applies its own manifest through the same mandatory chain as
@@ -38,8 +37,6 @@ export function composeMasterRuntime(): RuntimeRoleManifest | null {
 
 export interface RoleRuntimeDeps {
   pi: ExtensionAPI;
-  /** D93 sidebar identity (`display_agent`) is a herdr RPC — pi's ExtensionAPI has no such method. */
-  client: HerdrClientLike;
   /** Role-resolution base dir carried by the master at spawn (an isolate worker's own cwd resolves a different checkout). */
   roleBase: string;
   initialManifest: RuntimeRoleManifest | null;
@@ -51,8 +48,7 @@ export interface RoleRuntimeDeps {
 
 export interface RoleRuntime {
   readonly state: RoleState;
-  idleBadge(): string | null;
-  /** Replay the branch-point role record and re-anchor side effects (D77 visible layer, sidebar identity, badge). */
+  /** Replay the branch-point role record and re-anchor side effects (D77 visible layer). */
   syncFromBranch(ctx: unknown): void;
   /** Phase 0 axis scan of the workspace+user role layers (master session_start only). */
   scanRoleUsage(): void;
@@ -61,18 +57,8 @@ export interface RoleRuntime {
 }
 
 export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
-  const { pi, client, todos, roleBase, appendRoutingLog } = d;
+  const { pi, todos, roleBase, appendRoutingLog } = d;
   const roleState = initialRoleState(d.initialManifest);
-  let roleBadge: string | null = null;
-
-  /** D93: sidebar identity is the role name; null clears it. Best effort — herdr may be absent. */
-  const reportSidebarIdentity = (role: string): void => {
-    void client.reportDisplayAgent(role === 'worker-default' ? 'worker' : role).catch(() => {});
-  };
-
-  const setBadge = (m: RuntimeRoleManifest): string =>
-    (roleBadge = `role ${m.role} v${m.version ?? '?'} (${m.tools.length} tools)`);
-
   /**
    * Same-origin sync (RFC docs/rfc-pi-0.86-dynamic-tools.md §4.3): reconcile roleState against the CURRENT
    * branch point on session_start (resume) and session_tree — pi's tool deltas revert the loadout at the
@@ -111,8 +97,6 @@ export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
     } catch {
       /* Best effort recording; the mandatory layer does not depend on the session log. */
     }
-    reportSidebarIdentity(roleState.manifest.role);
-    setBadge(roleState.manifest);
     // D77 visible layer: hide tools outside the manifest AFTER all plugins load.
     // Intersection semantics prevent clearing everything; master without a
     // manifest stays full. setActiveTools persists as a tool delta (pi 0.86).
@@ -188,7 +172,6 @@ export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
     roleState.origin = 'switch';
     roleState.switchedBy = switchedBy;
     roleState.switchedAt = Date.now();
-    setBadge(next);
     try {
       pi.appendEntry(ROLE_MANIFEST_CUSTOM_TYPE, {
         version: 1,
@@ -204,7 +187,6 @@ export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
       });
     } catch {
     }
-    reportSidebarIdentity(next.role);
     const diff = [
       plan.added.length ? `+${plan.added.join(', ')}` : null,
       plan.removed.length ? `-${plan.removed.join(', ')}` : null,
@@ -298,7 +280,6 @@ export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
 
   return {
     state: roleState,
-    idleBadge: () => roleBadge,
     syncFromBranch,
     scanRoleUsage,
     applyRoleSwitch,

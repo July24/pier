@@ -8,13 +8,14 @@ import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
 import { basename, dirname, join } from 'node:path';
 import { cordisGet } from '../cordis-services.ts';
-import type { HerdrClientLike } from '../herdr-client.ts';
+import type { CoreClientLike, CoreEnv } from '../core-client.ts';
 import {
   Semaphore,
   SUBAGENT_OUTPUT_SCHEMA,
   agoText,
   attachSubagentStructuredContent,
   buildAliveNotice,
+  buildLaunchLine,
   idParam,
   flattenToolParams,
   isAlive,
@@ -54,15 +55,9 @@ import type { RoutingTelemetryRecord } from '../routing-telemetry.ts';
 
 type ToolParams = Record<string, unknown> | undefined;
 
-interface SubagentEnv {
-  paneId: string;
-  tabId: string;
-  workspaceId: string;
-}
-
 export interface SubagentDeps {
-  client: HerdrClientLike;
-  env: SubagentEnv | null;
+  client: CoreClientLike;
+  env: CoreEnv | null;
   /** Extension entry (index.ts) path — launchLine `-e`. */
   extPath: string;
   /** Master tree root (scope mount). */
@@ -86,7 +81,7 @@ export interface SubagentDeps {
 
 /** Sent with every request: what a call needs. Details live in SUBAGENT_MANUAL (`action: "help"`). */
 const SUBAGENT_DESCRIPTION = [
-  'Delegate a self-contained task to a subagent: an isolated pi session in its own herdr pane (separate context — it does NOT see this conversation; a human can talk to it in that pane).',
+  'Delegate a self-contained task to a subagent: an isolated pi session in its own herdr terminal pane (separate context — it does NOT see this conversation; a human can talk to it in that pane).',
   'Actions (default spawn): spawn | send | output | list | interrupt | resume | role | help.',
   'spawn: `prompt` is the COMPLETE task, since only the prompt reaches it; `description` labels the pane and is the todo-reconcile key — when delegating a todo entry, pass its content without the ` <sub>` marker and the entry auto-completes on settle. Several spawns in one message run in parallel (max 4).',
   'A foreground spawn BLOCKS this call for up to ~5 minutes; pass run_in_background: true for long tasks. A background (or timed-out foreground) worker\'s settlement notice arrives automatically at your next tool boundary — no need to sleep or poll.',
@@ -133,11 +128,11 @@ export default function subagentPlugin(ctx: Context): void {
 
   const runtime = { nodePath: process.execPath, cliPath: process.argv[1] ?? '', extPath: d.extPath };
   const subSemaphore = new Semaphore(SUBAGENT_CONCURRENCY);
-  /** B4: timestamps machine injection so grace-period working events are not mistaken for takeover. */
-  const lastMachineInjectAt = new Map<string, number>();
   /* Registry persisted as custom branch state so a parent restart can rebuild it. */
   const subs = new Map<string, SubEntry>();
   const outputCursors = new Map<string, SubagentOutputCursor>();
+  /** Read counters shown in `subagent output` headers (one monotonic number per worker). */
+  const outputRevisions = new Map<string, number>();
   /** D98: excludes branches during the worktree-add-to-registry race from orphan collection. */
   const pendingIsolateBranches = new Set<string>();
   const lastRequestIdByPane = new Map<string, string>();
@@ -159,7 +154,8 @@ export default function subagentPlugin(ctx: Context): void {
       ...(e.slug ? { slug: e.slug } : {}),
       tabId: e.tabId,
       tabName: e.tabName,
-      workspaceId: env?.workspaceId ?? '',
+      // The ledger keeps the column for older readers; herdr-core has no workspace identity.
+      workspaceId: '',
       cwd: e.cwd,
       description: e.description,
       sessionFile: e.sessionFile,
@@ -250,7 +246,6 @@ export default function subagentPlugin(ctx: Context): void {
     persistSubs,
     writeHistory,
     blockedGateNotified,
-    lastMachineInjectAt,
     session,
     git,
     injectNotice,
@@ -275,7 +270,7 @@ export default function subagentPlugin(ctx: Context): void {
   gc.startTicker(ctx);
   scoped.on('turn_start', () => gc.onTurnStart());
   const { readAskFlag, probeAlive } = session;
-  const { spawnPaneInTaskTab, launchLine, approveFor, waitSubReady, findExistingPane } = spawn;
+  const { spawnPaneInTaskTab, launchParts, approveFor, waitSubReady, findExistingPane } = spawn;
 
   /** P0-2: re-arm pollers for live running panes after a master restart, or settle notices stop arriving
    * and ledger rows stay 'running'. The `recover-*` requestId is never echoed by a worker, so this claim wins. */
@@ -283,15 +278,15 @@ export default function subagentPlugin(ctx: Context): void {
     if (!client.available) return;
     const running = [...subs.values()].filter((s) => s.background && s.status === 'running' && !pollers.has(s.paneId));
     if (running.length === 0) return;
-    let livePaneIds: ReadonlySet<string>;
+    let liveTerminalIds: ReadonlySet<string>;
     try {
-      livePaneIds = new Set((await client.listPanes()).map((p) => p.paneId));
+      liveTerminalIds = new Set((await client.listTerminals()).map((terminal) => terminal.id));
     } catch {
       return; // liveness lookup failed → do not guess
     }
     const recovered: string[] = [];
     for (const entry of running) {
-      if (!livePaneIds.has(entry.paneId)) continue; // zombie sweep already closed those
+      if (!liveTerminalIds.has(entry.paneId)) continue; // zombie sweep already closed those
       try {
         await startPoller(entry.paneId, entry.cwd, entry.createdAt, entry.description, `recover-${via}-${entry.paneId}`);
         recovered.push(`${entry.paneId} (${entry.description})`);
@@ -323,10 +318,9 @@ export default function subagentPlugin(ctx: Context): void {
   scoped.on('tool_result', async (rawEvent: unknown) => {
     const event = (rawEvent ?? {}) as { toolName?: string; isError?: boolean; content?: Array<{ type: string; text?: string }> };
     if (event.toolName !== 'subagent' || !event.isError) return;
-    // Extract only pane ids carried by our own errors; leave unrelated errors untouched.
+    // Extract only ids of rows we know; leave unrelated errors untouched.
     const errText = (event.content ?? []).map((c) => c.text ?? '').join(' ');
-    const paneId = [...subs.keys()].find((id) => errText.includes(id))
-      ?? (errText.match(/\bw[A-Za-z0-9]+:p\d+\b/) ?? [])[0];
+    const paneId = [...subs.keys()].find((id) => errText.includes(id));
     if (!paneId) return;
     const entry = subs.get(paneId);
     if (!entry || entry.status === 'settled' || entry.status === 'consumed') return;
@@ -356,22 +350,23 @@ export default function subagentPlugin(ctx: Context): void {
       ? latest.sessionFile : null;
     // D86 trust matches spawn; revive has no tool context, so use the process cwd.
     const approve = await approveFor(entry.cwd, process.cwd());
+    const argv = launchParts(resumeFile, null, approve);
     const spawned = await spawnPaneInTaskTab(
       { desiredTab: entry.tabName || latest.tabName || null, description: entry.description },
       entry.cwd,
       {
         PI_HERDR_SUBAGENT: '1',
         [DELEGATION_ENV]: JSON.stringify({
-          parentPaneId: env?.paneId ?? '',
+          parentPaneId: env?.terminalId ?? '',
           parentSessionId: bareSessionId(d.getSessionId()),
           // todo_sync needs the master's pipe; kind 'task' maps to the composed default.
-          parentPipe: pipeNameFor(process.cwd(), env?.paneId ?? ''),
+          parentPipe: pipeNameFor(process.cwd(), env?.terminalId ?? ''),
           taskId: entry.taskId,
           description: entry.description,
           role: entry.kind === 'task' ? 'worker-default' : entry.kind,
         } satisfies DelegationContext),
       },
-      launchLine(resumeFile, null, approve),
+      argv,
     );
     const ready = await waitSubReady(entry.cwd, spawned.paneId);
     if (!ready.ok) throw new Error(ready.message);
@@ -383,7 +378,7 @@ export default function subagentPlugin(ctx: Context): void {
       status: 'running' as const,
       consumedAt: null,
       revivedFrom: latest.paneId,
-      launchCommand: [launchLine(resumeFile, null, approve)],
+      launchCommand: [buildLaunchLine(argv)],
       createdAt: Date.now(),
     });
     writeHistory(entry, undefined, 'revive');
@@ -468,7 +463,7 @@ export default function subagentPlugin(ctx: Context): void {
   }
 
   async function executeSubagentResume(params: ToolParams) {
-    if (!client.available) return toolError('requires a herdr-managed pane.');
+    if (!client.available) return toolError('requires a herdr-core terminal.');
     const rawTaskId = idParam(params, 'taskId', 'agentId');
     if (!rawTaskId) return toolError('missing taskId for resume (see action list or delegation ledger).');
     const running = newestPerTaskId([...subs.values()].filter((s) => s.background && s.status === 'running'));
@@ -496,9 +491,9 @@ export default function subagentPlugin(ctx: Context): void {
     try {
       // D94: reuse an existing pane for the same session to avoid competing pi processes.
       const existing = await findExistingPane(latest.sessionFile);
-      // A ledger sessionFile mis-attributed to the master's own transcript would match the MASTER pane here,
+      // A ledger sessionFile mis-attributed to the master's own transcript would match the MASTER terminal here,
       // registering the master as its own subagent (later consumed, then closed by GC mid-run) — never adopt self.
-      if (existing?.paneId === env?.paneId) {
+      if (existing?.paneId === env?.terminalId) {
         return toolError(
           `Error: task ${taskId} is attributed to the master's own session (mis-recorded sessionFile in the ledger); it cannot be resumed here — spawn a fresh subagent for this work instead.`,
         );
@@ -576,12 +571,11 @@ export default function subagentPlugin(ctx: Context): void {
         text: String(params?.message ?? ''),
         // The reply pipe is the MASTER's (bound at session_start with this session's cwd);
         // entry.cwd would name a dead pipe for cross-repo workers.
-        from: pipeNameFor(cwd, env?.paneId ?? ''),
+        from: pipeNameFor(cwd, env?.terminalId ?? ''),
         push: true,
         steer: true,
       }),
       ok: (_res, reqId) => {
-        lastMachineInjectAt.set(entry.paneId, Date.now()); // B4: attribute working state during the observation window
         // An exception between status='running' and startPoller would leave a ghost running entry
         // with no poller (never settles, skipped by GC): roll back the status on failure.
         const prevStatus = entry.status;
@@ -661,7 +655,6 @@ export default function subagentPlugin(ctx: Context): void {
         continue;
       }
       const state = 'running';
-      const takeoverMark = sub.userTakeover ? ', user-controlled' : '';
       const probe = probes.get(sub.paneId);
       const statusTag = probe?.agentStatus ? ` ${probe.agentStatus}` : '';
       const activityTag = probe?.lastActivityMs != null ? `, active ${agoText(probe.lastActivityMs, now)}` : '';
@@ -673,7 +666,7 @@ export default function subagentPlugin(ctx: Context): void {
       const cwdTag = probe?.foregroundCwd && probe.foregroundCwd !== sub.cwd
         ? ` [cwd: ${basename(probe.foregroundCwd) || probe.foregroundCwd}]`
         : '';
-      lines.push(`${subRef(sub)} [${state}${takeoverMark}${statusTag}${activityTag}${gateTag}] (${sub.kind})${tabTag}${wtTag}${cwdTag} ${sub.description}`);
+      lines.push(`${subRef(sub)} [${state}${statusTag}${activityTag}${gateTag}] (${sub.kind})${tabTag}${wtTag}${cwdTag} ${sub.description}`);
     }
     return { content: [{ type: 'text', text: lines.join('\n') }], details: {} };
   }
@@ -686,7 +679,6 @@ export default function subagentPlugin(ctx: Context): void {
     persistSubs,
     writeHistory,
     pendingIsolateBranches,
-    lastMachineInjectAt,
     lastRequestIdByPane,
     git,
     session,
@@ -700,9 +692,14 @@ export default function subagentPlugin(ctx: Context): void {
     client,
     resolveEntry: (rawId: string, cwd: string) => resolveSubEntry(rawId, cwd),
     outputCursors,
+    nextRevision: (paneId: string): number => {
+      const next = (outputRevisions.get(paneId) ?? 0) + 1;
+      outputRevisions.set(paneId, next);
+      return next;
+    },
     getCwd: (toolCtx: unknown): string => (toolCtx as { cwd?: string })?.cwd ?? process.cwd(),
     // Transcript fallback: small worker panes show only the opaque status overlay, so the pane delta can never
-    // carry the final report. No preferred file — start from herdr's per-pane report, not a stale registry value.
+    // carry the final report. No preferred file — start from the worker's `pier.session` label, not a stale registry value.
     readFinalReport: async (paneId: string, entryCwd: string) =>
       (await session.subSessionState(paneId, entryCwd, 0)).text,
     persistSubs,

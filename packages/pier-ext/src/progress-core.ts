@@ -1,8 +1,7 @@
 /**
- * M16 progress visibility: conservative output only, no new D3 protocol. The progress badge
- * (N/M plus optional ETA) rides in the pane title, the tool badge (🔧 tool) goes through
- * report_agent.message, and an untrustworthy estimate falls back to plain `N/M` — never a
- * misleading ETA.
+ * M16 progress visibility: conservative output only. The progress badge (N/M plus optional ETA)
+ * rides in the todo summary (slim frame title and the `pier.todo` label), and an untrustworthy
+ * estimate falls back to plain `N/M` — never a misleading ETA.
  */
 
 import { countTodos, type TodoItem } from './vocab.ts';
@@ -60,12 +59,6 @@ export function formatProgressSuffix(opts: {
   return `${base} ${human}`;
 }
 
-/** Tool badge for report_agent.message: one name, or the first plus a count; empty → null (do not overwrite). */
-export function planToolBadge(runningToolNames: readonly string[]): string | null {
-  if (runningToolNames.length === 0) return null;
-  const first = runningToolNames[0];
-  return runningToolNames.length === 1 ? `🔧 ${first}` : `🔧 ${first} +${runningToolNames.length - 1}`;
-}
 
 /** Completed count over all tracked work (abandoned excluded). */
 export function progressOf(items: readonly TodoItem[]): { completed: number; total: number } {

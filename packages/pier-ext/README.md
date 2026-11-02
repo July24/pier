@@ -1,11 +1,11 @@
 # pi-pier
 
 > [!IMPORTANT]
-> **This npm package is only the pi-extension half of pier.** pier is a two-half system — this extension plus a **herdr plugin** (`pier.workbench`). Without the herdr side you still get `todo_write` / `ask_user_question`; `subagent` / `terminal` are not registered. Pane integration and notifications require herdr. See [Install the herdr half](#install-the-herdr-half-companion-plugin) below.
+> **This package is the whole of pier**: a pi extension. It talks to **[herdr-core](https://herdr.dev/)** (`hc`) for terminals and status, and the optional **Herdr app** displays those terminals. Without a core terminal (`HC_TERMINAL_ID` / `HC_TERMINAL_SOCKET`) you still get `todo_write` / `ask_user_question`; `subagent` / `terminal` are not registered.
 
-**pier** = **pi** × h**erdr** — a [pi](https://pi.dev/) extension that fuses coding agent sessions with the [herdr](https://herdr.dev/) pane/tab orchestrator.
+**pier** = **pi** × h**erdr** — a [pi](https://pi.dev/) extension that fuses coding agent sessions with terminals managed by [herdr-core](https://herdr.dev/).
 
-`pi-pier` fills two gaps pi deliberately leaves open — the **todo list loop** and **interactive subagents** — using herdr panes/tabs as the visual and interaction substrate. Outside herdr it loads only the todo loop.
+`pi-pier` fills two gaps pi deliberately leaves open — the **todo list loop** and **interactive subagents** — using core terminals as the visual and interaction substrate. Outside a core terminal it loads only the todo loop.
 
 ## Install (this pi half)
 
@@ -19,22 +19,21 @@ Or from git (monorepo root, same content):
 pi install git:github.com/July24/pier
 ```
 
-## Install the herdr half (companion plugin)
-
-The herdr plugin `pier.workbench` provides the other half: blocked-gate notifications (system notifications when a subagent waits for a human), the focus-heat layout (focused pane grows in place), and the ops dashboard / sidebar agent view. Install it from the same repo:
+Then install herdr-core (required for subagents) and, optionally, the Herdr app:
 
 ```sh
-herdr plugin install July24/pier/packages/pier-workbench --yes
+curl -fsSL https://releases.herdr.dev/core/install.sh | sh   # hc ≥ 0.1.16
+# Herdr app: https://herdr.dev/
 ```
 
-Or install **both halves at once** with the one-shot installer from the monorepo:
+Or install everything at once with the one-shot installer from the monorepo:
 
 ```sh
 git clone https://github.com/July24/pier && cd pier
-node install.mjs        # user mode: installs both halves
+node install.mjs        # user mode: installs the pi extension
 ```
 
-The installer also verifies node / pi / herdr versions.
+The installer verifies node / pi / `hc` versions and prints an informational line for `herdr-app`.
 
 ## What you get
 
@@ -42,49 +41,50 @@ The installer also verifies node / pi / herdr versions.
 
 | Tool | Purpose |
 |---|---|
-| `todo_write` | Full-replacement todo list. Session JSONL is the single source of truth; correct rollback on branch switches. Projected live onto the pane title (`▶i ○p ■b ✓c (N/M) · current task`). `/todos` command to view/edit/unblock |
-| `subagent` | Delegate self-contained subtasks to an isolated pi session in its own herdr pane. Actions: `spawn` (default; foreground / parallel / background), `list`, `send`, `interrupt`, `resume`, `output` (incremental preview of a running subagent's pane output), `role` (switch that worker's role profile mid-session — pi records the toolset change as a transcript delta, so it applies on the worker's next request and survives resume), `help` (the full manual — placement, isolate, roles, ledger — kept out of the per-request description). Every spawned task gets a stable slug: outputs print `slug@paneId`, and `agentId` accepts the slug, the pane id, or the combined form |
-| `terminal` | Persistent interactive shells in dedicated herdr panes. Actions: `open`, `send`, `read`, `signal`, `close`, `list` |
+| `todo_write` | Full-replacement todo list. Session JSONL is the single source of truth; correct rollback on branch switches. Progress shows in the resident widget and `/todos`; the list is mirrored into a `pier.todo` terminal label only so the master can rebuild worker summaries (no pane-title projection). `/todos` command to view/edit/unblock |
+| `subagent` | Delegate self-contained subtasks to an isolated pi session in its own herdr-core terminal. Actions: `spawn` (default; foreground / parallel / background), `list`, `send`, `interrupt`, `resume`, `output` (incremental preview of a running subagent's terminal output), `role` (switch that worker's role profile mid-session — pi records the toolset change as a transcript delta, so it applies on the worker's next request and survives resume), `help` (the full manual — placement, isolate, roles, ledger — kept out of the per-request description). Every spawned task gets a stable slug: outputs print `slug@paneId`, and `agentId` accepts the slug, the terminal id, or the combined form |
+| `terminal` | Persistent interactive shells in dedicated herdr-core terminals. Actions: `open`, `send`, `read`, `signal`, `close`, `list` |
 
 ### Commands
 
 | Command | Purpose |
 |---|---|
-| `/todos` | Show the todo list, or edit it: `/todos done|drop|rm|unblock <fuzzy match>` |
-| `/dashboard [overlay]` | Ops dashboard. Default opens the shared Pier **popup** on its `Dashboard` tab (90% × 80%, singleton); `overlay` opens the same view as an independent full-window pane. Non-Herdr falls back to an in-pane text view. |
-| `/pier-tree [overlay]` | Master only: the full delegation tree — your complete todo list plus every running subagent's full list (live-pushed over the pipe) and settled nodes with ages. Default opens the same shared popup on its `Tree` tab (the snapshot refreshes on every todo/worker push; `1`/`2`/`Tab` switch views inside the popup); `overlay` opens an independent full-window pane; bare pi / a missing plugin falls back to the in-pane notify view. The resident widget stays one line per agent and hides entirely once the self list is fully completed (D113/D114) |
-| `/locks` | Show write locks held by this pane and by live panes — the **human/operator view** of the write-lock beacons (herdr only). Agents see the holders inside their own write warnings; the raw tokens are readable via `herdr agent list` |
+| `/todos` | Show the todo list, or edit it: `/todos done\|drop\|rm\|unblock <fuzzy match>` |
+| `/pier-tree` | Master only: the full delegation tree — your complete todo list plus every running subagent's full list (live-pushed over the pipe) and settled nodes with ages. Opens as an in-pi overlay (`ui.custom`; `esc`/`q` closes, live refresh while open). Bare pi / RPC mode falls back to the in-pane notify view. The resident widget stays one line per agent and hides entirely once the self list is fully completed (D113/D114) |
+| `/locks` | Show write locks held by this terminal and by live terminals — the **human/operator view** of the `pier.lock.<hash>` labels (herdr-core only). Agents see the holders inside their own write warnings; raw labels are readable via `hc get <terminal> --json` |
 | `/pier-role` | Show the current role + available role names, or switch mid-session: `/pier-role <name>` (widening beyond the current toolset asks for confirmation; the switch lands as a transcript tool delta) |
 | `/pier-config` | Read-only configuration guide over four planes: bare call = index + hands a guided change to the agent; `show [plane\|all]` = effective value + source (`env > workspace > user > default`); `check` = validate all planes; `doc [path]` = write a report |
 
+`/dashboard` was removed in the core migration — the app-side plugin and its panels no longer exist.
+
 ### Behaviors
 
-- **Human-in-the-loop**: every subagent is a visible, interactive TUI pane — step into it anytime to talk directly (fix bugs, take over, answer its `ask_user_question`). Blocked gates raise sidebar markers + notifications
-- **Delegation identity**: the worker knows who delegated it — spawn env (`PI_HERDR_DELEGATION`) replays through the worker marker and the session's own first-frame entry; its system prompt carries a `pier-delegation` section (identity + delivery contract), the transcript opens with an "⟵ delegated by master …" card, the pane title gets an `↳` prefix, and `pi-parent`/`pi-task` tokens feed the workbench dashboard tree and blocked-alert attribution
-- **Blocking dialogs block the pane**: pi's `ui_prompt_start` / `ui_prompt_end` events cover the inherently blocking `ctx.ui` dialogs (`select` / `confirm` / `input` / `editor`), so a dialog from any extension (not only pier's own ask tool) reports the pane as blocked and emits the `herdr:blocked` edge; nested gates are coalesced. `custom` is excluded because pi also routes resident overlays through it (pier's slim-frame overlay never calls `done()`, and a resident overlay keeps pi's prompt span open anyway)
+- **Human-in-the-loop**: every subagent is a visible terminal shown as a pane by the Herdr app — attach to it anytime to talk directly (fix bugs, answer its `ask_user_question`). Status reaches the app through pi's native OSC 7501 report; pier does not synthesize it.
+- **Delegation identity**: the worker knows who delegated it — spawn env (`PI_HERDR_DELEGATION`) replays from the session's own first-frame entry; its system prompt carries a `pier-delegation` section (identity + delivery contract), and the transcript opens with an "⟵ delegated by master …" card
+- **Blocking dialogs report blocked**: pi 1.4's native OSC 7501 reporter covers the inherently blocking `ctx.ui` dialogs (`select` / `confirm` / `input` / `editor`) and permission dialogs from any extension. pier adds the `ui.custom` ask overlay — pi does not report it — so pier writes `blocked` while it is open and restores `working`/`idle` when it closes. Nested gates are coalesced.
 - **Role gate stops early**: a tool call denied by the role manifest returns `terminate`, so a batch whose results are all terminating ends without another model round trip
 - **Readable transcript**: pier's own session entries (todo edits, subagent/terminal registries, role manifests, soft approvals) and its reminder messages render as compact cards instead of raw JSON
-- **Soft locks**: write paths register per-pane beacons; conflicts warn (default) or block (`PI_HERDR_WRITE_LOCK=1`) instead of racing silently. Warnings name **every** holder — the audience split is: agent reads its own tool-result warning, human reads `/locks` (or `herdr agent list` for the raw token table). `write`/`edit` only — `bash` writes are not covered
-- **Role profiles**: built-in `master` / `worker-default`; custom roles mount from `.pi-herdr/roles/<name>.json`. Toolsets converge per role — deny rules cannot be bypassed. A role manifest may carry `guidelines` (behavior constraints a toolset cannot express); they ride the system prompt as a `pier-role` section each turn. Masters can switch a worker's role remotely via `subagent action:"role"`; humans can switch the pane they are in via `/pier-role`
+- **Soft locks**: write paths publish per-terminal `pier.lock.<hash>` labels; conflicts warn (default) or block (`PI_HERDR_WRITE_LOCK=1`) instead of racing silently. Warnings name **every** holder — the audience split is: agent reads its own tool-result warning, human reads `/locks` (or `hc get <terminal> --json` for the raw label table). `write`/`edit` only — `bash` writes are not covered
+- **Role profiles**: built-in `master` / `worker-default`; custom roles mount from `.pi-herdr/roles/<name>.json`. Toolsets converge per role — deny rules cannot be bypassed. A role manifest may carry `guidelines` (behavior constraints a toolset cannot express); they ride the system prompt as a `pier-role` section each turn. Masters can switch a worker's role remotely via `subagent action:"role"`; humans can switch the terminal they are in via `/pier-role`
 - **Settlement notices folded**: background subagent completions inject between turns (max 3 shown, rest collapsed) instead of flood-filling at run end
 
 ## Scope & degradation
 
-This extension mutates the pi session even outside herdr. After `pi install npm:pi-pier`:
+This extension mutates the pi session even outside a core terminal. After `pi install npm:pi-pier`:
 
-| Surface | Bare `pi` (no `HERDR_ENV`) | Inside herdr |
+| Surface | Bare `pi` (no `HC_TERMINAL_ID` / `HC_TERMINAL_SOCKET`) | Inside herdr-core |
 |---|---|---|
 | `todo_write`, `/todos`, widget, anti-freeze, stop reminder | live | live |
-| `ask_user_question` | live (TUI picker for single and multi; host select dialog / typed prompts as RPC fallback) | live + blocked marker |
-| Blocked reporting for blocking `ctx.ui` dialogs (`ui_prompt_start/end`, `select`/`confirm`/`input`/`editor`) | live | live + blocked marker |
+| `ask_user_question` | live (TUI picker for single and multi; host select dialog / typed prompts as RPC fallback) | live + blocked report while the overlay is open |
+| Blocked reporting for blocking `ctx.ui` dialogs (`select`/`confirm`/`input`/`editor`) | live | live |
 | Hidden inject (`before_agent_start` todo-read; settle reminder) | live | live |
 | `subagent`, `terminal` | **not registered** | live |
 | `/locks`, write-lock on `write`/`edit` | not installed | live |
 | `/pier-config` (read-only config guide over 4 planes) | live | live |
-| slim-frame overlay, pane title, pipe, isolate worktree | off | live |
-| `setActiveTools` role visible layer | off | on (herdr master) |
+| slim-frame overlay, pipe, isolate worktree | off | live |
+| `setActiveTools` role visible layer | off | on (master) |
 
-Session JSONL custom types (`pi-herdr.todo-edit`, `.subs`, `.terminals`, `.todo-read`, `.todo-reminder`, …) persist across `/resume` even without herdr.
+Session JSONL custom types (`pi-herdr.todo-edit`, `.subs`, `.terminals`, `.todo-read`, `.todo-reminder`, …) persist across `/resume` even without core.
 
 ## Plugin conflicts
 
@@ -102,23 +102,26 @@ pi overwrites tools/commands by name; event listeners stack.
 - [`@minhduydev/pi-subagents`](https://pi.dev/packages/@minhduydev/pi-subagents) (`task`)
 - any other extension that calls `setActiveTools`, `ui.custom` overlay, `before_agent_start`, or `sendUserMessage`/`sendMessage` followUp
 
-**Designed coexistence:** herdr’s official `herdr:pi` reporter. Keep it. pier emits `herdr:blocked` so that plugin remains lifecycle authority.
+**Status ownership:** pi's native OSC 7501 reporter is the only status source; pier never writes terminal status. Do not add a second OSC 7501 reporter for the same terminal.
 
 ## Requirements
 
 - Node ≥ 22
-- pi ≥ 1.3.0 (`@earendil-works/pi-coding-agent`) — `before_agent_start.messageType` and resumed-session active tools
-- **herdr ≥ 0.9.5** — required for subagents / pane integration / notifications (see the IMPORTANT note above); native `pane.focused`, self-reported resume, and shutdown-safe session saves restore subagent panes after a server restart
+- pi ≥ 1.4.0 (`@earendil-works/pi-coding-agent`) — the native OSC 7501 reporter is required
+- **herdr-core `hc` ≥ 0.1.16** — required for subagents / terminal integration; `curl -fsSL https://releases.herdr.dev/core/install.sh | sh`
+- Herdr app (optional) — display only
+
+**The last TUI-compatible release is 0.4.3.** The core-only cutover is the `feat/core-app-migration` branch.
 
 ## Development
 
 ```sh
 git clone https://github.com/July24/pier && cd pier
 npm install --ignore-scripts
-npm test   # node --test, ~590 unit tests
+npm test   # typecheck + node --test
 ```
 
-See the [monorepo README](https://github.com/July24/pier) for design principles, the herdr-plugin half, and the one-shot installer.
+See the [monorepo README](https://github.com/July24/pier) for design principles and the one-shot installer.
 
 ## License
 

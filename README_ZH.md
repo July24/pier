@@ -1,12 +1,12 @@
 <div align="center">
 
-# pier · pi × herdr 工作台融合
+# pier · pi × herdr-core 工作台融合
 
 [English](README.md) · **中文**
 
 **pier** = **pi** × h**erdr** 的融合体（码头/桥，对接、停泊、分发）。
 
-[pi](https://pi.dev/)（`@earendil-works/pi-coding-agent`）是 coding agent 载体，[herdr](https://herdr.dev/) 是终端工作区管理器。pier 补上 pi 刻意不内置的两项能力——**todo list 闭环**与**交互式子代理**——并让它们以 herdr 的 pane/tab 为视觉与交互底座。
+[pi](https://pi.dev/)（`@earendil-works/pi-coding-agent`）是 coding agent 载体；[herdr-core](https://herdr.dev/)（`hc`）运行常驻终端，**Herdr app** 把它们显示为 space / tab / pane。pier 补上 pi 刻意不内置的两项能力——**todo list 闭环**与**交互式子代理**——并以 core 终端为视觉与交互底座。app 侧不需要任何 mod：Herdr app 自带侧边栏与提醒就够了。
 
 </div>
 
@@ -14,51 +14,74 @@
 
 ## 是什么
 
-pier 由**两个半区**组成，各装一处：
+pier 是**一个 pi 扩展**，外加它与两个外部程序协作：
 
-| 半区 | 包 | 作用 |
+| 部件 | 包 | 作用 |
 |---|---|---|
-| **pi 扩展** | `packages/pier-ext`（npm: [`pi-pier`](https://www.npmjs.com/package/pi-pier)，[pi.dev 市场](https://pi.dev/packages/pi-pier)） | 在 pi 会话里注入 `todo_write` / `subagent` / `terminal` / `ask_user_question` 工具 + 经 herdr socket API 上报 pane 状态 |
-| **herdr 插件** | `packages/pier-workbench`（`pier.workbench`） | blocked 人类闸门通知、焦点热力布局（聚焦 pane 原地放大）、运维面板 + 侧边栏视图 |
+| **pi 扩展** | `packages/pier-ext`（npm: [`pi-pier`](https://www.npmjs.com/package/pi-pier)，[pi.dev 市场](https://pi.dev/packages/pi-pier)） | 在 pi 会话里注入 `todo_write` / `subagent` / `terminal` / `ask_user_question` 工具，并经 herdr-core 启动/读取 worker 终端 |
+| **herdr-core** | `hc` ≥ 0.1.16 | 终端服务器：`terminal.run/read/wait/send/keys/interrupt/label/kill/rm` 与状态/事件，走 `HC_TERMINAL_SOCKET` |
+| **Herdr app** | `herdr-app`（可选） | 把 core 终端显示为 space/tab/pane；自带侧边栏展示 agent 并做 blocked 提醒 |
+
+### 架构（谁和谁说话）
+
+- pier 通过自己继承的终端 socket 与 core 通信（`HC_TERMINAL_SOCKET`，自身地址 `HC_TERMINAL_ID`）。
+- 一个 worker 就是一次 `terminal.run {argv, cwd, env, labels: {herdr.space, herdr.tab}, noNotify: true}`。core 启动程序，app 自动把它挂成 **master 所在 tab 的 pane，且不抢焦点**。传入**新的** `herdr.tab` id 时 app 会自动新建 tab——pier 从不调用 app 命令，也不做放置位置计算。
+- worker 的程序随 master 程序结束而结束（`die_with_parent`）；pier 用 `terminal.kill` + `terminal.rm` 收尾。
+- **状态只来自 pi 原生 OSC 7501 上报**，core 存储、app 展示。pier 从不写终端状态。唯一缺口是 `ask_user_question`：它是 `ui.custom` overlay，pi 不为其上报状态，所以 pier 在弹窗打开期间上报 `blocked`，关闭时按当前活动状态回写 `working`/`idle`。
+- 元数据放在**终端 label**，且只保留 pier 内部有读方的：`pier.session`（worker 自己的会话文件）、`pier.todo`（worker todo 摘要，master 重建摘要时读取）、`pier.lock.<hash>`（写锁 beacon）。
+- master ↔ worker 的私有消息继续走 **pipe-channel**（每对进程一条本地专用 socket），绝不注入 PTY。core 的 parent note 对 worker 关闭（`noNotify: true`）——PTY 输入属于人类（D45）。
 
 ### 核心能力
 
-- **todo 闭环**：`todo_write` 全量替换语义、会话 JSONL 权威、分支正确回滚；窗格标题实时投影 `▶i ○p ■b ✓c (N/M) · 当前任务`；`/todos` 命令（含 unblock）可查看/编辑
+- **todo 闭环**：`todo_write` 全量替换语义、会话 JSONL 权威、分支正确回滚；`/todos` 命令（含 unblock）与常驻状态 widget 展示进度。列表会镜像到 `pier.todo` 终端 label，仅用于 master 重建 worker 摘要；不再有窗格标题投影。
 - **todo 反冻结**：全完成列表 ≥6 轮未写 → 读钩复读改为改写警告；≥1h 未写 → 归档——先给一次带旧条目参照的重写窗口，无视后终态通知并清空列表（rm 落 JSONL，空守卫接管，多步工作必须重建清单）；`/todos` 永远可查历史，会话 JSONL 权威不动
-- **交互式子代理**：每个子代理 = 独立 pane 的隔离 pi 会话（独立上下文窗口）；**人类可随时进入该 pane 直接对话**（修 bug、接管、回答 ask_user_question）
-- **委托身份一等公民**（D111）：spawn 时经 `PI_HERDR_DELEGATION` 把委托上下文（父 pane/父会话/taskId/任务/角色）下发 worker，env > worker marker > branch fold 三级回放；worker 系统提示注入 `pier-delegation` 段（身份 + 统一交付契约），首帧渲染「⟵ delegated by master …」卡片，pane title 带 `↳` 前缀；herdr `pi-parent`/`pi-task` token 独立批上报，dashboard 按 parent 分组树化、blocked 告警带 `worker ← master` 归属
-- **任务 slug**（D112）：spawn 分配任务 slug（冲突加序号），工具输出一律 `slug@paneId`，`agentId` 接受 slug/paneId/组合形式（revive 换 pane 后按 slug 兜底）。后台 worker 运行期间 master 的 bash 若 sleep ≥60s，结果会附一句「结算通知会自动到达」（D125；此前的 `report_progress` 工具一次都没被调用过，已删除）
-- **统一 TUI 状态条**（D113/D114）：常驻 widget 一行一 agent——自己一行 `▶ 当前条 ✓d/n`，每个 running 子代理一行 `↳ slug ▶ 当前条 ✓d/n`（blocked 显示任务+原因，settled 不占行；自己的清单全部完成时直接隐藏，不再只剩一个 `✓N/N`）；worker `todo_write` 经 pipe 实时推送全量清单（事件驱动零轮询），`/pier-tree` 在共享的 Pier **popup** 里打开完整委托树（自己 + 各 worker 全量 todo + settled 节点），与 `/dashboard` 是同一个单例面板，初始落在 `Tree` tab（面板内用 `1`/`2`/`Tab` 切换；显式 `/pier-tree overlay` 仍走独立全窗 pane；非 Herdr 环境回退为 pane 内通知）；`/dashboard` 打开同一面板的 `Dashboard` tab
-- **子代理输出预览**：`subagent(action: "output", agentId)` 返回后台子代理自上次调用以来的新输出——内存中的 per-pane 游标计算增量（优先 `agent.read`，旧版 herdr 回退 `pane.read`），结果带状态、revision、截断与 `restart` 标记（缓冲回卷/清屏），master 不必等到结算就能发现卡住的 worker。TUI 外框/页脚会被剥掉；worker 完成后以完整 transcript 终稿替代 pane 里有损的渲染副本，之后的结算通知只指向那次交付、不再重复全文（D124）
-- **软锁防争抢**（写路径按 pane 粒度锁 token，冲突时警告/阻止）
+- **交互式子代理**：每个子代理 = 独立 core 终端里的隔离 pi 会话（独立上下文窗口）；app 把它显示为 pane，**人类可随时 attach 该终端直接对话**（修 bug、回答 ask_user_question）。blocked 状态经 pi 原生 OSC 7501 到达 app。
+- **委托身份一等公民**（D111）：spawn 时经 `PI_HERDR_DELEGATION` 把委托上下文（父终端/父会话/taskId/任务/角色）下发 worker，由 spawn env 与会话自身首帧条目回放；worker 系统提示注入 `pier-delegation` 段（身份 + 统一交付契约），首帧渲染「⟵ delegated by master …」卡片
+- **任务 slug**（D112）：spawn 分配任务 slug（冲突加序号），工具输出一律 `slug@paneId`，`agentId` 接受 slug/终端 id/组合形式（revive 换终端后按 slug 兜底）。后台 worker 运行期间 master 的 bash 若 sleep ≥60s，结果会附一句「结算通知会自动到达」（D125；此前的 `report_progress` 工具一次都没被调用过，已删除）
+- **统一状态 widget**（D113/D114）：常驻 widget 一行一 agent——自己一行 `▶ 当前条 ✓d/n`，每个 running 子代理一行 `↳ slug ▶ 当前条 ✓d/n`（blocked 显示任务+原因，settled 不占行；自己的清单全部完成时直接隐藏，不再只剩一个 `✓N/N`）；worker `todo_write` 经 pipe 实时推送全量清单（事件驱动零轮询），`/pier-tree` 把完整委托树（自己 + 各 worker 全量 todo + settled 节点）打开为 **pi 内 overlay**（`ui.custom`，`esc`/`q` 关闭，打开期间实时刷新；裸 pi / RPC 模式回退为 pane 内通知）
+- **子代理输出预览**：`subagent(action: "output", agentId)` 返回后台子代理自上次调用以来的新输出——内存中的 per-terminal 游标经 core `terminal.read` 计算增量，结果带状态、revision、截断与 `restart` 标记（缓冲回卷/清屏），master 不必等到结算就能发现卡住的 worker。worker 完成后以完整 transcript 终稿替代终端里有损的渲染副本，之后的结算通知只指向那次交付、不再重复全文（D124）
+- **软锁防争抢**：写路径把锁 beacon 作为 `pier.lock.<hash>` label 发布到各自终端；跨终端冲突时警告（默认）或阻止（`PI_HERDR_WRITE_LOCK=1`）。警告列出全部持有者；`/locks` 是人类视图，`hc get <terminal> --json` 暴露原始 label
 - **角色档案**：`master` / `worker-default` 内置，自定义 role 按 `.pi-herdr/roles/<name>.json` 挂载；工具集按角色收敛（deny 规则不可绕过）
-- **人类闸门**：子代理 `ask_user_question` → 侧边栏 blocked 标记 + 通知；用户手动接管（ESC 打断后输入）→ 启发式检测自动暂停/归还 master 管理
+- **人类闸门**：子代理 `ask_user_question` → 终端上报 blocked，app 据此展示（并按自身规则提醒）；答案作为工具结果返回。不再做启发式的「人工接管」检测。
 - **选择题选择器**：`multi: true` 的问题直接渲染成可勾选列表（空格逐行切换、`a` 全选、回车确认、esc 拒绝，实时显示已选数量），末行固定为自由输入；`allowOther: false` 则纯选择。RPC 模式 / 旧版 pi 自动回退到「输入编号」的文本路径
-- **阻塞式对话框会把 pane 标成 blocked**：pi 的 `ui_prompt_start` / `ui_prompt_end` 覆盖真正阻塞的 `ctx.ui` 对话框（`select` / `confirm` / `input` / `editor`），所以**任何扩展**弹出这类对话框时该 pane 会标 blocked 并发 `herdr:blocked` 边沿；嵌套闸门自动合并，ask 工具不再需要 5s 刷新心跳。`custom` 有意排除——pi 也用它跑常驻 overlay（pier 自己的窄格静帧 overlay 从不调用 `done()`），早先的错误归类会让一个正在工作的 pane 整场会话都标成 blocked
+- **阻塞式对话框上报 blocked**：pi 1.4 原生 OSC 7501 上报覆盖**任何扩展**的 `select` / `confirm` / `input` / `editor` 与权限弹窗；pier 只额外处理 `ui.custom` 的 ask overlay。嵌套闸门自动合并。
 - **角色闸门提前终止**：被拒绝的 worker 工具调用返回 `terminate`，整批都是 terminating 时不再多跑一轮模型
 - **转写卡片**：pier 自己的会话条目（todo 编辑、子代理/终端注册表、角色清单、软审批）与提醒消息渲染为紧凑卡片，不再是裸 JSON——entry/message renderer，不依赖 pi-tui
-- **焦点热力布局**：聚焦 pane 原地放大（0.72 目标），blocked / ask / working / idle 按权重分大小，多余 pane 自动压成 title 条
 - **隔离工作树（`isolate`）回收有明确归属**：只回收本会话自己登记过的工作树，且**当前进程所在目录永不作为候选**——此前按 `refs/heads/pier/` 前缀匹配会删掉并行会话正在使用的工作树。清扫本会话未登记的分支需显式开启 `PIER_ISOLATE_SWEEP_ORPHANS=1`
-- **运维面板 + 侧边栏视图（herdr 0.9）**：`herdr plugin pane open --plugin pier.workbench --entrypoint dashboard` 打开实时 pane/tab/agent 看板（角色、状态、todo 进度）；插件还注册一个 `Pier` 侧边栏 agent 视图：不做 harness 过滤（任何 agent 都显示），只把 attention 高的排前面
-- **长任务生命周期（01a03c0d 复盘）**：观察超时改「无活动预算」（working 心跳续命，>10min 健康任务不再误杀）；follow_up 以 steer 间隙投递（补充契约秒级到达，不再排队整个 run）；GC 等结算通知送达再回收 pane；接管判定先归因机器注入；台账 via 标记 + closed 行 outcome 继承 + 僵尸 running 清扫；SUBS 快照哈希门控。可调：`PIER_SUBAGENT_TIMEOUT_MS`（无活动毫秒数）、`PIER_SETTLEMENT_WINDOW_MS`（ms）、`PIER_OBSERVATION_WINDOW_MS`（ms）
+- **长任务生命周期（01a03c0d 复盘）**：观察超时改「无活动预算」（working 心跳续命，>10min 健康任务不再误杀）；follow_up 以 steer 间隙投递（补充契约秒级到达，不再排队整个 run）；GC 等结算通知送达再回收终端；台账 via 标记 + closed 行 outcome 继承 + 僵尸 running 清扫；SUBS 快照哈希门控。可调：`PIER_SUBAGENT_TIMEOUT_MS`（无活动毫秒数）、`PIER_SETTLEMENT_WINDOW_MS`（ms）、`PIER_OBSERVATION_WINDOW_MS`（ms）
 - **结算通知折叠**：后台子代理结算不再攒到 run 结束洪水回填——turn 间隙注入，最多 3 条逐条展示、其余折叠指路
+
+### 迁移中删除的功能
+
+TUI 后端一次性切换，不保留双后端：
+
+- **重启后 resume**：core/app 重启后不再重建 worker 终端。`subagent(action: "resume")` 仍可用——它用 `pi --session <file>` 新开一个终端。
+- **人工接管检测**（D94）：不再启发式检测「ESC 打断后输入」。
+- **热力布局 / 焦点重排**：不再按焦点缩放 pane，也不再计算 spawn 放置位置；pane 由 app 按自身规则放置。
+- **`/dashboard`、app 侧插件与侧边栏 token 行**：整个 app 侧插件、`display_agent` / `pi-ask` / `pi-parent` / `pi-task` token 与窗格标题投影全部删除。`/pier-tree` 改为在 pi 内以 overlay 渲染。
+- **80 字符窗格标题截断**与 `agentExplain` 随标题通道一并删除。
+
+**最后一个兼容 Herdr TUI 的版本是 0.4.3**（npm；源码见 git tag `tui-final`）。仍在用 Herdr TUI 请固定 `npx pier-setup@0.4.3`。
+从旧版升级：`install` / `update` / `uninstall` 会检测旧的 herdr 插件 `pier.workbench` 并询问是否卸载
+（`--remove-legacy` / `--keep-legacy` 预先作答；非交互运行默认保留并打印 `herdr plugin …` 手动命令）。
 
 ## 安装
 
 ### 环境要求
 
 - Node ≥ 22
-- pi ≥ 1.3.0（`@earendil-works/pi-coding-agent`）——`before_agent_start.messageType` 与 resume active tools
-- herdr ≥ 0.9.5（macOS / Linux / Windows；Windows 为 preview beta）——原生 `pane.focused`、自报告 resume、关机安全保存
+- pi ≥ 1.4.0（`@earendil-works/pi-coding-agent`）——原生 OSC 7501 程序状态上报是唯一状态源
+- herdr-core ≥ 0.1.16（`hc`）——`curl -fsSL https://releases.herdr.dev/core/install.sh | sh`
+- Herdr app（可选）——显示 core 终端；没有它 pi 照常运行、pier 照常 spawn worker，只是看不到窗口
 
 ### 一键安装（推荐）
 
 无需克隆仓库，直接用 npm 包运行：
 
 ```sh
-npx pier-setup@latest            # 用户模式：pi install npm:pi-pier + herdr plugin install
-npx pier-setup@latest version    # 本地 vs npm latest（installer / pi-pier / herdr 插件）
-npx pier-setup@latest update     # 原地刷新两半区（不先卸载）
+npx pier-setup@latest            # 用户模式：pi install npm:pi-pier（预检 node / pi / hc）
+npx pier-setup@latest version    # 本地 vs npm latest（installer / pi-pier / herdr-core）
+npx pier-setup@latest update     # 原地刷新扩展（不先卸载）
 npx pier-setup@latest uninstall
 
 npm i -g pier-setup              # 或全局安装后：pier-setup / version / update
@@ -71,49 +94,49 @@ npm i -g pier-setup              # 或全局安装后：pier-setup / version / u
 
 ```sh
 git clone https://github.com/July24/pier && cd pier
-node install.mjs install --dev   # 本地路径 pi install + herdr plugin link，改码即生效
+node install.mjs install --dev   # 本地路径 pi install，改码即生效
 node install.mjs version --dev
 node install.mjs update --dev    # 仅重新校验环境与版本；代码请自己 git pull
 ```
 
-脚本自动校验环境（node / pi / herdr 版本）并注册两半区。
+脚本自动校验环境（node / pi / `hc` 版本；`herdr-app` 只作为信息行）并注册扩展。
 pi 中 pier 只能从一个来源注册：`install`/`update` 会自动清理旧的 `git:github.com/July24/pier`
 注册；若 pier 已从其它来源注册（如先 `--dev` 装了本地 checkout 再跑用户模式），则直接退出（exit 1，
 不做任何改动）并给出要执行的 `pi remove …`。`version` 显示 pi 实际加载的来源。
-
-`update` 会跑 `pi update npm:pi-pier`（失败则 `pi install`）和
-`herdr plugin install … --yes`。发行规格可用
-`--pi-spec=` / `--herdr-spec=` 覆盖。`pier-setup --help` 列出全部命令。
+`update` 会跑 `pi update npm:pi-pier`（失败则 `pi install`）；发行规格可用 `--pi-spec=` 覆盖。
+`pier-setup --help` 列出全部命令。herdr-core 与 Herdr app 是独立程序：用 `hc update`
+升级 core，安装器不碰它的配置。
 
 ### 手动安装（等价步骤）
 
 ```sh
+# herdr-core（一次）
+curl -fsSL https://releases.herdr.dev/core/install.sh | sh
+
 # pi 侧扩展（任选其一；npm 源 = 用户模式推荐，git 源 = 跟随仓库最新，本地路径 = 开发模式）
 pi install npm:pi-pier                # 用户模式（npm 发布版，自动出现在 pi.dev/packages 市场）
 pi install git:github.com/July24/pier # 用户模式（跟随 main 最新）
 pi install ./packages/pier-ext        # 开发期
-
-# herdr 侧插件
-herdr plugin install July24/pier/packages/pier-workbench --yes   # 用户模式（重装即更新）
-herdr plugin link ./packages/pier-workbench                        # 开发期
 ```
 
-扩展在非 herdr 环境下自动降级（详见下节"作用域"）。
+扩展在非 herdr-core 终端下自动降级（详见下节「作用域」）。
 
 ### 作用域（pi 扩展实际改了什么）
 
-装上 `pi-pier` 后，**裸跑 pi 也会改会话**，不是 herdr 休眠插件：
+装上 `pi-pier` 后，**裸跑 pi 也会改会话**，不是 core 休眠插件：
 
-| 表面 | 裸 `pi` | herdr 内 |
+| 表面 | 裸 `pi` | herdr-core 终端内 |
 |---|---|---|
 | `todo_write`、`/todos`、widget、反冻结、停工提醒 | 生效 | 生效 |
-| `ask_user_question` | 生效 | 生效 + blocked 标记 |
+| `ask_user_question` | 生效 | 生效 + 弹窗期间上报 blocked |
 | 隐藏注入（`before_agent_start` 读钩；停工 reminder） | 生效 | 生效 |
 | `subagent`、`terminal` | **不注册** | 生效 |
-| `/locks`、写锁、slim-frame、窗格标题、pipe | 不加载 | 生效 |
-| `setActiveTools` 角色可见层 | 不加载 | 生效（herdr master） |
+| `/locks`、写锁、slim-frame、pipe | 不加载 | 生效 |
+| `setActiveTools` 角色可见层 | 不加载 | 生效（master） |
 
-会话 JSONL 自定义类型（`pi-herdr.todo-edit`、`.subs`、`.terminals`、`.todo-read`、`.todo-reminder` 等）即使没有 herdr 也会随 `/resume` 回放。
+检测依据是 core 注入的 `HC_TERMINAL_ID` + `HC_TERMINAL_SOCKET`。会话 JSONL 自定义类型
+（`pi-herdr.todo-edit`、`.subs`、`.terminals`、`.todo-read`、`.todo-reminder` 等）即使没有 core
+也会随 `/resume` 回放。
 
 ### 插件冲突
 
@@ -131,32 +154,30 @@ pi 对同名 tool/command **后写覆盖**，event listener **累加**。两套 
 - [`@minhduydev/pi-subagents`](https://pi.dev/packages/@minhduydev/pi-subagents)（`task`）
 - 其它调用 `setActiveTools`、`ui.custom` overlay、`before_agent_start`、或 `sendUserMessage`/`sendMessage` followUp 的扩展
 
-**设计上可共存：** herdr 官方 `herdr:pi` 上报器。不要卸——pier 发 `herdr:blocked`，由它当生命周期权威。
-
-- **herdr 中用其他 agent（claude code / codex 等）**：不含 pi pane 的 tab 不参与
-  热力布局；blocked 通知只发给 pi。
+**状态归属：** pi 原生 OSC 7501 上报是唯一状态源。pier 不写终端状态，因此不要为同一个终端再加第二个写 OSC 7501 的上报器。
+其它跑在 core 终端里的 agent 对 app 可见，但 pier 不跟踪它们。
 
 ### 使用
 
-1. 在 herdr workspace 里开 pane 跑 pi（pane 内 `pi`），扩展检测 `HERDR_ENV` 自动开始上报
-2. 模型可调用 `todo_write`（窗格头实时投影）、`subagent`（spawn / list / send / interrupt / resume）、`terminal`（open / send / read / signal / close / list）
-3. 每个子代理 = 独立 pane（可观察、可进入交互、blocked 时触发通知）
-4. 重启恢复：herdr session 恢复自动重建 pane（子代理 rpc 会话文件已上报）；父 pi 会话用 `/resume` 恢复
+1. 启动 herdr-core 并打开一个终端（`hc run --bg pi`，或 Herdr app 的「新建终端」），在终端里跑 `pi`；扩展检测到 `HC_TERMINAL_ID` / `HC_TERMINAL_SOCKET` 后开始与 core 通信
+2. 模型可调用 `todo_write`（进度显示在常驻 widget 与 `/todos`）、`subagent`（spawn / list / send / interrupt / resume / output / role）、`terminal`（open / send / read / signal / close / list）
+3. 每个子代理 = 独立 core 终端，作为 master 所在 tab 的非焦点 pane 显示；`tab` 名第一次出现时 app 自动建 tab
+4. 没有重启恢复：core 在 app 重启后保留终端，但 core 停止则 worker 消失。父 pi 会话用 `/resume` 恢复；已完成的 worker 用 `subagent(action: "resume", taskId)` 复活
+5. `/pier-tree` 以 pi 内 overlay 打开委托树
 
 ## 仓库结构
 
 ```
 packages/
-  pier-ext/        # pi 扩展（npm: pi-pier）：todo/subagent 工具、herdr 客户端、vocab 权威、skill
-  pier-workbench/  # herdr 插件（pier.workbench）：blocked 通知 + 热力布局 + 运维面板
-docs/              # 安装手册、role 档案说明、侧边栏 role 配置
+  pier-ext/        # pi 扩展（npm: pi-pier）：todo/subagent 工具、core 客户端、vocab 权威、skill
+docs/              # 安装手册、配置总览、role 档案说明、迁移 RFC
 ```
 
 ## 测试
 
 ```sh
 npm install --ignore-scripts
-npm test          # node --test，733 项单测（规划器 / todo 重放 / 反冻结陈旧度 / 会话尾 / GC / 生命周期 / 渲染器 / 选择题选择器 / 子代理输出 / jev 决策层：诊断门·结算排序·摘录选窗）
+npm test          # typecheck + node --test（todo 重放 / 反冻结 / GC / 生命周期 / 渲染器 / 选择题选择器 / 子代理输出 / jev 决策层）
 ```
 
 ## 配置与环境变量
@@ -166,12 +187,11 @@ npm test          # node --test，733 项单测（规划器 / todo 重放 / 反�
 | 环境变量 | 默认值 | 单位 | 作用 |
 |---|---|---|---|
 | `PIER_SUBAGENT_TIMEOUT_MS` | `600000` | ms | 子代理无活动超时预算（超时强行终止） |
-| `PIER_SETTLEMENT_WINDOW_MS` | `60000` | ms | 结算通知窗口、机器注入宽限期及接管空闲判定阈值 |
-| `PIER_OBSERVATION_WINDOW_MS` | `30000` | ms | 结算后观察窗口（超时前自动消费）；worker transcript 已有终稿回答且 pane 空闲时跳过 |
+| `PIER_OBSERVATION_WINDOW_MS` | `4000` | ms | 子代理一轮结束后的结算去抖（期间重新进入 working 即取消）；transcript 已有终稿时跳过 |
 | `PIER_FOREGROUND_PATIENCE_MS` | `300000` | ms | 前台等待耐心阈值（超时自动切入后台） |
 | `PIER_GC_TICK_MS` | `30000` | ms | 子代理垃圾回收轮询间隔 |
-| `PIER_POLL_INTERVAL_MS` | `30000` | ms | 子代理状态观测轮询间隔 |
-| `PIER_READY_TIMEOUT_MS` | `90000` | ms | 子代理 pane 管道就绪等待（指数退避；pane 已退出则立刻失败并附上它的最后输出） |
+| `PIER_POLL_INTERVAL_MS` | `30000` | ms | 无 core 事件时的兜底复查间隔；结算由 `events.subscribe` 子终端订阅驱动 |
+| `PIER_READY_TIMEOUT_MS` | `90000` | ms | 子代理 pipe 就绪等待（指数退避；终端已退出则立刻失败并附上它的最后输出） |
 | `PIER_SESSION_TTL_SECONDS` | `600` | 秒 | 子代理进程退出后会话保留 TTL（超时清理） |
 | `PIER_GIT_TIMEOUT_MS` | `10000` | ms | Git 命令超时（worktree 创建、diff 汇总、清理） |
 | `PIER_TERM_READ_MAX` | `8000` | 字符 | 终端单次读取缓冲区字符上限 |
@@ -189,13 +209,16 @@ npm test          # node --test，733 项单测（规划器 / todo 重放 / 反�
 **命名**：`PIER_*` 是 pier 选项的规范前缀；历史写法 `PI_HERDR_*` 仍作为别名被读取（空值视为未设置）。
 交给子进程的**契约**名保持不变（`PI_HERDR_SUBAGENT`、`PI_HERDR_ROLE_MANIFEST`、`PI_HERDR_TUI`、
 `PI_HERDR_META_KEY`）——改名会让正在运行的 worker 与父进程对不上。
+core 自身身份变量（`HC_TERMINAL_ID`、`HC_TERMINAL_SOCKET`）由 core 注入，pier 只读。
 `/pier-config doctor` 会列出每个选项的生效值与来源，以及本会话被有意吞掉的异常。
 
-**焦点热力**：herdr 0.9.5 原生派发 `pane.focused`，pier 不再启动 per-pane 采样器，workbench 直接消费事件。`PIER_WORKBENCH_ROOT` 指向迁移后的插件目录。
+**状态与 label**：状态只来自程序自己发出的 OSC 7501——pi 1.4 原生上报，pier 从不合成状态。
+元数据是 `pier.*` 下的终端 label（`pier.session`、`pier.todo`、`pier.lock.<hash>`），
+用 `hc get <terminal> --json` 查看。Herdr app 自行渲染侧边栏与提醒；app 侧没有 mod，
+也不再存在 `PIER_WORKBENCH_ROOT`。
 
-**上游跟进**：pi 1.3 / herdr 0.9.5 的影响、版本下限清理，以及下一批扩展方向
-（跨机器、原生 worktree、plugin actions）见
-**[docs/rfc-upstream-absorption-2026-10.md](docs/rfc-upstream-absorption-2026-10.md)**。
+**迁移设计**：完整切换方案（实测 core 事实、删除清单、映射表）见
+**[docs/rfc-core-app-migration.md](docs/rfc-core-app-migration.md)**。
 
 ### 效率机制（D100–D103，默认关闭）
 
@@ -223,9 +246,10 @@ System One 分类，见 [rfc-jev-integration.md](docs/rfc-jev-integration.md)）
 ## 设计原则
 
 - **会话 JSONL 是唯一权威**：todo / 委派 / 注册表全部回放自会话分支，重启与分支切换正确
-- **事件驱动，不轮询**：状态经 herdr 事件订阅（`pane.agent_status_changed` / `pane.closed`）推送，仅事件触发时拉一次快照
-- **零位置迁移**：herdr BSP 布局拓扑创建时定死，pier 只调 split ratio——pane 位置永不动，大小按优先级重算
-- **尽力而为的投影层**：上报失败静默，绝不影响 pi 主流程
+- **事件驱动，不轮询**：状态经 core `events.subscribe`（`status` / `turn` / `finished` / `labels`）推送；仅事件触发时拉一次快照，收到 `missed` 事件时重新对齐
+- **app 侧零 mod**：pier 只通过 core 写终端与 label，Herdr app 按自身规则展示；`/pier-tree` 在 pi 内渲染，不占 pane
+- **PTY 输入属于人类**：机器间消息走 pipe-channel，worker 终端的 core parent note 关闭（D45）
+- **尽力而为的元数据层**：label/上报失败静默，绝不影响 pi 主流程
 
 ## License
 

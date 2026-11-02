@@ -1,5 +1,6 @@
-/** Terminal domain: the pure terminal-core planners (registry/validation/ANSI/increments/readiness/
- *  summarization/folding/idle nudge) + plugins/terminal.ts wiring through a real Context + PiSurface. */
+/** Terminal domain: the pure terminal-core planners (registry/validation/ANSI/increments/
+ *  summarization/folding/idle nudge) + plugins/terminal.ts wiring through a real Context + PiSurface
+ *  over the herdr-core client seam. */
 import { test, mock, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFileSync, mkdtempSync, writeFileSync } from 'node:fs';
@@ -9,22 +10,22 @@ import { Context } from '@deepseek-ai/cordis';
 import { cordisProvide } from '../src/cordis-services.ts';
 import terminalPlugin from '../src/plugins/terminal.ts';
 import {
-  MAX_TERMINALS, POSIX_PROMPT, POWERSHELL_PROMPT, PROMPT_TAIL_RE, SHELL_INIT_COMMAND, SIGNAL_KEYS, TERMINALS_CUSTOM_TYPE, TERM_REMINDERS_MAX,
-  TERM_REMINDER_CUSTOM_TYPE, classifyReadiness, closeTerminal, compilePattern, computeIncrement, detectContinuationPrompt, detectFullscreenTUI,
-  echoSafeWaitSuggestion, foldTerminalsRegistry, hashPaneText,
+  MAX_TERMINALS, POSIX_PROMPT, POWERSHELL_PROMPT, SHELL_INIT_COMMAND, SIGNAL_KEYS, TERMINALS_CUSTOM_TYPE, TERM_REMINDERS_MAX,
+  TERM_REMINDER_CUSTOM_TYPE, closeTerminal, compilePattern, computeIncrement, detectContinuationPrompt, detectFullscreenTUI,
+  echoSafeWaitSuggestion, foldTerminalsRegistry, foregroundIsShell, hashPaneText,
   makeTerminalsRegistry, nextTerminalId, planTerminalReminder, planShellInit, promptStrategyFor, registerTerminal,
   classifyWaitMatch, redirectedSentinel, regexLiteralPrefix, sentinelEchoHazard, stripAnsi, summarizeSessions, terminalIdleMs, validateSendText, validateSignal,
-  type PromptStrategy, type ReadinessTier, type TerminalEntry,
+  type PromptStrategy, type TerminalEntry,
 } from '../src/terminal-core.ts';
 import { PiSurface } from '../src/pi-surface.ts';
 import { DisposeLedger } from '../src/ledger.ts';
-import type { HerdrClientLike } from '../src/herdr-client.ts';
-import { fakeHerdr, fakePi, fire, withCleanup, type FakePi } from './test-utils.ts';
+import { CoreError, type CoreClientLike } from '../src/core-client.ts';
+import { fakeCore, fakePi, fire, terminalInfo, withCleanup, type FakePi } from './test-utils.ts';
 
 const base = { paneId: 'pane-a', tabId: 'tab-1', cwd: 'F:/work', label: 'dev server', createdAt: 1000, lastActivityAt: 1000 };
 
 const mkEntry = (over: Partial<TerminalEntry> = {}): TerminalEntry => ({
-  terminalId: 'term-1', status: 'open', closedAt: null, nudges: 0, nudgedAt: null, readRevision: null, readLen: 0, readTail: '', readTextLen: 0, readTextHash: 0, ...base, ...over,
+  terminalId: 'term-1', status: 'open', closedAt: null, nudges: 0, nudgedAt: null, readLen: 0, readTail: '', readTextLen: 0, readTextHash: 0, ...base, ...over,
 }) as TerminalEntry;
 
 test('registry: 取最大号 +1、默认 label = cwd 尾段、到达上限拒绝；closeTerminal 幂等', () => {
@@ -100,52 +101,49 @@ test('detectFullscreenTUI/stripAnsi：识别 alternate screen 序列，去 CSI/O
 });
 
 test('computeIncrement：首读 reset；全文相同 none；前缀扩展 append；回卷/清屏 reset；超限截尾', () => {
-  const first = computeIncrement(null, { text: 'hello world', revision: 3 }, 1000);
+  const first = computeIncrement(null, { text: 'hello world' }, 1000);
   assert.equal(first.mode, 'reset'); assert.equal(first.text, 'hello world');
-  assert.deepEqual(first.cursor, { revision: 3, len: 0, tail: '', textLen: 11, textHash: hashPaneText('hello world') });
+  assert.deepEqual(first.cursor, { len: 0, tail: '', textLen: 11, textHash: hashPaneText('hello world') });
 
-  // revision is not a change detector (herdr's screen buffer reports a constant 0): the full text decides
-  const prev = computeIncrement(null, { text: 'hello\n', revision: 3 }, 1000).cursor;
-  assert.equal(computeIncrement(prev, { text: 'hello\n', revision: 99 }, 1000).mode, 'none');
-  const app = computeIncrement(prev, { text: 'hello\nworld\n', revision: 4 }, 1000);
+  const prev = computeIncrement(null, { text: 'hello\n' }, 1000).cursor;
+  assert.equal(computeIncrement(prev, { text: 'hello\n' }, 1000).mode, 'none');
+  const app = computeIncrement(prev, { text: 'hello\nworld\n' }, 1000);
   assert.equal(app.mode, 'append'); assert.equal(app.text, 'world\n');
 
   // the screen buffer rewrites the line-ending \n into a space (observed fixture) — still an append
-  const read1 = computeIncrement(null, { text: 'PS F:\\herdr-pi>\n', revision: 0 }, 1000);
+  const read1 = computeIncrement(null, { text: 'PS F:\\herdr-pi>\n' }, 1000);
   const text2 = 'PS F:\\herdr-pi> echo hi\nhi\nPS F:\\herdr-pi>\n';
-  const inc = computeIncrement(read1.cursor, { text: text2, revision: 0 }, 1000);
+  const inc = computeIncrement(read1.cursor, { text: text2 }, 1000);
   assert.equal(inc.mode, 'append'); assert.match(inc.text, /echo hi/);
-  assert.equal(computeIncrement(inc.cursor, { text: text2, revision: 0 }, 1000).mode, 'none');
+  assert.equal(computeIncrement(inc.cursor, { text: text2 }, 1000).mode, 'none');
 
   // a scrolled screen window can keep the same last 64 chars while earlier text changed: not "no new output"
   const stableTail = 'x'.repeat(80) + '\nREADY_0\n';
   const scrolled = computeIncrement(
-    computeIncrement(null, { text: `ONE\n${stableTail}`, revision: 0 }, 1000).cursor,
-    { text: `TWO\n${stableTail}`, revision: 0 },
+    computeIncrement(null, { text: `ONE\n${stableTail}` }, 1000).cursor,
+    { text: `TWO\n${stableTail}` },
     1000,
   );
   assert.equal(scrolled.mode, 'reset');
   assert.match(scrolled.text, /TWO/);
 
   // a wrapped/cleared buffer is a reset carrying the truncation marker; oversized output is capped
-  const wrapped = computeIncrement({ revision: 3, len: 10, tail: 'xxxxxxxxxx', textLen: 10, textHash: 123 }, { text: 'brand new buffer', revision: 4 }, 1000);
+  const wrapped = computeIncrement({ len: 10, tail: 'xxxxxxxxxx', textLen: 10, textHash: 123 }, { text: 'brand new buffer' }, 1000);
   assert.equal(wrapped.mode, 'reset'); assert.match(wrapped.text, /reset|truncat/i);
-  const capped = computeIncrement(null, { text: 'x'.repeat(5000), revision: 9 }, 100);
+  const capped = computeIncrement(null, { text: 'x'.repeat(5000) }, 100);
   assert.ok(capped.text.length <= 200); assert.match(capped.text, /truncat/i);
 });
 
-test('classifyReadiness/PROMPT_TAIL_RE：PS1 尾匹配 → prompt；静默期 → silent；否则 busy', () => {
-  assert.equal(classifyReadiness('PS F:\\work> ', { silentMs: 100 }), 'prompt'); assert.equal(classifyReadiness('user@host:~$ ', { silentMs: 100 }), 'prompt');
-  assert.equal(classifyReadiness('compiling...', { silentMs: 3000 }), 'silent'); assert.equal(classifyReadiness('compiling...', { silentMs: 100 }), 'busy');
-  assert.equal(PROMPT_TAIL_RE.test('PS F:\\work> '), true); assert.equal(classifyReadiness('PS F:\\work> ', { silentMs: 100, prompt: POWERSHELL_PROMPT }), 'prompt');
-
-  // macOS zsh ends its prompt with `%`; the regex is tail-anchored, so ordinary output never matches
-  assert.ok(PROMPT_TAIL_RE.test('user@host ~ % ')); assert.ok(new RegExp(POSIX_PROMPT.waitPattern).test('yehaoyu@Mac pier % '));
-  assert.ok(PROMPT_TAIL_RE.test('root@host:/# ')); assert.ok(PROMPT_TAIL_RE.test('❯ '));
-  assert.equal(PROMPT_TAIL_RE.test('downloaded 50% of 1.2GB'), false);
+test('foregroundIsShell：空闲 shell 占前台；运行中的任务不算 shell', () => {
+  for (const name of ['zsh', '/bin/bash', '-zsh', 'C:\\Windows\\System32\\cmd.exe', 'pwsh', 'nu']) {
+    assert.equal(foregroundIsShell({ name }), true, name);
+  }
+  assert.equal(foregroundIsShell({ name: 'sh', argv: ['-sh'] }), true, 'argv0 fallback');
+  assert.equal(foregroundIsShell({ name: 'node', argv: ['/usr/local/bin/node'] }), false);
+  assert.equal(foregroundIsShell(null), false, 'no probe is treated as idle, never as a running job');
 });
 
-test('promptStrategyFor/planShellInit：env 优先于 $SHELL；未初始化且到提示符才注入双壳 init', () => {
+test('promptStrategyFor/planShellInit：env 优先于 $SHELL；未初始化才注入双壳 init', () => {
   const strategies: Array<[NodeJS.ProcessEnv, PromptStrategy, string]> = [
     [{}, POSIX_PROMPT, 'default'],
     [{ PIER_TERMINAL_PROMPT: 'powershell' }, POWERSHELL_PROMPT, 'powershell'],
@@ -160,9 +158,9 @@ test('promptStrategyFor/planShellInit：env 优先于 $SHELL；未初始化且�
   ];
   for (const [env, expected, label] of strategies) assert.equal(promptStrategyFor(env), expected, label);
 
-  type PlanOpts = { readiness?: ReadinessTier; strategy?: PromptStrategy; initialized?: boolean };
-  const init: PlanOpts[] = [{}, { readiness: 'prompt' }, { strategy: POSIX_PROMPT }];
-  const skip: PlanOpts[] = [{ readiness: 'silent' }, { readiness: 'busy' }, { initialized: true }, { strategy: POWERSHELL_PROMPT }];
+  type PlanOpts = { strategy?: PromptStrategy; initialized?: boolean };
+  const init: PlanOpts[] = [{}, { strategy: POSIX_PROMPT }];
+  const skip: PlanOpts[] = [{ initialized: true }, { strategy: POWERSHELL_PROMPT }];
   // `set +H` alone leaves zsh history expansion on (`echo "E$!"` wedges at dquote>): the init must
   // select zsh's `setopt NO_BANG_HIST` and keep bash's `set +H`.
   assert.match(SHELL_INIT_COMMAND, /ZSH_VERSION/); assert.match(SHELL_INIT_COMMAND, /setopt NO_BANG_HIST/);
@@ -210,20 +208,18 @@ test('foldTerminalsRegistry：last-wins 往返、nudgedAt 持久化、readTail �
 
   // A10: a fold that dropped the tail made the next computeIncrement throw on prev.tail.length, so the
   // round trip is exercised with a cursor the real computeIncrement produced.
-  const cursor = computeIncrement(null, { text: 'hello\n', revision: 7 }, 1000).cursor;
+  const cursor = computeIncrement(null, { text: 'hello\n' }, 1000).cursor;
   const restored = foldTerminalsRegistry([entry({ version: 1, terminals: [
-    mkEntry({ readRevision: 7, readLen: cursor.len, readTail: cursor.tail, readTextLen: cursor.textLen, readTextHash: cursor.textHash })] })])[0]!;
+    mkEntry({ readLen: cursor.len, readTail: cursor.tail, readTextLen: cursor.textLen, readTextHash: cursor.textHash })] })])[0]!;
   assert.equal(restored.readTail, cursor.tail); assert.equal(restored.readTextLen, cursor.textLen);
   assert.equal(restored.readTextHash, cursor.textHash);
-  assert.equal(restored.readRevision, 7);
   const rev = {
-    revision: restored.readRevision ?? 0,
     len: restored.readLen ?? 0,
     tail: restored.readTail ?? '',
     textLen: restored.readTextLen ?? 0,
     textHash: restored.readTextHash ?? 0,
   };
-  const inc = computeIncrement(rev, { text: 'hello\nworld\n', revision: 8 }, 1000);
+  const inc = computeIncrement(rev, { text: 'hello\nworld\n' }, 1000);
   assert.equal(inc.mode, 'append'); assert.equal(inc.text, 'world\n');
 
   const legacy = foldTerminalsRegistry([entry({ version: 1, terminals: [mkEntry()] })])[0]!;
@@ -279,28 +275,65 @@ test('planTerminalReminder：回合用过 → 首次提醒；再闲置超阈值 
 /* ── plugins/terminal.ts wiring ─────────────────────────────────── */
 
 const TOOL_NAME = 'terminal';
-const PANE_2 = { paneId: 'pane-2', tabId: 't1', workspaceId: 'w1', agentStatus: 'idle' };
+const TERMINAL_ID = 't2';
 
 interface ToolResult { content: Array<{ text: string }>; details: Record<string, unknown> }
 
 const run = (pi: FakePi, params: Record<string, unknown>, toolCtx?: unknown): Promise<ToolResult> =>
   pi.tools.get(TOOL_NAME)!.execute!(null, params, undefined, undefined, toolCtx) as Promise<ToolResult>;
 
-/** Mounts plugins/terminal.ts through a real cordis Context + PiSurface over fakeHerdr, optionally
+/** Drains pending immediates/microtasks so an async fire-and-forget delivery lands. */
+function nextTick(): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setImmediate(resolve);
+  return promise;
+}
+
+interface MountedTerminal {
+  pi: FakePi;
+  deps: { env: unknown; state: { activePaneIds: () => Set<string> } };
+  ledger: DisposeLedger;
+  client: CoreClientLike;
+  calls: {
+    run: Array<{ cwd?: string; argv?: readonly string[]; env?: Record<string, string>; labels?: Record<string, string>; noNotify?: boolean }>;
+    send: Array<{ id: string; text: string }>;
+    keys: Array<{ id: string; keys: readonly string[] }>;
+    interrupt: string[];
+    read: Array<{ id: string; lines?: number }>;
+    waitForOutput: Array<{ id: string; text: string; timeoutMs: number }>;
+    kill: string[];
+    remove: string[];
+  };
+}
+
+/** Mounts plugins/terminal.ts through a real cordis Context + PiSurface over fakeCore, optionally
  *  running `action: open` first; returns the recorded client calls the assertions need. */
-async function mountTerminal(t: TestContext, opts: { client?: Partial<HerdrClientLike>; open?: boolean } = {}) {
-  const calls = { waitForOutput: [] as Array<{ paneId: string; match: unknown; timeoutMs: number }>, sendPaneText: [] as string[], closePane: [] as string[] };
-  const client = fakeHerdr({
-    splitPane: async () => 'pane-2',
-    waitForOutput: async (paneId, match, timeoutMs) => { calls.waitForOutput.push({ paneId, match, timeoutMs }); return { matched: true }; },
-    readPane: async () => ({ text: '$ ', revision: 1, truncated: false }),
-    sendPaneText: async (_paneId, text) => { calls.sendPaneText.push(text); },
-    closePane: async (paneId) => { calls.closePane.push(paneId); },
-    listPanes: async () => [PANE_2], ...opts.client,
+async function mountTerminal(t: TestContext, opts: { client?: Partial<CoreClientLike>; open?: boolean } = {}): Promise<MountedTerminal> {
+  const calls: MountedTerminal['calls'] = {
+    run: [], send: [], keys: [], interrupt: [], read: [], waitForOutput: [], kill: [], remove: [],
+  };
+  const client = fakeCore({
+    run: async (options) => {
+      calls.run.push(options);
+      return terminalInfo({ id: TERMINAL_ID, cwd: options.cwd ?? '/test/cwd', labels: { ...options.labels } });
+    },
+    waitForOutput: async (id, text, timeoutMs) => { calls.waitForOutput.push({ id, text, timeoutMs }); return { matched: true }; },
+    read: async (id, options) => { calls.read.push({ id, lines: options?.lines }); return { text: '$ ', complete: true }; },
+    send: async (id, text) => { calls.send.push({ id, text }); },
+    keys: async (id, keys) => { calls.keys.push({ id, keys }); },
+    interrupt: async (id) => { calls.interrupt.push(id); return 'stopped'; },
+    kill: async (id) => { calls.kill.push(id); },
+    remove: async (id) => { calls.remove.push(id); },
+    listTerminals: async () => [terminalInfo({ id: TERMINAL_ID, title: 'npm run dev', labels: { 'herdr.tab': 'tb0' } })],
+    ...opts.client,
   });
   const pi = fakePi();
   const ledger = new DisposeLedger();
-  const deps = { client, env: { paneId: 'p1', tabId: 't1' }, state: { activePaneIds: (): Set<string> => new Set() } };
+  const deps = {
+    client,
+    env: { socketPath: '/tmp/hc.sock', terminalId: 't1' },
+    state: { activePaneIds: (): Set<string> => new Set() },
+  };
   const ctx = new Context();
   cordisProvide(ctx, 'pi-herdr.surface', new PiSurface(pi as unknown as object, ledger));
   cordisProvide(ctx, 'pi-herdr.terminal-deps', deps);
@@ -310,52 +343,68 @@ async function mountTerminal(t: TestContext, opts: { client?: Partial<HerdrClien
   return { pi, deps, ledger, client, calls };
 }
 
-test('plugins/terminal：工具挂载（snippet/guidelines、open/list/GC、herdr title、未知动作）', async (t) => {
-  const { pi, deps, calls } = await mountTerminal(t, { client: { listPanes: async () => [{ ...PANE_2, terminalTitleStripped: 'npm run dev' }] } });
+test('plugins/terminal：工具挂载（snippet/guidelines、open/list/GC、core title、未知动作）', async (t) => {
+  const { pi, deps, calls } = await mountTerminal(t);
   assert.ok(pi.tools.has(TOOL_NAME), 'terminal should register'); assert.ok(!pi.tools.has('terminal_open'), 'the old split tool names must not register');
   assert.equal(deps.state.activePaneIds().size, 0, 'no terminals yet');
 
   const open = await run(pi, { action: 'open' }, { cwd: 'F:/w' });
-  assert.match(open.content[0].text, /terminal term-1 open \(pane pane-2\)/); assert.equal(open.details.readiness, 'prompt');
-  assert.deepEqual(calls.sendPaneText, [SHELL_INIT_COMMAND], 'open should send the bash/zsh history-expansion init');
-  assert.ok(deps.state.activePaneIds().has('pane-2'), 'GC slot: an active terminal pane is visible');
+  assert.match(open.content[0].text, /terminal term-1 open \(pane t2\)/);
+  assert.equal(open.details.pane_id, TERMINAL_ID);
+  assert.deepEqual(calls.send.map((c) => c.text), [SHELL_INIT_COMMAND], 'open sends the bash/zsh history-expansion init through core send');
+  const launched = calls.run.at(-1)!;
+  assert.equal(launched.cwd, 'F:/w');
+  assert.equal(launched.argv, undefined, 'no argv = the machine shell');
+  assert.equal(launched.noNotify, true, 'D45: core must not paste notes into the pi terminal');
+  assert.deepEqual(launched.labels, { 'herdr.space': 'sp0', 'herdr.tab': 'tb0' }, 'the child lands in this terminal\'s app tab');
+  assert.ok(launched.env, 'the caller environment is passed explicitly');
+  assert.ok(deps.state.activePaneIds().has(TERMINAL_ID), 'GC slot: an active terminal pane is visible');
   assert.ok(pi.entries.some(([type]) => type === TERMINALS_CUSTOM_TYPE), 'the registry was appended');
 
   const list = await run(pi, { action: 'list' });
-  assert.match(list.content[0].text, /term-1 \[open\] pane=pane-2/);
-  assert.match(list.content[0].text, /title="npm run dev"/, 'herdr 0.9.1 terminal title shows in the listing');
+  assert.match(list.content[0].text, /term-1 \[open\] pane=t2/);
+  assert.match(list.content[0].text, /title="npm run dev"/, 'the core terminal title shows in the listing');
   await assert.rejects(async () => { await run(pi, { action: 'explode' }); }, /unknown action "explode"/);
 });
 
-test('plugins/terminal：wait/send/read 的动作契约（就绪校验、超时尾部、pane 作用域）', async (t) => {
+test('plugins/terminal：wait/send/read 的动作契约（超时尾部、regex 轮询、pane 作用域）', async (t) => {
   const { pi, client, calls } = await mountTerminal(t, { open: true });
 
-  // the matcher the tool hands to herdr is the contract; the open-time readiness probe records its own
+  // Substring waits go straight to core; core only reports output printed after the wait starts.
   const hit = await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: 'TERM_DONE_', timeout_ms: 5000 });
-  assert.equal(hit.details.matched, true, 'a hit → matched'); assert.equal(calls.waitForOutput.at(-1)?.paneId, 'pane-2');
-  assert.deepEqual(calls.waitForOutput.at(-1)?.match, { type: 'substring', value: 'TERM_DONE_' });
+  assert.equal(hit.details.matched, true, 'a hit → matched');
+  assert.deepEqual(calls.waitForOutput.at(-1), { id: TERMINAL_ID, text: 'TERM_DONE_', timeoutMs: 5000 });
 
-  client.readPane = async () => ({ text: 'bug=19820 terminal_result=ok\n$ ', revision: 3, truncated: false });
-  await run(pi, { action: 'read', terminal_id: 'term-1', max_chars: 7000 });
-  const waitsBeforeStale = calls.waitForOutput.length;
-  const stale = await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: 'terminal_result=', timeout_ms: 1000 });
+  // A regex wait has no core RPC: it polls read() and must not enter waitForOutput.
+  const waitsBeforeRegex = calls.waitForOutput.length;
+  client.read = async () => ({ text: 'bug=19820 terminal_result=ok\n$ ', complete: true });
+  const regexHit = await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: 'terminal_result=[a-z]+', regex: true, timeout_ms: 3000 });
+  assert.equal(regexHit.details.matched, true);
+  assert.match(regexHit.content[0].text, /terminal_result=ok/);
+  assert.equal(calls.waitForOutput.length, waitsBeforeRegex, 'a regex wait never asks core for a regex');
+
+  // A pattern already returned by read is stale: polling keeps going until the deadline, then says so.
+  await run(pi, { action: 'read', terminal_id: 'term-1' });
+  const stale = await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: 'terminal_result=', regex: true, timeout_ms: 1000 });
   assert.equal(stale.details.matched, false);
   assert.equal(stale.details.stale, true);
   assert.match(stale.content[0].text, /already-read output/);
-  assert.equal(calls.waitForOutput.length, waitsBeforeStale + 1, 'a stale hit must not re-enter waitForOutput');
-  client.readPane = async () => ({ text: 'bug=19820 terminal_result=ok\nsubmitted bug=19816\n$ ', revision: 4, truncated: false });
-  const freshWait = await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: 'submitted bug=19816', timeout_ms: 2000 });
+
+  // New output after the cursor is fresh.
+  client.read = async () => ({ text: 'bug=19820 terminal_result=ok\nsubmitted bug=19816\n$ ', complete: true });
+  const freshWait = await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: 'submitted bug=19816', regex: true, timeout_ms: 2000 });
   assert.equal(freshWait.details.matched, true);
   assert.match(freshWait.content[0].text, /submitted bug=19816/);
 
-  client.waitForOutput = async (paneId, match, timeoutMs) => {
-    calls.waitForOutput.push({ paneId, match, timeoutMs });
+  client.waitForOutput = async (id, text, timeoutMs) => {
+    calls.waitForOutput.push({ id, text, timeoutMs });
     return { matched: false, reason: 'timeout' };
   };
-  const miss = await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: 'never-appears', regex: true, timeout_ms: 5000 });
+  client.read = async () => ({ text: 'still compiling src/main.rs', complete: true });
+  const miss = await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: 'never-appears', timeout_ms: 5000 });
   assert.equal(miss.details.matched, false); assert.match(miss.content[0].text, /no match within 5000ms \(timeout\)/);
   assert.match(miss.content[0].text, /recent output tail/, 'a timeout returns the recent tail, so no blind re-polling');
-  assert.deepEqual(calls.waitForOutput.at(-1)?.match, { type: 'regex', value: 'never-appears' });
+  assert.deepEqual(calls.waitForOutput.at(-1), { id: TERMINAL_ID, text: 'never-appears', timeoutMs: 5000 });
 
   // an RPC that is unavailable reports its own reason; an invalid regex is a hard failure (A1)
   client.waitForOutput = async () => ({ matched: false, reason: 'unavailable' });
@@ -363,24 +412,29 @@ test('plugins/terminal：wait/send/read 的动作契约（就绪校验、超时�
   assert.equal(unavail.details.matched, false); assert.match(unavail.content[0].text, /no match within 3000ms \(wait unavailable\)/);
   await assert.rejects(async () => { await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: '(', regex: true }); }, /invalid regex/);
 
-  // wait_prompt: refuse while the shell is busy (nothing queued), send once it is back at a prompt
-  calls.sendPaneText.length = 0;
-  client.waitForOutput = async () => ({ matched: false, reason: 'timeout' });
-  client.readPane = async () => ({ text: 'compiling src/main.rs...', revision: 2, truncated: false });
-  const busySend = () => run(pi, { action: 'send', terminal_id: 'term-1', text: 'echo next', wait_prompt: true });
-  await assert.rejects(busySend, /text was NOT sent/);
-  await assert.rejects(busySend, /busy/);
-  assert.equal(calls.sendPaneText.length, 0, 'nothing is queued while busy');
+  // send: blocked targets refuse with a tool error and nothing is queued
+  client.send = async () => { throw new CoreError('terminal.send', 'blocked', 'question: waiting for input', null); };
+  await assert.rejects(
+    async () => { await run(pi, { action: 'send', terminal_id: 'term-1', text: 'echo next' }); },
+    /is blocked .*text was NOT sent/s,
+  );
 
-  client.waitForOutput = async () => ({ matched: true });
-  const sent = await run(pi, { action: 'send', terminal_id: 'term-1', text: 'echo next', wait_prompt: true });
-  assert.match(sent.content[0].text, /sent to term-1/); assert.deepEqual(calls.sendPaneText, ['echo next']);
+  client.send = async (id, text) => { calls.send.push({ id, text }); };
+  const sent = await run(pi, { action: 'send', terminal_id: 'term-1', text: 'echo next' });
+  assert.match(sent.content[0].text, /sent to term-1/);
 
-  // a direct pane_id read is limited to own-tab panes and self-created terminal panes
-  const own = await run(pi, { action: 'read', pane_id: 'pane-2' });
+  // ctrl+c is the interrupt action; every other key goes through core keys
+  const interrupted = await run(pi, { action: 'signal', terminal_id: 'term-1', key: 'ctrl+c' });
+  assert.equal(interrupted.details.outcome, 'stopped');
+  assert.deepEqual(calls.interrupt, [TERMINAL_ID]);
+  await run(pi, { action: 'signal', terminal_id: 'term-1', key: 'ctrl+d' });
+  assert.deepEqual(calls.keys.at(-1), { id: TERMINAL_ID, keys: ['ctrl+d'] });
+
+  // a direct pane_id read is limited to own-tab terminals and self-created terminal panes
+  const own = await run(pi, { action: 'read', pane_id: TERMINAL_ID });
   assert.equal(own.details.mode, 'reset', 'a self-created terminal pane is readable');
-  client.listPanes = async () => [{ paneId: 'pane-9', tabId: 'other', workspaceId: 'w1', agentStatus: 'idle' }];
-  await assert.rejects(async () => { await run(pi, { action: 'read', pane_id: 'pane-9' }); }, /limited to panes in this session's own tab/);
+  client.listTerminals = async () => [terminalInfo({ id: 't9', labels: { 'herdr.tab': 'other' } })];
+  await assert.rejects(async () => { await run(pi, { action: 'read', pane_id: 't9' }); }, /limited to panes in this session's own tab/);
 });
 
 test('plugins/terminal：消耗完预算的 unavailable 等待按 timeout 报告', (t) => withCleanup(async () => {
@@ -424,8 +478,8 @@ test('plugins/terminal：wait file: polls the log for a later match, reports an 
   assert.equal(later.details.matched, true);
   assert.equal(later.details.alreadyPresent, false);
   assert.match(later.content[0].text, /appeared after \d+s:\n[\s\S]*RUN_EXIT_0/);
-  assert.equal(calls.waitForOutput.length, 0, 'a file wait never asks herdr to watch the pane');
-  assert.equal(calls.sendPaneText.at(-1), sendText);
+  assert.equal(calls.waitForOutput.length, 0, 'a file wait never asks core to watch the terminal');
+  assert.equal(calls.send.at(-1)?.text, sendText);
 
   const old = await run(pi, { action: 'wait', terminal_id: 'term-1', file: log, pattern: 'RUN_EXIT_', timeout_ms: 5000 });
   assert.equal(old.details.alreadyPresent, true, 'the echo guard does not apply: files hold no typed echo');
@@ -445,8 +499,8 @@ test('wait 哨兵自匹配：命中自己回显的 pattern 直接拒绝，可区
   assert.equal(sentinelEchoHazard({ pattern: 'BUILD SUCCESS', lastSentText: sent }), false, '与命令无关的 pattern 无风险');
   assert.equal(sentinelEchoHazard({ pattern: 'x', lastSentText: null }), false, '本进程没发送过 → 无法判定，放行');
 
-  // 契约：发送过含哨兵的命令后，wait 该哨兵必须拒绝且不发起 herdr 等待
-  const { pi, calls } = await mountTerminal(t, { open: true });
+  // 契约：发送过含哨兵的命令后，wait 该哨兵必须拒绝且不发起 core 等待
+  const { pi, client, calls } = await mountTerminal(t, { open: true });
   calls.waitForOutput.length = 0;
   await run(pi, { action: 'send', terminal_id: 'term-1', text: sent });
   await assert.rejects(
@@ -457,15 +511,19 @@ test('wait 哨兵自匹配：命中自己回显的 pattern 直接拒绝，可区
     async () => { await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: 'G3FP_ALL_DONE', timeout_ms: 5000 }); },
     /do NOT re-send/,
   );
-  assert.equal(calls.waitForOutput.length, 0, 'an echo self-match never reaches herdr');
+  assert.equal(calls.waitForOutput.length, 0, 'an echo self-match never reaches core');
 
-  // 可区分的 pattern（锚定正则）照常走等待
+  // 可区分的 pattern（锚定正则）照常等待：core 无 regex 等待，走 read 轮询
+  client.read = async () => ({ text: 'G3FP_ALL_DONE\n$ ', complete: true });
   const hit = await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: '^G3FP_ALL_DONE', regex: true, timeout_ms: 5000 });
   assert.equal(hit.details.matched, true);
-  assert.deepEqual(calls.waitForOutput.at(-1)?.match, { type: 'regex', value: '^G3FP_ALL_DONE' });
+  assert.equal(calls.waitForOutput.length, 0, 'a regex wait is read-polled, not sent to core');
+  assert.ok(calls.read.length > 0);
 
   // close 清掉发送记录后，同 pattern 的 wait 不再被拒（终端已关闭则按未知终端报错）
   await run(pi, { action: 'close', terminal_id: 'term-1' });
+  assert.deepEqual(calls.kill, [TERMINAL_ID], 'close kills the terminal');
+  assert.deepEqual(calls.remove, [TERMINAL_ID], 'close removes the finished terminal record');
   await assert.rejects(
     async () => { await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: 'G3FP_ALL_DONE' }); },
     /unknown or closed terminal/,
@@ -473,7 +531,7 @@ test('wait 哨兵自匹配：命中自己回显的 pattern 直接拒绝，可区
 });
 
 test('classifyWaitMatch: a pattern only in already-read text is stale; new text is fresh', () => {
-  const first = computeIncrement(null, { text: 'bug=19820 terminal_result=ok\n', revision: 1 }, 10_000);
+  const first = computeIncrement(null, { text: 'bug=19820 terminal_result=ok\n' }, 10_000);
   assert.equal(classifyWaitMatch(first.cursor, 'bug=19820 terminal_result=ok\n', 'terminal_result=', false).kind, 'stale');
   const grown = 'bug=19820 terminal_result=ok\nsubmitted bug=19816\n';
   const fresh = classifyWaitMatch(first.cursor, grown, 'submitted bug=19816', false);
@@ -485,7 +543,7 @@ test('classifyWaitMatch: a pattern only in already-read text is stale; new text 
 test('classifyWaitMatch: line anchors match mid-buffer, so the documented ^SENTINEL_[0-9] form works', () => {
   // An anchored pattern must bind to line starts, not only index 0 of the whole pane buffer.
   assert.equal(compilePattern('^STEP2_[0-9]').test('x\nSTEP2_0'), true);
-  const prev = computeIncrement(null, { text: 'boot\nSTEP2_9\n$ ', revision: 0 }, 10_000);
+  const prev = computeIncrement(null, { text: 'boot\nSTEP2_9\n$ ' }, 10_000);
   const pane = 'boot\nSTEP2_9\n$ \nrunning\nSTEP2_0\n$ ';
   const hit = classifyWaitMatch(prev.cursor, pane, '^STEP2_[0-9]', true);
   assert.equal(hit.kind, 'fresh');
@@ -511,64 +569,19 @@ test('open 采纳请求的 terminal_id：open/send 用同名 id 直达，不再�
   assert.match(auto.content[0].text, /terminal term-1 open/);
 });
 
-test('plugins/terminal：后续 open 从最近的终端 pane 向下拆分，主 pane 不再被反复对半切', async (t) => {
-  const splits: Array<{ direction?: string; targetPaneId?: string }> = [];
-  let next = 2;
-  const { pi } = await mountTerminal(t, {
-    client: {
-      splitPane: async (opts) => { splits.push(opts); return `pane-${next++}`; },
-    },
-  });
-  await run(pi, { action: 'open' }, { cwd: '/tmp' });
-  await run(pi, { action: 'open' }, { cwd: '/tmp' });
-  await run(pi, { action: 'open' }, { cwd: '/tmp' });
-  assert.deepEqual(splits.map((s) => [s.direction, s.targetPaneId]), [
-    ['right', 'p1'], // first terminal still takes half of the master
-    ['down', 'pane-2'], // later ones stack under the previous terminal
-    ['down', 'pane-3'],
-  ]);
-});
-
-test('plugins/terminal：最近的终端 pane 已消失时 open 回退到主 pane', async (t) => {
-  const splits: Array<{ direction?: string; targetPaneId?: string }> = [];
-  let next = 2;
-  let anchoredFailure = false;
-  const { pi } = await mountTerminal(t, {
-    client: {
-      splitPane: async (opts) => {
-        splits.push(opts);
-        if (opts.targetPaneId === 'pane-2' && !anchoredFailure) {
-          anchoredFailure = true;
-          throw new Error('pane not found');
-        }
-        return `pane-${next++}`;
-      },
-    },
-  });
-  await run(pi, { action: 'open' }, { cwd: '/tmp' });
-  const second = await run(pi, { action: 'open' }, { cwd: '/tmp' });
-  assert.match(second.content[0].text, /terminal term-2 open \(pane pane-3\)/);
-  assert.deepEqual(splits.map((s) => [s.direction, s.targetPaneId]), [
-    ['right', 'p1'],
-    ['down', 'pane-2'], // stale restored terminal → herdr rejects the split
-    ['right', 'p1'], // fall back to the live master pane
-  ]);
-});
-
 test('plugins/terminal：init 失败不标记 initialized；shell 停在 dquote> 时 send 报“等待输入”', async (t) => {
   let initAttempts = 0;
   const sent: string[] = [];
   const { pi, client } = await mountTerminal(t, {
     client: {
-      splitPane: async () => 'pane-2',
-      sendPaneText: async (_paneId, text) => {
+      send: async (_id, text) => {
         if (text === SHELL_INIT_COMMAND) {
           initAttempts += 1;
           if (initAttempts <= 2) throw new Error('shell not ready');
         }
         sent.push(text);
       },
-      readPane: async () => ({ text: '$ ', revision: 1, truncated: false }),
+      read: async () => ({ text: '$ ', complete: true }),
     },
   });
   const registry = () => pi.entries.filter(([type]) => type === TERMINALS_CUSTOM_TYPE).at(-1)?.[1] as
@@ -585,7 +598,7 @@ test('plugins/terminal：init 失败不标记 initialized；shell 停在 dquote>
   assert.equal(registry()?.terminals[0]?.initialized, true);
 
   // An incomplete command wedges zsh at a secondary prompt; a bare "sent" success would hide it.
-  client.readPane = async () => ({ text: '$ echo "E$!\ndquote> ', revision: 1, truncated: false });
+  client.read = async () => ({ text: '$ echo "E$!\ndquote> ', complete: true });
   await assert.rejects(
     async () => { await run(pi, { action: 'send', terminal_id: 'term-1', text: 'echo more' }); },
     /waiting for more input/,
@@ -599,13 +612,22 @@ test('plugins/terminal：init 失败不标记 initialized；shell 停在 dquote>
 test('plugins/terminal：read 不因尾部相同而漏掉滚动后的新输出', async (t) => {
   const { pi, client } = await mountTerminal(t, { open: true });
   const tail = 'x'.repeat(80) + '\nREADY_0\n';
-  client.readPane = async () => ({ text: `ONE\n${tail}`, revision: 0, truncated: false });
+  client.read = async () => ({ text: `ONE\n${tail}`, complete: true });
   const first = await run(pi, { action: 'read', terminal_id: 'term-1' });
   assert.match(first.content[0].text, /ONE/);
-  client.readPane = async () => ({ text: `TWO\n${tail}`, revision: 0, truncated: false });
+  client.read = async () => ({ text: `TWO\n${tail}`, complete: true });
   const second = await run(pi, { action: 'read', terminal_id: 'term-1' });
   assert.notEqual(second.content[0].text, 'no new output', 'the last 64 chars match but earlier text changed');
   assert.match(second.content[0].text, /TWO/);
+});
+
+test('plugins/terminal：core incomplete read 仍返回文本，complete 只作 detail', async (t) => {
+  const { pi, client } = await mountTerminal(t, { open: true });
+  client.read = async () => ({ text: 'partial screen', complete: false });
+  const res = await run(pi, { action: 'read', terminal_id: 'term-1' });
+  assert.equal(res.details.error, undefined, 'an incomplete history read is not a fullscreen claim');
+  assert.equal(res.details.complete, false);
+  assert.match(res.content[0].text, /partial screen/);
 });
 
 test('wait 回显前缀：regex 的静态前缀命中命令回显即拒绝，并建议具体的锚定 pattern', async (t) => {
@@ -637,20 +659,26 @@ test('plugins/terminal：前台有任务时不催——dev server 刚启动不�
   mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   try {
     const { pi, client } = await mountTerminal(t, { open: true });
-    client.processInfo = async () => ({ paneId: 'pane-2', shellPid: 100, foreground: [{ name: 'node', argv0: 'node', pid: 200, cwd: null }] });
+    client.getTerminal = async () => terminalInfo({
+      id: TERMINAL_ID,
+      foreground: { pid: 200, name: 'node', argv: ['node'], cwd: '/w' },
+    });
     await fire(pi, 'agent_start');
     mock.timers.tick(50);
     await fire(pi, 'agent_settled');
     mock.timers.tick(5);
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await nextTick();
     assert.equal(pi.sent.length, 0, 'a pane running a foreground job is not nudged');
 
     // The job exits, the shell is back at its prompt: the idle threshold catches the pane.
-    client.processInfo = async () => ({ paneId: 'pane-2', shellPid: 100, foreground: [{ name: 'zsh', argv0: 'zsh', pid: 100, cwd: null }] });
+    client.getTerminal = async () => terminalInfo({
+      id: TERMINAL_ID,
+      foreground: { pid: 100, name: 'zsh', argv: ['-zsh'], cwd: '/w' },
+    });
     mock.timers.tick(50);
     await fire(pi, 'agent_settled');
     mock.timers.tick(5);
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await nextTick();
     assert.equal(pi.sent.length, 1);
     assert.match(String(pi.sent[0]?.msg.content), /idle \d+m/);
   } finally {
@@ -658,13 +686,14 @@ test('plugins/terminal：前台有任务时不催——dev server 刚启动不�
   }
 })());
 
-test('plugins/terminal：会话生命周期——shutdown 关停全部 open pane，ledger 墓碑让工具 inert', async (t) => {
+test('plugins/terminal：会话生命周期——shutdown 关停全部 open 终端，ledger 墓碑让工具 inert', async (t) => {
   const { pi, deps, ledger, calls } = await mountTerminal(t, { open: true });
-  assert.ok(deps.state.activePaneIds().has('pane-2'), 'precondition: the pane is registered');
+  assert.ok(deps.state.activePaneIds().has(TERMINAL_ID), 'precondition: the pane is registered');
   assert.ok((pi.listeners.get('session_shutdown')?.length ?? 0) >= 1, 'a shutdown handler is registered');
 
   await fire(pi, 'session_shutdown');
-  assert.deepEqual(calls.closePane, ['pane-2'], 'the resident shell is reclaimed through closePane');
+  assert.deepEqual(calls.kill, [TERMINAL_ID], 'the resident shell is killed');
+  assert.deepEqual(calls.remove, [TERMINAL_ID], 'the finishable terminal record is removed');
   assert.equal(deps.state.activePaneIds().size, 0, 'the GC slot no longer protects a closed pane');
   const registry = pi.entries.filter(([type]) => type === TERMINALS_CUSTOM_TYPE).at(-1)?.[1] as { terminals: Array<{ status: string; closedAt: number | null }> };
   assert.equal(registry.terminals[0].status, 'closed', 'the ledger records closed'); assert.ok(registry.terminals[0].closedAt != null);
@@ -692,7 +721,7 @@ test('plugins/terminal：agent_settled 催办——本回合用过先催一次�
       mock.timers.tick(50); // produce an idle duration above the threshold
       await fire(pi, 'agent_settled');
       mock.timers.tick(5); // the grace window elapses
-      await new Promise<void>((resolve) => setImmediate(resolve)); // drain the async delivery
+      await nextTick(); // drain the async delivery
     };
 
     await settle();
@@ -712,7 +741,7 @@ test('plugins/terminal：agent_settled 催办——本回合用过先催一次�
 
     await settle();
     assert.equal(pi.sent.length, 2, 'the per-terminal cap stops further nudges — no farewell loop');
-    assert.deepEqual([...deps.state.activePaneIds()], ['pane-2'], 'a nudge only reminds, it never closes panes');
+    assert.deepEqual([...deps.state.activePaneIds()], [TERMINAL_ID], 'a nudge only reminds, it never closes panes');
   } finally {
     mock.timers.reset();
   }
@@ -736,18 +765,14 @@ test('plugins/terminal：nudge 在投递时计数——agent_start 取消宽限�
 
     await fire(pi, 'agent_start'); // a new turn cancels the pending reminder
     mock.timers.tick(10);
-    const cancelled = Promise.withResolvers<void>();
-    setImmediate(cancelled.resolve);
-    await cancelled.promise;
+    await nextTick();
     assert.equal(pi.sent.length, 0, 'a cancelled reminder is never sent');
     assert.equal(nudges(), 0, 'a cancelled reminder must not consume one of the two nudges');
 
     mock.timers.tick(50);
     await fire(pi, 'agent_settled');
     mock.timers.tick(5);
-    const delivered = Promise.withResolvers<void>();
-    setImmediate(delivered.resolve);
-    await delivered.promise;
+    await nextTick();
     assert.equal(pi.sent.length, 1, 'the next settle delivers the reminder');
     assert.equal(nudges(), 1, 'the count advances when the notice is actually delivered');
   } finally {

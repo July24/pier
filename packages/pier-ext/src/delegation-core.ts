@@ -1,7 +1,7 @@
 /**
  * Delegation identity (RFC docs/rfc-delegation-identity.md Phase 1): a worker pane knows who
  * delegated it, for what task, and shows that on every surface it already touches — system prompt
- * section, session custom entry (first-frame card), herdr sidebar tokens, and the pane title.
+ * section, session custom entry (first-frame card), and the slim frame title.
  * Pure builders only; the composition root owns the side effects.
  */
 
@@ -9,11 +9,6 @@
 export const DELEGATION_ENV = 'PI_HERDR_DELEGATION';
 /** Worker-session custom entry written once at first boot; replayed on resume. */
 export const DELEGATION_CUSTOM_TYPE = 'pi-herdr.delegation';
-/** herdr sidebar tokens (pane.report_metadata): parent pane + delegated task. */
-export const DELEGATION_PARENT_TOKEN = 'pi-parent';
-export const DELEGATION_TASK_TOKEN = 'pi-task';
-/** herdr truncates title/token values at 80 chars; clip locally to keep glyphs whole. */
-const TOKEN_MAX = 80;
 
 export interface DelegationContext {
   /** Master pane that spawned this worker; '' when the master pane is unknown (tests, RPC). */
@@ -97,19 +92,9 @@ export function buildDelegationSection(ctx: DelegationContext, ownPaneId: string
   ].join('\n');
 }
 
-/** Sidebar token patch; empty (no request) when there is no parent pane to attribute. */
-export function delegationSidebarTokens(ctx: DelegationContext): Record<string, string> {
-  if (!ctx.parentPaneId) return {};
-  return {
-    [DELEGATION_PARENT_TOKEN]: ctx.parentPaneId.slice(0, TOKEN_MAX),
-    [DELEGATION_TASK_TOKEN]: ctx.description.slice(0, TOKEN_MAX),
-  };
-}
-
-/** Worker pane title marker: `↳ <todo title>`, or `↳ <task>` alone before the first todo_write. */
+/** Worker title marker: `↳ <todo title>`, or `↳ <task>` alone before the first todo_write. */
 export function applyWorkerTag(title: string | null, delegatedTask: string | null): string | null {
   if (!delegatedTask) return title;
-  const base = title ?? delegatedTask;
-  return `↳ ${base.slice(0, TOKEN_MAX - 2)}`;
+  return `↳ ${title ?? delegatedTask}`;
 }
 

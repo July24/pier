@@ -1,7 +1,8 @@
 # 安装与使用手册
 
-pi × herdr 工作台融合插件的双半区安装。环境要求：Node ≥ 22、pi ≥ 1.3.0、
-herdr ≥ 0.9.5（macOS / Linux 稳定支持；Windows 为 preview beta）。
+pier 的安装：一个 pi 扩展 + 两个外部程序（herdr-core / Herdr app）。
+环境要求：Node ≥ 22、pi ≥ 1.4.0（原生 OSC 7501 上报）、herdr-core `hc` ≥ 0.1.16。
+Herdr app 可选（只负责显示终端）。**最后一个兼容 Herdr TUI 的版本是 0.4.3**（git tag `tui-final`）。
 
 ## 0. 一键安装（推荐）
 
@@ -12,39 +13,61 @@ npx pier-setup@latest update     # 原地刷新（不先卸载）
 
 git clone git@github.com:July24/pier.git && cd pier
 node install.mjs                 # 用户模式（默认 npm:pi-pier）
-node install.mjs install --dev   # 开发模式（本地 link，改码即生效）
+node install.mjs install --dev   # 开发模式（本地路径，改码即生效）
 node install.mjs version
-node install.mjs update          # 用户模式：pi update + herdr plugin install --yes
+node install.mjs update          # 用户模式：pi update / install
 ```
 
 脚本流程：
 
-1. 校验 node ≥ 22、pi ≥ 1.3.0、herdr ≥ 0.9.5（缺失给安装指引并退出）；
-2. 注册两半区（见下表）。
+1. 校验 node ≥ 22、pi ≥ 1.4.0、`hc` ≥ 0.1.16（缺失给安装指引并退出：
+   `curl -fsSL https://releases.herdr.dev/core/install.sh | sh`）；
+2. 探测 `herdr-app`，只打印一行提示，**不作为硬依赖**；
+3. 检测旧的 herdr TUI 插件 `pier.workbench`（0.4.3 及以前），询问是否卸载（`herdr plugin uninstall`，本地 link 则 `unlink`）；
+   `--remove-legacy` / `--keep-legacy` 预先作答，非交互运行默认保留；
+4. 注册 pi 扩展（见下表）。
 
 | | 用户模式（默认） | 开发模式（`--dev`） |
 |---|---|---|
 | pi 扩展 | `pi install npm:pi-pier` | `pi install ./packages/pier-ext` |
-| herdr 插件 | `herdr plugin install July24/pier/packages/pier-workbench --yes` | `herdr plugin link ./packages/pier-workbench` |
 | 查看版本 | `npx pier-setup@latest version` | `node install.mjs version --dev` |
-| 更新 | `npx pier-setup@latest update`（`pi update` + herdr 重装 checkout，不先卸载） | 仅重新校验环境与版本（link 目录是活的） |
-| 卸载 | `npx pier-setup@latest uninstall` | 同左（unlink 保留文件） |
+| 更新 | `npx pier-setup@latest update`（`pi update`，不先卸载） | 仅重新校验环境与版本（本地路径是活的） |
+| 卸载 | `npx pier-setup@latest uninstall` | 同左 |
 
-发行规格覆盖：`--pi-spec=` / `--herdr-spec=`（npm 发布或 fork）。
+发行规格覆盖：`--pi-spec=`（npm 发布或 fork）。
+安装器**不安装、不升级、不配置** herdr-core 与 Herdr app：core 用 `hc update` 升级，
+app 从 <https://herdr.dev/> 安装。
 
-## 1. 手动安装：pi 侧扩展（`pier-ext` / `@pier/ext`）
+## 1. 手动安装：herdr-core 与 Herdr app
 
 ```sh
-# A. git 源（用户模式；根 package.json 的 pi 字段带扩展 + skill）
+# herdr-core（必需）
+curl -fsSL https://releases.herdr.dev/core/install.sh | sh
+hc --version                       # 应 ≥ 0.1.16
+
+# Herdr app（可选，显示终端）
+# 从 https://herdr.dev/ 安装（基线实测 herdr-app 0.1.11）
+```
+
+终端与状态都归 core：pier 通过 `HC_TERMINAL_ID` / `HC_TERMINAL_SOCKET` 找到它。
+关掉 app 不影响 core 里的终端；core 停止则终端与 worker 一起结束。
+
+## 2. 手动安装：pi 侧扩展（`pier-ext` / `pi-pier`）
+
+```sh
+# A. npm 源（用户模式）
+pi install npm:pi-pier
+
+# B. git 源（用户模式；根 package.json 的 pi 字段带扩展 + skill）
 pi install git:github.com/July24/pier
 
-# B. 本地路径（开发期；注册进 settings.packages，随包自动加载）
+# C. 本地路径（开发期；注册进 settings.packages，随包自动加载）
 pi install ./packages/pier-ext
 
-# C. 单次加载（不持久）
+# D. 单次加载（不持久）
 pi -e ./packages/pier-ext/src/index.ts
 
-# D. 开发期热重载（D87 姿势）：--expose-internals 是 node 旗标（detectExposeInternals 读
+# E. 开发期热重载（D87 姿势）：--expose-internals 是 node 旗标（detectExposeInternals 读
 #    process.execArgv），必须放在 pi 的 cli.js 之前；与 PI_HERDR_HMR=1 缺一不可，否则零 watcher
 PI_HERDR_HMR=1 node --expose-internals "$(readlink -f "$(command -v pi)")" -e ./packages/pier-ext/src/index.ts
 ```
@@ -52,49 +75,51 @@ PI_HERDR_HMR=1 node --expose-internals "$(readlink -f "$(command -v pi)")" -e ./
 卸载：`pi remove <同安装源>`。Skill（渐进式披露的模型手册）随包自动安装：
 `/skill:pi-herdr-workflow` 或模型按需读取。
 
-## 2. 手动安装：herdr 侧插件（`pier-workbench` / `pier.workbench`）
-
-```sh
-herdr plugin install July24/pier/packages/pier-workbench --yes   # 用户模式（subdir 安装）
-herdr plugin link ./packages/pier-workbench                        # 开发模式
-```
-
-- 提供 blocked 事件通知、焦点热力布局钩子与运维面板/侧边栏视图。
-  todo 显示走 pane 标题投影（`▶i ○p ■b ✓c · 当前任务`），不再开独立看板 pane。
-- 发布形态：GitHub 仓库 + `herdr-plugin` topic（marketplace 自动索引）。
-
-
 ## 3. 使用
 
-1. 在 herdr workspace 里开 pane 跑 pi（pane 内 `pi`），扩展自动检测 `HERDR_ENV` 并开始上报；
-2. 模型可调用 `todo_write`（窗格头实时投影）、`subagent`（spawn / list / send / interrupt / resume）、
+1. 启动 herdr-core，打开一个终端（`hc run --bg pi`，或 Herdr app 的「新建终端」），
+   在终端里跑 `pi`；扩展检测到 `HC_TERMINAL_ID` / `HC_TERMINAL_SOCKET` 后开始工作；
+2. 模型可调用 `todo_write`（进度显示在常驻 widget 与 `/todos`）、
+   `subagent`（spawn / list / send / interrupt / resume / output / role）、
    `terminal`（open / send / read / signal / close / list）；
-3. 每个子代理 = 独立 pane（可观察、可进入交互、blocked 时触发通知）；
-4. 重启恢复：herdr session 恢复自动重建 pane（`resume_agents_on_restore` 默认开，
-   子代理的 rpc 会话文件已上报为 agent_session）；父 pi 会话用 `/resume` 恢复，
-   子代理目录经会话分支持久化重建；
-5. 安装自检：在 pane 里跑 `/pier-config check`（4 平面的有效值与来源见 `/pier-config show all`）。
+3. 每个子代理 = 独立 core 终端，app 把它挂成 master 所在 tab 的非焦点 pane；
+   人类可 attach 该终端直接对话；blocked 状态来自 pi 原生 OSC 7501；
+4. 没有重启恢复：core 在 app 重启后保留终端，但 core 停止后 worker 结束；
+   父 pi 会话用 `/resume` 恢复，已完成的 worker 用 `subagent(action: "resume", taskId)` 复活；
+5. `/pier-tree` 在 pi 内以 overlay 打开委托树（`esc`/`q` 关闭）；`/dashboard` 已删除；
+6. 安装自检：在终端里跑 `/pier-config check`（4 平面的有效值与来源见 `/pier-config show all`）。
 
-## 4. 兼容矩阵与已知问题（历史实测：herdr 0.8.0-preview / Windows；0.8.2 / macOS；当前最低要求 0.9.5）
+## 4. 兼容矩阵与已知问题
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| Windows + herdr preview | ⚠️ beta | 全部实测通过，但协议/行为可能随版本变化 |
-| macOS（herdr 0.8.2） | ✅ 实测通过 | 插件钩子（POSIX 条目）→ subagent POSIX 启动行全链路冒烟通过 |
-| Linux | 未实测（理论可用） | 与 macOS 同走 POSIX 分支（unix socket + sh 引号） |
-| WSL2 内跑 herdr + Windows 原生 pi | 未实测 | 推荐整栈同环境（herdr 与 pi 同在 WSL 或同在 Windows），socket 路径约定不同 |
-| herdr pane 命令进程退出 | 已知行为 | pane 被重置为新 shell、输出清空（子 pane 用常驻 shell 包裹规避） |
-| pane.send_input | 不可用 | Windows preview 只产生终端回显、不投递进程 stdin；派活用 pane.send_text+CR（实测） |
-| 非 herdr 环境用 pi | ✅ 实测 | 自动降级：不注册 `subagent`/`terminal`/`/locks`；todo_write / ask_user_question 照常可用 |
-| herdr 中用其他 agent | ✅ 收紧隔离 | 非 pi tab 不 reflow、blocked 通知仅 pi |
-| agent start --kind pi | Windows npm 安装不可用 | `Start-Process pi` 无法执行 pi.ps1；启动走 layout.apply / split + shell 包裹（macOS/Linux 同款路径） |
-| herdr title 80 字符截断 | 已规避 | 标题投影本地先裁（TITLE_MAX=80）；明细走 /todos + widget |
-| state_labels | 仅合法键 | idle\|working\|blocked\|done\|unknown；blocked 徽标用 `blocked` 键 |
-| 子 pane 人机并存 | 软锁 | 派活仅发生在 agent_status=idle；prompt 走扩展管道（毫秒级），PTY 键盘通道 100% 归人 |
+| herdr-core 0.1.16 / macOS | ✅ 实测 | RPC `terminal.run` 起终端、app 自动挂 pane、OSC 7501 状态、`terminal.read/wait/send` 全链路 |
+| herdr-core 0.1.16 / Windows | 未实测 | core 走同一 RPC 接口；路径与引号差异按 core 实现为准 |
+| Linux | 未实测（理论可用） | 与 macOS 同走 POSIX 分支 |
+| 非 herdr-core 环境用 pi | ✅ 实测 | 自动降级：不注册 `subagent`/`terminal`/`/locks`；todo_write / ask_user_question 照常可用 |
+| 关闭 Herdr app | ✅ 设计如此 | core 里的终端继续运行；重开 app 后侧边栏状态完整 |
+| core 停止 / 重启 | 已知限制 | worker 终端不重建（重启 resume 已删除）；用 ledger 的 `subagent resume` 新开 |
+| `ui.custom` 弹窗 | 短期绕行 | pi 原生 reporter 不覆盖 `ui.custom`；pier 在 ask overlay 打开期间自己上报 blocked |
+| `terminal.send` | 有人类静默门槛 | 目标 blocked 时拒绝发送（core 返回错误），pier 转成工具错误 |
+| 子终端人机并存 | 软锁 | 机器消息走 pipe-channel（毫秒级），PTY 键盘通道归人；core parent note 对 worker 关闭（`noNotify`） |
 
-## 5. 测试
+## 5. 从 TUI 版本迁移（0.4.3 → core）
+
+切换是一次性的，不保留 TUI 双后端：
+
+- 删除**重启后 resume**（core 重启不重建 worker 终端；保留 `subagent resume` 从 ledger 新开）、
+  **人工接管检测**（D94）、**热力布局 / 焦点重排**；
+- 删除 **`/dashboard`**、整个 app 侧插件与 **sidebar token 行**（`display_agent` / `pi-ask` /
+  `pi-parent` / `pi-task`）、窗格标题投影与 80 字符截断；
+- 状态只来自 pi 原生 OSC 7501；元数据走 `pier.*` terminal label；机器间消息仍走 pipe-channel；
+- **`/pier-tree`** 改为 pi 内 overlay；app 侧零 mod。
+
+**最后一个兼容 TUI 的版本是 0.4.3**（npm `npx pier-setup@0.4.3`；源码 git tag `tui-final`）。
+升级时安装器会询问是否卸载旧的 herdr 插件 `pier.workbench`；herdr TUI 本身与其 `config.toml` 不动。
+
+## 6. 测试
 
 ```sh
 npm install --ignore-scripts   # 仓库根（devDeps：pi-coding-agent 类型 + typebox）
-npm test                       # 单测（733 项：规划器 / todo 重放 / 会话尾 / GC / 生命周期 / 跨平台引号）
+npm test                       # typecheck + node --test（todo 重放 / 会话尾 / GC / 生命周期 / 跨平台引号）
 ```

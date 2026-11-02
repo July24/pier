@@ -15,7 +15,7 @@ function isFinished(status: GcEntryStatus): boolean {
 }
 
 /** Close a task tab only when every work pane finished, the grace TTL elapsed (`ttlMs=0` means never
- *  auto-close), no pane is blocked and the rest are idle/done/unknown. */
+ *  auto-close), no terminal is blocked and the rest are idle/done/error (unknown = never reported). */
 export function shouldCloseTaskTab(opts: {
   entries: readonly GcEntryLike[];
   paneStatuses: readonly string[];
@@ -26,19 +26,19 @@ export function shouldCloseTaskTab(opts: {
   if (!opts.entries.every((e) => isFinished(e.status))) return false;
   if (!opts.entries.every((e) => (e.consumedAt ?? 0) > 0 && (e.consumedAt ?? 0) < opts.now - opts.ttlMs)) return false;
   if (opts.paneStatuses.some((s) => s === 'blocked')) return false;
-  if (!opts.paneStatuses.every((s) => s === 'idle' || s === 'done' || s === 'unknown')) return false;
+  if (!opts.paneStatuses.every((s) => s === 'idle' || s === 'done' || s === 'error' || s === 'unknown')) return false;
   return true;
 }
 
 /** Pane-level collection (orphan / compat path): consumed before the previous turn (grace so the
- *  settlement notice is still visible); missing pane → record closed (caller handles the write). */
+ *  settlement notice is still visible); a missing terminal → record closed (caller handles the write). */
 export function shouldClosePane(opts: {
   consumedAt: number | null;
-  herdrStatus: string | undefined;
+  status: string | undefined;
   prevTurnStart: number;
 }): boolean {
-  if (opts.herdrStatus === undefined) return true; // pane gone → record closed
-  if (opts.herdrStatus !== 'idle' && opts.herdrStatus !== 'done') return false;
+  if (opts.status === undefined) return true; // terminal gone → record closed
+  if (opts.status !== 'idle' && opts.status !== 'done' && opts.status !== 'error') return false;
   return (opts.consumedAt ?? 0) > 0 && opts.consumedAt! < opts.prevTurnStart;
 }
 

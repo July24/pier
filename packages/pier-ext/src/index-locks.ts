@@ -1,5 +1,5 @@
 /** M18 file write-lock installer (soft veto / hard block): owns the three pi hooks and the
- *  held-lock set; fail-open on agent.list is the collaboration policy. */
+ *  held-lock set; fail-open on terminal.list is the collaboration policy. */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import {
   acquireTokensFor,
@@ -9,7 +9,7 @@ import {
   releaseTokensFor,
   type LockAgentView,
 } from './lock-core.ts';
-import type { HerdrClientLike, HerdrEnv } from './herdr-client.ts';
+import type { CoreClientLike, CoreEnv } from './core-client.ts';
 
 export interface WriteLocksHandle {
   getHeldLocks: () => readonly string[];
@@ -18,8 +18,8 @@ export interface WriteLocksHandle {
 export function installWriteLocks(
   pi: ExtensionAPI,
   opts: {
-    client: HerdrClientLike;
-    env: HerdrEnv | null;
+    client: CoreClientLike;
+    env: CoreEnv | null;
     hard: boolean;
   },
 ): WriteLocksHandle {
@@ -33,7 +33,7 @@ export function installWriteLocks(
 
   async function acquireLocks(paths: readonly string[]): Promise<void> {
     for (const p of paths) heldLocks.add(p);
-    await client.reportLockTokens(acquireTokensFor(paths, env?.paneId ?? ''));
+    await client.setLabels(acquireTokensFor(paths, env?.terminalId ?? ''));
   }
 
   pi.on('tool_call', async (event: { toolName?: string; toolCallId?: string; input?: unknown }, ctx: { cwd?: string }) => {
@@ -42,11 +42,11 @@ export function installWriteLocks(
     let agents: LockAgentView[];
     let ownForegroundCwd: string | null = null;
     try {
-      const liveAgents = await client.listAgents();
-      agents = liveAgents.map((a) => ({ paneId: a.paneId, tokens: a.tokens }));
-      const me = liveAgents.find((a) => a.paneId === env.paneId);
-      if (me?.foregroundCwd) {
-        ownForegroundCwd = me.foregroundCwd;
+      const live = await client.listTerminals();
+      agents = live.map((t) => ({ paneId: t.id, tokens: t.labels }));
+      const me = live.find((t) => t.id === env.terminalId);
+      if (me?.foreground?.cwd) {
+        ownForegroundCwd = me.foreground.cwd;
       }
     } catch {
       return;
@@ -56,7 +56,7 @@ export function installWriteLocks(
       toolName: event.toolName ?? '',
       input: event.input,
       agents,
-      ownPaneId: env.paneId,
+      ownPaneId: env.terminalId,
       cwd: effectiveCwd,
       hard,
     });
@@ -84,7 +84,7 @@ export function installWriteLocks(
     if (heldLocks.size === 0) return;
     const paths = [...heldLocks];
     heldLocks.clear();
-    await client.reportLockTokens(releaseTokensFor(paths));
+    await client.setLabels(releaseTokensFor(paths));
   });
 
   pi.registerCommand('locks', {
@@ -97,8 +97,8 @@ export function installWriteLocks(
       lines.push('all live locks:');
       let any = false;
       try {
-        for (const a of await client.listAgents()) {
-          for (const [k, v] of Object.entries(a.tokens)) {
+        for (const t of await client.listTerminals()) {
+          for (const [k, v] of Object.entries(t.labels)) {
             if (!isLockTokenKey(k) || typeof v !== 'string' || !v) continue;
             const parsed = parseLockTokenValue(v);
             if (!parsed) continue;
@@ -107,9 +107,9 @@ export function installWriteLocks(
           }
         }
       } catch {
-        lines.push('  (agent.list failed)');
+        lines.push('  (terminal.list failed)');
       }
-      if (!any && lines[lines.length - 1] !== '  (agent.list failed)') lines.push('  (none)');
+      if (!any && lines[lines.length - 1] !== '  (terminal.list failed)') lines.push('  (none)');
       ui?.notify?.(lines.join('\n'), 'info');
     },
   });

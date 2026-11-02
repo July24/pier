@@ -8,16 +8,13 @@ import assert from 'node:assert/strict';
 import { handlePipeRequest, type MachineRequest, type PipeHandlerSession } from '../src/index-pipe.ts';
 import { emptySubagentPortBox } from '../src/subagent-core.ts';
 import { collapseNotices, createNoticeBuffer } from '../src/index-notices.ts';
-import { applyRestoredWorkerMode, planIndexMode, type IndexMode } from '../src/index-runtime.ts';
+import { planIndexMode, type IndexMode } from '../src/index-runtime.ts';
 import { installWriteLocks } from '../src/index-locks.ts';
 import { lockTokenKey, lockTokenValue } from '../src/lock-core.ts';
 import { PiSurface } from '../src/pi-surface.ts';
 import { DisposeLedger } from '../src/ledger.ts';
-import { createRoleRuntime } from '../src/index-roles.ts';
-import { TodosService } from '../src/todos-service.ts';
-import type { RuntimeRoleManifest } from '../src/tool-gate.ts';
-import { type AgentInfo, type HerdrEnv, type HerdrClientLike } from '../src/herdr-client.ts';
-import { fakeHerdr, fakePi, fire, withCleanup, type FakePi } from './test-utils.ts';
+import type { CoreEnv, TerminalInfo } from '../src/core-client.ts';
+import { fakeCore, fakePi, fire, terminalInfo, type FakePi } from './test-utils.ts';
 
 /* ── index-pipe: common-segment pipe dispatch ───────────────────── */
 
@@ -263,28 +260,15 @@ test('createNoticeBuffer: a notice buffered while rank is pending keeps its pane
 
 /* ── index-runtime: process-mode planner ────────────────────────── */
 
-test('planIndexMode: worker flag wins inside herdr; herdr pane → master; no herdr → neither', () => {
-  const herdrEnv = { HERDR_ENV: '1', HERDR_SOCKET_PATH: '/tmp/s', HERDR_PANE_ID: 'p1' };
+test('planIndexMode: worker flag wins inside a core terminal; core terminal → master; no core → neither', () => {
+  const coreEnv = { HC_TERMINAL_SOCKET: '/tmp/s', HC_TERMINAL_ID: 't1' };
   const CASES: Array<[string, NodeJS.ProcessEnv, IndexMode]> = [
-    ['worker flag inside herdr', { ...herdrEnv, PI_HERDR_SUBAGENT: '1' }, { isSubagent: true, hasHerdr: true, composeMaster: false }],
-    ['herdr pane without the worker flag', herdrEnv, { isSubagent: false, hasHerdr: true, composeMaster: true }],
-    ['herdr unavailable', {}, { isSubagent: false, hasHerdr: false, composeMaster: false }],
+    ['worker flag inside core', { ...coreEnv, PI_HERDR_SUBAGENT: '1' }, { isSubagent: true, hasCore: true, composeMaster: false }],
+    ['core terminal without the worker flag', coreEnv, { isSubagent: false, hasCore: true, composeMaster: true }],
+    ['terminal id without a socket', { HC_TERMINAL_ID: 't1' }, { isSubagent: false, hasCore: false, composeMaster: false }],
+    ['core unavailable', {}, { isSubagent: false, hasCore: false, composeMaster: false }],
   ];
   for (const [name, env, expect] of CASES) assert.deepEqual(planIndexMode(env), expect, name);
-});
-
-test('applyRestoredWorkerMode: a worker marker flips a herdr boot without the env flag to worker mode', () => {
-  const herdr = { isSubagent: false, hasHerdr: true, composeMaster: true };
-  const worker = { isSubagent: true, hasHerdr: true, composeMaster: false };
-  assert.deepEqual(applyRestoredWorkerMode(herdr, '/s/a.jsonl', () => true), worker, 'marker → todo-only mount');
-  assert.deepEqual(applyRestoredWorkerMode(herdr, '/s/a.jsonl', () => false), herdr, 'no marker → master as before');
-  assert.deepEqual(applyRestoredWorkerMode(herdr, undefined, () => true), herdr, 'no session file to key on → env stays authoritative');
-  assert.deepEqual(applyRestoredWorkerMode(worker, '/s/a.jsonl', () => false), worker, 'env worker flag already wins');
-  assert.deepEqual(
-    applyRestoredWorkerMode({ isSubagent: false, hasHerdr: false, composeMaster: false }, '/s/a.jsonl', () => true),
-    { isSubagent: false, hasHerdr: false, composeMaster: false },
-    'outside herdr there is nothing to restore',
-  );
 });
 
 /* ── index-locks: write-lock installer wiring ───────────────────── */
@@ -298,41 +282,40 @@ async function toolCallVerdict(pi: FakePi, event: unknown, ctx: unknown) {
   return undefined;
 }
 
-/** One `agent.list` entry: the pane id plus whatever the case overrides. */
-const agentAt = (paneId: string, over: Partial<AgentInfo> = {}): AgentInfo =>
-  ({ paneId, agent: 'pi', status: 'working', session: null, stateLabels: {}, tokens: {}, ...over });
+/** One live terminal: the address plus whatever the case overrides. */
+const terminalAt = (id: string, over: Partial<TerminalInfo> = {}): TerminalInfo => terminalInfo({ id, status: 'working', ...over });
 
 test('installWriteLocks: a peer lock blocks a relative write at the pane-resolved cwd', async (t) => {
   const win = process.platform === 'win32';
   const ctxCwd = win ? 'C:\\repo' : '/repo';
-  const CASES: Array<{ name: string; own: Partial<AgentInfo>; lockedPath: string }> = [
-    // Herdr ≥ 0.9.1 reports the pane's own foregroundCwd, which outranks the event ctx.cwd:
-    // 'file.ts' then resolves into /repo/sub and collides with p2's lock on /repo/sub/file.ts.
-    { name: 'foregroundCwd from the live agent list outranks ctx.cwd', own: { foregroundCwd: win ? 'C:\\repo\\sub' : '/repo/sub' },
+  const CASES: Array<{ name: string; own: Partial<TerminalInfo>; lockedPath: string }> = [
+    // The terminal's own foreground cwd outranks the event ctx.cwd:
+    // 'file.ts' then resolves into /repo/sub and collides with t2's lock on /repo/sub/file.ts.
+    { name: 'foreground cwd from the live terminal list outranks ctx.cwd', own: { foreground: { pid: 1, name: 'pi', argv: [], cwd: win ? 'C:\\repo\\sub' : '/repo/sub' } },
       lockedPath: win ? 'c:/repo/sub/file.ts' : '/repo/sub/file.ts' },
-    // Herdr < 0.9.1 reports no foregroundCwd: ctx.cwd is the resolution root.
+    // No foreground info: ctx.cwd is the resolution root.
     { name: 'falls back to ctx.cwd when the pane reports none', own: {}, lockedPath: win ? 'c:/repo/file.ts' : '/repo/file.ts' },
   ];
 
   for (const c of CASES) {
     await t.test(c.name, async () => {
       const reported: Array<Record<string, string | null>> = [];
-      const client = fakeHerdr({
-        listAgents: async (): Promise<AgentInfo[]> => [
-          // p1 is our own pane; p2 holds a lock on the resolved target path.
-          agentAt('p1', c.own),
-          agentAt('p2', { tokens: { [lockTokenKey(c.lockedPath)]: lockTokenValue(c.lockedPath, 'p2') } }),
+      const client = fakeCore({
+        listTerminals: async () => [
+          // t1 is our own terminal; t2 holds a lock on the resolved target path.
+          terminalAt('t1', c.own),
+          terminalAt('t2', { labels: { [lockTokenKey(c.lockedPath)]: lockTokenValue(c.lockedPath, 't2') } }),
         ],
-        reportLockTokens: async (tokens) => { reported.push(tokens); },
+        setLabels: async (labels) => { reported.push(labels); },
       });
-      const env: HerdrEnv = { socketPath: '/tmp/herdr.sock', paneId: 'p1', workspaceId: 'w1', tabId: 't1' };
+      const env: CoreEnv = { socketPath: '/tmp/core.sock', terminalId: 't1' };
       const pi = fakePi();
       const handle = installWriteLocks(pi as never, { client, env, hard: true });
 
       const verdict = await toolCallVerdict(pi, { toolName: 'write', toolCallId: 'call-1', input: { path: 'file.ts' } }, { cwd: ctxCwd });
 
       assert.ok(verdict?.block, 'a relative write colliding with a peer lock must be blocked');
-      assert.match(verdict.reason ?? '', /locked by pane p2/);
+      assert.match(verdict.reason ?? '', /locked by pane t2/);
       assert.deepEqual(handle.getHeldLocks(), [], 'a blocked call must not acquire the lock');
       assert.deepEqual(reported, [], 'a blocked call must not claim the lock in the pane registry');
     });
@@ -449,65 +432,6 @@ test('surface: pi 0.86 unsubscribe — retirement removes the listener instead o
   assert.match(((await callTool(pi, 't1')) as { content: Array<{ text: string }> }).content[0]!.text, /disposed/, 'tools still tombstone: pi has no unregisterTool');
 });
 
-/* ── index-roles: D93 sidebar identity rides the herdr client ───── */
-
-const roleManifest = (role: string): RuntimeRoleManifest =>
-  ({ role, version: 'v1', tools: ['read'], permissions: {}, unknownTools: 'deny' });
-
-/** A role runtime whose only observable side effect is what it reports to the herdr client. */
-function roleRuntimeFor(manifest: RuntimeRoleManifest, client: HerdrClientLike, roleBase: string) {
-  return createRoleRuntime({
-    pi: fakePi() as never,
-    client,
-    roleBase,
-    initialManifest: manifest,
-    isSubagent: false,
-    todos: new TodosService(TodosService.configFromRuntime(manifest, false)),
-    appendRoutingLog: () => {},
-  });
-}
-
-test('role runtime: D93 sidebar identity is reported through the herdr client', withCleanup(async (cleanup) => {
-  const tmp = cleanup.tempDir('parts-roles').path;
-  const env = cleanup.env();
-  // The role loader's user layer hangs off os.homedir(); pinning it to the temp dir keeps the builtin
-  // switch below hermetic (a stray ~/.pi/agent/herdr-pi/roles/master.json would fail its reserved-name check).
-  env.set('HOME', tmp);
-  env.set('USERPROFILE', tmp);
-
-  // worker-default is the one name the sidebar must never show verbatim (the D93 mapping).
-  const mapped: Array<string | null> = [];
-  roleRuntimeFor(roleManifest('worker-default'), fakeHerdr({ reportDisplayAgent: async (name) => { mapped.push(name); } }), tmp)
-    .syncFromBranch({ sessionManager: { getBranch: () => [] } });
-  assert.deepEqual(mapped, ['worker'], 'the herdr client carries the mapped identity, not the manifest name');
-
-  // Any other role is transported verbatim.
-  const plain: Array<string | null> = [];
-  roleRuntimeFor(roleManifest('reviewer'), fakeHerdr({ reportDisplayAgent: async (name) => { plain.push(name); } }), tmp)
-    .syncFromBranch({ sessionManager: { getBranch: () => [] } });
-  assert.deepEqual(plain, ['reviewer']);
-
-  // Resume/branch replay decides which role the identity follows (the anchor entry is written first).
-  const replayed: Array<string | null> = [];
-  // Spelled out on purpose: this is the persisted custom-entry name an existing session file carries,
-  // so the replay fixture must keep matching it even if the constant's value is ever renamed.
-  const branchRecord = {
-    type: 'custom',
-    customType: 'pi-herdr.role-manifest',
-    data: { version: 1, role: 'observer', manifestVersion: 'v2', tools: ['read'], permissions: {}, unknownTools: 'deny' },
-  };
-  roleRuntimeFor(roleManifest('worker-default'), fakeHerdr({ reportDisplayAgent: async (name) => { replayed.push(name); } }), tmp)
-    .syncFromBranch({ sessionManager: { getBranch: () => [branchRecord] } });
-  assert.deepEqual(replayed, ['observer'], 'the replayed role is what the sidebar is told');
-
-  // A mid-session switch (builtin master resolves without a role file) re-reports through the client.
-  const switchedTo: Array<string | null> = [];
-  const runtime = roleRuntimeFor(roleManifest('worker-default'), fakeHerdr({ reportDisplayAgent: async (name) => { switchedTo.push(name); } }), tmp);
-  runtime.syncFromBranch({ sessionManager: { getBranch: () => [] } });
-  const result = await runtime.applyRoleSwitch('master', 'human');
-  assert.equal(result.ok, true, result.message);
-  assert.deepEqual(switchedTo, ['worker', 'master'], 'the switch reports the new role through the same transport');
-}));
 
 test('handlePipeRequest: todo_sync routes the full worker list into the widget cache', async () => {
   const seen: Array<{ paneId: string; items: unknown[]; summary: string }> = [];

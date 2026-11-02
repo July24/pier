@@ -161,7 +161,7 @@ export function formatDelegationTree(opts: {
     lines.push('│');
     lines.push(`${last ? '└' : '├'}─ ✓ ${ref} (${s.paneId}${age})  result delivered`);
   }
-  lines.push('', '/todos edit list · subagent list → workers · /dashboard ops');
+  lines.push('', '/todos edit list · subagent list → workers');
   return lines;
 }
 

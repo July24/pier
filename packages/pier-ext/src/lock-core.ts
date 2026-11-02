@@ -1,18 +1,16 @@
 /**
  * M18 file-level write locks (S2: soft veto by default, `PI_HERDR_WRITE_LOCK=1` makes it hard).
  *
- * A lock is a *beacon*, not a mutex: the pane editing a file reports a token
- * (`lock-<hash>` → `paneId|path`, see herdr-client.reportLockTokens) and every other pane reads
- * the token table to warn or block. Tokens must match `^[A-Za-z0-9_-]{1,32}$` with ≤16 keys per
- * report, hence the hashed key and the path inside the value.
+ * A lock is a *beacon*, not a mutex: the terminal editing a file sets a label on itself
+ * (`pier.lock.<hash>` → `terminalId|path`) and every other terminal reads the live terminals' labels
+ * to warn or block. Each terminal writes only its own labels, so beacons never race; a finished
+ * terminal drops out of `terminal.list`, so its beacons expire with it.
  */
 import { resolve, sep } from 'node:path';
 
 export const WRITE_LOCK_ENV = 'PI_HERDR_WRITE_LOCK';
 export const WRITE_TOOLS = ['write', 'edit'] as const;
-export const LOCK_TOKEN_PREFIX = 'lock-';
-export const LOCK_BATCH_LIMIT = 16;
-export const LOCK_TTL_MS = 60 * 60 * 1000;
+export const LOCK_TOKEN_PREFIX = 'pier.lock.';
 
 export interface LockAgentView {
   paneId: string;
@@ -136,9 +134,9 @@ export function findLockHolders(
   return holders;
 }
 
-/** Where to look for the full holder table: humans use the slash command, agents read herdr tokens. */
+/** Where to look for the full holder table: humans use the slash command, agents read core labels. */
 const LOCK_HOLDERS_HINT =
-  'holders: /locks (human view in this pane) · herdr agent list → tokens (agent-readable)';
+  'holders: /locks (human view in this pane) · `hc ls` → labels pier.lock.* (agent-readable)';
 
 function holdersLabel(holders: readonly string[]): string {
   return holders.length === 1 ? `pane ${holders[0]}` : `panes ${holders.join(', ')}`;

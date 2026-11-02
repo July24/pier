@@ -26,7 +26,7 @@
 | `efficiency` | `<repo>/.pi-herdr/config.json`、`~/.pi/agent/herdr-pi/config.json`、`PI_HERDR_*` env | env > 工作区 > 用户 > 默认 | ✅ 工作区需项目受信 | pier（D100–D103） |
 | `roles` | `<repo>/.pi-herdr/roles/<name>.json`、`~/.pi/agent/herdr-pi/roles/<name>.json`、内置 `src/roles/` | 工作区/用户层覆盖（内置名不可劫持，D11） | 加载期校验（schema） | pier（D82/D11） |
 | `pi` | `~/.pi/agent/settings.json`（+ 受信项目 `.pi/settings.json`） | 项目 > 全局 | ✅ | pi 本体 |
-| `env` | `PIER_*`（runtime policy）、`PI_HERDR_*`（终端/待办/诊断/能效覆盖） | env 唯一（无文件） | — | pier |
+| `env` | `PIER_*`（runtime policy）、`PI_HERDR_*`（终端/待办/诊断/能效覆盖）；`HC_TERMINAL_ID` / `HC_TERMINAL_SOCKET` 由 herdr-core 注入、只读 | env 唯一（无文件） | — | pier |
 
 **为什么这么分层**：能效与角色是 pier 的**行为策略**，所以放在 pier 自己的目录（用户级 + 工作区级），并用 env 提供最高优先级的临时覆盖；而 pi 的模型/压缩等属于**宿主设置**，pier 只读其中与 OCC 有关的 `compaction.*`，其余引导用户走 pi 的 `/settings`。
 
@@ -47,7 +47,7 @@
 | 让长测试日志变成收据 | `efficiency` → `evidencePreservingReducer` | 开 `enabled`，并把 `model` 指向一个便宜的模型；只想归档不提炼 → `localOnly: true` | 新会话 |
 | 让多步任务自动压缩上下文 | `efficiency` → `onlineContextCompact` | 开 `enabled`；不确定缓存比率时留 `cacheWriteReadRatio: "auto"` | 新会话 |
 | 临时开一天观察 | `env` | `PI_HERDR_OBS_PACK_ENABLE=1 PI_HERDR_OBS_PACK_LOG=1 pi` | 仅该进程 |
-| 新增一个受限子代理角色 | `roles` | 在 `<repo>/.pi-herdr/roles/<name>.json` 写档案（见 `docs/sidebar-role-config.md`） | 下一次派发 |
+| 新增一个受限子代理角色 | `roles` | 在 `<repo>/.pi-herdr/roles/<name>.json` 写档案（字段见 `packages/pier-ext/README.md` 的 Behaviors → Role profiles） | 下一次派发 |
 | 给某个角色固定模型 | `roles` | 档案里的 `model: "provider/model"`（WS-D10 派发路由） | 下一次派发 |
 | 关掉 pi 的自动压缩 | `pi` | 用 pi 的 `/settings`；注意 `compaction.enabled=false` 会连带禁用 OCC（除非 `PI_HERDR_COMPACT_ENABLE=1` 强制） | 新会话 |
 | 让 OCC 的保留窗口跟随 pi | `pi` / `efficiency` | 不在效率配置里写 `keepRecentTokens` 即继承 pi 的值；显式写了就以效率配置为准 | 新会话 |
@@ -81,5 +81,5 @@
 | 文档 | 内容 |
 |---|---|
 | [`docs/efficiency-trial.md`](efficiency-trial.md) | D100–D103 试用指南（开哪个、看什么、怎么判划算、反馈模板） |
-| [`docs/sidebar-role-config.md`](sidebar-role-config.md) | 角色档案与侧边栏排版配置 |
+| [`docs/rfc-core-app-migration.md`](rfc-core-app-migration.md) | herdr-core + Herdr app 切换方案（状态源、label、pipe-channel、删除项） |
 | [`schemas/efficiency-config.schema.json`](../packages/pier-ext/schemas/efficiency-config.schema.json)、[`schemas/role-manifest.schema.json`](../packages/pier-ext/schemas/role-manifest.schema.json) | 契约（键与类型） |

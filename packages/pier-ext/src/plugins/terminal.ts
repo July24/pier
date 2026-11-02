@@ -1,7 +1,7 @@
 /**
  * M14 terminal loader entry for the D78 mount tree and D81 responsibility split.
  * A Cordis loader plugin so the terminal surface stays hot-swappable: services provide the tombstone-aware
- * pi surface, the herdr client/environment and the state slot used by index GC; terminal-core holds the
+ * pi surface, the herdr-core client/environment and the state slot used by index GC; terminal-core holds the
  * pure, independently testable logic.
  */
 import { open } from 'node:fs/promises';
@@ -10,16 +10,20 @@ import { resolve as resolvePath } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
 import { cordisGet } from '../cordis-services.ts';
-import type { HerdrClientLike } from '../herdr-client.ts';
-import { herdrUnavailableHint } from '../herdr-client.ts';
+import {
+  childEnvironment,
+  coreUnavailableHint,
+  isCoreErrorKind,
+  type CoreClientLike,
+  type CoreEnv,
+  type TerminalInfo,
+} from '../core-client.ts';
 import { toolError } from '../tool-error.ts'
 import {
-  READINESS_TIMEOUT_MS,
   READ_MAX_CHARS,
   TERM_REMINDER_CUSTOM_TYPE,
   TERMINALS_CUSTOM_TYPE,
   activeTerminalPaneIds,
-  classifyReadiness,
   closeTerminal,
   compilePattern,
   computeIncrement,
@@ -29,6 +33,7 @@ import {
   echoSafeWaitSuggestion,
   excerptAroundMatch,
   foldTerminalsRegistry,
+  foregroundIsShell,
   makeTerminalsRegistry,
   planTerminalReminder,
   planShellInit,
@@ -43,7 +48,6 @@ import {
   validateSendText,
   validateSignal,
   type ReadCursor,
-  type ReadinessTier,
   type TerminalEntry,
 } from '../terminal-core.ts';
 import { swallow } from '../swallow.ts';
@@ -60,6 +64,13 @@ type ActionHandler = (params: ToolParams, ctx: unknown, signal?: AbortSignal) =>
 const FILE_WAIT_POLL_MS = 1000;
 /** Only the log's tail is matched: a sentinel is the newest line, and a multi-GB log must not be read whole. */
 const FILE_WAIT_TAIL_BYTES = 1024 * 1024;
+/** Core waits on substrings only; a regex wait polls the screen at this interval instead. */
+const REGEX_WAIT_POLL_MS = 400;
+/** History above the screen for the read action and regex waits: the same window keeps the read
+ *  cursor aligned, so a stale/fresh classification compares like with like. */
+const SCREEN_HISTORY_LINES = 200;
+/** History above the screen returned as the timeout tail, so a model sees more than one screenful. */
+const WAIT_TAIL_LINES = 100;
 
 /** The last `maxBytes` of a file as UTF-8, or null when it does not exist (yet). */
 async function readFileTail(path: string, maxBytes: number): Promise<string | null> {
@@ -86,8 +97,9 @@ export interface TerminalStateSlot {
 }
 
 export interface TerminalDeps {
-  client: HerdrClientLike;
-  env: { paneId: string; tabId: string } | null;
+  client: CoreClientLike;
+  /** This process's own terminal address; null outside a herdr-core terminal. */
+  env: CoreEnv | null;
   state: TerminalStateSlot;
 }
 
@@ -100,7 +112,7 @@ export default function terminalPlugin(ctx: Context): void {
   // Keying the surface by this file lets HMR tombstone and replace exactly this registration.
   const scoped = surface.forModule(import.meta.url);
 
-  /* M14 resident terminal tools: dedicated herdr panes preserve shell state without reusing the pi TUI pane,
+  /* M14 resident terminal tools: dedicated core terminals preserve shell state without reusing the pi surface,
    * and active terminal panes remain exempt from index GC. Workers omit this master-side entry. */
 
   let terminals: TerminalEntry[] = [];
@@ -147,14 +159,17 @@ export default function terminalPlugin(ctx: Context): void {
   });
 
   // Session teardown (quit / Ctrl+D / SIGTERM) is the last chance to reclaim resident shells:
-  // a master that exits without closing them leaks live zsh panes. Session SWITCH never fires this
+  // a master that exits without closing them leaks live shell terminals. Session SWITCH never fires this
   // event, so switching branches cannot kill shells that session_start replays from the registry.
   scoped.on('session_shutdown', async () => {
     idleReminderTimer && clearTimeout(idleReminderTimer);
     idleReminderTimer = null;
     const open = terminals.filter((t) => t.status === 'open');
     if (open.length === 0) return;
-    await Promise.allSettled(open.map((t) => client.closePane(t.paneId)));
+    await Promise.allSettled(open.map(async (t) => {
+      await client.kill(t.paneId);
+      await client.remove(t.paneId);
+    }));
     const now = Date.now();
     terminals = terminals.map((t) =>
       t.status === 'open' ? { ...t, status: 'closed' as const, closedAt: now } : t,
@@ -190,12 +205,10 @@ export default function terminalPlugin(ctx: Context): void {
       terminals
         .filter((t) => t.status === 'open')
         .map(async (t) => {
-          // A pane running a foreground job (dev server, REPL, load test) is in use even when the
-          // last tool interaction is old: nudge only after it is back at a shell prompt.
-          const info = await client.processInfo(t.paneId).catch(() => null);
-          const busy = info?.shellPid != null
-            && info.foreground.some((p) => p.pid != null && p.pid !== info.shellPid);
-          return { ...t, busy };
+          // A terminal running a foreground job (dev server, REPL, load test) is in use even when the
+          // last tool interaction is old: nudge only after the shell itself owns the PTY again.
+          const info = await client.getTerminal(t.paneId).catch(() => null);
+          return { ...t, busy: info?.foreground != null && !foregroundIsShell(info.foreground) };
         }),
     );
     const plan = planTerminalReminder({
@@ -240,6 +253,7 @@ export default function terminalPlugin(ctx: Context): void {
 
   /** A1: a hard failure must throw (pi sets isError only for throws); non-failures stay results. */
   const fail = (msg: string): never => toolError(msg);
+  const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
   // Action routing: each handler validates its own params, and `open` additionally needs the tool ctx.
   const handlers: Record<TerminalAction, ActionHandler> = {
@@ -256,11 +270,11 @@ export default function terminalPlugin(ctx: Context): void {
     name: 'terminal',
     label: 'Terminal',
     description: [
-      'Persistent interactive shells in dedicated herdr panes; cwd, environment and background processes survive across calls.',
+      'Persistent interactive shells in dedicated Herdr terminals; cwd, environment and background processes survive across calls.',
       'Actions: open, send (type a command), wait (block until output matches), read, signal (ctrl+c/ctrl+d/ctrl+z/esc/enter), close, list.',
       'Long job: send "cmd; echo TERM_DONE_$?" and wait with regex "^TERM_DONE_[0-9]" — the shell echoes typed commands, so a literal "TERM_DONE_" would match its own echo. When output and sentinel go to a log ("cmd > run.log 2>&1; echo DONE_$? >> run.log"), wait with file: "run.log" instead of sleeping in bash.',
     ].join(' '),
-    promptSnippet: 'terminal: a persistent shell in its own pane — use for dev servers, REPLs, and multi-step shell work that must keep state between calls.',
+    promptSnippet: 'terminal: a persistent shell in its own Herdr pane — use for dev servers, REPLs, and multi-step shell work that must keep state between calls.',
     promptGuidelines: [
       'Prefer bash for one-shot commands. Use terminal only when state must persist (server, REPL, watch loop, interactive prompt) or output appears later; open once and reuse the terminal_id.',
       'wait returns the recent tail on timeout, so decide from it instead of re-polling.',
@@ -271,12 +285,11 @@ export default function terminalPlugin(ctx: Context): void {
       cwd: Type.Optional(Type.String({ description: '[open] Shell working directory (default: session cwd)' })),
       terminal_id: Type.Optional(Type.String({ description: '[open] Optional id for the new terminal (default term-N); [others] id returned by open' })),
       text: Type.Optional(Type.String({ description: '[send] Command text (Enter appended; multi-line runs line by line)' })),
-      wait_prompt: Type.Optional(Type.Boolean({ description: '[send] Refuse instead of queueing when the shell is not at a prompt' })),
       pattern: Type.Optional(Type.String({ description: '[wait] Literal text or regex to wait for (must not occur in the sent command text)' })),
-      file: Type.Optional(Type.String({ description: '[wait] Watch this log file instead of the pane (relative to the terminal cwd; may not exist yet)' })),
+      file: Type.Optional(Type.String({ description: '[wait] Watch this log file instead of the terminal (relative to its cwd; may not exist yet)' })),
       regex: Type.Optional(Type.Boolean({ description: '[wait] pattern is a regex (default literal)' })),
       timeout_ms: Type.Optional(Type.Number({ description: '[wait] Default 120000, max 600000' })),
-      pane_id: Type.Optional(Type.String({ description: '[read] Read another pane in your own tab' })),
+      pane_id: Type.Optional(Type.String({ description: '[read] Read another terminal in your own tab' })),
       max_chars: Type.Optional(Type.Number({ description: `[read] Output cap (default ${READ_MAX_CHARS})` })),
       key: Type.Optional(Type.String({ description: '[signal] ctrl+c | ctrl+d | ctrl+z | esc | enter' })),
     }),
@@ -293,27 +306,14 @@ export default function terminalPlugin(ctx: Context): void {
     },
   });
 
-  /** Probe whether the shell sits at its interactive prompt (advisory: probe failures degrade to 'busy'). */
-  async function probeReadiness(paneId: string): Promise<ReadinessTier> {
-    const prompt = promptStrategyFor();
-    try {
-      const waitRes = await client.waitForOutput(paneId, { type: 'regex', value: prompt.waitPattern }, READINESS_TIMEOUT_MS);
-      if (waitRes.matched) return 'prompt';
-      const read = await client.readPane(paneId, { stripAnsi: false });
-      return classifyReadiness(stripAnsi(read.text), { silentMs: 0, prompt });
-    } catch {
-      return 'busy';
-    }
-  }
-
-  /** Best-effort history-expansion init right after a shell becomes usable (zsh needs
-   *  `setopt NO_BANG_HIST`, bash `set +H`); returns whether the command was injected, so a shell not
-   *  yet at its prompt retries later. */
-  async function injectShellInit(entry: TerminalEntry, readiness?: ReadinessTier): Promise<boolean> {
-    const init = planShellInit({ strategy: promptStrategyFor(), readiness });
+  /** Best-effort history-expansion init right after a shell starts (zsh needs `setopt NO_BANG_HIST`,
+   *  bash `set +H`); core's send waits for the screen to settle, so no prompt probe is needed. Returns
+   *  whether the command went out, so a failed attempt retries on the next send. */
+  async function injectShellInit(entry: TerminalEntry): Promise<boolean> {
+    const init = planShellInit({ strategy: promptStrategyFor() });
     if (!init.shouldInit || !init.command) return false;
     try {
-      await client.sendPaneText(entry.paneId, init.command);
+      await client.send(entry.paneId, init.command);
       return true;
     } catch {
       return false;
@@ -321,12 +321,12 @@ export default function terminalPlugin(ctx: Context): void {
   }
 
   async function executeTerminalOpen(params: ToolParams, ctx: unknown) {
-    if (!client.available || !env) return fail('terminal tools require a herdr-managed pane');
+    if (!client.available || !env) return fail('terminal tools require a herdr-core terminal (HC_TERMINAL_SOCKET/HC_TERMINAL_ID)');
     const cwd = typeof params?.cwd === 'string' && params.cwd ? params.cwd
       : (ctx as { cwd?: string }).cwd ?? process.cwd();
     const r = registerTerminal(terminals, {
-      paneId: env.paneId, // Reserve a valid id until split returns the terminal pane.
-      tabId: env.tabId,
+      paneId: '', // Reserved until core returns the new terminal address.
+      tabId: '',
       cwd,
       // Adopt the caller-requested id so `open {terminal_id}` + `send {terminal_id}` agree;
       // silently ignoring it made the follow-up send fail on an unknown terminal.
@@ -334,43 +334,33 @@ export default function terminalPlugin(ctx: Context): void {
       createdAt: Date.now(),
     });
     if (!r.ok) return fail(r.error);
-    // Stack new terminals below the most recent one instead of halving the pi master pane again:
-    // every right-split of the master shrinks both (45 → 22 → 11 columns), which breaks output
-    // wrapping and multi-word waits. The first terminal still splits the master to the right.
-    const anchor = [...terminals].reverse().find((t) => t.status === 'open') ?? null;
-    const targetPaneId = anchor?.paneId ?? env.paneId;
-    const direction = anchor ? 'down' : 'right';
-    let paneId: string;
+    let info: TerminalInfo;
     try {
-      paneId = await client.splitPane({ direction, cwd, focus: false, targetPaneId });
+      // Keep the child in this terminal's app tab: the app adopts a terminal carrying the same
+      // herdr.space/herdr.tab labels as a pane and never steals focus from the pi master.
+      const labels = await client.placementLabels();
+      info = await client.run({
+        cwd,
+        env: childEnvironment(process.env, {}),
+        labels,
+        noNotify: true,
+      });
     } catch (e) {
-      if (!anchor) {
-        const hint = herdrUnavailableHint(e);
-        return fail(hint ?? `failed to split terminal pane: ${(e as Error).message}`);
-      }
-      // A terminal restored from an earlier session can point at a pane herdr no longer has: fall
-      // back to the master instead of failing to open at all.
-      try {
-        paneId = await client.splitPane({ direction: 'right', cwd, focus: false, targetPaneId: env.paneId });
-      } catch (fallbackError) {
-        const hint = herdrUnavailableHint(fallbackError);
-        return fail(hint ?? `failed to split terminal pane: ${(fallbackError as Error).message}`);
-      }
+      return fail(coreUnavailableHint(e) ?? `failed to open shell: ${errText(e)}`);
     }
-    r.entry.paneId = paneId;
+    r.entry.paneId = info.id;
+    r.entry.tabId = info.labels['herdr.tab'] ?? '';
     terminals = r.entries;
     persistTerminals();
-    const readiness = await probeReadiness(paneId);
-    if (await injectShellInit(r.entry, readiness)) {
+    if (await injectShellInit(r.entry)) {
       r.entry.initialized = true;
       persistTerminals();
     }
     const text = [
-      `terminal ${r.entry.terminalId} open (pane ${paneId})`,
+      `terminal ${r.entry.terminalId} open (pane ${info.id})`,
       `cwd: ${cwd}`,
-      `readiness: ${readiness}${readiness !== 'prompt' ? ' (prompt not detected yet — check with action read before sending)' : ''}`,
     ].join('\n');
-    return { content: [{ type: 'text', text }], details: { terminal_id: r.entry.terminalId, pane_id: paneId, readiness } };
+    return { content: [{ type: 'text', text }], details: { terminal_id: r.entry.terminalId, pane_id: info.id, status: info.status } };
   }
 
   async function executeTerminalSend(params: ToolParams) {
@@ -384,23 +374,19 @@ export default function terminalPlugin(ctx: Context): void {
         persistTerminals();
       }
     }
-    if (params?.wait_prompt === true) {
-      // Orchestration convention: read before writing. Text typed while a previous command still owns the
-      // foreground gets queued and fires later, which reads as "the shell ignored me"; refuse with the observed readiness.
-      const readiness = await probeReadiness(entry.paneId);
-      if (readiness !== 'prompt') {
+    try {
+      await client.send(entry.paneId, v.text);
+    } catch (e) {
+      if (isCoreErrorKind(e, 'blocked')) {
         return fail(
-          `shell is ${readiness === 'busy' ? 'busy (a previous command may still be running)' : 'silent (no prompt detected)'} — text was NOT sent. `
-            + 'Use action read to inspect the pane, or omit wait_prompt to send anyway.',
+          `terminal ${entry.terminalId} is blocked — its program is waiting for input, so the text was NOT sent. `
+            + 'Read the pane and answer the prompt first. '
+            + `(${errText(e)})`,
         );
       }
-    }
-    try {
-      await client.sendPaneText(entry.paneId, v.text);
-    } catch (e) {
-      // B5: a dead herdr socket would otherwise read as "pane may be closed", which sends the
+      // A dead core socket would otherwise read as "pane may be closed", which sends the
       // model hunting for a pane that is fine. Prefer the actionable transport sentence.
-      return fail(herdrUnavailableHint(e) ?? `send failed (pane may be closed): ${(e as Error).message}`);
+      return fail(coreUnavailableHint(e) ?? `send failed (terminal may be closed): ${errText(e)}`);
     }
     // In-memory only (never persisted): the wait echo-hazard check needs the text this pane last
     // received, because the shell echoes typed commands back into the pane.
@@ -410,7 +396,7 @@ export default function terminalPlugin(ctx: Context): void {
     // every later send is swallowed by it, so surface the wedge instead of reporting success.
     let pending: string | null = null;
     try {
-      const snapshot = await client.readPane(entry.paneId, { stripAnsi: false });
+      const snapshot = await client.read(entry.paneId);
       pending = detectContinuationPrompt(stripAnsi(snapshot.text));
     } catch {
       /* A pane read is advisory here: a transport failure must not turn a successful send into an error. */
@@ -442,7 +428,7 @@ export default function terminalPlugin(ctx: Context): void {
       try {
         compilePattern(raw);
       } catch (e) {
-        return fail(`invalid regex: ${(e as Error).message}`);
+        return fail(`invalid regex: ${errText(e)}`);
       }
     }
     if (typeof params?.file === 'string' && params.file.trim()) {
@@ -473,82 +459,103 @@ export default function terminalPlugin(ctx: Context): void {
     const requested = typeof params?.timeout_ms === 'number' && params.timeout_ms > 0 ? params.timeout_ms : WAIT_DEFAULT_MS;
     const timeoutMs = Math.min(Math.max(requested, 1000), WAIT_MAX_MS);
     const started = Date.now();
-    const matcher = useRegex ? { type: 'regex' as const, value: raw } : { type: 'substring' as const, value: raw };
+    // Core matches substrings only; keep the documented regex form by polling the screen.
+    if (useRegex) return waitForRegex(entry, raw, timeoutMs);
     let waitResult: { matched: boolean; reason?: 'timeout' | 'unavailable' };
     try {
-      waitResult = await client.waitForOutput(entry.paneId, matcher, timeoutMs);
+      waitResult = await client.waitForOutput(entry.paneId, raw, timeoutMs);
     } catch (e) {
-      return fail(herdrUnavailableHint(e) ?? `wait failed (pane may be closed): ${(e as Error).message}`);
+      return fail(coreUnavailableHint(e) ?? `wait failed (terminal may be closed): ${errText(e)}`);
     }
     if (!waitResult.matched) {
       // wait-for-text convention: on timeout, hand back the recent tail instead of re-polling blind.
-      let tail = '';
-      try {
-        const read = await client.readPane(entry.paneId, { stripAnsi: false });
-        tail = stripAnsi(read.text).slice(-WAIT_TAIL_CHARS);
-      } catch {
-      }
+      const tail = await readRecent(entry, WAIT_TAIL_LINES);
       // A wait that consumed its budget is a timeout even when the failing RPC reports itself as
       // unavailable: the distinction tells the model whether to re-check the command or the server.
       const consumedBudget = Date.now() - started >= timeoutMs * 0.95;
       const reason = waitResult.reason === 'timeout' || consumedBudget ? 'timeout' : 'wait unavailable';
       return {
-        content: [{ type: 'text', text: `no match within ${timeoutMs}ms (${reason}).${tail ? `\nrecent output tail:\n${tail}` : ''}` }],
+        content: [{ type: 'text', text: `no match within ${timeoutMs}ms (${reason}).${tail ? `\nrecent output tail:\n${tail.slice(-WAIT_TAIL_CHARS)}` : ''}` }],
         details: { terminal_id: entry.terminalId, matched: false, pattern: raw, reason },
       };
     }
-    // herdr matches the whole pane, including text a prior read already returned, and a second
-    // waitForOutput on that same text returns immediately. After a stale hit, poll the unread
-    // increment until a new occurrence appears or the original budget is gone — do not re-enter
-    // waitForOutput (that busy-loops on the old match).
-    const deadline = started + timeoutMs;
-    const cursor: ReadCursor | null = entry.readRevision != null
-      ? {
-        revision: entry.readRevision,
-        len: entry.readLen ?? 0,
-        tail: entry.readTail ?? '',
-        textLen: entry.readTextLen ?? 0,
-        textHash: entry.readTextHash ?? 0,
-      }
-      : null;
-    const shown = raw.length > 80 ? `${raw.slice(0, 80)}…` : raw;
-    let sawStale = false;
+    // Core only reports output printed after the wait starts, so a hit is already fresh.
+    const recent = await readRecent(entry, WAIT_TAIL_LINES);
+    const excerpt = recent.includes(raw) ? excerptAroundMatch(recent, raw, false) : '';
+    return {
+      content: [{ type: 'text', text: `matched in ${entry.terminalId} — new output contains the pattern${excerpt ? `:\n${excerpt}` : '; use action read to inspect it'}` }],
+      details: { terminal_id: entry.terminalId, matched: true, pattern: raw },
+    };
+  }
+
+  /** Cursor from this terminal's last `read`; null until the screen has been read. */
+  function readCursorOf(entry: TerminalEntry): ReadCursor | null {
+    const textLen = entry.readTextLen ?? 0;
+    if (textLen === 0 && !entry.readTail) return null;
+    return {
+      len: entry.readLen ?? 0,
+      tail: entry.readTail ?? '',
+      textLen,
+      textHash: entry.readTextHash ?? 0,
+    };
+  }
+
+  /** Recent screen text (history above the live screen), ANSI stripped; empty when the read fails. */
+  async function readRecent(entry: TerminalEntry, lines: number): Promise<string> {
+    try {
+      return stripAnsi((await client.read(entry.paneId, { lines })).text);
+    } catch {
+      return '';
+    }
+  }
+
+  /** Core has no regex wait. Poll the screen and reuse the read cursor so a pattern already returned
+   *  by `read` stays stale instead of completing the same job twice. */
+  async function waitForRegex(entry: TerminalEntry, pattern: string, timeoutMs: number) {
+    const regex = compilePattern(pattern);
+    const cursor = readCursorOf(entry);
+    const shown = pattern.length > 80 ? `${pattern.slice(0, 80)}…` : pattern;
     const staleFailure = {
       content: [{ type: 'text' as const, text: `pattern "${shown}" matched only in already-read output of ${entry.terminalId}; no new output contains it. This is not a new event — do not treat the job as finished. Wait for a marker that has not appeared yet, or use action read.` }],
-      details: { terminal_id: entry.terminalId, matched: false, stale: true, pattern: raw },
+      details: { terminal_id: entry.terminalId, matched: false, stale: true, pattern },
     };
+    let sawStale = false;
+    let text = '';
+    const deadline = Date.now() + timeoutMs;
     while (true) {
-      let paneText = '';
       try {
-        const read = await client.readPane(entry.paneId, { stripAnsi: false });
-        paneText = stripAnsi(read.text);
-      } catch {
+        text = stripAnsi((await client.read(entry.paneId, { lines: SCREEN_HISTORY_LINES })).text);
+      } catch (e) {
         if (sawStale) return staleFailure;
-        return {
-          content: [{ type: 'text', text: `matched in ${entry.terminalId} — output is ready, use action read to inspect it` }],
-          details: { terminal_id: entry.terminalId, matched: true, pattern: raw },
-        };
+        return fail(coreUnavailableHint(e) ?? `wait failed (terminal may be closed): ${errText(e)}`);
       }
-      const classified = classifyWaitMatch(cursor, paneText, raw, useRegex);
-      if (classified.kind === 'fresh') {
-        return {
-          content: [{ type: 'text', text: `matched in ${entry.terminalId} — new output contains the pattern:\n${classified.excerpt}` }],
-          details: { terminal_id: entry.terminalId, matched: true, pattern: raw },
-        };
+      if (regex.test(text)) {
+        const classified = classifyWaitMatch(cursor, text, pattern, true);
+        if (classified.kind === 'fresh') {
+          return {
+            content: [{ type: 'text', text: `matched in ${entry.terminalId} — new output contains the pattern:\n${classified.excerpt}` }],
+            details: { terminal_id: entry.terminalId, matched: true, pattern },
+          };
+        }
+        if (classified.kind === 'stale') sawStale = true;
+        else {
+          return {
+            content: [{ type: 'text', text: `matched in ${entry.terminalId} — output is ready, use action read to inspect it` }],
+            details: { terminal_id: entry.terminalId, matched: true, pattern },
+          };
+        }
       }
-      if (classified.kind !== 'stale') {
-        return {
-          content: [{ type: 'text', text: `matched in ${entry.terminalId} — output is ready, use action read to inspect it` }],
-          details: { terminal_id: entry.terminalId, matched: true, pattern: raw },
-        };
-      }
-      sawStale = true;
       const left = deadline - Date.now();
-      if (left <= 0) return staleFailure;
+      if (left <= 0) break;
       const { promise, resolve } = Promise.withResolvers<void>();
-      setTimeout(resolve, Math.min(400, left));
+      setTimeout(resolve, Math.min(REGEX_WAIT_POLL_MS, left));
       await promise;
     }
+    if (sawStale) return staleFailure;
+    return {
+      content: [{ type: 'text', text: `no match within ${timeoutMs}ms (timeout).${text ? `\nrecent output tail:\n${text.slice(-WAIT_TAIL_CHARS)}` : ''}` }],
+      details: { terminal_id: entry.terminalId, matched: false, pattern, reason: 'timeout' },
+    };
   }
 
   /** `wait` on a log file: the sentinel of a redirected job never reaches the pane. A match already in
@@ -598,17 +605,26 @@ export default function terminalPlugin(ctx: Context): void {
     };
   }
 
-  /** T5: a direct `pane_id` read is limited to panes in this session's own tab or to self-created terminal
-   *  panes, so one task can never read another's pane. Returns the error text instead of throwing. */
+  /** T5: a direct `pane_id` read is limited to terminals in this session's own app tab or to self-created
+   *  terminal panes, so one task can never read another's pane. Returns the error text instead of throwing. */
   async function resolveDirectPaneId(paneId: string): Promise<{ ok: true; paneId: string } | { ok: false; error: string }> {
-    let panes;
+    let live: TerminalInfo[];
     try {
-      panes = await client.listPanes();
+      live = await client.listTerminals();
     } catch (e) {
-      return { ok: false, error: herdrUnavailableHint(e) ?? `pane lookup failed: ${(e as Error).message}` };
+      return { ok: false, error: coreUnavailableHint(e) ?? `terminal lookup failed: ${errText(e)}` };
     }
-    const target = panes.find((p) => p.paneId === paneId);
-    const ownTab = Boolean(target?.tabId) && target?.tabId === env?.tabId;
+    const target = live.find((t) => t.id === paneId);
+    let ownTab = false;
+    if (target) {
+      try {
+        const placement = await client.placementLabels();
+        ownTab = Boolean(target.labels['herdr.tab'])
+          && target.labels['herdr.tab'] === placement['herdr.tab'];
+      } catch {
+        /* An unavailable placement probe leaves only self-created terminals readable. */
+      }
+    }
     if (!target || !(ownTab || activeTerminalPaneIds(terminals).has(paneId))) {
       return { ok: false, error: 'pane_id read is limited to panes in this session\'s own tab or self-created terminal panes' };
     }
@@ -631,39 +647,32 @@ export default function terminalPlugin(ctx: Context): void {
     }
     const maxChars = typeof params?.max_chars === 'number' && params.max_chars > 0
       ? Math.min(params.max_chars, TERM_READ_MAX) : TERM_READ_MAX;
-    let read: { text: string; revision: number; truncated: boolean };
+    let read: { text: string; complete: boolean };
     try {
-      read = await client.readPane(paneId, { stripAnsi: false });
+      read = await client.read(paneId, { lines: SCREEN_HISTORY_LINES });
     } catch (e) {
-      return fail(herdrUnavailableHint(e) ?? `read failed (pane may be closed): ${(e as Error).message}`);
+      return fail(coreUnavailableHint(e) ?? `read failed (terminal may be closed): ${errText(e)}`);
     }
-    // T6 inspects raw output because ANSI stripping would erase alternate-screen evidence.
+    // T6 inspects raw output because ANSI stripping would erase alternate-screen evidence. Core's
+    // `complete` is broader (requested history may be missing), so it stays a detail, not a trigger.
     const tui = detectFullscreenTUI(read.text);
     if (tui.detected) {
       const head = stripAnsi(read.text).slice(0, 200);
       const text = [
         'FULLSCREEN_TUI_DETECTED: this terminal is running a fullscreen program (e.g. vim/less/top); its screen output is not readable here.',
         'Suggestions:',
-        '1. Run such programs in a native herdr pane where the human can interact directly.',
+        '1. Run such programs where a human can interact directly (the Herdr app), not through this tool.',
         '2. Use non-interactive alternatives (cat/grep instead of less; edit/write tools instead of vim).',
         `Raw head (first 200 chars): ${head}`,
       ].join('\n');
       return { content: [{ type: 'text', text }], details: { error: 'FULLSCREEN_TUI_DETECTED' } };
     }
-    const prev: ReadCursor | null = entry
-      ? (entry.readRevision != null
-        ? {
-          revision: entry.readRevision,
-          len: entry.readLen ?? 0,
-          tail: entry.readTail ?? '',
-          textLen: entry.readTextLen ?? 0,
-          textHash: entry.readTextHash ?? 0,
-        }
-        : null)
-      : null;
-    const inc = computeIncrement(prev, { text: read.text, revision: read.revision }, maxChars);
+    // Cursor and output are both ANSI-stripped, so a wait's fresh/stale classification compares like
+    // with like (`read` is the only writer of the cursor).
+    const screen = stripAnsi(read.text);
+    const prev: ReadCursor | null = entry ? readCursorOf(entry) : null;
+    const inc = computeIncrement(prev, { text: screen }, maxChars);
     if (entry) {
-      entry.readRevision = inc.cursor.revision;
       entry.readLen = inc.cursor.len;
       entry.readTail = inc.cursor.tail;
       entry.readTextLen = inc.cursor.textLen;
@@ -671,13 +680,13 @@ export default function terminalPlugin(ctx: Context): void {
       touchTerminal(entry);
     }
     if (inc.mode === 'none') {
-      return { content: [{ type: 'text', text: 'no new output' }], details: { mode: 'none', revision: read.revision } };
+      return { content: [{ type: 'text', text: 'no new output' }], details: { mode: 'none', complete: read.complete } };
     }
-    const output = stripAnsi(inc.text);
+    const output = inc.text;
     const text = output.length ? output : '(empty)';
     return {
       content: [{ type: 'text', text }],
-      details: { mode: inc.mode, revision: read.revision, hard_capped: inc.hardCapped, source_revision_truncated: read.truncated },
+      details: { mode: inc.mode, hard_capped: inc.hardCapped, complete: read.complete },
     };
   }
 
@@ -686,10 +695,28 @@ export default function terminalPlugin(ctx: Context): void {
     if (!entry) return fail(`unknown or closed terminal "${String(params?.terminal_id)}" (see action list)`);
     const v = validateSignal(typeof params?.key === 'string' ? params.key : '');
     if (!v.ok) return fail(v.error);
+    // ctrl+c is the tool's interrupt: core picks the reporting-aware stop key and reports what it saw.
+    if (v.key === 'ctrl+c') {
+      let outcome: string;
+      try {
+        outcome = await client.interrupt(entry.paneId);
+      } catch (e) {
+        return fail(coreUnavailableHint(e) ?? `interrupt failed (terminal may be closed): ${errText(e)}`);
+      }
+      touchTerminal(entry);
+      const meaning = outcome === 'stopped' ? 'the program stopped'
+        : outcome === 'exited' ? 'the program exited'
+          : outcome === 'still_working' ? 'the program is still working'
+            : 'the outcome is unknown';
+      return {
+        content: [{ type: 'text', text: `interrupt (ctrl+c) sent to ${entry.terminalId}: ${meaning}` }],
+        details: { terminal_id: entry.terminalId, key: v.key, outcome },
+      };
+    }
     try {
-      await client.sendPaneKeys(entry.paneId, [v.key]);
+      await client.keys(entry.paneId, [v.key]);
     } catch (e) {
-      return fail(herdrUnavailableHint(e) ?? `signal failed (pane may be closed): ${(e as Error).message}`);
+      return fail(coreUnavailableHint(e) ?? `signal failed (terminal may be closed): ${errText(e)}`);
     }
     touchTerminal(entry);
     return { content: [{ type: 'text', text: `signal ${v.key} sent to ${entry.terminalId}` }], details: { terminal_id: entry.terminalId, key: v.key } };
@@ -700,10 +727,15 @@ export default function terminalPlugin(ctx: Context): void {
     const entry = terminals.find((t) => t.terminalId === id);
     if (!entry) return fail(`unknown terminal "${String(id)}" (see action list)`);
     if (entry.status === 'open') {
+      // kill then rm: core refuses to remove a live terminal. Either step may have been done by a
+      // person or with the app's tab; record the terminal as closed anyway.
       try {
-        await client.closePane(entry.paneId);
+        await client.kill(entry.paneId);
       } catch {
-        /* The pane may have been closed by a person or with its tab; record the terminal as closed anyway. */
+      }
+      try {
+        await client.remove(entry.paneId);
+      } catch {
       }
     }
     terminals = closeTerminal(terminals, entry.terminalId, Date.now()).entries;
@@ -713,20 +745,19 @@ export default function terminalPlugin(ctx: Context): void {
   }
 
   async function executeTerminalList() {
-    let livePanes: import('../herdr-client.ts').PaneListItem[] = [];
+    let live: TerminalInfo[] = [];
     try {
-      livePanes = await client.listPanes();
+      live = await client.listTerminals();
     } catch {
       /* Treat a failed query as unknown rather than closed, because an empty live set only affects stale detection. */
     }
-    const livePaneIds = livePanes.map((p) => p.paneId);
+    const livePaneIds = live.map((t) => t.id);
     const titleByPaneId = new Map<string, string>();
-    for (const p of livePanes) {
-      const cleanTitle = p.terminalTitleStripped ?? p.terminalTitle;
-      if (cleanTitle) titleByPaneId.set(p.paneId, cleanTitle);
+    for (const t of live) {
+      if (t.title) titleByPaneId.set(t.id, t.title);
     }
     const s = summarizeSessions(terminals, livePaneIds);
-    // T6 check 3: record vanished panes as closed across restarts rather than reviving them; tell the user to persist state.
+    // T6 check 3: record vanished terminals as closed across restarts rather than reviving them; tell the user to persist state.
     if (s.stalePaneIds.length > 0) {
       terminals = terminals.map((t) =>
         s.stalePaneIds.includes(t.paneId)

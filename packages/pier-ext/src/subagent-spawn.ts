@@ -1,13 +1,14 @@
 /**
- * Subagent spawn domain: git/worktree I/O, tab placement, launch line, readiness wait, and the `spawn`
- * action; placement is serialized by a mutex (concurrent spawns raced on tab lookup).
+ * Subagent spawn domain: git/worktree I/O, app tab placement, launch argv, readiness wait, and the
+ * `spawn` action. Children are created by herdr-core (`terminal.run`) with the full argv, so no shell
+ * prompt probe or pasted launch line is involved; the app adopts the terminal as a pane of its tab.
  */
 import { execFile as nodeExecFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, stat as statCb } from 'node:fs';
 import { basename, dirname, join, resolve as pathResolve } from 'node:path';
 import { promisify } from 'node:util';
-import type { HerdrClientLike } from './herdr-client.ts';
+import { childEnvironment, type CoreClientLike, type CoreEnv } from './core-client.ts';
 import { delegationEnv } from './delegation-core.ts';
 import { bareSessionId } from './session-tail.ts';
 import { pipeNameCandidates, pipeNameFor, pipeRequest, pipeRequestTo } from './pipe-channel.ts';
@@ -36,25 +37,16 @@ import {
   planForegroundTick,
   planIsolateWorktree,
   planLaunchValidation,
-  planShellReady,
   planTabPlacement,
   sleep,
   subRef,
   type SubEntry,
-  type TabPlacementPlan,
   type WorktreeZone,
 } from './subagent-core.ts';
-import { parseShapeTree, pickGridSplit, type PaneCell } from './plugins/grid-shape.ts';
-import { fromShapeTree, planSpawnSplitRatio, type LayoutNode } from './plugins/heat-plan.ts';
 import type { Poller } from './subagent-poller.ts';
 import type { SessionIo } from './subagent-session.ts';
 
 const statAsync = promisify(statCb);
-
-/** Bound on waiting for a fresh pane's shell to reach its prompt. On timeout the launch line is sent
- *  anyway: `waitSubReady` still diagnoses a failed boot, and an unsupported probe must not stall spawn. */
-export const SHELL_READY_TIMEOUT_MS = 2_000;
-const SHELL_READY_POLL_MS = 100;
 
 /* ── git adapter ────────────────────────────────────────────────── */
 
@@ -264,15 +256,9 @@ export function readyFailureText(failure: ReadyFailure): string {
 
 /* ── spawner ────────────────────────────────────────────────────── */
 
-interface SpawnEnv {
-  paneId: string;
-  tabId: string;
-  workspaceId: string;
-}
-
 interface SpawnerHost {
-  client: HerdrClientLike;
-  env: SpawnEnv | null;
+  client: CoreClientLike;
+  env: CoreEnv | null;
   runtime: { nodePath: string; cliPath: string; extPath: string };
   git: GitIo;
   /** Test override. Production reads `runtimePolicy.readinessTimeoutMs`. */
@@ -286,44 +272,16 @@ export interface Spawner {
     placement: { desiredTab?: string | null; description: string; zone?: WorktreeZone },
     cwd: string,
     envOver: Record<string, string>,
-    launch: string,
+    argv: readonly string[],
   ): Promise<{ tabId: string; paneId: string; tabName: string }>;
-  launchLine(resumeFile?: string | null, roleModel?: string | null, approve?: boolean): string;
+  launchParts(resumeFile?: string | null, roleModel?: string | null, approve?: boolean): string[];
   approveFor(cwd: string, masterCwd: string): Promise<boolean>;
   waitSubReady(cwd: string, paneId: string): Promise<ReadyOutcome>;
   findExistingPane(sessionFile: string | null): Promise<{ paneId: string; tabId: string } | null>;
 }
 
 export function createSpawner(h: SpawnerHost): Spawner {
-  const tabMutex = new Semaphore(1);
   const readyTimeoutMs = h.readinessTimeoutMs ?? runtimePolicy.readinessTimeoutMs;
-
-  async function liveTabs(): Promise<Array<{ tabName: string; tabId: string }>> {
-    try {
-      const ws = h.env?.workspaceId ?? '';
-      return (await h.client.tabList())
-        .filter((t) => !ws || t.workspaceId === ws)
-        .map((t) => ({ tabName: t.label, tabId: t.tabId }));
-    } catch {
-      return [];
-    }
-  }
-
-  function launchLine(resumeFile?: string | null, roleModel?: string | null, approve = false): string {
-    return buildLaunchLine(buildLaunchParts(h.runtime, { resumeFile, roleModel, approve }));
-  }
-
-  /** herdr 0.9.4 refuses over-long commands on a shell that is still starting; `pane.send_text`
-   *  has no such guard. Poll the foreground process until the shell owns the PTY (or give up). */
-  async function waitShellReady(paneId: string): Promise<void> {
-    const deadline = Date.now() + SHELL_READY_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-      const info = await h.client.processInfo(paneId).catch(() => null);
-      if (info === null) return; // older server or pane already gone: keep the old best-effort path
-      if (planShellReady(info.foreground) === 'ready') return;
-      await sleep(SHELL_READY_POLL_MS);
-    }
-  }
 
   async function approveFor(cwd: string, masterCwd: string): Promise<boolean> {
     if (isPathUnder(cwd, masterCwd)) return true;
@@ -356,27 +314,9 @@ export function createSpawner(h: SpawnerHost): Spawner {
       const plan = planReadyAttempt({ elapsedMs, attempt, timeoutMs: readyTimeoutMs, alive, ready: pinged });
       if (plan.kind === 'ready') return { ok: true };
       if (plan.kind === 'give-up') {
-        let explainHint: string | null = null;
-        if (h.client.available) {
-          try {
-            const diag = await h.client.agentExplain(paneId);
-            if (diag && typeof diag === 'object') {
-              const explainObj = ((diag.explain ?? diag) as Record<string, unknown>);
-              const parts: string[] = [];
-              if (explainObj.skip_state_reason) parts.push(`skip reason: ${String(explainObj.skip_state_reason)}`);
-              if (explainObj.screen_detection_skip_reason) parts.push(`screen rule bypassed: ${String(explainObj.screen_detection_skip_reason)}`);
-              if (explainObj.matched_rule) parts.push(`matched rule: ${String(explainObj.matched_rule)}`);
-              if (explainObj.idle_fallback_reason) parts.push(`idle fallback: ${String(explainObj.idle_fallback_reason)}`);
-              if (parts.length > 0) explainHint = `Herdr detection diagnosis: ${parts.join('; ')}`;
-            }
-          } catch {
-            /* diagnostics never mask the root error */
-          }
-        }
-        const defaultHint = plan.reason === 'timeout' && lastStatus === 'working'
+        const hint = plan.reason === 'timeout' && lastStatus === 'working'
           ? 'Tip: pass run_in_background to avoid blocking the master turn while the worker boots.'
           : null;
-        const hint = [explainHint, defaultHint].filter(Boolean).join('\n') || null;
         const failure: ReadyFailure = {
           paneId,
           reason: plan.reason,
@@ -409,139 +349,88 @@ export function createSpawner(h: SpawnerHost): Spawner {
     let alive: boolean | null = null;
     let status: string | null = null;
     try {
-      // pane.list includes unknown shells; agent.list does not. A fresh split is absent from
-      // agent.list until pi is identified — that is boot, not death.
-      const pane = (await h.client.listPanes()).find((p) => p.paneId === paneId);
-      alive = pane != null;
-      status = pane?.agentStatus ?? null;
+      // A terminal that core marks finished is gone; a live one may still be booting its pipe.
+      const terminal = await h.client.getTerminal(paneId);
+      alive = terminal != null && terminal.state !== 'finished';
+      status = terminal?.status ?? null;
     } catch {
+      /* core unreachable: liveness stays unknown, never "dead" */
     }
     let tail: string | null = null;
     try {
-      const read = await h.client.readPane(paneId, { stripAnsi: true });
+      const read = await h.client.read(paneId, { lines: 40 });
       if (read.text) tail = read.text.slice(-READY_TAIL_CHARS);
     } catch {
-      /* recycled pane or socket blip — caller keeps the last cached tail */
+      /* reaped terminal or socket blip — caller keeps the last cached tail */
     }
     return { alive, status, tail };
   }
 
+  /** Create the worker terminal in the planned tab. The app adopts it as an unfocused pane; a new
+   *  `herdr.tab` id makes the app create that tab, so no layout math is needed here. */
   async function spawnPaneInTaskTab(
     placement: { desiredTab?: string | null; description: string; zone?: WorktreeZone },
     cwd: string,
     envOver: Record<string, string>,
-    launch: string,
+    argv: readonly string[],
   ): Promise<{ tabId: string; paneId: string; tabName: string }> {
-    const release = await tabMutex.acquire();
-    try {
-      const allPanes = await h.client.listPanes();
-      const mainTabId = allPanes.find((p) => p.paneId === h.env?.paneId)?.tabId ?? (h.env?.tabId ? h.env.tabId : null);
-      let plan: TabPlacementPlan = planTabPlacement({
-        desiredTab: placement.desiredTab,
-        description: placement.description,
-        knownTabs: await liveTabs(),
-        zone: placement.zone,
-        mainTabId,
-      });
-      if (plan.mode === 'append' && plan.tabId) {
-        const exclude = new Set(
-          allPanes.filter((p) => p.tabId === plan.tabId && p.agentStatus === 'unknown').map((p) => p.paneId),
-        );
-        let pick: { targetPaneId: string; direction: 'right' | 'down' } | null = null;
-        let heatRoot: LayoutNode | null = null;
-        let focusPaneId: string | null = null;
-        let zoomed = false;
-        try {
-          const snapshot = await h.client.exportLayout({ tabId: plan.tabId });
-          const tree = snapshot?.root ? parseShapeTree(snapshot.root) : null;
-          if (tree) {
-            heatRoot = fromShapeTree(tree);
-            focusPaneId = snapshot?.focusedPaneId ?? null;
-            zoomed = snapshot?.zoomed === true;
-            let cells: PaneCell[] | undefined;
-            try {
-              const live = await h.client.paneLayout({ paneId: allPanes.find((p) => p.tabId === plan.tabId)?.paneId });
-              if (live?.panes.length) {
-                cells = live.panes.map((p) => ({ id: p.paneId, x: p.x, y: p.y, w: p.w, h: p.h }));
-              }
-            } catch { /* pane.layout missing → 200×50 model */ }
-            pick = pickGridSplit(tree, { exclude, cells });
-          }
-        } catch { /* layout export failure → legacy anchor split */ }
-        const anchorPaneId = pick?.targetPaneId
-          ?? allPanes.find((p) => p.tabId === plan.tabId && p.agentStatus !== 'unknown')?.paneId
-          ?? allPanes.find((p) => p.tabId === plan.tabId)?.paneId;
-        if (anchorPaneId) {
-          const direction = pick?.direction ?? 'down';
-          const statuses: Record<string, string> = {};
-          for (const p of allPanes) {
-            if (p.tabId === plan.tabId) statuses[p.paneId] = p.agentStatus;
-          }
-          const ratio = heatRoot && !zoomed
-            ? planSpawnSplitRatio({
-              root: heatRoot,
-              targetPaneId: anchorPaneId,
-              focusPaneId: focusPaneId ?? anchorPaneId,
-              direction,
-              statuses,
-            })
-            : null;
-          const paneId = await h.client.splitPane({
-            direction,
-            cwd,
-            env: envOver,
-            targetPaneId: anchorPaneId,
-            focus: false,
-            ...(ratio != null ? { ratio } : {}),
-          });
-          await waitShellReady(paneId);
-          await h.client.sendPaneText(paneId, launch);
-          return { tabId: plan.tabId, paneId, tabName: plan.tabName };
-        }
-        plan = { mode: 'new', tabName: plan.tabName, tabId: null };
-      }
-      const created = await h.client.createTab({
-        workspaceId: h.env?.workspaceId ?? '',
-        label: plan.tabName,
-        cwd,
-        env: envOver,
-      });
-      await waitShellReady(created.paneId);
-      await h.client.sendPaneText(created.paneId, launch);
-      return { tabId: created.tabId, paneId: created.paneId, tabName: plan.tabName };
-    } finally {
-      release();
-    }
+    const plan = planTabPlacement({
+      desiredTab: placement.desiredTab,
+      description: placement.description,
+      zone: placement.zone,
+    });
+    const placementLabels = await h.client.placementLabels();
+    const terminal = await h.client.run({
+      argv: [...argv],
+      cwd,
+      env: childEnvironment(process.env, envOver),
+      labels: plan.tabId ? { ...placementLabels, 'herdr.tab': plan.tabId } : placementLabels,
+      noNotify: true,
+    });
+    return {
+      tabId: plan.tabId ?? placementLabels['herdr.tab'] ?? '',
+      paneId: terminal.id,
+      tabName: plan.tabName,
+    };
   }
 
-  /** D94: reuse a pane that already runs the same session instead of competing on one transcript. */
+  /** D94: reuse a terminal that already runs the same session instead of competing on one transcript.
+   *  Workers self-report their session file in the `pier.session` label. */
   async function findExistingPane(sessionFile: string | null): Promise<{ paneId: string; tabId: string } | null> {
     if (!sessionFile) return null;
+    const wanted = bareSessionId(sessionFile);
     try {
-      const agents = await h.client.listAgents();
-      const match = agents.find((a) => a.session === sessionFile && a.status !== 'unknown');
+      const terminals = await h.client.listTerminals();
+      const match = terminals.find((t) => {
+        const reported = t.labels['pier.session'];
+        return reported != null && bareSessionId(reported) === wanted;
+      });
       if (!match) return null;
-      const pane = (await h.client.listPanes()).find((p) => p.paneId === match.paneId);
-      return pane ? { paneId: match.paneId, tabId: pane.tabId } : null;
+      return { paneId: match.id, tabId: match.labels['herdr.tab'] ?? '' };
     } catch {
       return null;
     }
   }
 
-  return { spawnPaneInTaskTab, launchLine, approveFor, waitSubReady, findExistingPane };
+  return {
+    spawnPaneInTaskTab,
+    launchParts: (resumeFile, roleModel, approve) => buildLaunchParts(h.runtime, { resumeFile, roleModel, approve: approve ?? false }),
+    approveFor,
+    waitSubReady,
+    findExistingPane,
+  };
 }
 
 /* ── spawn action ───────────────────────────────────────────────── */
 
 interface SpawnActionHost {
-  client: HerdrClientLike;
-  env: SpawnEnv | null;
+  client: CoreClientLike;
+  env: CoreEnv | null;
   subSemaphore: Semaphore;
   subs: Map<string, SubEntry>;
   persistSubs(): void;
   writeHistory(entry: SubEntry, patch?: Partial<HistoryEntry>, via?: string): void;
   pendingIsolateBranches: Set<string>;
-  lastMachineInjectAt: Map<string, number>;
   lastRequestIdByPane: Map<string, number | string>;
   git: GitIo;
   session: SessionIo;
@@ -556,7 +445,7 @@ interface SpawnActionHost {
 export function createSpawnAction(h: SpawnActionHost) {
   const { client, env, git, subs } = h;
   const { resolveSessionFile, collectFinalText, readAskFlag, probeAlive, subSessionState } = h.session;
-  const { spawnPaneInTaskTab, launchLine, waitSubReady } = h.spawn;
+  const { spawnPaneInTaskTab, launchParts, waitSubReady } = h.spawn;
   const { startPoller } = h.poller;
 
   return async function executeSubagentSpawn(
@@ -591,10 +480,10 @@ export function createSpawnAction(h: SpawnActionHost) {
         PI_HERDR_ROLE_BASE: masterCwd,
       };
       delegationEnvPatch = delegationEnv({
-        parentPaneId: env?.paneId ?? '',
+        parentPaneId: env?.terminalId ?? '',
         parentSessionId: bareSessionId(h.getSessionId()),
         // The master's own pipe so the worker's todo_sync push can dial home (D49).
-        parentPipe: pipeNameFor(masterCwd, env?.paneId ?? ''),
+        parentPipe: pipeNameFor(masterCwd, env?.terminalId ?? ''),
         taskId,
         description: spec.description,
         role: role.role,
@@ -666,14 +555,13 @@ export function createSpawnAction(h: SpawnActionHost) {
     let paneId = '';
     try {
       const spawnedAt = Date.now();
+      const argv = launchParts(null, roleModel, approve);
       const spawned = await spawnPaneInTaskTab(
         { desiredTab: tab, description: spec.description, zone },
         cwd,
-        // pier owns worker state reporting (report_agent with todo/blocked badges); pi 1.1+'s own
-        // OSC 7501 program-status emission would become a second, competing source once a terminal
-        // or dashboard starts reading it. One reporter per pane.
-        { PI_HERDR_SUBAGENT: '1', PI_PROGRAM_STATUS: '0', ...roleManifestEnv, ...delegationEnvPatch },
-        launchLine(null, roleModel, approve),
+        // Status comes ONLY from pi's native OSC 7501 reporter; pier no longer writes it.
+        { PI_HERDR_SUBAGENT: '1', ...roleManifestEnv, ...delegationEnvPatch },
+        argv,
       );
       paneId = spawned.paneId;
       // Phase 2: allocate once per spawn; revives/history keep the row's slug (stability beats beauty).
@@ -694,15 +582,15 @@ export function createSpawnAction(h: SpawnActionHost) {
         background,
         status: 'running',
         sessionFile: null,
-        launchCommand: [launchLine(null, roleModel, approve)],
+        launchCommand: [buildLaunchLine(argv)],
         createdAt: Date.now(),
         revivedFrom: null,
         ...(isolateMeta ? { isolate: isolateMeta } : {}),
       };
       const ready = await waitSubReady(cwd, paneId);
       if (!ready.ok) throw new Error(ready.message);
-      // herdr's per-pane report lags right after spawn, so the mtime fallback would otherwise adopt
-      // the newest PRE-EXISTING session in cwd; only a file written after the pane existed counts.
+      // The `pier.session` label lags right after spawn, so the mtime fallback would otherwise adopt
+      // the newest PRE-EXISTING session in cwd; only a file written after the terminal existed counts.
       entry.sessionFile = await resolveSessionFile(paneId, cwd, undefined, { minMtimeMs: spawnedAt - 2_000 });
       subs.set(paneId, entry);
       h.persistSubs();
@@ -715,14 +603,13 @@ export function createSpawnAction(h: SpawnActionHost) {
         id: `prompt-${taskId}`,
         text: spec.prompt,
         // The pipe name MUST be scoped by the MASTER's cwd: the server binds pipeNameFor(master
-        // session cwd, own paneId); the worker's cwd names a pipe nobody listens on.
-        from: pipeNameFor(masterCwd, env?.paneId ?? ''),
+        // session cwd, own terminal); the worker's cwd names a pipe nobody listens on.
+        from: pipeNameFor(masterCwd, env?.terminalId ?? ''),
         push: background,
       });
       if (injected.type !== 'ok') {
         throw new Error(`pipe prompt rejected: ${injected.type === 'error' ? injected.message : 'unknown response'}`);
       }
-      h.lastMachineInjectAt.set(paneId, injectTs); // attribute working state during the observation window
       const handToPoller = (requestId: string): void => {
         entry.background = true;
         h.lastRequestIdByPane.set(paneId, requestId);
@@ -740,12 +627,26 @@ export function createSpawnAction(h: SpawnActionHost) {
       }
 
       // Foreground waiting: content gate + patience threshold before backgrounding an idle pane.
+      // The worker is read from the children watch and the loop parks on its change counter.
+      const watch = client.watchChildren();
+      await watch.ready();
       const patienceDeadline = Date.now() + runtimePolicy.foregroundPatienceMs;
       let text: string | null = null;
       let settledKind: 'settled' | 'timeout' = 'timeout';
+      let workerError: string | null = null;
       while (Date.now() < Math.min(patienceDeadline, spawnedAt + runtimePolicy.subagentTimeoutMs)) {
-        const state = await client.waitAgent(paneId, ['idle', 'done', 'blocked'], 30_000);
-        const session = (state === 'idle' || state === 'done')
+        const seen = watch.version(paneId);
+        const park = (ms: number): Promise<boolean> => watch.changed(paneId, seen, ms);
+        const info = watch.connected
+          ? watch.get(paneId) ?? await client.getTerminal(paneId).catch(() => undefined)
+          : undefined;
+        // Same words the old blocking wait returned: null = still working (or unknown), else the status.
+        const state = info === null || info?.state === 'finished' ? 'exited'
+          : info === undefined || info.status === 'working' || info.status === 'unknown' ? null
+            : info.status;
+        if (state === 'exited') break; // the post-loop probe reports the dead worker
+        if (state === 'error') workerError = info?.statusMsg ?? workerError;
+        const session = (state === 'idle' || state === 'done' || state === 'error')
           ? await subSessionState(paneId, cwd, injectTs)
           : { text: null, pendingTool: false, activity: false };
         const tick = planForegroundTick({ state, session });
@@ -762,15 +663,27 @@ export function createSpawnAction(h: SpawnActionHost) {
           settledKind = 'settled';
           break;
         }
+        if (state === 'error' && workerError !== null) {
+          // The program failed without leaving transcript text: surface it now instead of blocking
+          // the master for the whole patience window.
+          handToPoller(`prompt-${taskId}`);
+          return {
+            content: [{ type: 'text', text: `Subagent "${spec.description}" reported an error (${workerError}). It stays backgrounded — check subagent(action: "output"), and its settlement notice will arrive automatically.${formatIsolateLocation(isolateMeta)}` }],
+            details: { paneId, taskId, background: true, role: kind, workerError },
+          };
+        }
         if (tick.kind === 'wait') {
-          await sleep(tick.delayMs);
+          await park(tick.delayMs);
           continue;
         }
         if (tick.kind === 'collect-final') {
           text = await collectFinalText(paneId, cwd, injectTs, 6);
           if (text) { settledKind = 'settled'; break; }
-          await sleep(FOREGROUND_POLL_MS);
+          await park(FOREGROUND_POLL_MS);
+          continue;
         }
+        // Still working: park until the worker's state changes.
+        await park(30_000);
       }
       if (!text) {
         const probe = await probeAlive(paneId, cwd);
@@ -783,8 +696,10 @@ export function createSpawnAction(h: SpawnActionHost) {
         }
         settledKind = 'timeout';
       }
+      // A worker that reported `error` and left no closing text still explains itself to the master.
+      const partial = text ?? (workerError ? `(worker reported error: ${workerError})` : '');
       const outcome =
-        settledKind === 'timeout' ? { kind: 'timeout' as const, text: text ?? '' }
+        settledKind === 'timeout' ? { kind: 'timeout' as const, text: partial }
           : text ? { kind: 'completed' as const, text }
             : { kind: 'no-output' as const, text: '' };
       entry.status = 'consumed';
@@ -796,11 +711,14 @@ export function createSpawnAction(h: SpawnActionHost) {
         details: { paneId, taskId, background, role: kind },
       };
     } catch (err) {
-      // A mid-spawn failure must remove the ledger entry and close its pane, or a ghost entry never settles.
+      // A mid-spawn failure must remove the ledger entry and retire its terminal, or a ghost entry never settles.
       if (paneId) {
         subs.delete(paneId);
         h.persistSubs();
-        void client.closePane(paneId).catch(() => { /* GC covers board exceptions */ });
+        void (async () => {
+          try { await client.kill(paneId); } catch { /* already gone */ }
+          try { await client.remove(paneId); } catch { /* core reaps finished terminals */ }
+        })();
       }
       // D98: an isolate whose startup never became ready has no work to preserve.
       if (isolateMeta) {

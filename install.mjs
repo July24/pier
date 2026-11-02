@@ -4,18 +4,21 @@
  *
  * Usage:
  *   node install.mjs install  [--dev]                        # Install (default command, 'install' can be omitted)
- *   node install.mjs update   [--dev]                        # Refresh both halves in place to latest release (no prior uninstall)
+ *   node install.mjs update   [--dev]                        # Refresh the pi extension in place to latest release (no prior uninstall)
  *   node install.mjs version  [--json]                       # Local vs npm latest
- *   node install.mjs uninstall [--dev]                       # Uninstall both halves
+ *   node install.mjs uninstall [--dev]                       # Uninstall the pi extension
  *   node install.mjs --prepare                                # npm prepare: hooksPath + repo root bin link
  *   node install.mjs --help
  *
  * Modes:
  *   User mode (default): pi install npm:pi-pier
- *                   + herdr plugin install July24/pier/packages/pier-workbench --yes
- *   --dev Development mode: pi install <repo>/packages/pier-ext + herdr plugin link <repo>/packages/pier-workbench
+ *   --dev Development mode: pi install <repo>/packages/pier-ext
  *                   (linked directory is live; code edits take effect immediately).
- * Distribution specs can be overridden via --pi-spec= / --herdr-spec= (for npm publish or fork scenarios).
+ * The extension runs inside a herdr-core (`hc`) terminal; the Herdr app only displays those terminals.
+ * `hc` is a preflight requirement; `herdr-app` presence is reported as information, never enforced.
+ * The distribution spec can be overridden via --pi-spec= (for npm publish or fork scenarios).
+ * Legacy: install / update / uninstall offer to remove the herdr TUI plugin pier.workbench (pier ≤ 0.4.3,
+ *   git tag tui-final); --remove-legacy / --keep-legacy answer up front, non-interactive runs keep it.
  * Failure semantics: Each step provides manual equivalent command; step failure does not abort reporting (exitCode=1).
  */
 import { execFileSync } from 'node:child_process';
@@ -26,7 +29,6 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)));
 const EXT_DIR = join(ROOT, 'packages', 'pier-ext');
-const WB_DIR = join(ROOT, 'packages', 'pier-workbench');
 const EXT_PATH = join(EXT_DIR, 'src', 'index.ts');
 const IS_WIN = process.platform === 'win32';
 const COMMANDS = ['install', 'uninstall', 'update', 'version', 'help'];
@@ -64,7 +66,6 @@ const flags = new Set(argv.filter((a) => (a.startsWith('--') && !a.includes('=')
 const optValue = (name) => argv.find((a) => a.startsWith(`--${name}=`))?.split('=').slice(1).join('=') ?? null;
 const dev = flags.has('--dev');
 const PI_SPEC = optValue('pi-spec') ?? 'npm:pi-pier';   // User mode defaults to npm release; --pi-spec=git:github.com/July24/pier tracks repo main
-const HERDR_SPEC = optValue('herdr-spec') ?? 'July24/pier/packages/pier-workbench';
 
 const log = (m) => console.log(m);
 const die = (m) => { console.error(`✗ ${m}`); process.exit(1); };
@@ -98,11 +99,6 @@ function run(cmd, args, opts = {}) {
 
 function tryRun(cmd, args) {
   try { run(cmd, args); return true; } catch (e) { log(`  (${e.message.split('\n')[0]})`); return false; }
-}
-
-/** Same as tryRun without the diagnostic line, for feature probes whose failure is expected. */
-function tryRunQuiet(cmd, args) {
-  try { run(cmd, args); return true; } catch { return false; }
 }
 
 function parseVersion(s) {
@@ -153,16 +149,19 @@ function checkEnv() {
   if (major < 22) die(`node ≥ 22 required, found ${process.versions.node}`);
   log(`✓ node ${process.versions.node}`);
   const piVersion = (() => { try { return parseVersion(run('pi', ['--version'])); } catch { return null; } })();
-  if (!piVersion || !geVersion(piVersion, [1, 3, 0])) {
-    die(`pi ≥ 1.3.0 required${piVersion ? `, found ${piVersion.join('.')}` : ' (pi not found or not runnable)'}. Install: npm i -g @earendil-works/pi-coding-agent`);
+  if (!piVersion || !geVersion(piVersion, [1, 4, 0])) {
+    die(`pi ≥ 1.4.0 required${piVersion ? `, found ${piVersion.join('.')}` : ' (pi not found or not runnable)'}. Install: npm i -g @earendil-works/pi-coding-agent`);
   }
   log(`✓ pi ${piVersion.join('.')}`);
-  const herdrVersion = (() => { try { return parseVersion(run('herdr', ['--version'])); } catch { return null; } })();
-  if (!herdrVersion || !geVersion(herdrVersion, [0, 9, 5])) {
-    die(`herdr ≥ 0.9.5 required${herdrVersion ? `, found ${herdrVersion.join('.')}` : ' (herdr not found)'}. Install: https://herdr.dev/`);
+  const hcVersion = (() => { try { return parseVersion(run('hc', ['--version'])); } catch { return null; } })();
+  if (!hcVersion || !geVersion(hcVersion, [0, 1, 16])) {
+    die(`herdr-core (hc) ≥ 0.1.16 required${hcVersion ? `, found ${hcVersion.join('.')}` : ' (hc not found or not runnable)'}. Install: curl -fsSL https://releases.herdr.dev/core/install.sh | sh`);
   }
-  log(`✓ herdr ${herdrVersion.join('.')}`);
-  return { piVersion, herdrVersion };
+  log(`✓ hc ${hcVersion.join('.')}`);
+  log(which('herdr-app')
+    ? 'ℹ herdr-app found (optional: it displays the core terminals)'
+    : 'ℹ herdr-app not found (optional: install the Herdr app if you want to see the terminals)');
+  return { piVersion, hcVersion };
 }
 
 /** pi extension source: user mode uses git/npm spec, dev mode uses local directory. */
@@ -297,57 +296,57 @@ function pkgDirFromExtPath(extPath) {
   return null;
 }
 
-const HERDR_PLUGIN_ID = 'pier.workbench';
-const HERDR_PLUGIN_NAME = 'pier-workbench';
-const NOT_INSTALLED = Object.freeze({ installed: false, spec: null, sha: null, version: null, source: null, enabled: false });
-
-/** `plugin list --json` (herdr 0.9.5+): returns undefined for a malformed payload, null when the
- *  plugin is absent, so the caller can fall back to the text listing on older binaries. */
-function parseHerdrPluginJson(out) {
-  let parsed;
-  try { parsed = JSON.parse(out); } catch { return undefined; }
-  const plugins = parsed?.result?.plugins ?? parsed?.plugins;
-  if (!Array.isArray(plugins)) return undefined;
-  const p = plugins.find((x) => x && (x.plugin_id === HERDR_PLUGIN_ID || x.name === HERDR_PLUGIN_NAME));
-  if (!p) return null;
-  const source = p.source && typeof p.source === 'object' ? p.source : {};
-  const kind = typeof source.kind === 'string' ? source.kind : null;
-  const root = typeof p.plugin_root === 'string' ? p.plugin_root : null;
-  const commit = typeof source.commit === 'string' ? source.commit : null;
-  const spec = kind === 'local'
-    ? `local:${root ?? p.manifest_path ?? ''}`
-    : (typeof p.version === 'string' ? `v${p.version}` : (kind ?? 'installed'));
-  return {
-    installed: true,
-    spec,
-    sha: commit ? commit.slice(0, 7) : null,
-    version: typeof p.version === 'string' ? p.version : null,
-    source: kind,
-    enabled: p.enabled === true,
-  };
-}
-
-function parseHerdrPluginText(out) {
-  const line = out.split(/\r?\n/).find((l) => l.includes(HERDR_PLUGIN_ID));
-  if (!line) return NOT_INSTALLED;
-  const bracket = line.match(/\[([^\]]+)\]/);
-  const spec = bracket ? bracket[1] : line.trim();
-  const at = spec.lastIndexOf('@');
-  const fullSha = at >= 0 && !spec.startsWith('local:') ? spec.slice(at + 1) : null;
-  return { installed: true, spec, sha: fullSha ? fullSha.slice(0, 7) : null, version: null, source: spec.startsWith('local:') ? 'local' : null, enabled: false };
-}
-
-function herdrPluginInfo() {
+/** Read-only `hc --version` probe for the status command (checkEnv dies on failure; this does not). */
+function hcVersionString() {
   try {
-    const out = run('herdr', ['plugin', 'list', '--json']);
-    const parsed = parseHerdrPluginJson(out);
-    if (parsed !== undefined) return parsed ?? NOT_INSTALLED;
-  } catch { /* older herdr or no server; fall through to the text listing */ }
-  try {
-    return parseHerdrPluginText(run('herdr', ['plugin', 'list']));
+    const v = parseVersion(run('hc', ['--version']));
+    return v ? v.join('.') : null;
   } catch {
-    return NOT_INSTALLED;
+    return null;
   }
+}
+
+/* ── Legacy TUI-era pier (herdr plugin pier.workbench) ─────────────── */
+// pier ≤ 0.4.3 (git tag `tui-final`) shipped a herdr TUI plugin next to the pi extension.
+// The core-based pier no longer uses it; it keeps reacting to herdr TUI events if left behind.
+const LEGACY_PLUGIN_ID = 'pier.workbench';
+
+/** `{ local: boolean }` when herdr lists pier.workbench, else null (no herdr, no server, not installed). */
+function legacyWorkbench() {
+  if (!which('herdr')) return null;
+  try {
+    const plugins = JSON.parse(run('herdr', ['plugin', 'list', '--json'], { timeout: 15000 }))?.result?.plugins;
+    if (Array.isArray(plugins)) {
+      const p = plugins.find((x) => x?.plugin_id === LEGACY_PLUGIN_ID || x?.name === 'pier-workbench');
+      return p ? { local: p.source?.kind === 'local' } : null;
+    }
+  } catch { /* older herdr: text listing below */ }
+  try {
+    const line = run('herdr', ['plugin', 'list'], { timeout: 15000 }).split(/\r?\n/).find((l) => l.includes(LEGACY_PLUGIN_ID));
+    return line ? { local: line.includes('local:') } : null;
+  } catch { return null; }
+}
+
+async function confirm(question) {
+  if (!process.stdin.isTTY) return false;
+  const { createInterface } = await import('node:readline/promises');
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try { return /^y(es)?$/i.test((await rl.question(`${question} [y/N] `)).trim()); } finally { rl.close(); }
+}
+
+/** Offer to remove the TUI-era plugin. `--remove-legacy` / `--keep-legacy` skip the prompt; non-interactive runs keep it. */
+async function offerLegacyRemoval() {
+  const legacy = legacyWorkbench();
+  if (!legacy) return;
+  const [verb, what] = legacy.local ? ['unlink', 'unlinked (files kept)'] : ['uninstall', 'uninstalled'];
+  const manual = `herdr plugin ${verb} ${LEGACY_PLUGIN_ID}`;
+  log(`ℹ found the old herdr TUI plugin ${LEGACY_PLUGIN_ID} (pier ≤ 0.4.3); the herdr-core pier does not use it`);
+  const remove = flags.has('--remove-legacy') ? true
+    : flags.has('--keep-legacy') ? false
+    : await confirm(`  remove it now (${manual})?`);
+  if (!remove) { log(`  kept. Remove later: ${manual}`); return; }
+  if (tryRun('herdr', ['plugin', verb, LEGACY_PLUGIN_ID])) log(`✓ ${LEGACY_PLUGIN_ID} ${what}; herdr itself is untouched`);
+  else { console.error(`✗ failed to remove ${LEGACY_PLUGIN_ID}`); log(`  manual: ${manual}`); process.exitCode = 1; }
 }
 
 function collectStatus() {
@@ -366,14 +365,14 @@ function collectStatus() {
     mode: dev ? 'dev' : 'user',
     installer: { name: 'pier-setup', version: installer },
     piExt: { spec, version: extDir ? readPkgVersion(extDir) : null, path: extDir },
-    herdr: herdrPluginInfo(),
+    core: { version: hcVersionString(), app: which('herdr-app') !== null },
     latest: { 'pier-setup': npmLatest('pier-setup'), 'pi-pier': npmLatest('pi-pier') },
   };
 }
 
 /* ── Commands ─────────────────────────────────────────────────────── */
 function usage() {
-  log(`pier-setup — install / update / inspect pier (pi-pier + pier.workbench)
+  log(`pier-setup — install / update / inspect pier (pi-pier on herdr-core)
 
 Usage:
   pier-setup [install] [--dev]
@@ -382,11 +381,15 @@ Usage:
   pier-setup uninstall [--dev]
 
   npx pier-setup@latest          # recommended user install
-  npx pier-setup@latest update   # refresh both halves to newest release
+  npx pier-setup@latest update   # refresh the pi extension to the newest release
   npx pier-setup@latest version  # local vs npm latest
 
-  --pi-spec= / --herdr-spec= override distribution sources
-  --dev  local link (clone); the linked directories are live`);
+  --pi-spec= override the pi extension source
+  --dev  local link (clone); the linked directory is live
+  --remove-legacy / --keep-legacy  answer the "remove the old herdr TUI plugin
+         pier.workbench?" prompt up front (non-interactive runs keep it)
+
+  The last herdr TUI release is git tag tui-final (pier 0.4.3): npx pier-setup@0.4.3`);
 }
 
 function version() {
@@ -399,8 +402,7 @@ function version() {
   log('');
   log(`  installer   pier-setup      ${s.installer.version ?? 'unknown'}    (this CLI)`);
   log(`  pi ext      ${s.piExt.spec}    ${s.piExt.version ?? 'not installed'}    ${s.piExt.path ?? ''}`);
-  const herdrVer = s.herdr.installed ? (s.herdr.sha ?? s.herdr.spec) : 'not installed';
-  log(`  herdr       pier.workbench  ${herdrVer}    ${s.herdr.spec ?? ''}`);
+  log(`  core        hc              ${s.core.version ?? 'not installed'}${s.core.app ? `    herdr-app found` : ''}`);
   log('');
   const ls = s.latest['pier-setup'] ?? 'unavailable (offline?)';
   const lp = s.latest['pi-pier'] ?? 'unavailable (offline?)';
@@ -414,9 +416,10 @@ function version() {
   }
 }
 
-function update() {
+async function update() {
   checkEnv();
   reconcilePierRegistrations();
+  await offerLegacyRemoval();
   const me = readPkgVersion(ROOT);
   const latestSetup = npmLatest('pier-setup');
   if (latestSetup && me && cmpSemver(me, latestSetup) < 0) {
@@ -428,57 +431,40 @@ function update() {
     if (tryRun('pi', ['update', piSource()])) log(`✓ pi extension updated (${piSource()})`);
     else if (tryRun('pi', ['install', piSource()])) log(`✓ pi extension installed (${piSource()})`);
     else { console.error('✗ pi update/install failed'); log(`  manual: pi update ${piSource()}`); process.exitCode = 1; }
-    // 0.9.4+ updates the GitHub checkout in place without disturbing running plugin panes.
-    // Only try it for an installed, non-local plugin; otherwise install from the configured spec.
-    const existing = herdrPluginInfo();
-    const updated = (existing.installed && existing.source !== 'local'
-      && tryRunQuiet('herdr', ['plugin', 'update', HERDR_PLUGIN_ID, '--yes']))
-      || tryRunQuiet('herdr', ['plugin', 'install', HERDR_SPEC, '--yes']);
-    if (updated) log(`✓ herdr plugin updated (${HERDR_SPEC})`);
-    else { console.error('✗ herdr plugin update failed'); log(`  manual: herdr plugin install ${HERDR_SPEC} --yes`); process.exitCode = 1; }
   }
   log('');
   version();
 }
 
-function install() {
+async function install() {
   checkEnv();
   reconcilePierRegistrations();
+  await offerLegacyRemoval();
 
   if (dev) {
     if (tryRun('pi', ['install', piSource()])) log('✓ pi extension installed (packages/pier-ext, local)');
     else { console.error('✗ pi install failed'); log(`  manual: pi install ${EXT_DIR}`); process.exitCode = 1; }
-    if (tryRun('herdr', ['plugin', 'link', WB_DIR])) log('✓ herdr plugin linked (packages/pier-workbench, local)');
-    else { console.error('✗ herdr plugin link failed'); log(`  manual: herdr plugin link ${WB_DIR}`); process.exitCode = 1; }
   } else {
     if (tryRun('pi', ['install', piSource()])) log(`✓ pi extension installed (${PI_SPEC})`);
     else { console.error('✗ pi install failed'); log(`  manual: pi install ${PI_SPEC}`); process.exitCode = 1; }
-    if (tryRun('herdr', ['plugin', 'install', HERDR_SPEC, '--yes'])) log(`✓ herdr plugin installed (${HERDR_SPEC})`);
-    else { console.error('✗ herdr plugin install failed'); log(`  manual: herdr plugin install ${HERDR_SPEC}`); process.exitCode = 1; }
   }
 
   log(`
-pier installed (${dev ? 'dev mode: local paths, code changes are live' : 'user mode: managed checkouts'}). Next:
-  1. start herdr, open/create a workspace and run \`pi\` inside a pane
-  2. inside pi, ask the model to use todo_write / subagent tools`);
+pier installed (${dev ? 'dev mode: local path, code changes are live' : 'user mode: managed checkout'}). Next:
+  1. start herdr-core and open a terminal (\`hc run\`, or the Herdr app's new-terminal action)
+  2. run \`pi\` inside that terminal
+  3. inside pi, ask the model to use todo_write / subagent tools`);
 }
 
-function uninstall() {
+async function uninstall() {
   if (tryRun('pi', ['remove', piSource()])) log('✓ pi extension removed');
   else { console.error('✗ pi remove failed'); log(`  manual: pi remove ${piSource()}`); process.exitCode = 1; }
-
-  if (dev) {
-    if (tryRun('herdr', ['plugin', 'unlink', 'pier.workbench'])) log('✓ herdr plugin unlinked (files kept)');
-    else { console.error('✗ herdr plugin unlink failed'); log('  manual: herdr plugin unlink pier.workbench'); process.exitCode = 1; }
-  } else {
-    if (tryRun('herdr', ['plugin', 'uninstall', 'pier.workbench'])) log('✓ herdr plugin uninstalled (managed checkout removed)');
-    else { console.error('✗ herdr plugin uninstall failed'); log('  manual: herdr plugin uninstall pier.workbench'); process.exitCode = 1; }
-  }
-  log('\npier uninstalled.');
+  await offerLegacyRemoval();
+  log('\npier uninstalled. herdr-core and the Herdr app are independent and were left untouched.');
 }
 
 if (command === 'help' || flags.has('--help') || flags.has('-h')) usage();
 else if (command === 'version' || flags.has('--version') || flags.has('-v')) version();
-else if (command === 'uninstall') uninstall();
-else if (command === 'update') update();
-else install();
+else if (command === 'uninstall') await uninstall();
+else if (command === 'update') await update();
+else await install();

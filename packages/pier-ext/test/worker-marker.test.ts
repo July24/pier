@@ -1,10 +1,10 @@
-/** Worker identity marker: path derivation from a session file, write/read roundtrip, and the
- * boot probe that restores worker mode after a herdr 0.9.2 server restart. */
+/** Worker identity marker: path derivation from a session file and the write/read roundtrip that
+ * keeps a worker's delegation identity available to a `/resume` replay. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { hasWorkerMarker, readWorkerMarker, workerMarkerPath, writeWorkerMarker } from '../src/worker-marker.ts';
+import { readWorkerMarker, workerMarkerPath, writeWorkerMarker } from '../src/worker-marker.ts';
 import { resolveSessionRoot } from '../src/efficiency-store.ts';
 import { withCleanup } from './test-utils.ts';
 
@@ -17,27 +17,26 @@ test('workerMarkerPath: sits beside the efficiency store for the same session (o
   assert.equal(workerMarkerPath(''), null);
 });
 
-test('writeWorkerMarker/hasWorkerMarker/readWorkerMarker: idempotent roundtrip; bare id keys the directory', withCleanup((cleanup) => {
+test('writeWorkerMarker/readWorkerMarker: idempotent roundtrip; bare id keys the directory', withCleanup((cleanup) => {
   const dir = cleanup.tempDir('marker');
   const sessionFile = join(dir.path, '2026-10-08T01-00-00Z_a1b2c3d4.jsonl');
-  assert.equal(hasWorkerMarker(sessionFile), false);
+  assert.equal(readWorkerMarker(sessionFile), null);
   writeWorkerMarker(sessionFile, 'worker-default');
   writeWorkerMarker(sessionFile, 'worker-default');
-  assert.equal(hasWorkerMarker(sessionFile), true);
   const marker = readWorkerMarker(sessionFile)!;
   assert.equal(marker.v, 1);
   assert.equal(marker.role, 'worker-default');
   assert.ok(marker.ts > 0);
   assert.equal(existsSync(join(dirname(sessionFile), 'herdr-pi', 'a1b2c3d4', 'worker.json')), true, 'timestamp prefix stripped from the id');
   // A master session file in the same directory has no marker of its own.
-  assert.equal(hasWorkerMarker(join(dir.path, '2026-10-08T02-00-00Z_e5f6.jsonl')), false);
+  assert.equal(readWorkerMarker(join(dir.path, '2026-10-08T02-00-00Z_e5f6.jsonl')), null);
 }));
 
 test('writeWorkerMarker/readWorkerMarker: delegation roundtrips; old markers without it still parse', withCleanup((cleanup) => {
   const dir = cleanup.tempDir('marker-delegation');
   const sessionFile = join(dir.path, '2026-10-08T01-00-00Z_a1b2c3d4.jsonl');
   const delegation = {
-    parentPaneId: 'wD:p1',
+    parentPaneId: 't1',
     parentSessionId: 'e5f6a7b8',
     taskId: 't-42',
     description: 'harden pipe channel',
@@ -45,7 +44,7 @@ test('writeWorkerMarker/readWorkerMarker: delegation roundtrips; old markers wit
   };
   writeWorkerMarker(sessionFile, 'worker-default', delegation);
   assert.deepEqual(readWorkerMarker(sessionFile)!.delegation, delegation);
-  // A torn delegation payload degrades to no-delegation, keeping worker-mode detection intact.
+  // A torn delegation payload degrades to no-delegation, keeping the rest of the marker intact.
   const markerPath = workerMarkerPath(sessionFile)!;
   writeFileSync(markerPath, `${JSON.stringify({ v: 1, ts: 1, role: 'worker-default', delegation: 'garbage' })}\n`);
   const torn = readWorkerMarker(sessionFile)!;
@@ -53,7 +52,7 @@ test('writeWorkerMarker/readWorkerMarker: delegation roundtrips; old markers wit
   assert.equal(torn.delegation, undefined);
 }));
 
-test('writeWorkerMarker: unwritable location never throws (restore is best-effort)', () => {
+test('writeWorkerMarker: unwritable location never throws (the marker is best-effort)', () => {
   writeWorkerMarker('/definitely/not/writable/2026-10-08T01-00-00Z_a1b2c3d4.jsonl');
   writeWorkerMarker(null);
 });
