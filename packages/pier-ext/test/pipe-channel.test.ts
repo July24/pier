@@ -47,14 +47,29 @@ async function sendLine(name: string, line: string): Promise<Record<string, unkn
   return JSON.parse((await done.promise).split('\n')[0] || 'null') as Record<string, unknown>;
 }
 
-test('pipe naming: workspace encoding + candidate retry order', () => {
-  assert.equal(pipeNameFor('F:\\herdr-pi', 'w6:p2C'), 'pi-herdr---F%3A%5Cherdr-pi---w6-p2C');
-  assert.equal(pipeNameFor('/home/u/proj', 'w1:p9'), 'pi-herdr---%2Fhome%2Fu%2Fproj---w1-p9');
-  // New (percent-encoded) encoding first, legacy second: the client retries down the list.
+test('pipe naming: digest primary + historical candidates for mixed-version peers', () => {
+  const digest = (cwd: string) => pipeNameFor(cwd, 'w').split('-')[2]!;
+  // Digest form: short, workspace-unique, paneId tail encoded like every other candidate.
+  assert.match(pipeNameFor('F:\\herdr-pi', 'w6:p2C'), /^pi-herdr-[0-9a-f]{16}-w6-p2C$/);
+  assert.notEqual(digest('F:\\herdr-pi'), digest('/home/u/proj'), 'workspaces must not collide');
+  // Digest first, percent-encoded second, legacy third: the client retries down the list.
   assert.deepEqual(pipeNameCandidates('F:\\herdr-pi', 'w6:p2C'), [
+    pipeNameFor('F:\\herdr-pi', 'w6:p2C'),
     'pi-herdr---F%3A%5Cherdr-pi---w6-p2C',
     'pi-herdr---F--herdr-pi---w6-p2C',
   ]);
+});
+
+test('pipe naming: the primary socket path fits every unix sun_path (no silent truncation)', () => {
+  const longCwd = process.platform === 'win32'
+    ? 'C:\\Users\\runner\\AppData\\Local\\Temp\\a-workspace-name-long-enough-to-overflow-any-historical-encoding'
+    : '/var/folders/h8/9t7dh7ls3jjczmzp0l8tq5500000gn/T/a-workspace-name-long-enough-to-overflow';
+  const path = pipePathFor(pipeNameFor(longCwd, 'w1:p9'));
+  if (process.platform !== 'win32') {
+    assert.ok(path.length <= 100, `${path} would truncate sun_path and collide panes`);
+  } else {
+    assert.ok(path.startsWith('\\\\.\\pipe\\') && path.length < 200);
+  }
 });
 
 test('pipePathFor: win32 namespace prefix, POSIX /tmp socket path', () => {
@@ -132,10 +147,10 @@ test('pipeRequestTo: legacy fallback and last-error propagation', async (t) => {
   const cwd = 'F:\\herdr-pi';
   const paneId = `w-test:${process.pid}`;
   const names = pipeNameCandidates(cwd, paneId);
-  assert.equal(names.length, 2);
+  assert.equal(names.length, 3);
   const legacy: Handler = async (req) => ({ type: 'ok', id: req.id, detail: 'legacy' });
   await t.test('reaches a server listening on the legacy name only', () =>
-    withServer('legacy', () => startPipeServer(names[1]!, legacy), async () => {
+    withServer('legacy', () => startPipeServer(names.at(-1)!, legacy), async () => {
       assert.deepEqual(await pipeRequestTo(cwd, paneId, { type: 'ping', id: 'mig' }, 2000),
         { type: 'ok', id: 'mig', detail: 'legacy' });
     }));

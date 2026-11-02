@@ -611,7 +611,7 @@ test('F6 reconcile: a pipe settlement auto-completes the todo and refreshes the 
   ];
   const widgets: string[][] = [];
   const pi = await mountIndex(cleanup, 'master', {
-    HC_TERMINAL_SOCKET: '/tmp/pier-test-sock-reconcile', HC_TERMINAL_ID: 't1',
+    HC_TERMINAL_SOCKET: '/tmp/pier-test-sock-reconcile', HC_TERMINAL_ID: 'p1',
   });
   try {
     const ctx = {

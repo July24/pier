@@ -11,21 +11,33 @@
  * Only pure transport-layer logic here; index.ts performs pi injection in the server callback.
  */
 import * as net from 'node:net';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
-import { sessionDirCandidates, sessionDirName } from './storage-layout.ts';
+import { sessionDirCandidates } from './storage-layout.ts';
 
 function encodePaneId(paneId: string): string {
   return String(paneId).replace(/[^A-Za-z0-9_-]/g, '-');
 }
 
-/** Pipe name: workspace-scoped (same encoding as history dirs) + paneId. */
-export function pipeNameFor(cwd: string, paneId: string): string {
-  return `pi-herdr-${sessionDirName(cwd)}-${encodePaneId(paneId)}`;
+/** POSIX sun_path caps at ~104-108 bytes and libuv silently truncates longer paths, which would
+ *  collide every pane of a workspace onto one socket under long TMPDIRs (macOS /var/folders).
+ *  The workspace therefore rides as a 16-hex digest; the historical encodings stay in the
+ *  client's candidate list so a digest-era client still reaches a pre-digest server. */
+function workspaceDigest(cwd: string): string {
+  return createHash('sha256').update(cwd).digest('hex').slice(0, 16);
 }
 
-/** New encoding first, then legacy — client retries so mixed-version peers still connect. */
+/** Pipe name: workspace-scoped + paneId, short enough for every socket namespace. */
+export function pipeNameFor(cwd: string, paneId: string): string {
+  return `pi-herdr-${workspaceDigest(cwd)}-${encodePaneId(paneId)}`;
+}
+
+/** Digest name first, then the historical encodings — client retries so mixed-version peers still connect. */
 export function pipeNameCandidates(cwd: string, paneId: string): string[] {
-  return sessionDirCandidates(cwd).map((dir) => `pi-herdr-${dir}-${encodePaneId(paneId)}`);
+  return [
+    pipeNameFor(cwd, paneId),
+    ...sessionDirCandidates(cwd).map((dir) => `pi-herdr-${dir}-${encodePaneId(paneId)}`),
+  ];
 }
 
 /** Windows named-pipe address in the kernel namespace, not a filesystem path. */

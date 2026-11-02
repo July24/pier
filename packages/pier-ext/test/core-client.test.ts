@@ -5,8 +5,18 @@ import assert from 'node:assert/strict';
 import { createServer, type Server, type Socket } from 'node:net';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { CoreClient, CoreError, CoreWatch, childEnvironment, coreUnavailableHint, detectCoreEnv } from '../src/core-client.ts';
+
+
+/** Windows named pipes live in the kernel namespace: listening on a filesystem path fails with
+ *  EACCES, so tests pick a pipe name there and a temp-dir unix socket everywhere else. */
+let sockSeq = 0;
+function testSocketPath(prefix: string): string {
+  return process.platform === 'win32'
+    ? `\\\\.\\pipe\\${prefix}-${process.pid}-${sockSeq++}`
+    : join(mkdtempSync(join(tmpdir(), `${prefix}-`)), 's.sock');
+}
 
 interface Call { method: string; params: Record<string, unknown> }
 type Answer = { result: unknown } | { error: { kind: string; message: string } };
@@ -15,8 +25,7 @@ async function withCore(
   answer: (call: Call) => Answer,
   body: (client: CoreClient, calls: Call[]) => Promise<void>,
 ): Promise<void> {
-  const dir = mkdtempSync(join(tmpdir(), 'pier-core-'));
-  const socketPath = join(dir, 's.sock');
+  const socketPath = testSocketPath('pier-core');
   const calls: Call[] = [];
   const server: Server = createServer((sock) => {
     let buf = '';
@@ -43,7 +52,7 @@ async function withCore(
     await body(new CoreClient({ socketPath, terminalId: 't1' }), calls);
   } finally {
     server.close();
-    rmSync(dir, { recursive: true, force: true });
+    if (process.platform !== 'win32') rmSync(dirname(socketPath), { recursive: true, force: true });
   }
 }
 
@@ -172,8 +181,7 @@ interface EventServer {
 }
 
 async function withEventServer(body: (watch: CoreWatch, server: EventServer) => Promise<void>): Promise<void> {
-  const dir = mkdtempSync(join(tmpdir(), 'pier-watch-'));
-  const socketPath = join(dir, 's.sock');
+  const socketPath = testSocketPath('pier-watch');
   const subscriptions: Array<Record<string, unknown>> = [];
   const pending: Socket[] = [];
   const takers: Array<(s: Socket) => void> = [];
@@ -214,7 +222,7 @@ async function withEventServer(body: (watch: CoreWatch, server: EventServer) => 
   } finally {
     watch.close();
     server.close();
-    rmSync(dir, { recursive: true, force: true });
+    if (process.platform !== 'win32') rmSync(dirname(socketPath), { recursive: true, force: true });
   }
 }
 
