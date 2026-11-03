@@ -50,8 +50,6 @@ import { createGitIo, createSpawnAction, createSpawner } from '../subagent-spawn
 import { createPoller } from '../subagent-poller.ts';
 import { createGcController, createSubagentRegistry } from '../subagent-gc.ts';
 import { createSessionIo, executeSubagentOutput, type SubagentOutputCursor } from '../subagent-session.ts';
-import type { RoutingTelemetryRecord } from '../routing-telemetry.ts';
-import { listRoleNames } from '../role-loader.ts';
 import type { NoticeBuffer } from '../index-notices.ts';
 
 type ToolParams = Record<string, unknown> | undefined;
@@ -79,8 +77,6 @@ export interface SubagentDeps {
   terminalState: TerminalStateSlot;
   /** Optional jev seam (settle attribution check); absent → fail-open legacy behavior. */
   jev?: { ask: JevRuntime['ask']; getMinConfidence: () => number };
-  /** Phase 0 routing telemetry (RFC rfc-jev-role-routing §8): spawn profile append; absent in tests. */
-  logRouting?: (row: RoutingTelemetryRecord) => void;
 }
 
 /** Sent with every request: what a call needs. Details live in SUBAGENT_MANUAL (`action: "help"`). */
@@ -90,7 +86,7 @@ const SUBAGENT_DESCRIPTION = [
   'spawn: `prompt` is the COMPLETE task, since only the prompt reaches it; `description` labels the pane and is the todo-reconcile key — when delegating a todo entry, pass its content without the ` <sub>` marker and the entry auto-completes on settle. Several spawns in one message run in parallel (max 4).',
   'A foreground spawn BLOCKS this call for up to ~5 minutes; pass run_in_background: true for long tasks. A background (or timed-out foreground) worker\'s settlement notice arrives automatically at your next tool boundary; when you have nothing else to do, call wait instead of sleeping or polling list/output.',
   'wait: block until a worker (agentId) or any running worker settles or needs a human; returns its notice. send: follow-up to a running or settled worker (steered between its tool calls). output: what it printed since your last check, plus its final report once done (for checking a stuck worker). resume: revive a collected task by taskId.',
-  'help: the full manual (isolate/cwd/tab placement, role profiles, the delegation ledger).',
+  'help: the full manual (isolate/cwd/tab placement, the delegation ledger).',
 ].join(' ');
 
 /** Returned by `action: "help"`: the reference text that used to ride every request. */
@@ -101,9 +97,7 @@ const SUBAGENT_MANUAL = [
   '',
   'isolate (default false) — creates a FRESH git worktree (branch pier/<slug> from your HEAD under ~/.herdr/worktrees/<repo>/). Choose it for heavy independent writing in parallel with your own edits or other workers, or work needing its own clean reviewable diff; omit it for read-mostly or sequential helper work (shared checkout, writes guarded by the write-lock); use cwd for an existing directory/worktree. Its writes cannot conflict with your checkout, its prompt is prefixed with commit discipline (commit to its own branch, never push), and on settle you get a diff summary (commits since base, files changed, uncommitted count). Review with git log/diff HEAD..<branch>, merge with git merge --no-ff <branch>; once merged and clean the worktree auto-removes (branch kept). Mutually exclusive with cwd.',
   '',
-  'role + allowed_tools — `role` picks a profile from the enum in the schema: built-in worker-default (the default) plus the custom JSON profiles found when pier loaded (workspace .pi-herdr/roles/ → user-global ~/.pi/agent/herdr-pi/roles/). The worker toolset becomes baseline ∪ allowed_tools minus role-deny tools (deny always wins). A live worker\'s role is switched by a human with /pier-role in its terminal.',
-  '',
-  'list — background subagents with live state (running / idle), pane ids, last activity, role and description; foreground one-shot panes are not listed.',
+  'list — background subagents with live state (running / idle), pane ids, last activity and description; foreground one-shot panes are not listed.',
   '',
   'wait — blocks until a background worker settles, fails, closes or starts waiting on a human, and returns that notice (final report included) as the result; it is then not delivered again. `agentId` waits for one worker, omitted waits for any running one; `timeout_ms` default 600000, max 1800000. Returns at once when nothing is running or a target is already blocked on a human. Use it when you have nothing else to do — instead of sleep or repeated list/output calls.',
   '',
@@ -371,11 +365,10 @@ export default function subagentPlugin(ctx: Context): void {
         [DELEGATION_ENV]: JSON.stringify({
           parentPaneId: env?.terminalId ?? '',
           parentSessionId: bareSessionId(d.getSessionId()),
-          // todo_sync needs the master's pipe; kind 'task' maps to the composed default.
+          // todo_sync needs the master's pipe.
           parentPipe: pipeNameFor(process.cwd(), env?.terminalId ?? ''),
           taskId: entry.taskId,
           description: entry.description,
-          role: entry.kind === 'task' ? 'worker-default' : entry.kind,
         } satisfies DelegationContext),
       },
       argv,
@@ -727,7 +720,6 @@ export default function subagentPlugin(ctx: Context): void {
     spawn,
     poller,
     getSessionId: d.getSessionId,
-    ...(d.logRouting ? { logRouting: d.logRouting } : {}),
   });
 
   const outputActionDeps = {
@@ -757,9 +749,6 @@ export default function subagentPlugin(ctx: Context): void {
     output: (params, toolCtx) => executeSubagentOutput(params, toolCtx, outputActionDeps),
     help: async () => ({ content: [{ type: 'text', text: SUBAGENT_MANUAL }], details: {} }),
   };
-
-  // Custom profiles are listed once at load: an enum stops the model from inventing role names.
-  const spawnRoles = ['worker-default', ...listRoleNames(process.cwd())];
 
   scoped.registerTool({
     name: 'subagent',
@@ -791,9 +780,7 @@ export default function subagentPlugin(ctx: Context): void {
       run_in_background: Type.Optional(Type.Boolean({ description: '[spawn] Return at once; the settlement notice arrives later (default false)' })),
       cwd: Type.Optional(Type.String({ description: '[spawn] Existing directory or worktree to run in (absolute or workspace-relative); exclusive with isolate' })),
       isolate: Type.Optional(Type.Boolean({ description: '[spawn] Run in a fresh git worktree (branch pier/<slug>) for heavy parallel writes or a reviewable diff; settle reports a diff summary (see help)' })),
-      role: Type.Optional(Type.Union(spawnRoles.map((name) => Type.Literal(name)), { description: '[spawn] Role profile (default worker-default)' })),
       tab: Type.Optional(Type.String({ description: '[spawn] Give the worker a pane in this task tab (joined or created; "main" = your tab). Default: no pane, listed under your agent' })),
-      allowed_tools: Type.Optional(Type.Array(Type.String(), { description: '[spawn] Extra tools on top of the role baseline' })),
       taskId: Type.Optional(Type.String({ description: '[resume] Task id from the delegation ledger' })),
       agentId: Type.Optional(Type.String({ description: '[send|interrupt|output|wait] Slug, pane id, or slug@paneId as printed by spawn/list' })),
       timeout_ms: Type.Optional(Type.Integer({ description: `[wait] Default ${WAIT_DEFAULT_MS}, max ${WAIT_MAX_MS}` })),

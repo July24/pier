@@ -21,11 +21,10 @@ test('writeWorkerMarker/readWorkerMarker: idempotent roundtrip; bare id keys the
   const dir = cleanup.tempDir('marker');
   const sessionFile = join(dir.path, '2026-10-08T01-00-00Z_a1b2c3d4.jsonl');
   assert.equal(readWorkerMarker(sessionFile), null);
-  writeWorkerMarker(sessionFile, 'worker-default');
-  writeWorkerMarker(sessionFile, 'worker-default');
+  writeWorkerMarker(sessionFile);
+  writeWorkerMarker(sessionFile);
   const marker = readWorkerMarker(sessionFile)!;
   assert.equal(marker.v, 1);
-  assert.equal(marker.role, 'worker-default');
   assert.ok(marker.ts > 0);
   assert.equal(existsSync(join(dirname(sessionFile), 'herdr-pi', 'a1b2c3d4', 'worker.json')), true, 'timestamp prefix stripped from the id');
   // A master session file in the same directory has no marker of its own.
@@ -40,15 +39,13 @@ test('writeWorkerMarker/readWorkerMarker: delegation roundtrips; old markers wit
     parentSessionId: 'e5f6a7b8',
     taskId: 't-42',
     description: 'harden pipe channel',
-    role: 'worker-default',
   };
-  writeWorkerMarker(sessionFile, 'worker-default', delegation);
+  writeWorkerMarker(sessionFile, delegation);
   assert.deepEqual(readWorkerMarker(sessionFile)!.delegation, delegation);
   // A torn delegation payload degrades to no-delegation, keeping the rest of the marker intact.
   const markerPath = workerMarkerPath(sessionFile)!;
-  writeFileSync(markerPath, `${JSON.stringify({ v: 1, ts: 1, role: 'worker-default', delegation: 'garbage' })}\n`);
+  writeFileSync(markerPath, `${JSON.stringify({ v: 1, ts: 1, delegation: 'garbage' })}\n`);
   const torn = readWorkerMarker(sessionFile)!;
-  assert.equal(torn.role, 'worker-default');
   assert.equal(torn.delegation, undefined);
 }));
 

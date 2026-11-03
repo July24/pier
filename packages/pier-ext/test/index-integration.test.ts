@@ -49,7 +49,7 @@ async function mountIndex(
   extra: Record<string, string | undefined> = {},
 ): Promise<FakePi> {
   const env = cleanup.env();
-  for (const key of ['PI_HERDR_SUBAGENT', 'HC_TERMINAL_SOCKET', 'HC_TERMINAL_ID', 'PI_HERDR_ROLE_MANIFEST']) {
+  for (const key of ['PI_HERDR_SUBAGENT', 'HC_TERMINAL_SOCKET', 'HC_TERMINAL_ID']) {
     env.delete(key);
   }
   if (mode === 'worker' || mode === 'core-worker') env.set('PI_HERDR_SUBAGENT', '1');
@@ -205,22 +205,6 @@ test('outside a core terminal the ask gate writes nothing', withCleanup(async (c
   const pi = await mountIndex(cleanup, 'worker');
   await pi.tools.get('ask_user_question')!.execute!({}, { question: 'ok?' }, undefined, undefined, { ui: { input: async () => 'y' } });
   assert.deepEqual(statusReports(), []);
-}));
-
-/* ── role manifest ──────────────────────────────────────────────── */
-
-test('role manifest deny returns terminate for the whole batch', withCleanup(async (cleanup) => {
-  const pi = await mountIndex(cleanup, 'worker', {
-    PI_HERDR_ROLE_MANIFEST: JSON.stringify({ role: 'probe', version: 'v1', tools: ['read'], permissions: { bash: 'deny' }, unknownTools: 'deny' }),
-  });
-  const verdicts: unknown[] = [];
-  for (const handler of pi.listeners.get('tool_call') ?? []) {
-    verdicts.push(await handler({ toolName: 'bash' }));
-  }
-  const verdict = verdicts[0] as { block?: boolean; terminate?: boolean; reason?: string };
-  assert.equal(verdict.block, true);
-  assert.equal(verdict.terminate, true, 'denied batches must be able to stop without another model call');
-  assert.match(verdict.reason ?? '', /bash/);
 }));
 
 /* ── session lifecycle ──────────────────────────────────────────── */
@@ -507,7 +491,6 @@ const DELEGATION_ENV_JSON = JSON.stringify({
   parentSessionId: 'e5f6a7b8',
   taskId: 't-42',
   description: 'harden pipe channel',
-  role: 'worker-default',
 });
 
 /** Fires one before_agent_start and returns the sections map the handler mutated. */
@@ -528,7 +511,7 @@ test('worker session_start: delegation env writes the first-frame entry, the pro
   await fire(pi, 'session_start', { reason: 'new' }, ctx);
   const entry = pi.entries.find(([type]) => type === 'pi-herdr.delegation');
   assert.ok(entry, 'first-frame delegation entry written');
-  assert.deepEqual(entry![1], { version: 1, parentPaneId: 'wD:p1', parentSessionId: 'e5f6a7b8', taskId: 't-42', description: 'harden pipe channel', role: 'worker-default', ts: (entry![1] as { ts: number }).ts });
+  assert.deepEqual(entry![1], { version: 1, parentPaneId: 'wD:p1', parentSessionId: 'e5f6a7b8', taskId: 't-42', description: 'harden pipe channel', ts: (entry![1] as { ts: number }).ts });
   const sections = await delegationSections(pi);
   assert.match(sections['pier-delegation'] ?? '', /delegated subagent of the master pane wD:p1/);
   assert.match(sections['pier-delegation'] ?? '', /Task: harden pipe channel/);
@@ -539,7 +522,7 @@ test('worker session_start: delegation env writes the first-frame entry, the pro
 test('restored worker: no env — the marker and the branch entry each re-arm the delegation identity', withCleanup(async (cleanup) => {
   const dir = cleanup.tempDir('delegation-restore');
   const sessionFile = join(dir.path, '2026-10-08T01-00-00Z_a1b2c3d4.jsonl');
-  writeWorkerMarker(sessionFile, 'worker-default', JSON.parse(DELEGATION_ENV_JSON));
+  writeWorkerMarker(sessionFile, JSON.parse(DELEGATION_ENV_JSON));
   const pi = await mountIndex(cleanup, 'worker', { PI_SESSION_FILE: sessionFile });
   await fire(pi, 'session_start', { reason: 'resume' }, {
     sessionManager: { getBranch: () => [], getSessionFile: () => sessionFile, getSessionDir: () => dir.path },
@@ -664,7 +647,7 @@ test('D113 unified widget: worker todo_write pushes todo_sync to the master pipe
       HC_TERMINAL_SOCKET: '/tmp/pier-test-sock-dead', HC_TERMINAL_ID: 'w2',
       PI_HERDR_DELEGATION: JSON.stringify({
         parentPaneId: 't1', parentSessionId: 'm1m1m1m1', parentPipe,
-        taskId: 't-88', description: 'harden pipe channel', role: 'worker-default',
+        taskId: 't-88', description: 'harden pipe channel',
       }),
     });
     try {

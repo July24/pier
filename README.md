@@ -36,19 +36,18 @@ pier is **one pi extension** plus the two external programs it talks to:
 - **Todo loop**: `todo_write` with full-replace semantics, session JSONL as source of truth, correct branch rollback; `/todos` command (including unblock) and the resident status widget show progress. The list is mirrored into a `pier.todo` terminal label only so the master can rebuild a worker's summary; there is no pane-title projection.
 - **Todo anti-freeze**: an all-completed list unchanged for ≥6 turns flips the read hook from recitation to a rewrite warning; after ≥1h it archives — first offering one rewrite window with old entries as reference, then (if ignored) a final notice that clears the list (rm persisted to JSONL; the empty guard takes over — multi-step work must re-track); `/todos` still shows history, session JSONL untouched
 - **Interactive subagents**: every subagent = an isolated pi session in its own core terminal (separate context window); the app lists it under the master (a pane only with `tab`), and **a human can peek at that terminal and talk to it directly** (fix bugs, answer ask_user_question). Blocked state reaches the app through pi's native OSC 7501 report.
-- **Delegation identity** (D111): spawn hands the worker a `PI_HERDR_DELEGATION` context (parent terminal/session, taskId, task, role), replayed from the spawn env and the session's own first-frame entry; the worker's system prompt gains a `pier-delegation` section (identity + one stable delivery contract), and its transcript opens with an "⟵ delegated by master …" card
+- **Delegation identity** (D111): spawn hands the worker a `PI_HERDR_DELEGATION` context (parent terminal/session, taskId, task), replayed from the spawn env and the session's own first-frame entry; the worker's system prompt gains a `pier-delegation` section (identity + one stable delivery contract), and its transcript opens with an "⟵ delegated by master …" card
 - **Task slugs** (D112): spawn allocates a task slug (numbered on collision); tool outputs print `slug@paneId` and `agentId` accepts the bare slug, bare terminal id, or the combined form (the slug part survives a revive that changed the terminal). A master bash call that sleeps ≥60 s while background workers run gets a note pointing at `subagent wait` (D125/D144; the earlier `report_progress` tool was never called and is gone)
 - **Unified status widget** (D113/D114): the resident widget is one line per agent — self as `▶ current item ✓done/total`, each running subagent as `↳ slug ▶ current item ✓d/n` (blocked shows the task + reason; settled rows never occupy the strip; a fully completed self list hides the widget instead of showing a bare `✓N/N`); workers push their full todo list over the pipe on every `todo_write` (event-driven, no polling), and `/pier-tree` opens the complete delegation tree (your todos + every worker's full list + settled nodes) as a **pi overlay** (`ui.custom`, `esc`/`q` closes, live refresh while open; bare pi / RPC mode falls back to the in-pane notify view)
 - **Subagent output preview**: `subagent(action: "output", agentId)` returns what a running background subagent has printed since the previous call — an in-memory per-terminal cursor computes the delta via core `terminal.read`, and the result carries status, revision, truncation and a `restart` flag for scrolled/cleared buffers, so the master can notice a stuck worker instead of waiting for settlement. Once the worker has finished, the complete transcript report replaces the terminal's lossy rendered copy, and a later settlement notice points at that delivery instead of repeating it (D124)
 - **Blocking subagent wait** (D144): `subagent(action: "wait", agentId?)` blocks until a worker settles, fails, closes or starts waiting on a human, and returns that notice — final report included — as the tool result; the notice is taken out of the turn-gap buffer so it is never delivered twice. It replaces `sleep` and repeated `list`/`output` polling while the master has nothing else to do
 - **Terminal commands with exit codes** (D145): `terminal(action: "send", text, wait: true)` appends a nonce'd exit sentinel itself and returns the exit code plus the command's output; hand-written sentinels and the echo trap they fell into are only needed for output that never ends (a server's "listening on")
 - **Soft write-locks**: each terminal publishes lock beacons as `pier.lock.<hash>` labels on `write`/`edit` paths; cross-terminal conflicts warn (default) or block (`PI_HERDR_WRITE_LOCK=1`). The warning lists every holder; `/locks` is the human view of the same table, and `hc get <terminal> --json` exposes the raw labels to agents
-- **Role profiles**: built-in `master` / `worker-default`; custom roles as `.pi-herdr/roles/<name>.json`; toolset converges per role (deny rules are not bypassable); `subagent spawn` offers `role` as an enum of the profiles present when pier loads
+- **One model for the whole tree**: a worker runs the master's current model (a `/model` switch included); there are no role profiles or per-worker tool gates (D146)
 - **Human gate**: subagent `ask_user_question` → the terminal is reported blocked, so the app shows it and (per its own rules) notifies; the answer returns as the tool result. There is no heuristic "human takeover" detection any more.
 - **Ask picker**: every choice question renders through one pier-owned picker in the TUI — single-select (arrows + enter/space pick the highlighted row) and `multi: true` toggle list (checkboxes: space toggles, `a` toggles all, live selection count) share the same framed chrome, `recommended` seeds the cursor (and pre-checks in multi), and the free-text row stays last; `allowOther: false` gives pure choice. `tab` folds the picker to a two-line bar so the transcript above gets the room, and `tab` again unfolds it with cursor and toggles intact; while folded only `tab` acts, so enter/esc cannot answer or decline blind. The host select dialog and typed-index prompts remain the fallbacks for RPC mode and older pi
 - **Blocking dialogs report blocked**: pi 1.4's native OSC 7501 reporter covers `select` / `confirm` / `input` / `editor` and permission dialogs from *any* extension; pier only adds the `ui.custom` ask overlay. Nested gates coalesce.
-- **Role gate stops early**: a denied worker tool call returns `terminate`, so a batch whose results are all terminating ends without another model round trip
-- **Transcript cards**: pier's own session entries (todo edits, subagent/terminal registries, role manifests, soft approvals) and its reminder messages render as compact cards instead of raw JSON — entry/message renderers, no pi-tui dependency
+- **Transcript cards**: pier's own session entries (todo edits, subagent/terminal registries, delegation) and its reminder messages render as compact cards instead of raw JSON — entry/message renderers, no pi-tui dependency
 - **Isolated worktree subagents (`isolate`)**: heavy parallel writers get a fresh git worktree (branch `pier/<slug>` from your HEAD under `~/.herdr/worktrees/<repo>/`) with commit discipline in the prompt; settlement carries a diff summary (commits since base, files changed, uncommitted count); merge with `git merge --no-ff` and the worktree auto-removes once merged and clean — the branch stays for audit
 - **Worktree collection is ownership-scoped**: only worktrees this session registered are collected, and the running process's own directory is never a candidate — the earlier prefix match on `refs/heads/pier/` could delete a parallel session's worktree out from under it. Sweeping branches the session never registered is opt-in (`PIER_ISOLATE_SWEEP_ORPHANS=1`)
 - **Long-task lifecycle (01a03c0d review)**: observation timeout is an inactivity budget (working slices renew it — healthy >10min tasks are no longer killed); follow_up messages deliver via steer at tool-call gaps (supplementary contracts arrive in seconds, not after the whole run); GC waits for the settlement notice to be delivered before closing terminals; ledger rows carry a `via` tag, closed rows inherit their outcome, zombie running rows are swept on startup; SUBS snapshots are hash-gated. Tunables: `PIER_SUBAGENT_TIMEOUT_MS` (inactivity ms), `PIER_SETTLEMENT_WINDOW_MS` (ms), `PIER_OBSERVATION_WINDOW_MS` (ms)
@@ -138,7 +137,6 @@ The extension degrades gracefully outside a herdr-core terminal (see Scope below
 | Hidden inject (`before_agent_start` todo-read; settle reminder) | live | live |
 | `subagent`, `terminal` | **not registered** | live |
 | `/locks`, write-lock, slim-frame, pipe | off | live |
-| `setActiveTools` role visible layer | off | on (master) |
 
 Detection is `HC_TERMINAL_ID` + `HC_TERMINAL_SOCKET`, both injected by core. Session JSONL
 custom types (`pi-herdr.todo-edit`, `.subs`, `.terminals`, `.todo-read`, `.todo-reminder`, …)
@@ -177,7 +175,7 @@ Other agents running in core terminals are visible to the app but are not tracke
 ```
 packages/
   pier-ext/        # pi extension (npm: pi-pier): todo/subagent tools, core client, vocab authority
-docs/              # install guide, configuration overview, role profile docs, migration RFC
+docs/              # install guide, configuration overview, migration RFC
 ```
 
 ## Testing
@@ -241,7 +239,7 @@ Three token-saving mechanisms ship **disabled by default** and are safe to try o
 scaled auto-research loops. pier adopts three of them (ObservationPack / EPR / OCC; the fourth,
 Action Fusion, is not adopted) and re-implements them on its own stack, extending the originals
 with a jev decision layer (small System One classifications at the diagnostic gate, excerpt-window
-pick, and settle attribution — [rfc-jev-integration.md](docs/rfc-jev-integration.md)), role gating,
+pick, and settle attribution — [rfc-jev-integration.md](docs/rfc-jev-integration.md)),
 and the 4-plane efficiency config with per-mechanism JSONL telemetry (D100–D103).
 
 - **ObservationPack** — large tool outputs are projected as placeholders after the first `fullSends` requests, with paged retrieval via `obs_recall` (session JSONL stays untouched).
@@ -254,10 +252,10 @@ PI_HERDR_OBS_PACK_ENABLE=1 PI_HERDR_OBS_PACK_LOG=1 pi   # start here
 
 Full quick start, what to watch in `efficiency-logs/*.jsonl`, rollback steps and a feedback template: **[docs/efficiency-trial.md](docs/efficiency-trial.md)**.
 
-Everything above (plus roles, pi settings and the `PIER_*`/`PI_HERDR_*` env knobs) is also inspectable in-session:
+Everything above (plus pi settings and the `PIER_*`/`PI_HERDR_*` env knobs) is also inspectable in-session:
 
 ```text
-/pier-config            # 4-plane index; hands a guided change to the agent
+/pier-config            # 3-plane index; hands a guided change to the agent
 /pier-config show all   # effective value + source (env > workspace > user > default) per key
 /pier-config check      # validation across planes   ·   /pier-config doc → written report
 ```
@@ -280,4 +278,4 @@ MIT
 
 > 💡 **For contributors**: `.gitignore` is tracked in the repository. `docs/research/` contains local research notes ignored by `.gitignore`.
 >
-> **Naming convention**: the brand is **pier** (repo/packages/plugin); runtime protocol identifiers keep the **`pi-herdr`** prefix (`.pi-herdr/roles/` dir, `pi-herdr.subs` session custom entries, `~/.pi/agent/herdr-pi/roles/` user dir) — they persist with user sessions/config files, renaming would break existing data, so they are the compatibility layer.
+> **Naming convention**: the brand is **pier** (repo/packages/plugin); runtime protocol identifiers keep the **`pi-herdr`** prefix (`.pi-herdr/` dir, `pi-herdr.subs` session custom entries, `~/.pi/agent/herdr-pi/` user dir) — they persist with user sessions/config files, renaming would break existing data, so they are the compatibility layer.

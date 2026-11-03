@@ -19,8 +19,6 @@ export interface DelegationContext {
   readonly taskId: string;
   /** Task short label (SubEntry.description). */
   readonly description: string;
-  /** Role manifest name active at spawn. */
-  readonly role: string;
   /** The master's pipe name — the worker's `todo_sync` push dials it directly (D49 reply-address
    * semantics, precomputed because the worker cannot derive the master's session cwd). */
   readonly parentPipe?: string;
@@ -43,7 +41,6 @@ export function delegationFromRecord(parsed: unknown): DelegationContext | null 
     parentSessionId: str(rec.parentSessionId) ?? '',
     taskId,
     description,
-    role: str(rec.role) ?? 'worker-default',
     ...(parentPipe ? { parentPipe } : {}),
   };
 }
@@ -87,7 +84,7 @@ export function buildDelegationSection(ctx: DelegationContext, ownPaneId: string
     : '';
   return [
     `You are a delegated subagent of the master pane ${parent} (session ${session}); you were not started by a human.`,
-    `Task: ${ctx.description}. Role: ${ctx.role}.${self}`,
+    `Task: ${ctx.description}.${self}`,
     'Contract: when finished, state your final answer plainly — the master collects it from this pane\'s settlement; do not ask who requested the work. If you cannot finish, say exactly what blocks you instead of stopping silently.',
   ].join('\n');
 }

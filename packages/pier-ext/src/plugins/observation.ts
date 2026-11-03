@@ -14,7 +14,6 @@ import { containsReducerReceipt, countLines, deriveObservationId, estimateTokens
 import { appendEfficiencyLog, efficiencyLogPath, observationObjectExists, observationObjectPath, readStoredObjectChunk, resolveSessionRoot, storeContentAddressedObject } from '../efficiency-store.ts';
 import { resolveEfficiencyConfig, type EfficiencyConfig, type ObservationPackConfig } from '../efficiency-config-core.ts';
 import { resolveCacheRatioFromCost } from '../compact-economics-core.ts';
-import { planToolGate, type RuntimeRoleManifest } from '../tool-gate.ts';
 import { toolError } from '../tool-error.ts';
 
 export const RECALL_TOOL_NAME = 'obs_recall';
@@ -125,17 +124,12 @@ export type PickMiddleExcerpts = (
  * unit-testable without index.ts. */
 export function createCompactionBatchPackHook(deps: {
   getObsConfig: () => ObservationPackConfig;
-  getManifest?: () => RuntimeRoleManifest | null;
   getSessionId?: () => string | undefined;
   pickMiddleExcerpts?: PickMiddleExcerpts;
 }): (sessionRoot: string, ctx: unknown) => Promise<void> {
   return async (sessionRoot: string, ctx: unknown): Promise<void> => {
     const obsConfig = deps.getObsConfig();
     if (!obsConfig.enabled) return;
-
-    // Role gate: a role that cannot call obs_recall must not receive placeholders.
-    const manifest = deps.getManifest?.() ?? null;
-    if (manifest && planToolGate(RECALL_TOOL_NAME, manifest).kind === 'deny') return;
 
     const branch = (ctx as { sessionManager?: { getBranch?: () => readonly unknown[] } })
       ?.sessionManager?.getBranch?.() ?? [];
@@ -407,7 +401,6 @@ async function runRecall(
 /** All deps optional: the plugin must work without efficiency config or jev. */
 interface ObservationPackDeps {
   getConfig?: (ctx: ExtensionContext) => EfficiencyConfig;
-  getRuntimeManifest?: () => RuntimeRoleManifest | null;
   getRemainingHorizon?: () => number;
   pickMiddleExcerpts?: PickMiddleExcerpts;
 }
@@ -422,9 +415,6 @@ async function projectPlaceholders(
   const effConfig = deps.getConfig ? deps.getConfig(ctx) : resolveEfficiencyConfig();
   const obsConfig: ObservationPackConfig = effConfig.observationPack;
   if (!obsConfig.enabled) return undefined;
-
-  const manifest = deps.getRuntimeManifest ? deps.getRuntimeManifest() : null;
-  if (manifest && planToolGate(RECALL_TOOL_NAME, manifest).kind === 'deny') return undefined;
 
   const sessionDir = ctx?.sessionManager?.getSessionDir?.();
   const sessionId = ctx?.sessionManager?.getSessionId?.();

@@ -66,15 +66,15 @@ test('buildLaunchParts: fullscreen TUI by default (static frames); PI_HERDR_TUI=
   const base = ['/usr/local/bin/node', '/opt/pi/dist/cli.js', '-e', '/ext/index.ts'];
   assert.deepEqual(buildLaunchParts(RT, {}, {}), [...base, '--tui-mode', 'fullscreen']);
   assert.deepEqual(buildLaunchParts(RT, {}, { PI_HERDR_TUI: 'regular' }), base);
-  assert.deepEqual(buildLaunchParts(RT, { approve: true, roleModel: 'zai/glm-4.7', resumeFile: '/s.jsonl' }, {}), [
+  assert.deepEqual(buildLaunchParts(RT, { approve: true, model: 'zai/glm-4.7', resumeFile: '/s.jsonl' }, {}), [
     '/usr/local/bin/node', '/opt/pi/dist/cli.js', '-a', '-e', '/ext/index.ts',
     '--tui-mode', 'fullscreen', '--provider', 'zai', '--model', 'glm-4.7', '--session', '/s.jsonl',
   ]);
 });
 
 test('buildLaunchParts: the provider is split off at the first "/" only', () => {
-  const modelArgs = (roleModel: string) => {
-    const parts = buildLaunchParts(RT, { roleModel }, { PI_HERDR_TUI: 'regular' });
+  const modelArgs = (model: string) => {
+    const parts = buildLaunchParts(RT, { model }, { PI_HERDR_TUI: 'regular' });
     return parts.slice(parts.indexOf('-e') + 2);
   };
   assert.deepEqual(modelArgs('openrouter/moonshotai/kimi-k2'), ['--provider', 'openrouter', '--model', 'moonshotai/kimi-k2']);
@@ -271,7 +271,7 @@ test('buildBlockedGateNotice: the master must not take over or answer for the hu
   assert.ok(!buildBlockedGateNotice({ paneId: 'wB:p4', description: 'X', question: null }).includes('question:'));
 });
 
-test('planLaunchValidation: core availability, prompt, isolate/cwd and role/kind normalization', () => {
+test('planLaunchValidation: core availability, prompt, isolate/cwd', () => {
   const errorText = (result: { kind: string; text?: string }): string => (result.kind === 'error' ? result.text! : '');
   assert.match(errorText(planLaunchValidation({ prompt: 'x' }, false)), /herdr-core terminal/);
   assert.match(errorText(planLaunchValidation({ prompt: '   ' }, true)), /prompt/);
@@ -281,19 +281,13 @@ test('planLaunchValidation: core availability, prompt, isolate/cwd and role/kind
     description: 'scan',
     prompt: 'do it',
     run_in_background: true,
-    allowed_tools: ['read', 1, 'write'],
     tab: 'feat',
   }, true);
   assert.equal(ok.kind, 'ok');
   if (ok.kind !== 'ok') return;
   assert.equal(ok.spec.description, 'scan');
   assert.equal(ok.background, true);
-  assert.equal(ok.manifestRole, 'worker-default');
-  assert.deepEqual(ok.suggested, ['read', 'write']);
   assert.equal(ok.tab, 'feat');
-  assert.equal(ok.roleKind, 'task');
-  const role = planLaunchValidation({ prompt: 'x', role: 'resident' }, true);
-  assert.equal(role.kind === 'ok' && role.roleKind, 'task', 'legacy role labels fold to task');
 });
 
 test('planForegroundTick: human gate, finalized text, collect, wait, continue', () => {
@@ -465,7 +459,7 @@ test('subagent plugin: help returns the manual, and a missing action normalizes 
   const def = pi.tools.get('subagent')!;
   const help = await runSubagent(pi, { action: 'help' });
   assert.match(help.content[0]!.text, /^subagent manual/);
-  for (const topic of ['isolate', 'role + allowed_tools', 'resume', 'history.jsonl']) assert.ok(help.content[0]!.text.includes(topic), topic);
+  for (const topic of ['isolate', 'wait', 'resume', 'history.jsonl']) assert.ok(help.content[0]!.text.includes(topic), topic);
   assert.equal(String(def.description).includes('history.jsonl'), false, 'ledger detail rides help, not every request');
   assert.deepEqual(def.prepareArguments?.({ description: 'x', prompt: 'y' }), { description: 'x', prompt: 'y', action: 'spawn' });
   assert.deepEqual(def.prepareArguments?.({ action: 'list' }), { action: 'list' });

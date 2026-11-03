@@ -58,7 +58,7 @@ test('drift guards: the catalog matches the JSON schema and the runtime env read
     .join('\n');
   const found = new Set((sources.match(/\bPI(_HERDR)?_[A-Z0-9_]+\b/g) ?? []).filter((n) => !n.endsWith('_')));
   // Internal/pi-owned names that are not user configuration.
-  const allowlist = new Set(['PI_HERDR_ROLE_MANIFEST', 'PI_HERDR_SUBAGENT', 'PI_SESSION_FILE', 'PI_SESSION_ID', 'PI_CODING_AGENT_DIR']);
+  const allowlist = new Set(['PI_HERDR_SUBAGENT', 'PI_SESSION_FILE', 'PI_SESSION_ID', 'PI_CODING_AGENT_DIR']);
   const registered = new Set(PIER_OPTIONS.flatMap((o) => [o.name, ...(o.legacy ? [o.legacy] : [])]));
   const efficiencyEnv = new Set(CONFIG_KNOBS.filter((k) => k.plane === 'efficiency' && k.envVar).map((k) => k.envVar!));
   for (const name of found) {
@@ -143,14 +143,13 @@ test('secret-shaped keys are redacted and never rendered verbatim', () => {
   assert.match(report, /# pier config report/); assert.match(report, /Precedence: env > workspace \(trusted\) > user > default\./); assert.ok(!report.includes('sk-live'), 'the key never reaches the report');
 });
 
-test('renderers cover the four planes and stay compact', () => {
+test('renderers cover the three planes and stay compact', () => {
   const resolved = [...resolveConfigKnobs({ env: {}, user: { observationPack: { enabled: true } }, workspaceTrusted: false }), ...resolveEnvKnobs({})];
   const planeEntries = (id: string) => resolved.filter((r) => r.knob.plane === id);
   const index = renderIndex({
     efficiency: planeEntries('efficiency'), pi: planeEntries('pi'), env: planeEntries('env'),
-    roleSummary: '2 role(s)',
   });
-  assert.match(index[0]!, /4 planes/); assert.ok(index.length <= 8, 'index stays a short summary');
+  assert.match(index[0]!, /3 planes/); assert.ok(index.length <= 8, 'index stays a short summary');
   assert.ok(index.some((l) => l.includes('OCC off / OBS on / EPR off')));
 
   assert.ok(renderPlane(planeEntries('efficiency')).some((l) => l.includes('observationPack.enabled = true'))); assert.deepEqual(renderPlane([]), []);
@@ -167,26 +166,20 @@ interface Fixture {
   paths: { cwd: string; agentDir: string; userConfigPath: string; workspaceConfigPath: string };
 }
 
-function makeFixture(cleanup: CleanupContext, opts: { brokenRole?: boolean; reservedRole?: boolean; trustWorkspace?: boolean } = {}): Fixture {
+function makeFixture(cleanup: CleanupContext, opts: { trustWorkspace?: boolean } = {}): Fixture {
   const base = cleanup.tempDir('cfg-guide').path;
   const cwd = join(base, 'repo');
   const agentDir = join(base, 'agent');
-  const rolesDir = join(cwd, '.pi-herdr', 'roles');
-  const userRolesDir = join(base, 'user-roles');
   const userConfigPath = join(base, 'user-efficiency.json');
   const workspaceConfigPath = join(cwd, '.pi-herdr', 'config.json');
-  for (const dir of [userRolesDir, agentDir, rolesDir, join(cwd, '.pi')]) mkdirSync(dir, { recursive: true });
+  for (const dir of [agentDir, join(cwd, '.pi-herdr'), join(cwd, '.pi')]) mkdirSync(dir, { recursive: true });
 
   // pi owns settings.json; OCC reads compaction.* only. The user config enables OCC (pi's
   // compaction.enabled=false wins unless env forces it); the workspace config enables OBS at 4096.
-  const role = (role: string, version: string) => JSON.stringify({ role, version, manifest: { tools: ['read', 'todo_write', 'ask_user_question'], rules: {}, unknownTools: 'allow' } });
   const files: Array<[string, string]> = [
     [join(agentDir, 'settings.json'), JSON.stringify({ compaction: { enabled: false, keepRecentTokens: 35000 } })],
     [userConfigPath, JSON.stringify({ version: 1, onlineContextCompact: { enabled: true } })],
     [workspaceConfigPath, JSON.stringify({ version: 1, observationPack: { enabled: true, thresholdBytes: 4096 } })],
-    [join(rolesDir, 'auditor.json'), role('auditor', '1.0.0')],
-    ...(opts.brokenRole ? [[join(rolesDir, 'broken.json'), JSON.stringify({ role: 'broken' })]] as Array<[string, string]> : []),
-    ...(opts.reservedRole ? [[join(rolesDir, 'master.json'), role('master', '9.9.9')]] as Array<[string, string]> : []),
   ];
   for (const [path, content] of files) writeFileSync(path, content);
 
@@ -194,7 +187,7 @@ function makeFixture(cleanup: CleanupContext, opts: { brokenRole?: boolean; rese
     base,
     paths: { cwd, agentDir, userConfigPath, workspaceConfigPath },
     deps: {
-      rolesUserDir: userRolesDir, cwd, env: {},
+      cwd, env: {},
       isProjectTrusted: opts.trustWorkspace ?? true, agentDir, userConfigPath,
     },
   };
@@ -210,8 +203,7 @@ test('collectConfigSnapshot: reports effective values, sources and per-plane che
   assert.match(snapshot.entries.find((e) => e.knob.key === 'onlineContextCompact.enabled')!.note ?? '', /pi compaction\.enabled=false/);
   assert.equal(knobValue(snapshot, 'pi', 'compaction.keepRecentTokens'), '35000 [pi]');
 
-  for (const plane of ['efficiency', 'roles', 'env'] as const) assert.equal(planeReport(snapshot, plane).ok, true, planeReport(snapshot, plane).issues.join(' | '));
-  assert.equal(snapshot.roleSummary, '3 role(s): workspace 1 / user 0 / builtin 2');
+  for (const plane of ['efficiency', 'env'] as const) assert.equal(planeReport(snapshot, plane).ok, true, planeReport(snapshot, plane).issues.join(' | '));
 
   assert.ok(renderGuide(snapshot, 'index').some((l) => l.includes('/pier-config show')));
   const efficiencyLines = renderGuide(snapshot, 'efficiency');
@@ -224,7 +216,7 @@ test('collectConfigSnapshot: reports effective values, sources and per-plane che
 }));
 
 interface ProbeCase {
-  name: string; fixture?: { brokenRole?: boolean; reservedRole?: boolean; trustWorkspace?: boolean };
+  name: string; fixture?: { trustWorkspace?: boolean };
   setup?: (fx: Fixture) => void; deps?: (fx: Fixture) => ConfigGuideDeps;
   /** [plane, issue substring, plane stays ok?] — a missing pi-owned file is reported, not an error. */
   expect: Array<[string, string, boolean?]>; extra?: (snapshot: ConfigGuideSnapshot, fx: Fixture) => void;
@@ -237,7 +229,6 @@ const PROBE_CASES: ProbeCase[] = [
       assert.ok(renderGuide(s, 'efficiency').some((l) => l.includes('IGNORED: untrusted project')));
     } },
   { name: 'broken workspace JSON is reported as invalid JSON', setup: (fx) => writeFileSync(fx.paths.workspaceConfigPath, '{ not json'), expect: [['efficiency', 'invalid JSON']] },
-  { name: 'invalid and reserved roles are flagged', fixture: { brokenRole: true, reservedRole: true }, expect: [['roles', 'broken'], ['roles', 'master']] },
   {
     name: 'missing pi settings are reported, not thrown',
     deps: (fx) => ({ ...fx.deps, agentDir: join(fx.base, 'nope-agent') }),

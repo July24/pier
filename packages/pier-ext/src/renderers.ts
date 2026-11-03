@@ -12,11 +12,6 @@ import { TODO_REMINDER_CUSTOM_TYPE } from './todo-reminder-core.ts';
 // Width handling lives in ansi-text.ts so ask_user_question can reuse it without this import graph.
 import { truncateStyled } from './ansi-text.ts';
 
-/** Role manifest entry is written by index.ts; keep the literal here to avoid an import cycle. */
-export const ROLE_MANIFEST_CUSTOM_TYPE = 'pi-herdr.role-manifest';
-/** Soft-approval trace from the worker manifest gate in index.ts. */
-export const APPROVAL_NEEDED_CUSTOM_TYPE = 'pi-herdr.approval-needed';
-
 /** Structural subset of pi's Theme actually used here. */
 export interface RenderTheme {
   fg(color: string, text: string): string;
@@ -107,16 +102,14 @@ function delegationLines(data: unknown, theme: RenderTheme, expanded: boolean): 
     parentSessionId?: unknown;
     taskId?: unknown;
     description?: unknown;
-    role?: unknown;
   };
   const parent = typeof rec.parentPaneId === 'string' && rec.parentPaneId ? rec.parentPaneId : '?';
   const head = `${theme.fg('accent', '⟵ delegated')} ${theme.fg('dim', `by master ${parent} · ${clip(String(rec.description ?? ''), 60)}`)}`;
   if (!expanded) return [head];
   const session = typeof rec.parentSessionId === 'string' && rec.parentSessionId ? rec.parentSessionId : '?';
-  const role = typeof rec.role === 'string' && rec.role ? rec.role : '?';
   return [
     head,
-    theme.fg('dim', `  task ${typeof rec.taskId === 'string' ? rec.taskId : '?'} · role ${role} · parent session ${session}`),
+    theme.fg('dim', `  task ${typeof rec.taskId === 'string' ? rec.taskId : '?'} · parent session ${session}`),
   ];
 }
 
@@ -127,36 +120,6 @@ function terminalsLines(data: unknown, theme: RenderTheme, expanded: boolean): s
     unit: 'open',
     row: (t) => `  ${t.paneId} · ${clip(String(t.label ?? t.cwd ?? ''), 70)}`,
   });
-}
-
-function roleManifestLines(data: unknown, theme: RenderTheme): string[] {
-  const rec = (data ?? {}) as {
-    role?: unknown;
-    manifestVersion?: unknown;
-    tools?: unknown;
-    permissions?: unknown;
-    origin?: unknown;
-    switchedBy?: unknown;
-  };
-  const role = typeof rec.role === 'string' ? rec.role : '?';
-  const version = typeof rec.manifestVersion === 'string' || typeof rec.manifestVersion === 'number' ? String(rec.manifestVersion) : '?';
-  const tools = Array.isArray(rec.tools) ? rec.tools.length : 0;
-  const gates = Object.values((rec.permissions ?? {}) as Record<string, unknown>)
-    .filter((v) => v === 'deny' || v === 'ask').length;
-  const tail = gates > 0 ? theme.fg('warning', ` · ${gates} gated`) : '';
-  // P0: switch provenance — origin 'switch' marks a mid-session swap (vs the session_start anchor).
-  const switched =
-    rec.origin === 'switch'
-      ? theme.fg('accent', ` ⇄ ${typeof rec.switchedBy === 'string' && rec.switchedBy ? rec.switchedBy : '?'}`)
-      : '';
-  return [`${theme.fg('accent', theme.bold('role'))} ${role} ${theme.fg('dim', `v${version} · ${tools} tools`)}${tail}${switched}`];
-}
-
-function approvalLines(data: unknown, theme: RenderTheme): string[] {
-  const rec = (data ?? {}) as { role?: unknown; tool?: unknown };
-  const role = typeof rec.role === 'string' ? rec.role : '?';
-  const tool = typeof rec.tool === 'string' ? rec.tool : '?';
-  return [`${theme.fg('warning', '⚠ approval needed')} ${theme.fg('dim', `· ${tool} (${role})`)}`];
 }
 
 /** Reminder custom messages carry the full injected text; restyle without altering it. */
@@ -202,8 +165,6 @@ export function installRenderers(pi: unknown): string[] {
   entry(SUBS_CUSTOM_TYPE, subsLines);
   entry(TERMINALS_CUSTOM_TYPE, terminalsLines);
   entry(DELEGATION_CUSTOM_TYPE, delegationLines);
-  entry(ROLE_MANIFEST_CUSTOM_TYPE, (data, theme) => roleManifestLines(data, theme));
-  entry(APPROVAL_NEEDED_CUSTOM_TYPE, (data, theme) => approvalLines(data, theme));
   message(TODO_REMINDER_CUSTOM_TYPE, (msg, theme, expanded) => reminderLines(msg, theme, 'todo reminder', expanded));
   message(TERM_REMINDER_CUSTOM_TYPE, (msg, theme, expanded) => reminderLines(msg, theme, 'terminal nudge', expanded));
   return registered;

@@ -2,7 +2,7 @@
  * pi-herdr extension entry point and composition root.
  *
  * Layout: index-runtime.ts picks the process mode (worker / bare pi / herdr master);
- * index-roles.ts the role runtime, index-gates.ts human-gate reporting, index-pipe.ts the
+ * index-gates.ts human-gate reporting, index-pipe.ts the
  * pipe protocol handler, index-notices.ts the notice buffer, index-locks.ts write locks;
  * index-master.ts / index-worker.ts are the dynamic master / todo-only mounts.
  *
@@ -36,7 +36,6 @@ import type { TodoUiSlot } from './plugins/todo.ts';
 import { estimateEta, formatProgressSuffix, progressOf } from './progress-core.ts';
 import { WRITE_LOCK_ENV } from './lock-core.ts';
 import { ABORT_STOP_REASON, planSettleWake, shouldPushSettleReply } from './settle-wake-core.ts';
-import { parseRuntimeManifest } from './tool-gate.ts';
 import { TODO_LABEL, formatPaneTitle } from './pane-title.ts';
 import { registerSlimFrame, updateSlimFrame } from './slim-frame.ts';
 import { planIndexMode } from './index-runtime.ts';
@@ -69,9 +68,7 @@ import { installConfigCommand } from './config-command.ts';
 import { CompactCoordinator } from './compact-coordinator.ts';
 import { handleReducerToolResult, type ToolResultEventLike } from './reducer-invoker.ts';
 import { appendEfficiencyLog, efficiencyLogPath, pruneSessionObjects, resolveSessionRoot } from './efficiency-store.ts';
-import type { RoutingTelemetryRecord, RoutingTelemetryRow } from './routing-telemetry.ts';
 import { loadEfficiencyConfigFromDisk, resolveEfficiencyConfig, type EfficiencyConfig } from './efficiency-config-core.ts';
-import { composeMasterRuntime, createRoleRuntime } from './index-roles.ts';
 import { createGateRuntime } from './index-gates.ts';
 
 function agentSessionsDir(): string {
@@ -81,7 +78,6 @@ function agentSessionsDir(): string {
 export default async function (pi: ExtensionAPI) {
   const mode = planIndexMode();
   const isSubagent = mode.isSubagent;
-  const roleBase = process.env.PI_HERDR_ROLE_BASE || process.cwd();
 
   let sessionId: string = process.env.PI_SESSION_FILE ?? process.env.PI_SESSION_ID ?? '';
   let sessionRoot: string | null = null;
@@ -90,20 +86,7 @@ export default async function (pi: ExtensionAPI) {
   const { client, env } = createCoreClient();
   /** RFC rfc-delegation-identity §2.1: resolved env → marker → branch fold; worker panes only. */
   let delegation: DelegationContext | null = parseDelegationContext(process.env.PI_HERDR_DELEGATION);
-  const initialManifest =
-    parseRuntimeManifest(process.env.PI_HERDR_ROLE_MANIFEST) ??
-    (mode.composeMaster ? composeMasterRuntime() : null);
   const todos = new TodosService();
-
-  /** Phase 0 routing telemetry (RFC docs/rfc-jev-role-routing.md §8): best-effort append; never gates anything. */
-  const appendRoutingLog = (row: RoutingTelemetryRecord): void => {
-    const root = sessionRoot;
-    if (!root) return;
-    const stamped: RoutingTelemetryRow = { ...row, sessionId: sessionId || 'unknown' };
-    void appendEfficiencyLog(efficiencyLogPath(root, 'routing'), stamped).catch(() => {});
-  };
-
-  const roles = createRoleRuntime({ pi, roleBase, initialManifest, appendRoutingLog });
 
   /* ── Jev decision layer (RFC docs/rfc-jev-integration.md): direct HTTP, total-budget
    * abort, fail-open at every site. Disabled or keyless → behavior identical to before. ── */
@@ -469,8 +452,6 @@ export default async function (pi: ExtensionAPI) {
     // P2-5: resume folds todos/compaction state from the branch like session_tree; a fresh session folds nothing.
     rebuildFromBranch(ctx);
     mirrorTodos();
-    roles.syncFromBranch(ctx);
-    if (mode.composeMaster && sessionRoot) roles.scanRoleUsage();
     if (isSubagent) {
       // The worker marker keeps the delegation identity next to the session file, so a /resume of
       // this session (which carries no spawn env) still knows who delegated it.
@@ -493,14 +474,14 @@ export default async function (pi: ExtensionAPI) {
       }
       // The master reads the worker's session file from this label.
       if (sessionFile) void client.setLabels({ 'pier.session': sessionFile });
-      if (sessionRoot) writeWorkerMarker(sessionFile, roles.state.manifest?.role, delegation ?? undefined);
+      if (sessionRoot) writeWorkerMarker(sessionFile, delegation ?? undefined);
     }
 
     startPipeServerFor(cwd);
   });
 
   /* RFC rfc-delegation-identity §2.2: worker identity + delivery contract ride the prompt
-   * sections each turn (same diff discipline as pier-role; removal cleans up). */
+   * sections each turn (pi diffs sections; removal cleans up). */
   if (isSubagent) {
     pi.on('before_agent_start', async (event) => {
       const sections = event.systemPromptOptions?.sections;
@@ -517,9 +498,6 @@ export default async function (pi: ExtensionAPI) {
   pi.on('session_tree', async (_event, ctx) => {
     sessionId = resolveSessionId(ctx);
     rebuildFromBranch(ctx);
-    // pi reverts the transcript loadout at the navigated branch point; the role
-    // runtime follows the same point (same-origin, RFC §4.3).
-    roles.syncFromBranch(ctx);
     todoUi.renderWidget(ctx);
     mirrorTodos();
   });
@@ -625,7 +603,6 @@ export default async function (pi: ExtensionAPI) {
         cancelReminder: todoUi.cancelReminder,
         onBeforeCompact: createCompactionBatchPackHook({
           getObsConfig: () => effConfig.observationPack,
-          getManifest: () => roles.state.manifest,
           getSessionId: () => sessionId,
           pickMiddleExcerpts,
         }),
@@ -639,7 +616,6 @@ export default async function (pi: ExtensionAPI) {
   registerObservationPack({
     pi,
     getConfig: () => effConfig,
-    getRuntimeManifest: () => roles.state.manifest,
     pickMiddleExcerpts,
     getRemainingHorizon: () => {
       const usage = (latestCtx as { getContextUsage?: () => { contextWindow?: number } })?.getContextUsage?.();
@@ -715,7 +691,6 @@ export default async function (pi: ExtensionAPI) {
       isCompactionInFlight: () => coordinator.compactionInFlight,
       isIntentionalAbort: () => coordinator.intentionalAbort,
       jev: { ask: (request, meta) => jevRuntime.ask(request, meta), getMinConfidence: () => effConfig.jev.minConfidence },
-      appendRoutingLog,
     });
 
     /* ── /pier-tree (D113): full todo × subagent delegation tree; the resident widget is minimal ── */

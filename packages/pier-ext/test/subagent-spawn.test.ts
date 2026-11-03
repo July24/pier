@@ -2,8 +2,7 @@
  * injection, foreground/background settlement, rollback) and the injectable git adapter. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import type { Server, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -174,6 +173,8 @@ interface PipeEnv {
   spawnEnvs: Array<Record<string, string>>;
   /** `herdr.*` label blocks handed to `terminal.run` in spawn order. */
   spawnLabels: Array<Record<string, string>>;
+  /** argv handed to `terminal.run` in spawn order. */
+  spawnArgv: string[][];
   /** Uncancellable poll loop: make the children watch's `changed` never resolve, so a row it holds
    *  stays `running` for the rest of the test. */
   parkPollers(): void;
@@ -193,7 +194,7 @@ async function withPipeEnv(
   const sessionFile = join(cwd, 'sub-session.jsonl');
   let parked = false;
   const env: PipeEnv = {
-    cwd, home, pi: undefined as never, port: undefined as never, frames: [], retired: [], spawnEnvs: [], spawnLabels: [],
+    cwd, home, pi: undefined as never, port: undefined as never, frames: [], retired: [], spawnEnvs: [], spawnLabels: [], spawnArgv: [],
     parkPollers: () => { parked = true; }, rejectPrompt: false,
   };
   let paneCounter = 0;
@@ -239,6 +240,7 @@ async function withPipeEnv(
       read: async () => ({ text: '', complete: true }),
       run: async (o) => {
         env.spawnEnvs.push(o.env ?? {});
+        env.spawnArgv.push([...(o.argv ?? [])]);
         env.spawnLabels.push(o.labels ?? {});
         return terminalInfo({ id: nextPaneId(), cwd: o.cwd, labels: o.labels });
       },
@@ -300,16 +302,20 @@ test('spawn env: the worker gets the spawn contract on top of the caller environ
     assert.equal(env.spawnEnvs.length, 1, 'one terminal created for the worker');
     assert.equal('PI_PROGRAM_STATUS' in env.spawnEnvs[0]!, false, 'pier never writes or silences the status source');
     assert.equal(env.spawnEnvs[0]!.PI_HERDR_SUBAGENT, '1');
-    // Delegation identity (RFC rfc-delegation-identity §2.1): the worker learns parent/task/role.
+    // Delegation identity (RFC rfc-delegation-identity §2.1): the worker learns parent/task.
     const delegation = JSON.parse(env.spawnEnvs[0]!.PI_HERDR_DELEGATION ?? 'null') as Record<string, unknown>;
     assert.equal(delegation.parentPaneId, 't0', 'parent terminal is the master terminal');
     assert.equal(delegation.description, '探查');
     assert.equal(typeof delegation.taskId, 'string');
-    assert.equal(delegation.role, 'worker-default');
+    assert.equal('role' in delegation, false);
     assert.equal(delegation.parentPipe, pipeNameFor(env.cwd, 't0'), 'the worker can dial the master pipe for todo_sync');
     // D140: no `tab` means no placement labels — the app lists it under its parent, not as a pane.
     assert.deepEqual(env.spawnLabels[0], {});
-    await runSubagent(env.pi, { description: '探查', prompt: PROMPT, tab: 'research' }, env.cwd);
+    const execute = env.pi.tools.get('subagent')!.execute!;
+    await execute('tc', { description: '探查', prompt: PROMPT, tab: 'research' }, undefined, undefined, { cwd: env.cwd, model: { provider: 'opencode-go', id: 'kimi-k2.7-code' } });
+    const argv = env.spawnArgv[1]!;
+    assert.deepEqual(argv.slice(argv.indexOf('--provider'), argv.indexOf('--provider') + 4), ['--provider', 'opencode-go', '--model', 'kimi-k2.7-code'], 'the worker runs the master\'s current model');
+    assert.equal(env.spawnArgv[0]!.includes('--model'), false, 'no master model known → pi\'s own default');
     assert.equal(env.spawnLabels[1]!['herdr.space'], 'sp0', 'an explicit tab still lands in this terminal\'s space');
     assert.equal(env.spawnLabels[1]!['herdr.tab'], 'tbpier-research', 'the named tab is joined or created');
   });
@@ -410,25 +416,6 @@ test('isolate: mutually exclusive with cwd, and outside a git repo it fails inst
     );
   } finally {
     await root.fiber.dispose();
-  }
-});
-
-test('isolate: an invalid role fails before any worktree or pier/ branch is created', async () => {
-  const repo = mkdtempSync(join(tmpdir(), 'd98-badrole-'));
-  const git = (...args: string[]) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
-  git('init', '-q');
-  git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'init');
-  const { root, pi } = await mountSubagent({ client: { available: true } });
-  try {
-    assert.match(
-      await runSubagentRejects(pi, { description: 'x', prompt: 'do x', isolate: true, role: 'no-such-role' }, repo),
-      /role "no-such-role" manifest invalid/,
-    );
-    assert.equal(git('worktree', 'list', '--porcelain').match(/^worktree /gm)?.length, 1, 'no isolate worktree was added');
-    assert.equal(git('for-each-ref', 'refs/heads/pier/').trim(), '', 'no pier/ branch was left behind');
-  } finally {
-    await root.fiber.dispose();
-    rmSync(repo, { recursive: true, force: true });
   }
 });
 

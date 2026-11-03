@@ -11,7 +11,6 @@ import { DisposeLedger } from '../src/ledger.ts';
 import { createPlatformPaths } from '../src/platform-paths.ts';
 import { PIER_OPTIONS, formatOptionRows, pierOption, pierOptionRows } from '../src/pier-options.ts';
 import { createRuntimePolicy, type RuntimePolicy } from '../src/runtime-policy.ts';
-import { planDenyHitRow, planSpawnProfileRow, scanRoleAxisUsage, taskFingerprint } from '../src/routing-telemetry.ts';
 import {
   historyFilePath, historyFilePathLegacy, preferredHistoryFile, piCoreSessionDirName,
   piSessionDirCandidates, preferredSessionDir, sessionDirName, sessionDirNameLegacy,
@@ -57,48 +56,6 @@ test('ledger: keys are normalized (file:// URL vs path, backslashes, logical nam
     led.add(registered, () => ran.push('hit'));
     assert.equal(led.disposeKey(lookup), 1, `${registered} ↔ ${lookup}`); assert.deepEqual(ran, ['hit']);
   }
-});
-
-/* ── routing telemetry (docs/rfc-jev-role-routing.md §8) ────────────────── */
-
-test('telemetry rows: task fingerprint, spawn profile (snapshot tool lists, no task text), deny hit', () => {
-  const a = taskFingerprint('fix the login bug in auth.ts');
-  assert.match(a, /^[0-9a-f]{8}$/); assert.equal(a, taskFingerprint('fix the login bug in auth.ts'), 'same task, same fingerprint (correlatable across spawns)');
-  assert.notEqual(a, taskFingerprint('write unit tests for auth.ts'));
-
-  const allowedTools = ['bash'];
-  const row = planSpawnProfileRow({ now: 123, roleExplicit: false, role: 'worker-default', allowedTools, manifestTools: ['read', 'bash', 'todo_write'], task: 'secret task text' });
-  assert.deepEqual(row, {
-    kind: 'spawn', ts: 123, roleExplicit: false, role: 'worker-default', allowedTools: ['bash'],
-    manifestTools: ['read', 'bash', 'todo_write'], taskSha8: taskFingerprint('secret task text'),
-  });
-  allowedTools.push('mutated');
-  assert.deepEqual(row.allowedTools, ['bash'], 'the row holds a copy, not the caller array');
-  assert.ok(!JSON.stringify(row).includes('secret task text'), 'privacy: task text never lands in the row');
-  assert.deepEqual(planDenyHitRow({ now: 7, role: 'worker-default', tool: 'subagent' }), { kind: 'deny', ts: 7, role: 'worker-default', tool: 'subagent' });
-});
-
-const ROLE_A = JSON.stringify({ role: 'reviewer', manifest: { unknownTools: 'deny', rules: { '*': 'allow', edit: 'ask', write: 'deny' } } });
-const ROLE_B = JSON.stringify({ role: 'worker-default', manifest: { unknownTools: 'allow', rules: { subagent: 'deny', terminal: 'deny', '*': 'allow' } } });
-
-test('axis scan: minimal profiles parse, and ask/stance/explicit-deny counts are exact', () => {
-  const minimal = scanRoleAxisUsage({
-    now: 1,
-    files: [
-      { name: 'minimal.json', text: JSON.stringify({ role: 'fast-worker', manifest: { tools: ['read'] } }) },
-      { name: 'no-manifest.json', text: JSON.stringify({ role: 'x' }) },
-    ],
-  });
-  assert.equal(minimal.parsed, 1, 'omitted rules ≠ invalid'); assert.equal(minimal.invalid, 1, 'a missing manifest is what makes it invalid');
-  assert.equal(minimal.stanceDeny, 1, 'unknownTools defaults to deny (schema contract)'); assert.equal(minimal.askEntries, 0);
-  assert.deepEqual(minimal.explicitDenies, []);
-
-  // A wildcard `*: deny` is a stance, not an explicit per-tool deny.
-  const row = scanRoleAxisUsage({ now: 1, files: [{ name: 'a.json', text: ROLE_A }, { name: 'b.json', text: ROLE_B }] });
-  assert.deepEqual(row, {
-    kind: 'axis-usage', ts: 1, files: 2, parsed: 2, invalid: 0, askEntries: 1, stanceAllow: 1, stanceDeny: 1,
-    explicitDenies: [['reviewer', 'write'], ['worker-default', 'subagent'], ['worker-default', 'terminal']],
-  });
 });
 
 /* ── storage-layout / platform-paths ────────────────────────────────────── */

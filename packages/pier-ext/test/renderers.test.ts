@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { charWidth, styledWidth, truncateStyled } from '../src/ansi-text.ts';
 import {
-  APPROVAL_NEEDED_CUSTOM_TYPE, ROLE_MANIFEST_CUSTOM_TYPE, installRenderers, type RenderComponent, type RenderTheme,
+  installRenderers, type RenderComponent, type RenderTheme,
 } from '../src/renderers.ts';
 import { TODO_EDIT_CUSTOM_TYPE } from '../src/todo-core.ts';
 import { SUBS_CUSTOM_TYPE } from '../src/subagent-core.ts';
@@ -63,9 +63,7 @@ test('every card clips its lines to the requested width', () => {
     [TODO_EDIT_CUSTOM_TYPE, { edits: [{ op: 'done', content: 'x'.repeat(200) }] }],
     [SUBS_CUSTOM_TYPE, { version: 2, subs: [{ paneId: 'wD:p4', status: 'running', description: 'y'.repeat(200) }] }],
     [TERMINALS_CUSTOM_TYPE, { version: 1, terminals: [{ paneId: 'wD:p9', label: 'z'.repeat(200), cwd: '/repo' }] }],
-    [ROLE_MANIFEST_CUSTOM_TYPE, { role: 'worker-default', manifestVersion: 'v1', tools: ['read'], permissions: { read: 'allow' } }],
     [DELEGATION_CUSTOM_TYPE, { parentPaneId: 'wD:p1', description: 'x'.repeat(200) }],
-    [APPROVAL_NEEDED_CUSTOM_TYPE, { role: 'worker', tool: 'bash' }],
   ];
   for (const [type, data] of cases) {
     const lines = cardLines('entry', type, data, true, plain, 12);
@@ -96,14 +94,9 @@ const CASES: RenderCase[] = [
   { name: 'terminals collapsed', kind: 'entry', type: TERMINALS_CUSTOM_TYPE, data: { version: 1, terminals: [{ paneId: 'wD:p9', label: 'dev server', cwd: '/repo' }, { paneId: 'wD:p8', cwd: '/tmp' }] }, expect: ['terminals · 2 open'] },
   { name: 'terminals expanded (label, else cwd)', kind: 'entry', type: TERMINALS_CUSTOM_TYPE, expanded: true, data: { version: 1, terminals: [{ paneId: 'wD:p9', label: 'dev server', cwd: '/repo' }, { paneId: 'wD:p8', cwd: '/tmp' }] }, expect: ['terminals · 2 open', '  wD:p9 · dev server', '  wD:p8 · /tmp'] },
   { name: 'terminals empty data', kind: 'entry', type: TERMINALS_CUSTOM_TYPE, data: {}, expect: ['terminals · none'] },
-  { name: 'role manifest (marker theme)', kind: 'entry', type: ROLE_MANIFEST_CUSTOM_TYPE, theme: marker, data: { role: 'worker-default', manifestVersion: 'v1', tools: ['read', 'bash', 'write'], permissions: { bash: 'deny', write: 'ask', read: 'allow' } }, expect: ['[accent]**role** worker-default [dim]vv1 · 3 tools[warning] · 2 gated'] },
-  { name: 'role manifest switched', kind: 'entry', type: ROLE_MANIFEST_CUSTOM_TYPE, theme: marker, data: { role: 'worker-default', manifestVersion: 'v1', tools: ['read', 'bash', 'write'], permissions: { bash: 'deny', write: 'ask', read: 'allow' }, origin: 'switch', switchedBy: 'p-master' }, expect: ['[accent]**role** worker-default [dim]vv1 · 3 tools[warning] · 2 gated[accent] ⇄ p-master'] },
-  { name: 'role manifest missing', kind: 'entry', type: ROLE_MANIFEST_CUSTOM_TYPE, expect: ['role ? v? · 0 tools'] },
-  { name: 'delegation card collapsed', kind: 'entry', type: DELEGATION_CUSTOM_TYPE, theme: marker, data: { parentPaneId: 'wD:p1', parentSessionId: 'a1b2c3d4', taskId: 't-9', description: 'refactor auth flow', role: 'worker-default' }, expect: ['[accent]⟵ delegated [dim]by master wD:p1 · refactor auth flow'] },
-  { name: 'delegation card expanded', kind: 'entry', type: DELEGATION_CUSTOM_TYPE, expanded: true, data: { parentPaneId: 'wD:p1', parentSessionId: 'a1b2c3d4', taskId: 't-9', description: 'refactor auth flow', role: 'reviewer' }, expect: ['⟵ delegated by master wD:p1 · refactor auth flow', '  task t-9 · role reviewer · parent session a1b2c3d4'] },
-  { name: 'delegation card missing fields', kind: 'entry', type: DELEGATION_CUSTOM_TYPE, expanded: true, data: {}, expect: ['⟵ delegated by master ? · ', '  task ? · role ? · parent session ?'] },
-  { name: 'approval needed', kind: 'entry', type: APPROVAL_NEEDED_CUSTOM_TYPE, data: { role: 'worker', tool: 'bash' }, expect: ['⚠ approval needed · bash (worker)'] },
-  { name: 'approval needed without a tool', kind: 'entry', type: APPROVAL_NEEDED_CUSTOM_TYPE, data: {}, expect: ['⚠ approval needed · ? (?)'] },
+  { name: 'delegation card collapsed', kind: 'entry', type: DELEGATION_CUSTOM_TYPE, theme: marker, data: { parentPaneId: 'wD:p1', parentSessionId: 'a1b2c3d4', taskId: 't-9', description: 'refactor auth flow' }, expect: ['[accent]⟵ delegated [dim]by master wD:p1 · refactor auth flow'] },
+  { name: 'delegation card expanded', kind: 'entry', type: DELEGATION_CUSTOM_TYPE, expanded: true, data: { parentPaneId: 'wD:p1', parentSessionId: 'a1b2c3d4', taskId: 't-9', description: 'refactor auth flow' }, expect: ['⟵ delegated by master wD:p1 · refactor auth flow', '  task t-9 · parent session a1b2c3d4'] },
+  { name: 'delegation card missing fields', kind: 'entry', type: DELEGATION_CUSTOM_TYPE, expanded: true, data: {}, expect: ['⟵ delegated by master ? · ', '  task ? · parent session ?'] },
   { name: 'todo reminder collapsed', kind: 'message', type: TODO_REMINDER_CUSTOM_TYPE, data: { content: 'Reminder 1/3: you stopped with unfinished todos\nsecond line' }, expect: ['↻ todo reminder', '  Reminder 1/3: you stopped with unfinished todos'] },
   { name: 'todo reminder expanded', kind: 'message', type: TODO_REMINDER_CUSTOM_TYPE, expanded: true, data: { content: 'Reminder 1/3: you stopped with unfinished todos\nsecond line' }, expect: ['↻ todo reminder', 'Reminder 1/3: you stopped with unfinished todos', 'second line'] },
   { name: 'terminal nudge with empty content', kind: 'message', type: TERM_REMINDER_CUSTOM_TYPE, data: {}, expect: ['↻ terminal nudge', '  terminal nudge'] },
@@ -121,7 +114,7 @@ test('card renderers: each custom type renders its lines', async (t) => {
 
 test('installRenderers: registers every pier custom type when the host API exists', () => {
   const harness = install();
-  assert.deepEqual([...harness.entries.keys()], [TODO_EDIT_CUSTOM_TYPE, SUBS_CUSTOM_TYPE, TERMINALS_CUSTOM_TYPE, DELEGATION_CUSTOM_TYPE, ROLE_MANIFEST_CUSTOM_TYPE, APPROVAL_NEEDED_CUSTOM_TYPE]);
+  assert.deepEqual([...harness.entries.keys()], [TODO_EDIT_CUSTOM_TYPE, SUBS_CUSTOM_TYPE, TERMINALS_CUSTOM_TYPE, DELEGATION_CUSTOM_TYPE]);
 });
 
 test('installRenderers: a missing API registers nothing, a throwing host is contained per type', () => {
@@ -132,6 +125,6 @@ test('installRenderers: a missing API registers nothing, a throwing host is cont
     registerEntryRenderer: () => { calls += 1; throw new Error('boom'); },
     registerMessageRenderer: () => { calls += 1; },
   });
-  assert.equal(calls, 8, 'one throwing registration must not skip the rest');
+  assert.equal(calls, 6, 'one throwing registration must not skip the rest');
   assert.deepEqual(registered, [TODO_REMINDER_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE]);
 });

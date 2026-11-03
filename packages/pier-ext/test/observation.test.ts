@@ -15,7 +15,6 @@ import {
   completeLineExcerpt, deriveObservationId, isObservationId,
   REDUCER_RECEIPT_PREFIX, shouldPackForCache, sliceBufferChunk,
 } from '../src/observation-core.ts';
-import type { RuntimeRoleManifest } from '../src/tool-gate.ts';
 import { fakePi, withCleanup } from './test-utils.ts';
 
 /* ── pure helpers (observation-core) ───────────────────────────────── */
@@ -84,7 +83,6 @@ const toolResult = (text: string, id = 'tc_1', toolName = 'bash') => ({ role: 't
 const assistant = () => ({ role: 'assistant', content: [{ type: 'text', text: 'analyzing...' }] });
 /** One log line repeated past the test's byte threshold (~2KB). */
 const longLog = (marker = 'INFO: step processing') => `${marker}\n`.repeat(100);
-const restrictedRole: RuntimeRoleManifest = { role: 'restricted-agent', version: '1.0.0', tools: ['bash', 'read'], permissions: { '*': 'allow' }, unknownTools: 'deny' };
 
 /** Fresh temp session root plus a memo reset — the memo is module-global and keyed by session root. */
 async function inSession(fn: (sessionDir: string) => Promise<void>): Promise<void> {
@@ -98,7 +96,6 @@ type ProjectedEvent = { messages: Array<{ content: Array<{ text: string }> }> };
 type RecallResult = { content: Array<{ text: string }>; details: Record<string, unknown> };
 interface MountDeps {
   getConfig?: () => EfficiencyConfig;
-  getRuntimeManifest?: () => RuntimeRoleManifest | null;
   getRemainingHorizon?: () => number;
   pickMiddleExcerpts?: PickMiddleExcerpts;
 }
@@ -156,14 +153,6 @@ test('ObservationPack: 注册 obs_recall；活跃窗口内原样，超窗后投�
     // Storage gone → an error result instead of a throw, so the model can see the handle went stale
     const missing = await recall({ id: 'obs_000000000000000000000000' }, ctx);
     assert.ok(missing.content[0].text.includes('Error: failed to recall observation'), '缺文件自愈路径');
-  });
-});
-
-test('ObservationPack: 角色被拒 obs_recall 时完全不投影（模型不该拿到不可用的句柄）', async () => {
-  await inSession(async (sessionDir) => {
-    const { project } = mountObservation({ getRuntimeManifest: () => restrictedRole });
-    const res = await project([toolResult(longLog('DEBUG: trace output')), { role: 'assistant', content: [] }], ctxFor(sessionDir, 'session_test_02'));
-    assert.equal(res, undefined);
   });
 });
 
@@ -290,7 +279,7 @@ test('ObservationPack: a resumed process reuses stored objects without re-packin
   });
 });
 
-test('ObservationPack: createCompactionBatchPackHook 尊重配置、角色闸门与分支形状', async () => {
+test('ObservationPack: createCompactionBatchPackHook 尊重配置与分支形状', async () => {
   await inSession(async (sessionDir) => {
     const objectsDir = join(sessionDir, 'observation-pack', 'objects');
     const readObjects = async (): Promise<string[]> => await readdir(objectsDir).catch(() => []);
@@ -305,16 +294,8 @@ test('ObservationPack: createCompactionBatchPackHook 尊重配置、角色闸门
     await createCompactionBatchPackHook({ getObsConfig: () => ({ ...config, enabled: false }) })(sessionDir, ctx);
     assert.deepEqual(await readObjects(), [], '未启用即 no-op');
 
-    await createCompactionBatchPackHook({
-      getObsConfig: () => config,
-      getManifest: () => restrictedRole,
-      getSessionId: () => 'session_hook',
-    })(sessionDir, ctx);
-    assert.deepEqual(await readObjects(), [], '无 obs_recall 权限的角色不该收到预打包占位符');
-
     const hook = createCompactionBatchPackHook({
       getObsConfig: () => config,
-      getManifest: () => null,
       getSessionId: () => 'session_hook',
     });
     await hook(sessionDir, ctx);

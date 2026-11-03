@@ -36,19 +36,18 @@ pier 是**一个 pi 扩展**，外加它与两个外部程序协作：
 - **todo 闭环**：`todo_write` 全量替换语义、会话 JSONL 权威、分支正确回滚；`/todos` 命令（含 unblock）与常驻状态 widget 展示进度。列表会镜像到 `pier.todo` 终端 label，仅用于 master 重建 worker 摘要；不再有窗格标题投影。
 - **todo 反冻结**：全完成列表 ≥6 轮未写 → 读钩复读改为改写警告；≥1h 未写 → 归档——先给一次带旧条目参照的重写窗口，无视后终态通知并清空列表（rm 落 JSONL，空守卫接管，多步工作必须重建清单）；`/todos` 永远可查历史，会话 JSONL 权威不动
 - **交互式子代理**：每个子代理 = 独立 core 终端里的隔离 pi 会话（独立上下文窗口）；app 把它列在 master 下（仅 `tab` 时为 pane），**人类可随时 peek 该终端直接对话**（修 bug、回答 ask_user_question）。blocked 状态经 pi 原生 OSC 7501 到达 app。
-- **委托身份一等公民**（D111）：spawn 时经 `PI_HERDR_DELEGATION` 把委托上下文（父终端/父会话/taskId/任务/角色）下发 worker，由 spawn env 与会话自身首帧条目回放；worker 系统提示注入 `pier-delegation` 段（身份 + 统一交付契约），首帧渲染「⟵ delegated by master …」卡片
+- **委托身份一等公民**（D111）：spawn 时经 `PI_HERDR_DELEGATION` 把委托上下文（父终端/父会话/taskId/任务）下发 worker，由 spawn env 与会话自身首帧条目回放；worker 系统提示注入 `pier-delegation` 段（身份 + 统一交付契约），首帧渲染「⟵ delegated by master …」卡片
 - **任务 slug**（D112）：spawn 分配任务 slug（冲突加序号），工具输出一律 `slug@paneId`，`agentId` 接受 slug/终端 id/组合形式（revive 换终端后按 slug 兜底）。后台 worker 运行期间 master 的 bash 若 sleep ≥60s，结果会附一句指向 `subagent wait` 的提示（D125/D144；此前的 `report_progress` 工具一次都没被调用过，已删除）
 - **统一状态 widget**（D113/D114）：常驻 widget 一行一 agent——自己一行 `▶ 当前条 ✓d/n`，每个 running 子代理一行 `↳ slug ▶ 当前条 ✓d/n`（blocked 显示任务+原因，settled 不占行；自己的清单全部完成时直接隐藏，不再只剩一个 `✓N/N`）；worker `todo_write` 经 pipe 实时推送全量清单（事件驱动零轮询），`/pier-tree` 把完整委托树（自己 + 各 worker 全量 todo + settled 节点）打开为 **pi 内 overlay**（`ui.custom`，`esc`/`q` 关闭，打开期间实时刷新；裸 pi / RPC 模式回退为 pane 内通知）
 - **子代理输出预览**：`subagent(action: "output", agentId)` 返回后台子代理自上次调用以来的新输出——内存中的 per-terminal 游标经 core `terminal.read` 计算增量，结果带状态、revision、截断与 `restart` 标记（缓冲回卷/清屏），master 不必等到结算就能发现卡住的 worker。worker 完成后以完整 transcript 终稿替代终端里有损的渲染副本，之后的结算通知只指向那次交付、不再重复全文（D124）
 - **阻塞等待子代理**（D144）：`subagent(action: "wait", agentId?)` 阻塞到某个 worker 结算、失败、关闭或开始等人工，并把那条通知（含终稿）作为工具结果返回；通知从回合间隙缓冲中取出，不会再投递一次。master 无事可做时用它代替 `sleep` 与反复的 `list`/`output` 轮询
 - **终端命令带退出码**（D145）：`terminal(action: "send", text, wait: true)` 由 pier 自己追加带 nonce 的退出哨兵，返回退出码与命令输出；手写哨兵（及其回显陷阱）只剩不会结束的输出需要（服务的 "listening on"）
 - **软锁防争抢**：写路径把锁 beacon 作为 `pier.lock.<hash>` label 发布到各自终端；跨终端冲突时警告（默认）或阻止（`PI_HERDR_WRITE_LOCK=1`）。警告列出全部持有者；`/locks` 是人类视图，`hc get <terminal> --json` 暴露原始 label
-- **角色档案**：`master` / `worker-default` 内置，自定义 role 按 `.pi-herdr/roles/<name>.json` 挂载；工具集按角色收敛（deny 规则不可绕过）；`subagent spawn` 的 `role` 是 pier 加载时已有档案的枚举
+- **整棵树同一模型**：worker 沿用 master 当前的模型（包括 `/model` 切换后的）；不再有角色档案与按 worker 的工具闸门（D146）
 - **人类闸门**：子代理 `ask_user_question` → 终端上报 blocked，app 据此展示（并按自身规则提醒）；答案作为工具结果返回。不再做启发式的「人工接管」检测。
 - **选择题选择器**：`multi: true` 的问题直接渲染成可勾选列表（空格逐行切换、`a` 全选、回车确认、esc 拒绝，实时显示已选数量），末行固定为自由输入；`allowOther: false` 则纯选择。`tab` 把选择器折叠成两行横条，把屏幕让给上方对话记录，回看完再按 `tab` 展开，光标与勾选保持不变；折叠期间只有 `tab` 生效，回车/esc 不会盲答或拒绝。RPC 模式 / 旧版 pi 自动回退到「输入编号」的文本路径
 - **阻塞式对话框上报 blocked**：pi 1.4 原生 OSC 7501 上报覆盖**任何扩展**的 `select` / `confirm` / `input` / `editor` 与权限弹窗；pier 只额外处理 `ui.custom` 的 ask overlay。嵌套闸门自动合并。
-- **角色闸门提前终止**：被拒绝的 worker 工具调用返回 `terminate`，整批都是 terminating 时不再多跑一轮模型
-- **转写卡片**：pier 自己的会话条目（todo 编辑、子代理/终端注册表、角色清单、软审批）与提醒消息渲染为紧凑卡片，不再是裸 JSON——entry/message renderer，不依赖 pi-tui
+- **转写卡片**：pier 自己的会话条目（todo 编辑、子代理/终端注册表、委托身份）与提醒消息渲染为紧凑卡片，不再是裸 JSON——entry/message renderer，不依赖 pi-tui
 - **隔离工作树（`isolate`）回收有明确归属**：只回收本会话自己登记过的工作树，且**当前进程所在目录永不作为候选**——此前按 `refs/heads/pier/` 前缀匹配会删掉并行会话正在使用的工作树。清扫本会话未登记的分支需显式开启 `PIER_ISOLATE_SWEEP_ORPHANS=1`
 - **长任务生命周期（01a03c0d 复盘）**：观察超时改「无活动预算」（working 心跳续命，>10min 健康任务不再误杀）；follow_up 以 steer 间隙投递（补充契约秒级到达，不再排队整个 run）；GC 等结算通知送达再回收终端；台账 via 标记 + closed 行 outcome 继承 + 僵尸 running 清扫；SUBS 快照哈希门控。可调：`PIER_SUBAGENT_TIMEOUT_MS`（无活动毫秒数）、`PIER_SETTLEMENT_WINDOW_MS`（ms）、`PIER_OBSERVATION_WINDOW_MS`（ms）
 - **结算通知折叠**：后台子代理结算不再攒到 run 结束洪水回填——turn 间隙注入，最多 3 条逐条展示、其余折叠指路
@@ -134,7 +133,6 @@ pi install ./packages/pier-ext        # 开发期
 | 隐藏注入（`before_agent_start` 读钩；停工 reminder） | 生效 | 生效 |
 | `subagent`、`terminal` | **不注册** | 生效 |
 | `/locks`、写锁、slim-frame、pipe | 不加载 | 生效 |
-| `setActiveTools` 角色可见层 | 不加载 | 生效（master） |
 
 检测依据是 core 注入的 `HC_TERMINAL_ID` + `HC_TERMINAL_SOCKET`。会话 JSONL 自定义类型
 （`pi-herdr.todo-edit`、`.subs`、`.terminals`、`.todo-read`、`.todo-reminder` 等）即使没有 core
@@ -172,7 +170,7 @@ pi 对同名 tool/command **后写覆盖**，event listener **累加**。两套 
 ```
 packages/
   pier-ext/        # pi 扩展（npm: pi-pier）：todo/subagent 工具、core 客户端、vocab 权威
-docs/              # 安装手册、配置总览、role 档案说明、迁移 RFC
+docs/              # 安装手册、配置总览、迁移 RFC
 ```
 
 ## 测试
@@ -242,7 +240,7 @@ PI_HERDR_OBS_PACK_ENABLE=1 PI_HERDR_OBS_PACK_LOG=1 pi   # 从这里开始
 （[论文](https://arxiv.org/abs/2609.20519) · [博客](https://nvlabs.github.io/SoL-Pi/)）——
 其通过规模化自动研究循环发现的四个 harness 级效率机制中的三个（第四个 Action Fusion 未采纳）。
 pier 在自有栈上独立实现，并叠加了 jev 决策层（诊断门 / 摘录选窗 / 结算归因的小型
-System One 分类，见 [rfc-jev-integration.md](docs/rfc-jev-integration.md)）、角色门禁
+System One 分类，见 [rfc-jev-integration.md](docs/rfc-jev-integration.md)）
 与四平面效率配置 + 分机制 JSONL 遥测。
 
 ## 设计原则
@@ -261,4 +259,4 @@ MIT
 
 > 💡 **开发说明**：`.gitignore` 目前已入库跟踪。`docs/research/` 内为本地调研文档，已被 `.gitignore` 忽略。
 >
-> **命名约定**：品牌名 **pier**（仓库/包/插件），运行时协议标识保留 **`pi-herdr`** 前缀（`.pi-herdr/roles/` 目录、`pi-herdr.subs` 等会话 custom 条目、`~/.pi/agent/herdr-pi/roles/` 用户目录）——它们随用户会话/配置文件持久化，改动会破坏既有数据，属兼容层。
+> **命名约定**：品牌名 **pier**（仓库/包/插件），运行时协议标识保留 **`pi-herdr`** 前缀（`.pi-herdr/` 目录、`pi-herdr.subs` 等会话 custom 条目、`~/.pi/agent/herdr-pi/` 用户目录）——它们随用户会话/配置文件持久化，改动会破坏既有数据，属兼容层。

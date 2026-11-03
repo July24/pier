@@ -54,7 +54,6 @@ export const SUBAGENT_OUTPUT_SCHEMA = Type.Object({
   ]),
   paneId: Type.Optional(Type.String()),
   taskId: Type.Optional(Type.String()),
-  role: Type.Optional(Type.String()),
   background: Type.Optional(Type.Boolean()),
   alreadyRunning: Type.Optional(Type.Boolean()),
 }, { additionalProperties: true });
@@ -365,10 +364,10 @@ export function rekeySub(subs: Map<string, SubEntry>, previousPaneId: string, en
 }
 
 /** Split `provider/model` on the first '/' only: model ids such as `moonshotai/kimi-k2` carry their own. */
-export function splitRoleModel(roleModel: string): { provider: string | null; model: string } {
-  const slash = roleModel.indexOf('/');
-  if (slash <= 0 || slash === roleModel.length - 1) return { provider: null, model: roleModel };
-  return { provider: roleModel.slice(0, slash), model: roleModel.slice(slash + 1) };
+export function splitModelRef(ref: string): { provider: string | null; model: string } {
+  const slash = ref.indexOf('/');
+  if (slash <= 0 || slash === ref.length - 1) return { provider: null, model: ref };
+  return { provider: ref.slice(0, slash), model: ref.slice(slash + 1) };
 }
 
 /** pi's AgentToolResult shape — a bare string crashes the interactive TUI's getTextOutput. */
@@ -465,15 +464,15 @@ function placementFor(tabName: string): TabPlacementPlan {
 /** D97: fullscreen is what makes the pane a static frame the master can read. */
 export function buildLaunchParts(
   runtime: { nodePath: string; cliPath: string; extPath: string },
-  opts: { resumeFile?: string | null; roleModel?: string | null; approve?: boolean } = {},
+  opts: { resumeFile?: string | null; model?: string | null; approve?: boolean } = {},
   env: { PI_HERDR_TUI?: string | undefined } = process.env,
 ): string[] {
   const parts = [runtime.nodePath, runtime.cliPath];
   if (opts.approve) parts.push('-a');
   parts.push('-e', runtime.extPath);
   if (env.PI_HERDR_TUI !== 'regular') parts.push('--tui-mode', 'fullscreen');
-  if (opts.roleModel) {
-    const { provider, model } = splitRoleModel(opts.roleModel);
+  if (opts.model) {
+    const { provider, model } = splitModelRef(opts.model);
     if (provider) parts.push('--provider', provider);
     parts.push('--model', model);
   }
@@ -573,14 +572,10 @@ type LaunchValidation =
     background: boolean;
     isolate: boolean;
     cwdParam: string | null;
-    roleKind: string;
-    suggested: string[];
-    manifestRole: string | null;
     tab: string | null;
   };
 
-/** Validate spawn parameters. `role` doubles as the pane label and (when it names a profile) the
- *  manifest to compose; unknown names stay labels. `isolate` and `cwd` are mutually exclusive. */
+/** Validate spawn parameters. `isolate` and `cwd` are mutually exclusive. */
 export function planLaunchValidation(
   params: {
     description?: unknown;
@@ -588,8 +583,6 @@ export function planLaunchValidation(
     run_in_background?: unknown;
     cwd?: unknown;
     isolate?: unknown;
-    role?: unknown;
-    allowed_tools?: unknown;
     tab?: unknown;
   } | null | undefined,
   available: boolean,
@@ -610,18 +603,12 @@ export function planLaunchValidation(
       text: 'Error: `isolate` and `cwd` are mutually exclusive — isolate creates a new worktree, cwd delegates into an existing one',
     };
   }
-  const role = typeof params?.role === 'string' ? params.role.trim() : undefined;
   return {
     kind: 'ok',
     spec,
     background: params?.run_in_background === true,
     isolate,
     cwdParam,
-    roleKind: normalizeEntryKind(role),
-    suggested: Array.isArray(params?.allowed_tools)
-      ? params.allowed_tools.filter((t): t is string => typeof t === 'string' && t.trim() !== '')
-      : [],
-    manifestRole: role || 'worker-default',
     tab: typeof params?.tab === 'string' ? params.tab : null,
   };
 }

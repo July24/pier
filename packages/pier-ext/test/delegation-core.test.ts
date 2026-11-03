@@ -18,7 +18,6 @@ const CTX = {
   parentSessionId: 'a1b2c3d4',
   taskId: 't-9',
   description: 'refactor auth flow',
-  role: 'reviewer',
 };
 
 test('delegationEnv ↔ parseDelegationContext: JSON roundtrip, contract env name', () => {
@@ -32,9 +31,9 @@ test('parseDelegationContext: absent/torn/malformed input degrades to null', () 
     assert.equal(parseDelegationContext(bad), null, JSON.stringify(bad));
 });
 
-test('parseDelegationContext: empty parent ids are tolerated (tests/RPC), role defaults', () => {
+test('parseDelegationContext: empty parent ids are tolerated (tests/RPC)', () => {
   const parsed = parseDelegationContext(JSON.stringify({ parentPaneId: '', parentSessionId: '', taskId: 't', description: 'd' }));
-  assert.deepEqual(parsed, { parentPaneId: '', parentSessionId: '', taskId: 't', description: 'd', role: 'worker-default' });
+  assert.deepEqual(parsed, { parentPaneId: '', parentSessionId: '', taskId: 't', description: 'd' });
 });
 
 test('delegationFromRecord: non-object records are null, not an error', () => {
@@ -45,7 +44,7 @@ test('delegationFromRecord: non-object records are null, not an error', () => {
 test('buildDelegationSection: identity, self pane, and the delivery contract are all present', () => {
   const text = buildDelegationSection(CTX, 'wD:p2');
   assert.match(text, /master pane wD:p1 \(session a1b2c3d4\)/);
-  assert.match(text, /Task: refactor auth flow\. Role: reviewer\./);
+  assert.match(text, /Task: refactor auth flow\. You are pane wD:p2/);
   assert.match(text, /pane wD:p2 \(agentId "wD:p2"\)/);
   assert.match(text, /state your final answer plainly/);
   assert.match(text, /say exactly what blocks you/);
@@ -70,7 +69,8 @@ test('foldDelegation: last branch entry wins; foreign/torn entries are skipped',
     { type: 'custom', customType: DELEGATION_CUSTOM_TYPE, data: { taskId: 't-9', description: 'second', role: 'coder' } },
     { type: 'custom', customType: DELEGATION_CUSTOM_TYPE, data: { broken: true } },
   ];
-  assert.deepEqual(foldDelegation(entries), { parentPaneId: '', parentSessionId: '', taskId: 't-9', description: 'second', role: 'coder' });
+  // A legacy `role` field in old sessions is ignored.
+  assert.deepEqual(foldDelegation(entries), { parentPaneId: '', parentSessionId: '', taskId: 't-9', description: 'second' });
   assert.equal(foldDelegation([]), null);
   assert.equal(foldDelegation([{ type: 'custom', customType: DELEGATION_CUSTOM_TYPE, data: { broken: true } }]), null);
 });

@@ -13,9 +13,7 @@ import { childEnvironment, type CoreClientLike, type CoreEnv } from './core-clie
 import { delegationEnv } from './delegation-core.ts';
 import { bareSessionId } from './session-tail.ts';
 import { pipeNameCandidates, pipeNameFor, pipeRequest, pipeRequestTo } from './pipe-channel.ts';
-import { composeForRole } from './manifest-compose.ts';
 import { platformPaths } from './platform-paths.ts';
-import { planSpawnProfileRow, type RoutingTelemetryRecord } from './routing-telemetry.ts';
 import { runtimePolicy } from './runtime-policy.ts';
 import { toolError } from './tool-error.ts';
 import type { HistoryEntry } from './history-store.ts';
@@ -274,7 +272,7 @@ export interface Spawner {
     envOver: Record<string, string>,
     argv: readonly string[],
   ): Promise<{ tabId: string; paneId: string; tabName: string }>;
-  launchParts(resumeFile?: string | null, roleModel?: string | null, approve?: boolean): string[];
+  launchParts(resumeFile?: string | null, model?: string | null, approve?: boolean): string[];
   approveFor(cwd: string, masterCwd: string): Promise<boolean>;
   waitSubReady(cwd: string, paneId: string): Promise<ReadyOutcome>;
   findExistingPane(sessionFile: string | null): Promise<{ paneId: string; tabId: string } | null>;
@@ -411,7 +409,7 @@ export function createSpawner(h: SpawnerHost): Spawner {
 
   return {
     spawnWorker,
-    launchParts: (resumeFile, roleModel, approve) => buildLaunchParts(h.runtime, { resumeFile, roleModel, approve: approve ?? false }),
+    launchParts: (resumeFile, model, approve) => buildLaunchParts(h.runtime, { resumeFile, model, approve: approve ?? false }),
     approveFor,
     waitSubReady,
     findExistingPane,
@@ -435,8 +433,6 @@ interface SpawnActionHost {
   poller: Poller;
   /** Master session id for the delegation identity handed to the worker. */
   getSessionId: () => string;
-  /** Phase 0 routing telemetry (RFC rfc-jev-role-routing §8): best-effort spawn profile; absent in tests. */
-  logRouting?: (row: RoutingTelemetryRecord) => void;
 }
 
 export function createSpawnAction(h: SpawnActionHost) {
@@ -452,53 +448,28 @@ export function createSpawnAction(h: SpawnActionHost) {
   ): Promise<unknown> {
     const launch = planLaunchValidation(params, client.available);
     if (launch.kind === 'error') return toolError(launch.text);
-    const { spec, background, isolate, cwdParam, roleKind: kind, suggested, manifestRole, tab } = launch;
+    const { spec, background, isolate, cwdParam, tab } = launch;
     const masterCwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
     const taskId = randomUUID();
-    // Validate the role before any isolate worktree exists: this early return has no cleanup path.
-    let roleManifestEnv: Record<string, string> = {};
-    let roleModel: string | null = null;
-    // Delegation identity (RFC rfc-delegation-identity §2.1): the worker learns who delegated it.
-    let delegationEnvPatch: Record<string, string> = {};
-    try {
-      const { role, manifest } = composeForRole(manifestRole ?? 'worker-default', suggested, { loadRoleOpts: { baseDir: masterCwd } });
-      roleManifestEnv = {
-        PI_HERDR_ROLE_MANIFEST: JSON.stringify({
-          role: role.role,
-          version: role.version,
-          tools: manifest.tools,
-          permissions: manifest.permissions,
-          unknownTools: manifest.unknownTools,
-          // Without guidelines parseRuntimeManifest yields none and the pier-role prompt section silently no-ops.
-          ...(role.guidelines?.length ? { guidelines: role.guidelines } : {}),
-        }),
-        // Role base: /pier-role and the pipe switch resolve .pi-herdr/roles/ against the MASTER's checkout.
-        PI_HERDR_ROLE_BASE: masterCwd,
-      };
-      delegationEnvPatch = delegationEnv({
-        parentPaneId: env?.terminalId ?? '',
-        parentSessionId: bareSessionId(h.getSessionId()),
-        // The master's own pipe so the worker's todo_sync push can dial home (D49).
-        parentPipe: pipeNameFor(masterCwd, env?.terminalId ?? ''),
-        taskId,
-        description: spec.description,
-        role: role.role,
-      });
-      if (typeof role.model === 'string' && role.model.trim()) roleModel = role.model.trim();
-      h.logRouting?.(
-        planSpawnProfileRow({
-          now: Date.now(),
-          roleExplicit: typeof manifestRole === 'string' && manifestRole.trim() !== '',
-          role: role.role,
-          allowedTools: suggested,
-          manifestTools: manifest.tools,
-          task: spec.prompt,
-        }),
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return toolError(`Error: role "${manifestRole}" manifest invalid — ${msg}`);
+    const kind = 'task';
+    // Workers run the master's current model (a /model switch included); null = pi's default.
+    let masterModel: string | null = null;
+    if (toolCtx && typeof toolCtx === 'object' && 'model' in toolCtx) {
+      const model = toolCtx.model;
+      if (model && typeof model === 'object' && 'id' in model && typeof model.id === 'string' && model.id) {
+        const provider = 'provider' in model && typeof model.provider === 'string' ? model.provider : '';
+        masterModel = provider ? `${provider}/${model.id}` : model.id;
+      }
     }
+    // Delegation identity (RFC rfc-delegation-identity §2.1): the worker learns who delegated it.
+    const delegationEnvPatch = delegationEnv({
+      parentPaneId: env?.terminalId ?? '',
+      parentSessionId: bareSessionId(h.getSessionId()),
+      // The master's own pipe so the worker's todo_sync push can dial home (D49).
+      parentPipe: pipeNameFor(masterCwd, env?.terminalId ?? ''),
+      taskId,
+      description: spec.description,
+    });
     // D98: create the isolate through pier's execFile git path, not herdr's socket worktree.create
     // (bootstrap races, missing root-pane env, linked_worktree_source rejection).
     let isolateMeta: SubEntry['isolate'] | null = null;
@@ -551,12 +522,12 @@ export function createSpawnAction(h: SpawnActionHost) {
     let paneId = '';
     try {
       const spawnedAt = Date.now();
-      const argv = launchParts(null, roleModel, approve);
+      const argv = launchParts(null, masterModel, approve);
       const spawned = await spawnWorker(
         { desiredTab: tab },
         cwd,
         // Status comes ONLY from pi's native OSC 7501 reporter; pier no longer writes it.
-        { PI_HERDR_SUBAGENT: '1', ...roleManifestEnv, ...delegationEnvPatch },
+        { PI_HERDR_SUBAGENT: '1', ...delegationEnvPatch },
         argv,
       );
       paneId = spawned.paneId;

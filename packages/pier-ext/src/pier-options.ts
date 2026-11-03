@@ -2,7 +2,7 @@
  * B10 environment naming. `PIER_*` is the canonical namespace for *pier options* (timeouts, windows,
  * toggles); the historical `PI_HERDR_*` spelling stays accepted as a fallback alias.
  *
- * `PI_HERDR_SUBAGENT`, `PI_HERDR_ROLE_MANIFEST`, `PI_HERDR_TUI` stay as they are: those are
+ * `PI_HERDR_SUBAGENT`, `PI_HERDR_DELEGATION`, `PI_HERDR_TUI` stay as they are: those are
  * *contracts* handed to the child process by pier itself, and renaming them would split running
  * workers from their parent.
  *

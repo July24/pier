@@ -1,5 +1,5 @@
 /**
- * D104 `/pier-config`: probes the four configuration planes (real files + process env), renders
+ * D104 `/pier-config`: probes the three configuration planes (real files + process env), renders
  * `show|check|doc|doctor`, and registers the command.
  *
  * Read-only by design: effective values are reported with their provenance and the actual edit goes
@@ -8,7 +8,7 @@
  * throwing into pi's command pipeline. All paths are injectable, so tests never touch a real home dir.
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { VERSION as piVersion, type ExtensionAPI, type ExtensionContext } from '@earendil-works/pi-coding-agent';
@@ -31,7 +31,6 @@ import {
   loadPiNativeCompactionSettings,
   validateEfficiencyConfig,
 } from './efficiency-config-core.ts';
-import { RESERVED_ROLE_NAMES, listRoleNames, loadRoleConfig, roleLayers } from './role-loader.ts';
 import { formatOptionRows } from './pier-options.ts';
 import { formatSwallowedErrors } from './swallow.ts';
 import { CORE_VERSION_PINNED } from './core-client.ts';
@@ -44,7 +43,6 @@ export const CONFIG_GUIDANCE_PROMPT = [
   '   (untrusted project) must be reported as such instead of edited blindly.',
   '2. Route by plane:',
   '   - efficiency (D100-D103): read `docs/efficiency-trial.md` before proposing values.',
-  '   - roles: read `docs/sidebar-role-config.md` and `schemas/role-manifest.schema.json`; builtin role names cannot be overridden.',
   "   - pi (settings.json): recommend pi's own `/settings`; the only OCC-relevant keys here are `compaction.enabled` and",
   '     `compaction.keepRecentTokens` (read-only from our side).',
   '   - env (PIER_* / PI_HERDR_*): affects new processes only; state that explicitly.',
@@ -74,8 +72,6 @@ export interface ConfigGuideDeps {
   agentDir?: string;
   /** User-level efficiency config path (defaults to ~/.pi/agent/herdr-pi/config.json). */
   userConfigPath?: string;
-  /** User-level roles dir override (defaults to ~/.pi/agent/herdr-pi/roles). */
-  rolesUserDir?: string;
 }
 
 export interface ConfigGuideSnapshot {
@@ -83,7 +79,6 @@ export interface ConfigGuideSnapshot {
   readonly reports: readonly CheckReport[];
   readonly files: Readonly<Record<ConfigPlaneId, readonly ConfigPlaneFile[]>>;
   readonly workspaceTrusted: boolean;
-  readonly roleSummary: string;
 }
 
 
@@ -96,13 +91,6 @@ function readJsonLayer(path: string): { value: unknown; issue?: string } {
   }
 }
 
-function listJsonFiles(dir: string): string[] {
-  try {
-    return readdirSync(dir).filter((f) => f.endsWith('.json')).sort();
-  } catch {
-    return [];
-  }
-}
 
 export function collectConfigSnapshot(deps: ConfigGuideDeps = {}): ConfigGuideSnapshot {
   const env = deps.env ?? process.env;
@@ -113,7 +101,7 @@ export function collectConfigSnapshot(deps: ConfigGuideDeps = {}): ConfigGuideSn
   const workspaceConfigPath = defaultWorkspaceEfficiencyConfigFile(cwd);
 
   const reports: CheckReport[] = [];
-  const files: Record<ConfigPlaneId, ConfigPlaneFile[]> = { efficiency: [], roles: [], pi: [], env: [] };
+  const files: Record<ConfigPlaneId, ConfigPlaneFile[]> = { efficiency: [], pi: [], env: [] };
 
   /* efficiency: workspace layer (trusted projects only) + user layer, JSON issues reported as-is */
   const workspaceLayer = readJsonLayer(workspaceConfigPath);
@@ -147,37 +135,8 @@ export function collectConfigSnapshot(deps: ConfigGuideDeps = {}): ConfigGuideSn
   const envIssues = checkEnvKnobs(env);
   files.env.push({ path: '(process environment)', label: 'env', exists: true });
 
-  /* roles: every layer's JSON must load; builtin names are intentionally shadow-proof */
-  const roleIssues: string[] = [];
-  const roleNames = new Set<string>();
-  const layerCounts: string[] = [];
-  for (const layer of roleLayers({ baseDir: cwd, userDir: deps.rolesUserDir })) {
-    const names = listJsonFiles(layer.dir);
-    const label: ConfigPlaneFile['label'] = layer.label.startsWith('workspace')
-      ? 'workspace'
-      : layer.label.startsWith('user') ? 'user' : 'builtin';
-    files.roles.push({ path: layer.dir, label, exists: names.length > 0 });
-    layerCounts.push(`${label} ${names.length}`);
-    for (const file of names) roleNames.add(file.replace(/\.json$/, ''));
-  }
-  for (const name of [...roleNames].sort()) {
-    try {
-      loadRoleConfig(name, { baseDir: cwd });
-    } catch (err) {
-      const issues = (err as { issues?: readonly string[] }).issues ?? [];
-      roleIssues.push(`role "${name}": ${err instanceof Error ? err.message : String(err)}${issues.length ? ` — ${issues.join('; ')}` : ''}`);
-    }
-  }
-  const shadowed = listRoleNames(cwd, deps.rolesUserDir).filter((name) => RESERVED_ROLE_NAMES.includes(name));
-  if (shadowed.length > 0) {
-    roleIssues.push(`reserved role name(s) shadowed in a custom layer (ignored for built-ins): ${shadowed.join(', ')}`);
-  }
-  const roleSummary = `${roleNames.size} role(s): ${layerCounts.join(' / ')}`;
-
-
   reports.push(
     { plane: 'efficiency', ok: efficiencyIssues.length === 0, issues: efficiencyIssues },
-    { plane: 'roles', ok: roleIssues.length === 0, issues: roleIssues },
     { plane: 'pi', ok: true, issues: piIssues },
     { plane: 'env', ok: envIssues.length === 0, issues: envIssues },
   );
@@ -185,7 +144,7 @@ export function collectConfigSnapshot(deps: ConfigGuideDeps = {}): ConfigGuideSn
     ...resolveConfigKnobs({ env, workspace: workspaceLayer.value, user: userLayer.value, workspaceTrusted, piSettings }),
     ...resolveEnvKnobs(env),
   ];
-  return { entries, reports, files, workspaceTrusted, roleSummary };
+  return { entries, reports, files, workspaceTrusted };
 }
 
 
@@ -199,7 +158,6 @@ export function renderGuide(snapshot: ConfigGuideSnapshot, view: GuideView): str
       efficiency: plane('efficiency'),
       pi: plane('pi'),
       env: plane('env'),
-      roleSummary: snapshot.roleSummary,
     });
   }
   if (view === 'check') {
@@ -284,7 +242,7 @@ export function installConfigCommand(deps: ConfigCommandDeps): void {
 
   pi.registerCommand('pier-config', {
     description:
-      'Show pier configuration (4 planes) with effective values and sources; `check` validates them; `doctor` lists option values and swallowed errors; no argument hands a guided change to the agent',
+      'Show pier configuration (3 planes) with effective values and sources; `check` validates them; `doctor` lists option values and swallowed errors; no argument hands a guided change to the agent',
     getArgumentCompletions: (prefix: string) => {
       const tokens = (prefix ?? '').split(/\s+/);
       const head = tokens[0] ?? '';

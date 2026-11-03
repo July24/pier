@@ -9,7 +9,7 @@
 
 import { PIER_OPTIONS } from './pier-options.ts';
 
-export type ConfigPlaneId = 'efficiency' | 'roles' | 'pi' | 'env';
+export type ConfigPlaneId = 'efficiency' | 'pi' | 'env';
 
 export type ConfigKind = 'boolean' | 'number' | 'string' | 'enum';
 
@@ -47,13 +47,6 @@ export const CONFIG_PLANES: readonly ConfigPlane[] = Object.freeze([
     owner: 'pier',
     files: ['<workspace>/.pi-herdr/config.json', '~/.pi/agent/herdr-pi/config.json', 'PI_HERDR_* env'],
     editHint: 'Edit the workspace or user JSON (env wins); see docs/efficiency-trial.md',
-  },
-  {
-    id: 'roles',
-    title: 'Role profiles (D82/D11)',
-    owner: 'pier',
-    files: ['<workspace>/.pi-herdr/roles/<name>.json', '~/.pi/agent/herdr-pi/roles/<name>.json', 'builtin src/roles/'],
-    editHint: 'Add or edit a role JSON; builtin names (master/worker-default) cannot be overridden',
   },
   {
     id: 'pi',
@@ -122,7 +115,7 @@ const ENV_KNOBS: readonly ConfigKnob[] = PIER_OPTIONS.map((option) => ({
   impact: option.description,
 }));
 
-/** Every knob the catalog can resolve (roles is a per-file plane: its schema is the reference). */
+/** Every knob the catalog can resolve. */
 export const CONFIG_KNOBS: readonly ConfigKnob[] = Object.freeze([...EFFICIENCY_KNOBS, ...PI_KNOBS, ...ENV_KNOBS]);
 
 export function readDotted(obj: unknown, dotted: string): unknown {
@@ -261,17 +254,15 @@ export function renderIndex(lines: {
   efficiency: readonly ResolvedKnob[];
   pi: readonly ResolvedKnob[];
   env: readonly ResolvedKnob[];
-  roleSummary: string;
 }): string[] {
   const mechanism = (prefix: string): string =>
     lines.efficiency.some((e) => e.knob.key === `${prefix}.enabled` && e.value === 'true') ? 'on' : 'off';
   return [
-    'pier config — 4 planes, env > workspace > user > default',
+    'pier config — 3 planes, env > workspace > user > default',
     `  efficiency  ${summarizePlane(lines.efficiency)} — OCC ${mechanism('onlineContextCompact')} / OBS ${mechanism('observationPack')} / EPR ${mechanism('evidencePreservingReducer')}`,
-    `  roles       ${lines.roleSummary}`,
     `  pi          ${summarizePlane(lines.pi)} — OCC reads compaction.* only`,
     `  env         ${summarizePlane(lines.env)}`,
-    '  show: /pier-config show <efficiency|roles|pi|env|all>   check: /pier-config check   report: /pier-config doc',
+    '  show: /pier-config show <efficiency|pi|env|all>   check: /pier-config check   report: /pier-config doc',
   ];
 }
 

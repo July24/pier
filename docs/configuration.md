@@ -1,4 +1,4 @@
-# pier 配置总览（4 个平面）
+# pier 配置总览（3 个平面）
 
 > **一句话**：`/pier-config` 会按平面列出**当前生效值 + 来源**（`env` > 工作区 > 用户 > 默认），无参调用则把"改配置"这件事交给 agent 引导完成。
 > 本文件讲**为什么这样分层**与**每层改哪里**；机器真值（当前值/来源/校验）请直接跑命令：`/pier-config show all`、`/pier-config check`、`/pier-config doc`。
@@ -9,7 +9,7 @@
 ## 0. 先跑这些
 
 ```text
-/pier-config                 # 4 平面索引（≤10 行）+ 把引导交给 agent
+/pier-config                 # 3 平面索引（≤10 行）+ 把引导交给 agent
 /pier-config show all        # 每个键的 生效值 / 来源 / 默认 / 影响一句话
 /pier-config check           # 未知键、类型越界、未受信被忽略、JSON 损坏、env 非法
 /pier-config doc             # 生成机器真值报告 → <repo>/.pi-herdr/config-report.md（建议把该文件加进 .gitignore）
@@ -19,16 +19,15 @@
 
 ---
 
-## 1. 四个平面与优先级
+## 1. 三个平面与优先级
 
 | 平面 | 文件 / 来源 | 优先级 | 受信门控 | 谁拥有 |
 |---|---|---|---|---|
 | `efficiency` | `<repo>/.pi-herdr/config.json`、`~/.pi/agent/herdr-pi/config.json`、`PI_HERDR_*` env | env > 工作区 > 用户 > 默认 | ✅ 工作区需项目受信 | pier（D100–D103） |
-| `roles` | `<repo>/.pi-herdr/roles/<name>.json`、`~/.pi/agent/herdr-pi/roles/<name>.json`、内置 `src/roles/` | 工作区/用户层覆盖（内置名不可劫持，D11） | 加载期校验（schema） | pier（D82/D11） |
 | `pi` | `~/.pi/agent/settings.json`（+ 受信项目 `.pi/settings.json`） | 项目 > 全局 | ✅ | pi 本体 |
 | `env` | `PIER_*`（runtime policy）、`PI_HERDR_*`（终端/待办/诊断/能效覆盖）；`HC_TERMINAL_ID` / `HC_TERMINAL_SOCKET` 由 herdr-core 注入、只读 | env 唯一（无文件） | — | pier |
 
-**为什么这么分层**：能效与角色是 pier 的**行为策略**，所以放在 pier 自己的目录（用户级 + 工作区级），并用 env 提供最高优先级的临时覆盖；而 pi 的模型/压缩等属于**宿主设置**，pier 只读其中与 OCC 有关的 `compaction.*`，其余引导用户走 pi 的 `/settings`。
+**为什么这么分层**：能效是 pier 的**行为策略**，所以放在 pier 自己的目录（用户级 + 工作区级），并用 env 提供最高优先级的临时覆盖；而 pi 的模型/压缩等属于**宿主设置**，pier 只读其中与 OCC 有关的 `compaction.*`，其余引导用户走 pi 的 `/settings`。
 
 ### 优先级与覆盖语义（试用期最容易踩的四条）
 
@@ -47,8 +46,7 @@
 | 让长测试日志变成收据 | `efficiency` → `evidencePreservingReducer` | 开 `enabled`，并把 `model` 指向一个便宜的模型；只想归档不提炼 → `localOnly: true` | 新会话 |
 | 让多步任务自动压缩上下文 | `efficiency` → `onlineContextCompact` | 开 `enabled`；不确定缓存比率时留 `cacheWriteReadRatio: "auto"` | 新会话 |
 | 临时开一天观察 | `env` | `PI_HERDR_OBS_PACK_ENABLE=1 PI_HERDR_OBS_PACK_LOG=1 pi` | 仅该进程 |
-| 新增一个受限子代理角色 | `roles` | 在 `<repo>/.pi-herdr/roles/<name>.json` 写档案（字段见 `packages/pier-ext/README.md` 的 Behaviors → Role profiles） | 下一次派发 |
-| 给某个角色固定模型 | `roles` | 档案里的 `model: "provider/model"`（WS-D10 派发路由） | 下一次派发 |
+| 子代理换模型 | `pi` | worker 沿用 master 当前模型：在 master 里 `/model` 切换后，之后派发的 worker 都用新模型（D146） | 下一次派发 |
 | 关掉 pi 的自动压缩 | `pi` | 用 pi 的 `/settings`；注意 `compaction.enabled=false` 会连带禁用 OCC（除非 `PI_HERDR_COMPACT_ENABLE=1` 强制） | 新会话 |
 | 让 OCC 的保留窗口跟随 pi | `pi` / `efficiency` | 不在效率配置里写 `keepRecentTokens` 即继承 pi 的值；显式写了就以效率配置为准 | 新会话 |
 | 调子代理超时/GC/轮询 | `env` | `PIER_SUBAGENT_TIMEOUT_MS`、`PIER_GC_TICK_MS`、`PIER_POLL_INTERVAL_MS` … | 新进程 |
@@ -68,7 +66,7 @@
 
 - **命令绝不 dump `process.env`**：只读取目录中登记的键；密钥形态的键值渲染为 `***`。
 - **EPR 会把日志发给模型**：`localOnly: true` 只归档不提炼；命中 `api_key|authorization|bearer|access_token|secret` 特征会直接回退全文。
-- **未受信项目**：工作区 `efficiency` / 角色层不被采纳（`roles` 由 schema 校验，`efficiency` 由信任门控），`show` 会标注。
+- **未受信项目**：工作区 `efficiency` 层不被采纳（由信任门控），`show` 会标注。
 - **常见症状对照**：
   - "改了没生效" → `check` 看是否未知键/类型错误被回退；再确认是否用了工作区层而项目未受信；最后确认是否需要重启进程。
   - "OCC 明明开了却没压" → `show pi` 看 `compaction.enabled`；`show efficiency` 看 `onlineContextCompact.enabled` 的来源与 note。
@@ -82,4 +80,4 @@
 |---|---|
 | [`docs/efficiency-trial.md`](efficiency-trial.md) | D100–D103 试用指南（开哪个、看什么、怎么判划算、反馈模板） |
 | [`docs/rfc-core-app-migration.md`](rfc-core-app-migration.md) | herdr-core + Herdr app 切换方案（状态源、label、pipe-channel、删除项） |
-| [`schemas/efficiency-config.schema.json`](../packages/pier-ext/schemas/efficiency-config.schema.json)、[`schemas/role-manifest.schema.json`](../packages/pier-ext/schemas/role-manifest.schema.json) | 契约（键与类型） |
+| [`schemas/efficiency-config.schema.json`](../packages/pier-ext/schemas/efficiency-config.schema.json) | 契约（键与类型） |

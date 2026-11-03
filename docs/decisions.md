@@ -10,15 +10,15 @@
 
 | 编号 (ID) | 决策摘要 (Summary) | 代码锚点 (Anchor) |
 |---|---|---|
-| WS-D6 | 移除角色档案中的限速约束（`rate_limits`），pier 仅负责权限边界，资源配额由集成方接管 | `packages/pier-ext/src/role-manifest.ts:12` |
-| WS-D7 | 主控 pane 自应用其角色档案（master manifest），与子代理走同构的强制权限校验链 | `packages/pier-ext/src/index.ts:66` |
-| WS-D8 | 角色清单移除 `roleType` 顶层字段，收敛为版本号 + 三态规则（`allow`/`ask`/`deny`） | `packages/pier-ext/src/manifest-compose.ts:73` |
-| WS-D10 | 支持按角色在 manifest 中配置 `provider/model` 模型路由（省略则回退到进程默认模型） | `packages/pier-ext/schemas/role-manifest.schema.json:10` |
-| D1 | （推断，代码用法见 `packages/pier-ext/test/roles.test.ts:243`）不在角色 tools 清单内的工具直接判定为 deny（测试决策断言） | `packages/pier-ext/test/roles.test.ts:243` |
-| D2 | （推断，代码用法见 `packages/pier-ext/test/roles.test.ts:244`）受限工作角色对 subagent 等高危派活工具的权限阻断（测试决策断言） | `packages/pier-ext/test/roles.test.ts:244` |
+| WS-D6 | （已废弃，见 D146）移除角色档案中的限速约束（`rate_limits`），pier 仅负责权限边界，资源配额由集成方接管 | `packages/pier-ext/src/subagent-spawn.ts:456` |
+| WS-D7 | （已废弃，见 D146）主控 pane 自应用其角色档案（master manifest），与子代理走同构的强制权限校验链 | `packages/pier-ext/src/subagent-spawn.ts:456` |
+| WS-D8 | （已废弃，见 D146）角色清单移除 `roleType` 顶层字段，收敛为版本号 + 三态规则（`allow`/`ask`/`deny`） | `packages/pier-ext/src/subagent-spawn.ts:456` |
+| WS-D10 | （已废弃，见 D146）支持按角色在 manifest 中配置 `provider/model` 模型路由；现由 worker 沿用 master 当前模型 | `packages/pier-ext/src/subagent-spawn.ts:456` |
+| D1 | （已废弃，见 D146）不在角色 tools 清单内的工具直接判定为 deny | `packages/pier-ext/src/subagent-spawn.ts:456` |
+| D2 | （已废弃，见 D146）受限工作角色对 subagent 等高危派活工具的权限阻断；worker 进程本就不注册 subagent/terminal | `packages/pier-ext/src/subagent-spawn.ts:456` |
 | D3 | 基于 core 的阻塞式状态等待（`terminal.wait`，不做高频轮询；状态只来自 pi 原生 OSC 7501 上报） | `packages/pier-ext/src/core-client.ts:384` |
 | D10 | （推断，代码用法见 `packages/pier-ext/src/subagent-core.ts:1`）子代理核心生命周期契约与向后兼容基线 | `packages/pier-ext/src/subagent-core.ts:1` |
-| D11 | 内置角色（master / worker-default）直接读取内置档案，无视 workspace/user 目录诱饵以防角色劫持 | `packages/pier-ext/src/role-loader.ts:75` |
+| D11 | （已废弃，见 D146）内置角色（master / worker-default）直接读取内置档案，无视 workspace/user 目录诱饵以防角色劫持 | `packages/pier-ext/src/subagent-spawn.ts:456` |
 | D25 | （推断，代码用法见 `packages/pier-ext/src/subagent-core.ts:158`）子代理任务 tab 放置决策纯逻辑规划 | `packages/pier-ext/src/subagent-core.ts:158` |
 | D26 | 子代理派发互斥锁（mutex），防止并发创建 tab 与 pane 时产生竞态 | `packages/pier-ext/src/subagent-spawn.ts:287` |
 | D28 | （已废弃，见 D110）workspace 打开时主 tab 自动引导及会话恢复后布局重放（herdr 插件 `[[events]]` 与 `[[startup]]` 钩子） | `packages/pier-ext/src/config-catalog-core.ts:12` |
@@ -45,14 +45,14 @@
 | D69 | 将 todo 阅读钩子挂载于 `before_agent_start` 事件（设置 `display: false` 静默注入） | `packages/pier-ext/src/todo-read-hook.ts:2` |
 | D71 | 常驻交互式终端工具族（open/send/read/signal/close/list），由 core terminal 承载 | `packages/pier-ext/src/plugins/terminal.ts:57` |
 | D75 | TodosService 运行时配置提取与 strict/parallel 执行模式分流 | `packages/pier-ext/src/plugins/todo.ts:304` |
-| D76 | 角色档案规范 v2（role manifest v2）及规则校验器（三态规则系统） | `packages/pier-ext/schemas/role-manifest.schema.json:4` |
-| D77 | 可见层裁剪：session_start 时将角色 manifest 以外的工具从模型工具集视野中隐藏 | `packages/pier-ext/src/index-roles.ts:116` |
+| D76 | （已废弃，见 D146）角色档案规范 v2（role manifest v2）及规则校验器（三态规则系统） | `packages/pier-ext/src/subagent-spawn.ts:456` |
+| D77 | （已废弃，见 D146）可见层裁剪：session_start 时将角色 manifest 以外的工具从模型工具集视野中隐藏 | `packages/pier-ext/src/subagent-spawn.ts:456` |
 | D78 | （已废弃，见 D130）树边界 = 进程边界（master pi 扩展与 herdr workbench 运行于独立 Cordis 服务树） | `packages/pier-ext/src/core-client.ts:1` |
 | D79 | pi 扩展注册面代理（`pi-surface`）与 tombstone 补偿，保障重载/退出时幂等清理 | `packages/pier-ext/src/pi-surface.ts:2` |
 | D80 | Cordis 生态接入：Loader group builtins、HMR fiber effect 销毁补偿与优雅降级 | `packages/pier-ext/src/bootstrap.ts:2` |
 | D81 | 架构三分法裁剪（entry loader / pure core / platform adapter），worker 进程旁路跳过 Cordis 树 | `packages/pier-ext/src/bootstrap.ts:7` |
-| D82 | 未知工具姿态（`unknownTools: allow/deny`）：用户安装扩展走信任关系轴，区分显式规则与默认可见性 | `packages/pier-ext/schemas/role-manifest.schema.json:30` |
-| D83 | 角色继承制：`worker-default` 严格继承 `master.tools` 扣除 subagent 与 terminal 族，防止配置漂移 | `packages/pier-ext/src/role-loader.ts:9` |
+| D82 | （已废弃，见 D146）未知工具姿态（`unknownTools: allow/deny`）：用户安装扩展走信任关系轴，区分显式规则与默认可见性 | `packages/pier-ext/src/subagent-spawn.ts:456` |
+| D83 | （已废弃，见 D146）角色继承制：`worker-default` 严格继承 `master.tools` 扣除 subagent 与 terminal 族 | `packages/pier-ext/src/subagent-spawn.ts:456` |
 | D84 | （已废弃，见 D130）事件环境变量载荷双形态兼容（适配直接字符串与嵌套 JSON 信封两类 dump 载荷） | `packages/pier-ext/src/core-client.ts:1` |
 | D86 | ~~子代理按 git worktree 分组放置（主检出进 main tab，worktree 进同名 tab；main tab 永不整关）~~ 放置部分由 D140 取代；worktree 分区仅保留用于信任判定（`-a`） | `packages/pier-ext/src/subagent-core.ts:439` |
 | D87 | HMR 重载边界管理：保留重载边界之后的新代注册，仅清理老代遗留 | `packages/pier-ext/src/bootstrap.ts:80` |
@@ -72,7 +72,7 @@
 | D104 | 配置说明只读命令与 agent 引导式改配置（4 平面目录、生效值+来源、schema 漂移守卫；boot 平面随 D110 移除） | `packages/pier-ext/src/config-catalog-core.ts:1` |
 | D105 | （已废弃，见 D130）Pier 侧边栏 agent 视图不设 harness 过滤（`filter: null`，任何 agent 都显示），只保留 attention-first 排序：`agent.view.set` 全局替换 herdr 内置 Agents 投影，任何过滤都会静默隐藏未列入的 harness | `packages/pier-ext/src/core-client.ts:1` |
 | D106 | pi 0.86 基线升级：动态工具集走 transcript 持久化（`setActiveTools` delta 存活于 resume/branch），删除 feature-detect 兼容层；`pi.on()` 原生 unsubscribe 真摘除退休世代监听（tombstone 保留给 tool/command） | `packages/pier-ext/src/pi-surface.ts:1` |
-| D107 | 会话中角色切换（P0）：roleState 可变状态 + `/pier-role`（人，放宽需 confirm）+ pipe `role` 请求（master 自由）；切换以注册全集为论域重算 active（可找回被 D77 裁掉的工具）；resume 从最后一条 role-manifest entry 重放 gate manifest（变更才写防覆盖）；per-role `guidelines` 作为 `pier-role` prompt section 幂等注入 | `packages/pier-ext/src/role-state.ts:1` |
+| D107 | （已废弃，见 D146）会话中角色切换（P0）：roleState 可变状态 + `/pier-role` + pipe `role` 请求；resume 从最后一条 role-manifest entry 重放 gate manifest；per-role `guidelines` 作为 `pier-role` prompt section 注入 | `packages/pier-ext/src/subagent-spawn.ts:456` |
 | D108 | Master 自身永不成为子代理目标（会话 01a0bd3a 自杀链）：sessionFile 归因同时排除自身会话与他人活 pane 占用（`bareSessionId` 统一比较，单一 `agent.list` 同时产出上报与占用集）；resume 命中 master pane 硬失败、revive 视中毒 sessionFile 为缺失；pane 级 GC 无条件跳过 `env.paneId`（D94 复用与 D86 主 tab 保护的补口） | `packages/pier-ext/src/subagent-session.ts:234` |
 | D109 | 报告必达与会话恢复（01a0bd3a 后续批次）：worker 经 pipe 自报的会话 id 为权威（裸 id 映射为路径后可覆盖中毒 sessionFile；worker settle push 同样按 id 解析自读 transcript）；结算文本候选以 entry.sessionFile 为 preferred；null 收尾文本经 jev 双 Noul（尾巴归属/最终答案）分类 attribution-suspect / extraction-failed / silent，jev 不可用回落旧措辞；master resume 后对存活 running 子代理重建 poller（requestId `recover-*`）并重放 branch fold（todos/OCC 债务）；OCC 压缩失败进入指数退避（封顶 4）+ 可见失败消息 + 指令限长 | `packages/pier-ext/src/subagent-session.ts:143` |
 | D110 | 移除 workspace 自动引导与重启重放（废弃 D28）：新 workspace 不再自动注入 pi 启动命令、herdr 重启不再重放主 tab，pi 一律由人手动在 pane 启动；连带删除 boot-config 生成/校验全链（install.mjs 探测写入、/pier-config boot 平面、herdr-rpc 启动命令拼装与 boot.jsonl） | `packages/pier-ext/src/config-catalog-core.ts:12` |
@@ -107,7 +107,8 @@
 | D139 | pipe 名主形式改为 `pi-herdr-<sha256(cwd) 前 16 hex>-<paneId>`：百分号编码的全路径名在 POSIX sun_path（~104-108B）下被 libuv 静默截断，长 TMPDIR（macOS /var/folders）下同工作区所有 pane 撞到同一 socket；历史两种编码降级为客户端候选（混合版本对端仍可达），并加 sun_path 长度不变式测试；core-client 测试的假 socket 在 win32 用 `\\.\pipe\` 名（文件路径 listen 报 EACCES） | `packages/pier-ext/src/pipe-channel.ts:22` |
 | D140 | 子代理默认不开 pane：spawn 只设 `parent`（不带 `herdr.space`/`herdr.tab`），Herdr app 按其设计把它列在父 agent 下、点开 peek（可人工输入），子代理随 master 程序结束（core 默认 children die with parent，pier 不设 `outlive_parent`）；侧栏不再出现"嵌套子行 + 独立顶层行"的重复。显式 `tab` 才挂 pane（`main` = master 所在 tab），同样随 master 结束；revive 沿用记录的 tabName（'' = 无 pane）；terminal `pane_id` 读取范围加入本 master 的子代理 | `packages/pier-ext/src/subagent-core.ts:452`、`packages/pier-ext/src/subagent-spawn.ts:372`、`packages/pier-ext/src/plugins/terminal.ts:618` |
 | D141 | `ask_user_question` 参数修复补齐「字符串吞字段」写法：模型把 `options` 流成字符串时连同其后的 `"question": …}]` 一并吞入（45 天内 8 次，`JSON.parse` 报 Extra data）；`prepareAskArguments` 改为按字符串感知的括号扫描取出前导数组，剩余成员剥掉尾部闭合符后解析，只回填调用未自带的键。整个 arguments 尾随 `]}` 的形态（4 次）在 pi-ai 解析阶段就成 `arguments: {}`，扩展侧不可修复 | `packages/pier-ext/src/ask-user.ts:292` |
-| D142 | 删除 worker 严格 todo 模式与角色 `services.todos`：strict 下 `validateTodos` 先拒绝 2 条 in_progress，`normalizeStrict` 的降级分支永远走不到（worker-default 25 次调用 6 次被拒），且挂载时值拷贝使 `/pier-role` 切换不生效；master/worker 统一放行多条 in_progress。旧档案里的 `services` 仍被接受并忽略；worker-default 升 1.7.0、master 升 1.5.0 | `packages/pier-ext/src/todo-core.ts:42`、`packages/pier-ext/src/role-manifest.ts:54` |
-| D143 | 工具面精简：`spawn role` 改为加载时可用档案的枚举（模型曾编造 general-purpose/coder 等名并报错，描述却称「未知名仅作标签」）；删除 `subagent(action:"role")` 与 pipe `role` 消息（0 次调用，人类仍用 `/pier-role`）；删除 `terminal read` 的 `pane_id`（3 次调用 1 次报错，与 `subagent output` 重叠；取代 D140 的 pane_id 部分）；删除 `pi-herdr-workflow` skill（693 会话读取 2 次且已过期），其多代理裁决规则并入 `subagent` promptGuidelines | `packages/pier-ext/src/plugins/subagent.ts:762`、`packages/pier-ext/src/plugins/subagent.ts:774`、`packages/pier-ext/src/plugins/terminal.ts:676` |
-| D144 | `subagent(action:"wait")`：master 平均每次 spawn 跟约 3 次 `output` + 1.8 次 `list` 轮询，后台会话仍有 `sleep ≥30`。wait 阻塞到目标（`agentId` 或全部 running）产生结算/失败/关闭/人工闸门通知，并把这些通知从 D92 缓冲中取出作为工具结果（不再于回合间隙重复投递，其他 worker 的通知照常排队）；调用时已 blocked 的目标立即返回问题；每 15s 重算 running 集合，默认 600s、上限 1800s，ESC 中止。poller 的 blocked/pane-closed/timeout 通知改为带 paneId 标记；D125 的 sleep 提示改指 wait | `packages/pier-ext/src/plugins/subagent.ts:673`、`packages/pier-ext/src/index-notices.ts:74` |
+| D142 | 删除 worker 严格 todo 模式与角色 `services.todos`：strict 下 `validateTodos` 先拒绝 2 条 in_progress，`normalizeStrict` 的降级分支永远走不到（worker-default 25 次调用 6 次被拒），且挂载时值拷贝使 `/pier-role` 切换不生效；master/worker 统一放行多条 in_progress（角色档案本身随后由 D146 删除） | `packages/pier-ext/src/todo-core.ts:42` |
+| D143 | 工具面精简：`spawn role` 改为加载时可用档案的枚举（角色部分已由 D146 整体删除）；删除 `subagent(action:"role")` 与 pipe `role` 消息（0 次调用）；删除 `terminal read` 的 `pane_id`（3 次调用 1 次报错，与 `subagent output` 重叠；取代 D140 的 pane_id 部分）；删除 `pi-herdr-workflow` skill（693 会话读取 2 次且已过期），其多代理裁决规则并入 `subagent` promptGuidelines | `packages/pier-ext/src/plugins/subagent.ts:763`、`packages/pier-ext/src/plugins/terminal.ts:676` |
+| D144 | `subagent(action:"wait")`：master 平均每次 spawn 跟约 3 次 `output` + 1.8 次 `list` 轮询，后台会话仍有 `sleep ≥30`。wait 阻塞到目标（`agentId` 或全部 running）产生结算/失败/关闭/人工闸门通知，并把这些通知从 D92 缓冲中取出作为工具结果（不再于回合间隙重复投递，其他 worker 的通知照常排队）；调用时已 blocked 的目标立即返回问题；每 15s 重算 running 集合，默认 600s、上限 1800s，ESC 中止。poller 的 blocked/pane-closed/timeout 通知改为带 paneId 标记；D125 的 sleep 提示改指 wait | `packages/pier-ext/src/plugins/subagent.ts:666`、`packages/pier-ext/src/index-notices.ts:74` |
 | D145 | `terminal send` 加 `wait: true`：pier 追加带随机 nonce 的退出哨兵（POSIX `printf '\n__PIER_<n>_%s__\n' "$?"`，PowerShell 用 `$?`/`$LASTEXITCODE` 子表达式），键入回显里只有 `%s`/`$(…)`，行锚定正则不可能命中回显；单行用 `; ` 连接，含 ` #` 注释、以 `&` 结尾或多行时哨兵单独成行；返回退出码与自发送前快照以来的输出并推进 read 游标，超时给出可直接复制的 `wait` 调用。模型手写哨兵被回显守卫拦截的 5 次失败由此消失；手写 `wait`/`file` 保留给不结束的输出（服务就绪、日志） | `packages/pier-ext/src/terminal-core.ts:240`、`packages/pier-ext/src/plugins/terminal.ts:438` |
+| D146 | 删除整套 role 机制：`role-loader`/`role-manifest`/`role-state`/`manifest-compose`/`tool-gate`/`index-roles`/`routing-telemetry` 七个模块、内置 `master`/`worker-default` 档案与 `role-manifest.schema.json`、`/pier-role`、`spawn` 的 `role`/`allowed_tools`、`PI_HERDR_ROLE_MANIFEST`/`PI_HERDR_ROLE_BASE`、`/pier-config` 的 roles 平面（3 平面）、role-manifest/approval-needed 卡片与 `routing.jsonl`。依据：worker 进程只挂 todo 插件，subagent/terminal 本就不注册，deny 规则多余；内置档案全是 `*: allow` + `unknownTools: allow`，强制层与可见层恒为空操作（20 份 routing.jsonl 0 条 deny）；`allowed_tools` 0 次调用。唯一生效的 per-role `model`（fast-worker，45 天 1 次）改为 worker 直接沿用 master 当前模型（`ctx.model` → `--provider/--model`，`/model` 切换随之生效；revive 沿用会话自身模型）。旧会话的 delegation 条目与 worker marker 里的 `role` 字段被忽略；取代 WS-D6/WS-D8/WS-D10/D11/D76/D77/D82/D83/D107 与 D142/D143 的角色部分 | `packages/pier-ext/src/subagent-spawn.ts:456` |
