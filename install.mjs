@@ -149,8 +149,8 @@ function checkEnv() {
   if (major < 22) die(`node ≥ 22 required, found ${process.versions.node}`);
   log(`✓ node ${process.versions.node}`);
   const piVersion = (() => { try { return parseVersion(run('pi', ['--version'])); } catch { return null; } })();
-  if (!piVersion || !geVersion(piVersion, [1, 4, 0])) {
-    die(`pi ≥ 1.4.0 required${piVersion ? `, found ${piVersion.join('.')}` : ' (pi not found or not runnable)'}. Install: npm i -g @earendil-works/pi-coding-agent`);
+  if (!piVersion || !geVersion(piVersion, [1, 5, 0])) {
+    die(`pi ≥ 1.5.0 required${piVersion ? `, found ${piVersion.join('.')}` : ' (pi not found or not runnable)'}. Install: npm i -g @earendil-works/pi-coding-agent`);
   }
   log(`✓ pi ${piVersion.join('.')}`);
   const hcVersion = (() => { try { return parseVersion(run('hc', ['--version'])); } catch { return null; } })();

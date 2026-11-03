@@ -4,7 +4,7 @@
  * options plus a runtime Other row, so the model cannot forget a free-text escape and Esc is a real decline.
  */
 import { Type } from 'typebox';
-import { OTHER_ROW_LABEL, numberedOptionLine, runSelectDialog } from './ask-dialog.ts';
+import { OTHER_ROW_LABEL, numberedOptionLine, runSelectDialog, type CustomDialogOptions } from './ask-dialog.ts';
 
 export const ASK_TOOL_NAME = 'ask_user_question';
 export const OTHER_OPTION = OTHER_ROW_LABEL;
@@ -110,8 +110,9 @@ export type AskToolResult = {
 export type AskUi = {
   select?: (title: string, options: string[], opts?: { signal?: AbortSignal }) => Promise<string | undefined>;
   input: (title: string, placeholder?: string, opts?: { signal?: AbortSignal }) => Promise<string | undefined>;
-  /** TUI-only: full custom components (absent in RPC mode, where it returns undefined). */
-  custom?: (factory: unknown) => Promise<unknown>;
+  /** TUI-only: full custom components (absent in RPC mode, where it returns undefined). `blocked`
+   *  makes pi's OSC 7501 reporter show the pane as blocked while the dialog is open (pi ≥ 1.5). */
+  custom?: (factory: unknown, options?: CustomDialogOptions) => Promise<unknown>;
   /** TUI-only helpers from pi's extension UI context; wired for ctrl+o parity with pi's selector. */
   getToolsExpanded?: () => boolean;
   setToolsExpanded?: (expanded: boolean) => void;
@@ -356,13 +357,6 @@ export function prepareAsk(params: unknown): PrepareAskResult {
       }],
     },
   };
-}
-
-export function gateLabel(spec: AskSpec): string {
-  if (spec.mode === 'freeform') return spec.question;
-  const first = spec.questions[0]?.question ?? '';
-  const extra = spec.questions.length - 1;
-  return extra > 0 ? `${first} (+${extra})` : first;
 }
 
 /** Typed-prompt list: numbered authored options plus the Other row when it is offered. */

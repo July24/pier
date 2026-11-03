@@ -46,7 +46,7 @@ pier is **one pi extension** plus the two external programs it talks to:
 - **One model for the whole tree**: a worker runs the master's current model (a `/model` switch included); there are no role profiles or per-worker tool gates (D146)
 - **Human gate**: subagent `ask_user_question` → the terminal is reported blocked, so the app shows it and (per its own rules) notifies; the answer returns as the tool result. There is no heuristic "human takeover" detection any more.
 - **Ask picker**: every choice question renders through one pier-owned picker in the TUI — single-select (arrows + enter/space pick the highlighted row) and `multi: true` toggle list (checkboxes: space toggles, `a` toggles all, live selection count) share the same framed chrome, `recommended` seeds the cursor (and pre-checks in multi), and the free-text row stays last; `allowOther: false` gives pure choice. `tab` folds the picker to a two-line bar so the transcript above gets the room, and `tab` again unfolds it with cursor and toggles intact; while folded only `tab` acts, so enter/esc cannot answer or decline blind. The host select dialog and typed-index prompts remain the fallbacks for RPC mode and older pi
-- **Blocking dialogs report blocked**: pi 1.4's native OSC 7501 reporter covers `select` / `confirm` / `input` / `editor` and permission dialogs from *any* extension; pier only adds the `ui.custom` ask overlay. Nested gates coalesce.
+- **Blocking dialogs report blocked**: pi's native OSC 7501 reporter covers `select` / `confirm` / `input` / `editor` and permission dialogs from *any* extension, and since pi 1.5 pier's `ui.custom` ask picker too (opened with `blocked: { kind: "question" }`). pier writes no status itself.
 - **Transcript cards**: pier's own session entries (todo edits, subagent/terminal registries, delegation) and its reminder messages render as compact cards instead of raw JSON — entry/message renderers, no pi-tui dependency
 - **Isolated worktree subagents (`isolate`)**: heavy parallel writers get a fresh git worktree (branch `pier/<slug>` from your HEAD under `~/.herdr/worktrees/<repo>/`) with commit discipline in the prompt; settlement carries a diff summary (commits since base, files changed, uncommitted count); merge with `git merge --no-ff` and the worktree auto-removes once merged and clean — the branch stays for audit
 - **Worktree collection is ownership-scoped**: only worktrees this session registered are collected, and the running process's own directory is never a candidate — the earlier prefix match on `refs/heads/pier/` could delete a parallel session's worktree out from under it. Sweeping branches the session never registered is opt-in (`PIER_ISOLATE_SWEEP_ORPHANS=1`)
@@ -72,7 +72,7 @@ Upgrading from it: `install` / `update` / `uninstall` detect the old herdr plugi
 ### Requirements
 
 - Node ≥ 22
-- pi ≥ 1.4.0 (`@earendil-works/pi-coding-agent`) — the native OSC 7501 program-status reporter is the only status source
+- pi ≥ 1.5.0 (`@earendil-works/pi-coding-agent`) — the native OSC 7501 program-status reporter is the only status source
 - herdr-core ≥ 0.1.16 (`hc`) — `curl -fsSL https://releases.herdr.dev/core/install.sh | sh`
 - Herdr app (optional) — displays core terminals; without it pi still runs and pier still spawns workers, you just cannot watch them in a window
 
@@ -220,7 +220,7 @@ read-only for pier.
 `/pier-config doctor` lists every option with its effective value and where it came from, plus the
 errors pier deliberately swallowed this session.
 
-**Status & labels:** status is whatever the program reports through OSC 7501 — pi 1.4 does this
+**Status & labels:** status is whatever the program reports through OSC 7501 — pi does this
 natively, and pier never synthesizes it. Metadata is terminal labels under `pier.*`
 (`pier.session`, `pier.todo`, `pier.lock.<hash>`); inspect them with `hc get <terminal> --json`.
 The Herdr app renders the sidebar and notifications itself; there is no app-side mod and no

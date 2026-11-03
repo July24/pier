@@ -46,7 +46,7 @@ pier 是**一个 pi 扩展**，外加它与两个外部程序协作：
 - **整棵树同一模型**：worker 沿用 master 当前的模型（包括 `/model` 切换后的）；不再有角色档案与按 worker 的工具闸门（D146）
 - **人类闸门**：子代理 `ask_user_question` → 终端上报 blocked，app 据此展示（并按自身规则提醒）；答案作为工具结果返回。不再做启发式的「人工接管」检测。
 - **选择题选择器**：`multi: true` 的问题直接渲染成可勾选列表（空格逐行切换、`a` 全选、回车确认、esc 拒绝，实时显示已选数量），末行固定为自由输入；`allowOther: false` 则纯选择。`tab` 把选择器折叠成两行横条，把屏幕让给上方对话记录，回看完再按 `tab` 展开，光标与勾选保持不变；折叠期间只有 `tab` 生效，回车/esc 不会盲答或拒绝。RPC 模式 / 旧版 pi 自动回退到「输入编号」的文本路径
-- **阻塞式对话框上报 blocked**：pi 1.4 原生 OSC 7501 上报覆盖**任何扩展**的 `select` / `confirm` / `input` / `editor` 与权限弹窗；pier 只额外处理 `ui.custom` 的 ask overlay。嵌套闸门自动合并。
+- **阻塞式对话框上报 blocked**：pi 原生 OSC 7501 上报覆盖**任何扩展**的 `select` / `confirm` / `input` / `editor` 与权限弹窗；pi 1.5 起 pier 的 `ui.custom` ask 选择器也以 `blocked: { kind: "question" }` 打开、由 pi 上报。pier 自己不写任何状态。
 - **转写卡片**：pier 自己的会话条目（todo 编辑、子代理/终端注册表、委托身份）与提醒消息渲染为紧凑卡片，不再是裸 JSON——entry/message renderer，不依赖 pi-tui
 - **隔离工作树（`isolate`）回收有明确归属**：只回收本会话自己登记过的工作树，且**当前进程所在目录永不作为候选**——此前按 `refs/heads/pier/` 前缀匹配会删掉并行会话正在使用的工作树。清扫本会话未登记的分支需显式开启 `PIER_ISOLATE_SWEEP_ORPHANS=1`
 - **长任务生命周期（01a03c0d 复盘）**：观察超时改「无活动预算」（working 心跳续命，>10min 健康任务不再误杀）；follow_up 以 steer 间隙投递（补充契约秒级到达，不再排队整个 run）；GC 等结算通知送达再回收终端；台账 via 标记 + closed 行 outcome 继承 + 僵尸 running 清扫；SUBS 快照哈希门控。可调：`PIER_SUBAGENT_TIMEOUT_MS`（无活动毫秒数）、`PIER_SETTLEMENT_WINDOW_MS`（ms）、`PIER_OBSERVATION_WINDOW_MS`（ms）
@@ -71,7 +71,7 @@ TUI 后端一次性切换，不保留双后端：
 ### 环境要求
 
 - Node ≥ 22
-- pi ≥ 1.4.0（`@earendil-works/pi-coding-agent`）——原生 OSC 7501 程序状态上报是唯一状态源
+- pi ≥ 1.5.0（`@earendil-works/pi-coding-agent`）——原生 OSC 7501 程序状态上报是唯一状态源
 - herdr-core ≥ 0.1.16（`hc`）——`curl -fsSL https://releases.herdr.dev/core/install.sh | sh`
 - Herdr app（可选）——显示 core 终端；没有它 pi 照常运行、pier 照常 spawn worker，只是看不到窗口
 
@@ -212,7 +212,7 @@ npm test          # typecheck + node --test（todo 重放 / 反冻结 / GC / 生
 core 自身身份变量（`HC_TERMINAL_ID`、`HC_TERMINAL_SOCKET`）由 core 注入，pier 只读。
 `/pier-config doctor` 会列出每个选项的生效值与来源，以及本会话被有意吞掉的异常。
 
-**状态与 label**：状态只来自程序自己发出的 OSC 7501——pi 1.4 原生上报，pier 从不合成状态。
+**状态与 label**：状态只来自程序自己发出的 OSC 7501——pi 原生上报，pier 从不合成状态。
 元数据是 `pier.*` 下的终端 label（`pier.session`、`pier.todo`、`pier.lock.<hash>`），
 用 `hc get <terminal> --json` 查看。Herdr app 自行渲染侧边栏与提醒；app 侧没有 mod，
 也不再存在 `PIER_WORKBENCH_ROOT`。

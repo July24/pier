@@ -60,7 +60,7 @@ The installer verifies node / pi / `hc` versions and prints an informational lin
 
 - **Human-in-the-loop**: every subagent is a visible terminal the Herdr app lists under its master (a pane only with `tab`) — peek at it anytime to talk directly (fix bugs, answer its `ask_user_question`). Status reaches the app through pi's native OSC 7501 report; pier does not synthesize it.
 - **Delegation identity**: the worker knows who delegated it — spawn env (`PI_HERDR_DELEGATION`) replays from the session's own first-frame entry; its system prompt carries a `pier-delegation` section (identity + delivery contract), and the transcript opens with an "⟵ delegated by master …" card
-- **Blocking dialogs report blocked**: pi 1.4's native OSC 7501 reporter covers the inherently blocking `ctx.ui` dialogs (`select` / `confirm` / `input` / `editor`) and permission dialogs from any extension. pier adds the `ui.custom` ask overlay — pi does not report it — so pier writes `blocked` while it is open and restores `working`/`idle` when it closes. Nested gates are coalesced.
+- **Blocking dialogs report blocked**: pi's native OSC 7501 reporter covers the inherently blocking `ctx.ui` dialogs (`select` / `confirm` / `input` / `editor`) and permission dialogs from any extension; since pi 1.5 pier opens its `ui.custom` ask picker with `blocked: { kind: "question" }`, so pi reports it too and restores the run state when it closes. pier writes no status itself.
 - **Readable transcript**: pier's own session entries (todo edits, subagent/terminal registries, delegation) and its reminder messages render as compact cards instead of raw JSON
 - **Soft locks**: write paths publish per-terminal `pier.lock.<hash>` labels; conflicts warn (default) or block (`PI_HERDR_WRITE_LOCK=1`) instead of racing silently. Warnings name **every** holder — the audience split is: agent reads its own tool-result warning, human reads `/locks` (or `hc get <terminal> --json` for the raw label table). `write`/`edit` only — `bash` writes are not covered
 - **One model for the whole tree**: workers are spawned with the master's current model (`--provider/--model` from the master's live model, so a `/model` switch carries over); no role profiles or tool gates
@@ -104,7 +104,7 @@ pi overwrites tools/commands by name; event listeners stack.
 ## Requirements
 
 - Node ≥ 22
-- pi ≥ 1.4.0 (`@earendil-works/pi-coding-agent`) — the native OSC 7501 reporter is required
+- pi ≥ 1.5.0 (`@earendil-works/pi-coding-agent`) — the native OSC 7501 reporter is required
 - **herdr-core `hc` ≥ 0.1.16** — required for subagents / terminal integration; `curl -fsSL https://releases.herdr.dev/core/install.sh | sh`
 - Herdr app (optional) — display only
 

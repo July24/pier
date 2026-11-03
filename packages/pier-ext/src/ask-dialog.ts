@@ -304,10 +304,16 @@ export function createDialogComponent(opts: DialogUiOptions): DialogComponent {
   };
 }
 
-/** Run the dialog through `ctx.ui.custom`. Returns null when the host cannot render custom components
- *  (RPC mode / older pi), so the caller can fall back to the select dialog or the typed prompt. */
+/** `ctx.ui.custom` options pier uses: pi ≥ 1.5 reports an inline component as blocked while it is open. */
+export interface CustomDialogOptions {
+  blocked?: { kind: 'question'; message: string };
+}
+
+/** Run the dialog through `ctx.ui.custom`, reported to the terminal as `blocked kind=question` by pi's
+ *  own OSC 7501 reporter. Returns null when the host cannot render custom components (RPC mode / older
+ *  pi), so the caller can fall back to the select dialog or the typed prompt. */
 export async function runSelectDialog(
-  custom: (factory: unknown) => Promise<unknown>,
+  custom: (factory: unknown, options?: CustomDialogOptions) => Promise<unknown>,
   title: string,
   config: DialogConfig,
   options?: { signal?: AbortSignal; toggleToolsExpanded?: () => void },
@@ -323,7 +329,7 @@ export async function runSelectDialog(
       toggleToolsExpanded: options?.toggleToolsExpanded,
       done: (outcome) => done(outcome),
       requestRender: () => (tui as { requestRender?: () => void } | undefined)?.requestRender?.(),
-    }));
+    }), { blocked: { kind: 'question', message: title } });
   if (result === undefined || result === null) return null;
   const outcome = result as DialogOutcome;
   if (outcome.kind === 'cancel' || outcome.kind === 'other' || outcome.kind === 'selected') return outcome;

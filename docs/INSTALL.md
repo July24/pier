@@ -1,7 +1,7 @@
 # 安装与使用手册
 
 pier 的安装：一个 pi 扩展 + 两个外部程序（herdr-core / Herdr app）。
-环境要求：Node ≥ 22、pi ≥ 1.4.0（原生 OSC 7501 上报）、herdr-core `hc` ≥ 0.1.16。
+环境要求：Node ≥ 22、pi ≥ 1.5.0（原生 OSC 7501 上报）、herdr-core `hc` ≥ 0.1.16。
 Herdr app 可选（只负责显示终端）。**最后一个兼容 Herdr TUI 的版本是 0.4.3**（git tag `tui-final`）。
 
 ## 0. 一键安装（推荐）
@@ -20,7 +20,7 @@ node install.mjs update          # 用户模式：pi update / install
 
 脚本流程：
 
-1. 校验 node ≥ 22、pi ≥ 1.4.0、`hc` ≥ 0.1.16（缺失给安装指引并退出：
+1. 校验 node ≥ 22、pi ≥ 1.5.0、`hc` ≥ 0.1.16（缺失给安装指引并退出：
    `curl -fsSL https://releases.herdr.dev/core/install.sh | sh`）；
 2. 探测 `herdr-app`，只打印一行提示，**不作为硬依赖**；
 3. 检测旧的 herdr TUI 插件 `pier.workbench`（0.4.3 及以前），询问是否卸载（`herdr plugin uninstall`，本地 link 则 `unlink`）；

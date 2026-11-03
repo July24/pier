@@ -15,7 +15,7 @@ import { readWorkerMarker, writeWorkerMarker } from '../src/worker-marker.ts';
 
 type IndexMode = 'worker' | 'core-worker' | 'bare' | 'master';
 
-/** OSC 7501 reports pier writes to the terminal (captured, never forwarded to the real stdout). */
+/** OSC 7501 sequences pier writes itself (captured, never forwarded): status belongs to pi's reporter, so none. */
 const statusWrites: string[] = [];
 const realWrite = process.stdout.write.bind(process.stdout);
 process.stdout.write = ((chunk: unknown, ...rest: unknown[]) => {
@@ -25,19 +25,6 @@ process.stdout.write = ((chunk: unknown, ...rest: unknown[]) => {
   }
   return (realWrite as (...a: unknown[]) => boolean)(chunk, ...rest);
 }) as typeof process.stdout.write;
-
-/** Decoded status reports since the last mount: `{ state, kind?, msg? }`. */
-function statusReports(): Array<Record<string, string>> {
-  return statusWrites.map((seq) => {
-    const out: Record<string, string> = {};
-    for (const pair of seq.slice('\x1b]7501;'.length, -2).split(':')) {
-      const [key, value = ''] = pair.split('=', 2) as [string, string?];
-      if (key === 'app') continue;
-      out[key] = key === 'msg' ? Buffer.from(value, 'base64').toString('utf8') : value;
-    }
-    return out;
-  });
-}
 
 /**
  * Boots the real composition root on one process-mode branch. `extra` lands on top of the mode
@@ -67,10 +54,6 @@ async function mountIndex(
   return pi;
 }
 
-/** The `ui` the ask tool sees for an authored pick: the test's own `select`, and an input path that must not run. */
-const authoredUi = (select: (title: string, options: string[]) => Promise<string | undefined>) =>
-  ({ ui: { select, input: async () => { throw new Error('input must not run for an authored pick'); } } });
-
 /** Mounts a worker inside a core terminal and returns the registered ask tool's execute. */
 async function workerAsk(cleanup: CleanupContext) {
   const pi = await mountIndex(cleanup, 'core-worker');
@@ -79,22 +62,17 @@ async function workerAsk(cleanup: CleanupContext) {
   return { pi, exec };
 }
 
-const BLOCKED = (msg: string) => ({ state: 'blocked', kind: 'question', msg });
-
-/**
- * Control for the negative ask cases: on the *same* mounted index a valid ask must report blocked
- * for the whole wait and restore afterwards. Without it a mount whose gate is dead would make every
- * "nothing reported" assertion below pass vacuously.
- */
-async function expectGateOpensAndCloses(exec: (...a: unknown[]) => unknown): Promise<void> {
-  let release: ((value: string) => void) | undefined;
-  const held = new Promise<string>((resolve) => { release = resolve; });
-  const running = exec({}, { question: 'deploy staging?' }, undefined, undefined, { ui: { input: () => held } });
-  assert.deepEqual(statusReports(), [BLOCKED('deploy staging?')], 'a valid ask reports blocked while the human is asked');
-  release!('ok');
-  const result = await running as { content: Array<{ text: string }> };
-  assert.match(result.content[0]?.text ?? '', /"deploy staging\?"="ok"/);
-  assert.deepEqual(statusReports(), [BLOCKED('deploy staging?'), { state: 'idle' }]);
+/** A `ui` whose `ui.custom` records the options of every dialog it opens and answers `Redis`. */
+function recordingDialogUi() {
+  const opened: unknown[] = [];
+  const ui = {
+    input: async () => { throw new Error('typed prompt must not run when ui.custom answers'); },
+    custom: async (_factory: unknown, options?: unknown) => {
+      opened.push(options);
+      return { kind: 'selected', labels: ['Redis'] };
+    },
+  };
+  return { ui, opened };
 }
 
 /* ── mount surface per process mode ─────────────────────────────── */
@@ -117,7 +95,7 @@ test('index mount surface: worker and bare pi stay todo-only', async (t) => {
     await fire(pi, 'tool_execution_end', { toolCallId: 'c1' });
     await fire(pi, 'agent_settled', {}, ctx);
     await fire(pi, 'session_shutdown');
-    assert.deepEqual(statusReports(), [], `${mode} never writes a status report`);
+    assert.deepEqual(statusWrites, [], `${mode} never writes a status report`);
   }));
 });
 
@@ -129,83 +107,38 @@ test('index core master: mounts subagent + terminal + locks + /pier-tree', withC
   await fire(pi, 'session_shutdown');
 }));
 
-/* ── ask gate: pi does not report ui.custom dialogs, so pier writes OSC 7501 itself ── */
+/* ── ask gate: pi ≥ 1.5 reports ui.custom dialogs as blocked; pier writes no status ── */
 
-test('ask_user_question reports blocked kind=question for the whole wait, then restores the run state', withCleanup(async (cleanup) => {
+test('ask_user_question opens every dialog as blocked kind=question for pi\'s reporter and writes no status itself', withCleanup(async (cleanup) => {
   const { exec } = await workerAsk(cleanup);
-  await expectGateOpensAndCloses(exec!);
-}));
-
-test('ask_user_question restores working when the ask closes mid-turn', withCleanup(async (cleanup) => {
-  const { pi, exec } = await workerAsk(cleanup);
-  await fire(pi, 'turn_start');
-  await exec!({}, { question: 'ship it?' }, undefined, undefined, { ui: { input: async () => 'yes' } });
-  assert.deepEqual(statusReports(), [BLOCKED('ship it?'), { state: 'working' }]);
-}));
-
-test('ask_user_question rejections never report blocked', async (t) => {
-  const CASES: Array<[string, Record<string, unknown>, unknown, string]> = [
-    ['empty question', { question: '   ' }, { ui: { input: async () => 'nope' } }, 'empty_question'],
-    ['reserved Other', { question: 'Which database?', options: [{ label: 'Redis', description: 'mem' }, { label: 'Other', description: 'typed' }] },
-      { ui: { input: async () => 'nope' } }, 'reserved_label'],
-    ['no ui', { question: 'deploy staging?' }, {}, 'no_ui'],
-  ];
-  for (const [name, params, ctx, error] of CASES) await t.test(name, withCleanup(async (cleanup) => {
-    const { exec } = await workerAsk(cleanup);
-    const result = await exec!({}, params, undefined, undefined, ctx) as { details: { error?: string } };
-    assert.equal(result.details.error, error);
-    assert.deepEqual(statusReports(), [], 'a rejected ask must not report blocked');
-    await expectGateOpensAndCloses(exec!);
-  }));
-});
-
-test('ask_user_question options path and question batches report one blocked edge', withCleanup(async (cleanup) => {
-  const { exec } = await workerAsk(cleanup);
-  let selects = 0;
-  const running = exec!({}, {
+  const { ui, opened } = recordingDialogUi();
+  const result = await exec!({}, {
     questions: [
       { question: 'Cache?', options: [{ label: 'Redis', description: 'mem' }, { label: 'Memcached', description: 'dist' }] },
-      { question: 'SQL?', options: [{ label: 'Postgres', description: 'rel' }, { label: 'SQLite', description: 'file' }] },
+      { question: 'Store?', options: [{ label: 'Redis', description: 'mem' }, { label: 'Postgres', description: 'rel' }] },
     ],
-  }, undefined, undefined, authoredUi(async (_title, options) => {
-    selects += 1;
-    assert.equal(statusReports().length, 1, 'blocked stays reported between questions');
-    return options[0];
+  }, undefined, undefined, { ui }) as { content: Array<{ text: string }> };
+  assert.match(result.content[0]?.text ?? '', /"Store\?"="Redis"/);
+  assert.deepEqual(opened, [
+    { blocked: { kind: 'question', message: 'Cache?' } },
+    { blocked: { kind: 'question', message: 'Store?' } },
+  ]);
+  assert.deepEqual(statusWrites, [], 'status is pi\'s alone: no second OSC 7501 writer');
+}));
+
+test('ask_user_question rejections never open a dialog', async (t) => {
+  const CASES: Array<[string, Record<string, unknown>, string]> = [
+    ['empty question', { question: '   ' }, 'empty_question'],
+    ['reserved Other', { question: 'Which database?', options: [{ label: 'Redis', description: 'mem' }, { label: 'Other', description: 'typed' }] }, 'reserved_label'],
+  ];
+  for (const [name, params, error] of CASES) await t.test(name, withCleanup(async (cleanup) => {
+    const { exec } = await workerAsk(cleanup);
+    const { ui, opened } = recordingDialogUi();
+    const result = await exec!({}, params, undefined, undefined, { ui }) as { details: { error?: string } };
+    assert.equal(result.details.error, error);
+    assert.deepEqual(opened, []);
   }));
-  const result = await running as { content: Array<{ text: string }> };
-  assert.equal(selects, 2);
-  assert.match(result.content[0]?.text ?? '', /"SQL\?"="Postgres"/);
-  assert.deepEqual(statusReports().map((r) => r.state), ['blocked', 'idle']);
-}));
-
-test('pi\'s own dialogs are left to pi\'s reporter; a nested prompt inside the ask adds no report', withCleanup(async (cleanup) => {
-  const { pi, exec } = await workerAsk(cleanup);
-  await fire(pi, 'ui_prompt_start', { reason: 'ui_prompt', kind: 'confirm', title: 'Delete branch?' });
-  await fire(pi, 'ui_prompt_end', { reason: 'ui_prompt' });
-  assert.deepEqual(statusReports(), [], 'pi 1.4 reports select/confirm/input/editor itself');
-
-  let resolveInput: ((value: string) => void) | undefined;
-  const input = new Promise<string>((resolve) => { resolveInput = resolve; });
-  const running = exec!({}, { question: 'ship it?' }, undefined, undefined, {
-    ui: {
-      input: async () => {
-        await fire(pi, 'ui_prompt_start', { kind: 'input', title: 'ship it?' });
-        const value = await input;
-        await fire(pi, 'ui_prompt_end', {});
-        return value;
-      },
-    },
-  });
-  resolveInput!('yes');
-  await running;
-  assert.deepEqual(statusReports(), [BLOCKED('ship it?'), { state: 'idle' }]);
-}));
-
-test('outside a core terminal the ask gate writes nothing', withCleanup(async (cleanup) => {
-  const pi = await mountIndex(cleanup, 'worker');
-  await pi.tools.get('ask_user_question')!.execute!({}, { question: 'ok?' }, undefined, undefined, { ui: { input: async () => 'y' } });
-  assert.deepEqual(statusReports(), []);
-}));
+});
 
 /* ── session lifecycle ──────────────────────────────────────────── */
 

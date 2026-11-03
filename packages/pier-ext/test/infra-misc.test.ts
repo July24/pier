@@ -366,7 +366,7 @@ function npxLayoutProbe(cleanup: CleanupContext, opts: NpxLayoutProbeOptions = {
   writeFileSync(join(extPkg, 'package.json'), JSON.stringify({ name: 'pi-pier', version: '1.0.0' }));
   writeFileSync(extEntry, 'export default {};\n');
 
-  fakeCli('pi', { bin: binDir, fake: fakeDir, log: logFile }, "if (args[0] === '--version') console.log('1.4.0');");
+  fakeCli('pi', { bin: binDir, fake: fakeDir, log: logFile }, "if (args[0] === '--version') console.log('1.5.0');");
   const hcDecide = opts.hcVersion === null
     ? 'process.exit(1);'
     : `if (args[0] === '--version') console.log('${opts.hcVersion ?? '0.1.16'}');`;

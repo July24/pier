@@ -15,7 +15,6 @@ import {
   ASK_PROMPT_GUIDELINES,
   ASK_TOOL_DESCRIPTION,
   ASK_TOOL_NAME,
-  gateLabel,
   hasAskUi,
   noUiResult,
   prepareAsk,
@@ -140,9 +139,7 @@ export default async function (pi: ExtensionAPI) {
   const todoUi: TodoUiSlot = { renderWidget: () => { /* filled after plugin mounting */ } };
   const gates = createGateRuntime({
     pi,
-    writeStatus: env ? (sequence) => { process.stdout.write(sequence); } : null,
     rerenderWidget: () => todoUi.rerenderWidget?.(),
-    isAgentActive: () => agentActive,
   });
 
   /** Session identity: sessionManager is authoritative (env may be unset in print/RPC mode). */
@@ -639,12 +636,12 @@ export default async function (pi: ExtensionAPI) {
       if (!prepared.ok) return prepared.result;
       const ui = ctx && typeof ctx === 'object' && 'ui' in ctx ? ctx.ui : undefined;
       if (!hasAskUi(ui)) return noUiResult();
-      gates.publish(true, gateLabel(prepared.spec));
-      // pi does not report `ui.custom` dialogs, so the gate writes blocked itself for the whole wait.
+      // pi's reporter shows each ask dialog as blocked (ui.custom `blocked`); the gate only collapses the widget.
+      gates.hold(true);
       try {
         return await runAsk(prepared.spec, ui, signal instanceof AbortSignal ? signal : undefined);
       } finally {
-        gates.publish(false, null);
+        gates.hold(false);
       }
     },
   });

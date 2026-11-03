@@ -11,7 +11,7 @@ import {
   type DialogConfig, type DialogOutcome, type DialogState, type KeybindingsLike, type MinimalTheme,
 } from '../src/ask-dialog.ts';
 import {
-  DECLINE_TEXT, formatAskContent, gateLabel, hasAskUi, noUiResult, optionLines, parseChoice,
+  DECLINE_TEXT, formatAskContent, hasAskUi, noUiResult, optionLines, parseChoice,
   prepareAsk, prepareAskArguments, runAsk, type AskAnswer, type AskQuestion, type AskSpec, type AskUi,
 } from '../src/ask-user.ts';
 
@@ -411,12 +411,6 @@ test('prepareAsk: the (Recommended) marker the model repeats is stripped, only a
   const only = failOf({ question: 'q', options: [{ label: ' (Recommended) ' }, { label: 'B' }] });
   assert.equal(only.code, 'empty_options');
   assert.match(only.text, /marker the UI appends/);
-});
-
-test('gateLabel: single question verbatim; multiple first (+N)', () => {
-  assert.equal(gateLabel({ mode: 'freeform', question: 'deploy?' }), 'deploy?');
-  assert.equal(gateLabel({ mode: 'questionnaire', questions: [q()] }), 'Which database?');
-  assert.equal(gateLabel({ mode: 'questionnaire', questions: [q(), q({ question: 'SQL?' })] }), 'Which database? (+1)');
 });
 
 test('optionLines / parseChoice: authored rows, the Other row, the marker and both answer spellings', () => {
