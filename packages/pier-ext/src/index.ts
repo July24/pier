@@ -93,7 +93,7 @@ export default async function (pi: ExtensionAPI) {
   const initialManifest =
     parseRuntimeManifest(process.env.PI_HERDR_ROLE_MANIFEST) ??
     (mode.composeMaster ? composeMasterRuntime() : null);
-  const todos = new TodosService(TodosService.configFromRuntime(initialManifest, isSubagent));
+  const todos = new TodosService();
 
   /** Phase 0 routing telemetry (RFC docs/rfc-jev-role-routing.md §8): best-effort append; never gates anything. */
   const appendRoutingLog = (row: RoutingTelemetryRecord): void => {
@@ -103,7 +103,7 @@ export default async function (pi: ExtensionAPI) {
     void appendEfficiencyLog(efficiencyLogPath(root, 'routing'), stamped).catch(() => {});
   };
 
-  const roles = createRoleRuntime({ pi, roleBase, initialManifest, isSubagent, todos, appendRoutingLog });
+  const roles = createRoleRuntime({ pi, roleBase, initialManifest, appendRoutingLog });
 
   /* ── Jev decision layer (RFC docs/rfc-jev-integration.md): direct HTTP, total-budget
    * abort, fail-open at every site. Disabled or keyless → behavior identical to before. ── */
@@ -404,7 +404,6 @@ export default async function (pi: ExtensionAPI) {
         sendUserMessageAs,
         abort: () => { latestCtx?.abort?.(); },
         setPendingMachineRequest: (next) => { pendingMachineRequest = next; },
-        applyRoleSwitch: roles.applyRoleSwitch,
         applyWorkerTodos,
       }));
     } catch {
@@ -705,6 +704,8 @@ export default async function (pi: ExtensionAPI) {
       pipeServerBox,
       deliverNotice,
       noticePending: notices.noticePending,
+      takeNotices: notices.takeNotices,
+      awaitNotice: notices.awaitNotice,
       getSessionId: () => sessionId,
       getBlockedDepth: () => gates.depth(),
       getWorkers: widgetWorkers,

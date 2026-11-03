@@ -25,7 +25,7 @@ pier 是**一个 pi 扩展**，外加它与两个外部程序协作：
 ### 架构（谁和谁说话）
 
 - pier 通过自己继承的终端 socket 与 core 通信（`HC_TERMINAL_SOCKET`，自身地址 `HC_TERMINAL_ID`）。
-- 一个 worker 就是一次 `terminal.run {argv, cwd, env, labels: {herdr.space, herdr.tab}, noNotify: true}`。core 启动程序，app 自动把它挂成 **master 所在 tab 的 pane，且不抢焦点**。传入**新的** `herdr.tab` id 时 app 会自动新建 tab——pier 从不调用 app 命令，也不做放置位置计算。
+- 一个 worker 就是一次 `terminal.run {argv, cwd, env, parent: master, noNotify: true}`（D140）。core 启动程序；不带放置 label 时 app 把它列为 **master 下的子 agent**（peek 查看或直接输入；关闭 master 即一并结束）。只有显式 `tab` 才加 `herdr.space`/`herdr.tab` label：app 把它挂成该 tab 的非焦点 pane，**新的** `herdr.tab` id 会自动新建 tab——pier 从不调用 app 命令，也不做放置位置计算。
 - worker 的程序随 master 程序结束而结束（`die_with_parent`）；pier 用 `terminal.kill` + `terminal.rm` 收尾。
 - **状态只来自 pi 原生 OSC 7501 上报**，core 存储、app 展示。pier 从不写终端状态。唯一缺口是 `ask_user_question`：它是 `ui.custom` overlay，pi 不为其上报状态，所以 pier 在弹窗打开期间上报 `blocked`，关闭时按当前活动状态回写 `working`/`idle`。
 - 元数据放在**终端 label**，且只保留 pier 内部有读方的：`pier.session`（worker 自己的会话文件）、`pier.todo`（worker todo 摘要，master 重建摘要时读取）、`pier.lock.<hash>`（写锁 beacon）。
@@ -35,15 +35,17 @@ pier 是**一个 pi 扩展**，外加它与两个外部程序协作：
 
 - **todo 闭环**：`todo_write` 全量替换语义、会话 JSONL 权威、分支正确回滚；`/todos` 命令（含 unblock）与常驻状态 widget 展示进度。列表会镜像到 `pier.todo` 终端 label，仅用于 master 重建 worker 摘要；不再有窗格标题投影。
 - **todo 反冻结**：全完成列表 ≥6 轮未写 → 读钩复读改为改写警告；≥1h 未写 → 归档——先给一次带旧条目参照的重写窗口，无视后终态通知并清空列表（rm 落 JSONL，空守卫接管，多步工作必须重建清单）；`/todos` 永远可查历史，会话 JSONL 权威不动
-- **交互式子代理**：每个子代理 = 独立 core 终端里的隔离 pi 会话（独立上下文窗口）；app 把它显示为 pane，**人类可随时 attach 该终端直接对话**（修 bug、回答 ask_user_question）。blocked 状态经 pi 原生 OSC 7501 到达 app。
+- **交互式子代理**：每个子代理 = 独立 core 终端里的隔离 pi 会话（独立上下文窗口）；app 把它列在 master 下（仅 `tab` 时为 pane），**人类可随时 peek 该终端直接对话**（修 bug、回答 ask_user_question）。blocked 状态经 pi 原生 OSC 7501 到达 app。
 - **委托身份一等公民**（D111）：spawn 时经 `PI_HERDR_DELEGATION` 把委托上下文（父终端/父会话/taskId/任务/角色）下发 worker，由 spawn env 与会话自身首帧条目回放；worker 系统提示注入 `pier-delegation` 段（身份 + 统一交付契约），首帧渲染「⟵ delegated by master …」卡片
-- **任务 slug**（D112）：spawn 分配任务 slug（冲突加序号），工具输出一律 `slug@paneId`，`agentId` 接受 slug/终端 id/组合形式（revive 换终端后按 slug 兜底）。后台 worker 运行期间 master 的 bash 若 sleep ≥60s，结果会附一句「结算通知会自动到达」（D125；此前的 `report_progress` 工具一次都没被调用过，已删除）
+- **任务 slug**（D112）：spawn 分配任务 slug（冲突加序号），工具输出一律 `slug@paneId`，`agentId` 接受 slug/终端 id/组合形式（revive 换终端后按 slug 兜底）。后台 worker 运行期间 master 的 bash 若 sleep ≥60s，结果会附一句指向 `subagent wait` 的提示（D125/D144；此前的 `report_progress` 工具一次都没被调用过，已删除）
 - **统一状态 widget**（D113/D114）：常驻 widget 一行一 agent——自己一行 `▶ 当前条 ✓d/n`，每个 running 子代理一行 `↳ slug ▶ 当前条 ✓d/n`（blocked 显示任务+原因，settled 不占行；自己的清单全部完成时直接隐藏，不再只剩一个 `✓N/N`）；worker `todo_write` 经 pipe 实时推送全量清单（事件驱动零轮询），`/pier-tree` 把完整委托树（自己 + 各 worker 全量 todo + settled 节点）打开为 **pi 内 overlay**（`ui.custom`，`esc`/`q` 关闭，打开期间实时刷新；裸 pi / RPC 模式回退为 pane 内通知）
 - **子代理输出预览**：`subagent(action: "output", agentId)` 返回后台子代理自上次调用以来的新输出——内存中的 per-terminal 游标经 core `terminal.read` 计算增量，结果带状态、revision、截断与 `restart` 标记（缓冲回卷/清屏），master 不必等到结算就能发现卡住的 worker。worker 完成后以完整 transcript 终稿替代终端里有损的渲染副本，之后的结算通知只指向那次交付、不再重复全文（D124）
+- **阻塞等待子代理**（D144）：`subagent(action: "wait", agentId?)` 阻塞到某个 worker 结算、失败、关闭或开始等人工，并把那条通知（含终稿）作为工具结果返回；通知从回合间隙缓冲中取出，不会再投递一次。master 无事可做时用它代替 `sleep` 与反复的 `list`/`output` 轮询
+- **终端命令带退出码**（D145）：`terminal(action: "send", text, wait: true)` 由 pier 自己追加带 nonce 的退出哨兵，返回退出码与命令输出；手写哨兵（及其回显陷阱）只剩不会结束的输出需要（服务的 "listening on"）
 - **软锁防争抢**：写路径把锁 beacon 作为 `pier.lock.<hash>` label 发布到各自终端；跨终端冲突时警告（默认）或阻止（`PI_HERDR_WRITE_LOCK=1`）。警告列出全部持有者；`/locks` 是人类视图，`hc get <terminal> --json` 暴露原始 label
-- **角色档案**：`master` / `worker-default` 内置，自定义 role 按 `.pi-herdr/roles/<name>.json` 挂载；工具集按角色收敛（deny 规则不可绕过）
+- **角色档案**：`master` / `worker-default` 内置，自定义 role 按 `.pi-herdr/roles/<name>.json` 挂载；工具集按角色收敛（deny 规则不可绕过）；`subagent spawn` 的 `role` 是 pier 加载时已有档案的枚举
 - **人类闸门**：子代理 `ask_user_question` → 终端上报 blocked，app 据此展示（并按自身规则提醒）；答案作为工具结果返回。不再做启发式的「人工接管」检测。
-- **选择题选择器**：`multi: true` 的问题直接渲染成可勾选列表（空格逐行切换、`a` 全选、回车确认、esc 拒绝，实时显示已选数量），末行固定为自由输入；`allowOther: false` 则纯选择。RPC 模式 / 旧版 pi 自动回退到「输入编号」的文本路径
+- **选择题选择器**：`multi: true` 的问题直接渲染成可勾选列表（空格逐行切换、`a` 全选、回车确认、esc 拒绝，实时显示已选数量），末行固定为自由输入；`allowOther: false` 则纯选择。`tab` 把选择器折叠成两行横条，把屏幕让给上方对话记录，回看完再按 `tab` 展开，光标与勾选保持不变；折叠期间只有 `tab` 生效，回车/esc 不会盲答或拒绝。RPC 模式 / 旧版 pi 自动回退到「输入编号」的文本路径
 - **阻塞式对话框上报 blocked**：pi 1.4 原生 OSC 7501 上报覆盖**任何扩展**的 `select` / `confirm` / `input` / `editor` 与权限弹窗；pier 只额外处理 `ui.custom` 的 ask overlay。嵌套闸门自动合并。
 - **角色闸门提前终止**：被拒绝的 worker 工具调用返回 `terminate`，整批都是 terminating 时不再多跑一轮模型
 - **转写卡片**：pier 自己的会话条目（todo 编辑、子代理/终端注册表、角色清单、软审批）与提醒消息渲染为紧凑卡片，不再是裸 JSON——entry/message renderer，不依赖 pi-tui
@@ -160,8 +162,8 @@ pi 对同名 tool/command **后写覆盖**，event listener **累加**。两套 
 ### 使用
 
 1. 启动 herdr-core 并打开一个终端（`hc run --bg pi`，或 Herdr app 的「新建终端」），在终端里跑 `pi`；扩展检测到 `HC_TERMINAL_ID` / `HC_TERMINAL_SOCKET` 后开始与 core 通信
-2. 模型可调用 `todo_write`（进度显示在常驻 widget 与 `/todos`）、`subagent`（spawn / list / send / interrupt / resume / output / role）、`terminal`（open / send / read / signal / close / list）
-3. 每个子代理 = 独立 core 终端，作为 master 所在 tab 的非焦点 pane 显示；`tab` 名第一次出现时 app 自动建 tab
+2. 模型可调用 `todo_write`（进度显示在常驻 widget 与 `/todos`）、`subagent`（spawn / wait / list / send / interrupt / resume / output / help）、`terminal`（open / send [`wait: true`] / wait / read / signal / close / list）
+3. 每个子代理 = 独立 core 终端，app 把它列在 master 下并随 master 关闭而结束；显式 `tab` 时作为该 tab 的非焦点 pane 显示，`tab` 名第一次出现时 app 自动建 tab
 4. 没有重启恢复：core 在 app 重启后保留终端，但 core 停止则 worker 消失。父 pi 会话用 `/resume` 恢复；已完成的 worker 用 `subagent(action: "resume", taskId)` 复活
 5. `/pier-tree` 以 pi 内 overlay 打开委托树
 
@@ -169,7 +171,7 @@ pi 对同名 tool/command **后写覆盖**，event listener **累加**。两套 
 
 ```
 packages/
-  pier-ext/        # pi 扩展（npm: pi-pier）：todo/subagent 工具、core 客户端、vocab 权威、skill
+  pier-ext/        # pi 扩展（npm: pi-pier）：todo/subagent 工具、core 客户端、vocab 权威
 docs/              # 安装手册、配置总览、role 档案说明、迁移 RFC
 ```
 

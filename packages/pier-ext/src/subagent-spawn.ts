@@ -1,7 +1,8 @@
 /**
- * Subagent spawn domain: git/worktree I/O, app tab placement, launch argv, readiness wait, and the
- * `spawn` action. Children are created by herdr-core (`terminal.run`) with the full argv, so no shell
- * prompt probe or pasted launch line is involved; the app adopts the terminal as a pane of its tab.
+ * Subagent spawn domain: git/worktree I/O, optional app tab placement, launch argv, readiness wait, and
+ * the `spawn` action. Children are created by herdr-core (`terminal.run`) with the full argv and this
+ * terminal as `parent`, so no shell prompt probe or pasted launch line is involved. Without an explicit
+ * tab the app shows the child as a sub-agent of its parent (peekable, killed with it), not a pane.
  */
 import { execFile as nodeExecFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -41,7 +42,6 @@ import {
   sleep,
   subRef,
   type SubEntry,
-  type WorktreeZone,
 } from './subagent-core.ts';
 import type { Poller } from './subagent-poller.ts';
 import type { SessionIo } from './subagent-session.ts';
@@ -268,8 +268,8 @@ interface SpawnerHost {
 type ReadyOutcome = { ok: true } | { ok: false; message: string };
 
 export interface Spawner {
-  spawnPaneInTaskTab(
-    placement: { desiredTab?: string | null; description: string; zone?: WorktreeZone },
+  spawnWorker(
+    placement: { desiredTab?: string | null },
     cwd: string,
     envOver: Record<string, string>,
     argv: readonly string[],
@@ -366,20 +366,17 @@ export function createSpawner(h: SpawnerHost): Spawner {
     return { alive, status, tail };
   }
 
-  /** Create the worker terminal in the planned tab. The app adopts it as an unfocused pane; a new
-   *  `herdr.tab` id makes the app create that tab, so no layout math is needed here. */
-  async function spawnPaneInTaskTab(
-    placement: { desiredTab?: string | null; description: string; zone?: WorktreeZone },
+  /** Create the worker terminal (parent = this terminal). D140: only an explicit tab adds the
+   *  `herdr.space`/`herdr.tab` labels that make the app adopt it as an unfocused pane (a new
+   *  `herdr.tab` id makes the app create that tab). Core ends the worker with its parent either way. */
+  async function spawnWorker(
+    placement: { desiredTab?: string | null },
     cwd: string,
     envOver: Record<string, string>,
     argv: readonly string[],
   ): Promise<{ tabId: string; paneId: string; tabName: string }> {
-    const plan = planTabPlacement({
-      desiredTab: placement.desiredTab,
-      description: placement.description,
-      zone: placement.zone,
-    });
-    const placementLabels = await h.client.placementLabels();
+    const plan = planTabPlacement({ desiredTab: placement.desiredTab });
+    const placementLabels = plan.tabName ? await h.client.placementLabels() : {};
     const terminal = await h.client.run({
       argv: [...argv],
       cwd,
@@ -413,7 +410,7 @@ export function createSpawner(h: SpawnerHost): Spawner {
   }
 
   return {
-    spawnPaneInTaskTab,
+    spawnWorker,
     launchParts: (resumeFile, roleModel, approve) => buildLaunchParts(h.runtime, { resumeFile, roleModel, approve: approve ?? false }),
     approveFor,
     waitSubReady,
@@ -445,7 +442,7 @@ interface SpawnActionHost {
 export function createSpawnAction(h: SpawnActionHost) {
   const { client, env, git, subs } = h;
   const { resolveSessionFile, collectFinalText, readAskFlag, probeAlive, subSessionState } = h.session;
-  const { spawnPaneInTaskTab, launchParts, waitSubReady } = h.spawn;
+  const { spawnWorker, launchParts, waitSubReady } = h.spawn;
   const { startPoller } = h.poller;
 
   return async function executeSubagentSpawn(
@@ -472,7 +469,6 @@ export function createSpawnAction(h: SpawnActionHost) {
           tools: manifest.tools,
           permissions: manifest.permissions,
           unknownTools: manifest.unknownTools,
-          services: role.services ?? {},
           // Without guidelines parseRuntimeManifest yields none and the pier-role prompt section silently no-ops.
           ...(role.guidelines?.length ? { guidelines: role.guidelines } : {}),
         }),
@@ -546,7 +542,7 @@ export function createSpawnAction(h: SpawnActionHost) {
         return toolError(`Error: \`cwd\` is not an existing directory: ${cwdParam}`);
       }
     }
-    // D86 R1: group by the git worktree containing cwd (main checkout → main tab; other → its tab).
+    // Worktree zone only decides trust now; placement is opt-in via `tab` (D140).
     const zone = classifyWorktreeZone({ cwd, masterCwd, worktrees: await git.listWorktrees(masterCwd) });
     // D86 trust: pass -a only for the master's checkout/worktrees; external dirs stay behind pi's Trust dialog.
     const approve = isPathUnder(cwd, masterCwd) || zone.zone === 'worktree';
@@ -556,8 +552,8 @@ export function createSpawnAction(h: SpawnActionHost) {
     try {
       const spawnedAt = Date.now();
       const argv = launchParts(null, roleModel, approve);
-      const spawned = await spawnPaneInTaskTab(
-        { desiredTab: tab, description: spec.description, zone },
+      const spawned = await spawnWorker(
+        { desiredTab: tab },
         cwd,
         // Status comes ONLY from pi's native OSC 7501 reporter; pier no longer writes it.
         { PI_HERDR_SUBAGENT: '1', ...roleManifestEnv, ...delegationEnvPatch },

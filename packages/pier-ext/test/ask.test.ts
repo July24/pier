@@ -49,8 +49,8 @@ test('rowCount/isOtherRow count the Other row only while it is offered', () => {
   const cfg = multi();
   assert.equal(rowCount(cfg), 4);
   assert.equal(rowCount(multi({ allowOther: false })), 3);
-  assert.equal(isOtherRow({ cursor: 3, selected: [false, false, false] }, cfg), true);
-  assert.equal(isOtherRow({ cursor: 2, selected: [false, false, false] }, cfg), false);
+  assert.equal(isOtherRow({ cursor: 3, selected: [false, false, false], collapsed: false }, cfg), true);
+  assert.equal(isOtherRow({ cursor: 2, selected: [false, false, false], collapsed: false }, cfg), false);
 });
 
 test('cursor wraps in both directions and never reaches a hidden Other row', () => {
@@ -105,6 +105,9 @@ const GRAMMAR_CASES: GrammarCase[] = [
   { name: 'pick-one: space is an alias for enter', config: single(), keys: ['toggle'], outcome: { kind: 'selected', labels: ['alpha'] } },
   { name: 'pick-one: enter on the Other row opens free text', config: single(), keys: ['up', 'confirm'], outcome: { kind: 'other', labels: [] } },
   { name: 'pick-one: space on the Other row opens free text', config: single(), keys: ['up', 'toggle'], outcome: { kind: 'other', labels: [] } },
+  { name: 'collapsed: enter neither answers nor moves', config: single(), keys: ['collapse', 'down', 'confirm'], cursor: 0 },
+  { name: 'collapsed: cancel does not decline', config: single(), keys: ['collapse', 'cancel'] },
+  { name: 'expanding again restores the live grammar', config: single(), keys: ['collapse', 'down', 'collapse', 'down', 'confirm'], outcome: { kind: 'selected', labels: ['beta'] } },
 ];
 
 test('stepDialog key grammar', async (t) => {
@@ -126,7 +129,7 @@ test('stepDialog key grammar', async (t) => {
 test('resolveDialogKey understands host bindings, literals and fallback sequences', () => {
   // Host bindings path; the literals pi's own selector shares work with and without them.
   const HOST: Array<readonly [string, string]> = [
-    ['\x1b[A', 'up'], ['\x1b[B', 'down'], ['\r', 'confirm'], ['\x03', 'cancel'], ['k', 'up'], ['j', 'down'], [' ', 'toggle'], ['a', 'all'],
+    ['\x1b[A', 'up'], ['\x1b[B', 'down'], ['\r', 'confirm'], ['\x03', 'cancel'], ['k', 'up'], ['j', 'down'], [' ', 'toggle'], ['a', 'all'], ['\t', 'collapse'],
   ];
   for (const [data, key] of HOST) assert.equal(resolveDialogKey(data, kb), key, `host: ${JSON.stringify(data)}`);
   // No keybindings manager: the built-in sequences still resolve.
@@ -153,10 +156,10 @@ test('dialogLines: cursor, toggles, recommendation and the free-text row', async
 
 /** `width` is the inner (width-2) the component measures hints against; omitted = unbounded. */
 const FOOTER_CASES: Array<{ name: string; config: DialogConfig; keys?: Key[]; width?: number; expected: string }> = [
-  { name: 'multi lists the toggle grammar (no count yet)', config: multi(), expected: '↑↓ navigate  space toggle  a all  enter confirm  escape/ctrl+c cancel' },
-  { name: 'multi counts the live selection', config: multi(), keys: ['toggle'], expected: '↑↓ navigate  space toggle  a all  enter confirm  escape/ctrl+c cancel · 1 selected' },
-  { name: 'pick-one matches the host selector wording and never counts', config: single(), expected: '↑↓ navigate  enter select  escape/ctrl+c cancel' },
-  { name: '80-col pane drops a-all only', config: multi(), keys: ['toggle'], width: 80 - 2, expected: '↑↓ navigate  space toggle  enter confirm  escape/ctrl+c cancel · 1 selected' },
+  { name: 'multi lists the toggle grammar (no count yet)', config: multi(), expected: '↑↓ navigate  space toggle  a all  enter confirm  escape/ctrl+c cancel  tab collapse' },
+  { name: 'multi counts the live selection', config: multi(), keys: ['toggle'], expected: '↑↓ navigate  space toggle  a all  enter confirm  escape/ctrl+c cancel  tab collapse · 1 selected' },
+  { name: 'pick-one matches the host selector wording and never counts', config: single(), expected: '↑↓ navigate  enter select  escape/ctrl+c cancel  tab collapse' },
+  { name: '80-col pane drops tab-collapse and a-all', config: multi(), keys: ['toggle'], width: 80 - 2, expected: '↑↓ navigate  space toggle  enter confirm  escape/ctrl+c cancel · 1 selected' },
   { name: '70-col pane drops a-all then navigate', config: multi(), keys: ['toggle'], width: 70 - 2, expected: 'space toggle  enter confirm  escape/ctrl+c cancel · 1 selected' },
   { name: '58-col pane keeps the action keys and the whole count', config: multi(), keys: ['toggle'], width: 58 - 2, expected: 'space toggle  enter confirm · 1 selected' },
   { name: '40-col pane sheds only the navigate hint for pick-one', config: single(), width: 40 - 2, expected: 'enter select  escape/ctrl+c cancel' },
@@ -179,6 +182,18 @@ test('component: renders the framed chrome and fits every line to width', () => 
   for (const line of lines) assert.equal(styledWidth(line) <= 40, true);
   component.invalidate();
   assert.equal(outcome, null);
+});
+
+test('component: tab folds the dialog to a width-fitted bar and unfolds it with the selection intact', () => {
+  const component = createDialogComponent({ title: 'Pick one of these', config: single({ recommended: 1 }), theme: plain, keybindings: kb, done: () => { throw new Error('dialog must not finish'); } });
+  const expanded = component.render(40);
+  component.handleInput('\t');
+  component.handleInput('\r');
+  const folded = component.render(14);
+  for (const line of folded) assert.equal(styledWidth(line) <= 14, true);
+  assert.deepEqual(folded.map((l) => l.replace(/\x1b\[[0-9;]*m/g, '')), ['─'.repeat(14), ' ▸ Pick one o…', ' tab expand t…', '─'.repeat(14)]);
+  component.handleInput('\t');
+  assert.deepEqual(component.render(40), expanded);
 });
 
 test('component: long titles and descriptions wrap inside the frame instead of clipping', () => {
@@ -528,6 +543,25 @@ test('prepareAskArguments: stringified options and questions are parsed before v
   assert.match(notAnArray.text, /must be an array/);
   const broken = failOf(prepareAskArguments({ question: 'Q?', options: '[{"label":"Redis"' }));
   assert.equal(broken.code, 'empty_options');
+});
+
+test('prepareAskArguments: an options string that swallowed the following keys is split back out', () => {
+  // Recorded GLM shape: the options string runs on through `"question": ...` and the closers.
+  const swallowed = '[{"description": "merge --no-ff", "label": "merge"}, {"label": "hold"}], "question": "怎么合？"}]';
+  const flat = prepareAsk(prepareAskArguments({ options: swallowed, allowOther: true }));
+  if (!flat.ok) assert.fail(flat.result.content[0]?.text);
+  const first = flat.spec.mode === 'questionnaire' ? flat.spec.questions[0] : undefined;
+  assert.equal(first?.question, '怎么合？');
+  assert.deepEqual(first?.options.map((o) => o.label), ['merge', 'hold']);
+
+  // A key the call sent itself wins over the spilled copy.
+  const explicit = prepareAsk(prepareAskArguments({ question: 'Real?', options: '[{"label":"a"},{"label":"b"}], "question": "Spilled?"}' }));
+  if (!explicit.ok) assert.fail(explicit.result.content[0]?.text);
+  assert.equal(explicit.spec.mode === 'questionnaire' ? explicit.spec.questions[0]?.question : undefined, 'Real?');
+
+  // Junk after the array that is not an object member stays an error.
+  const junk = failOf(prepareAskArguments({ question: 'Q?', options: '[{"label":"a"}] trailing' }));
+  assert.equal(junk.code, 'empty_options');
 });
 
 test('runAsk: a blank Other answer returns to the choices and keeps the toggles', async () => {

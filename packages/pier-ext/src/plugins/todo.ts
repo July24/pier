@@ -15,7 +15,7 @@ import { makeProgressUpdate } from '../subagent-core.ts';
 import { TODO_DETAILS_KEY, TODO_STATUSES, TODO_TOOL_NAME, formatTodoConfirmation, type TodoItem } from '../vocab.ts';
 import { toolError } from '../tool-error.ts';
 import { formatAge, isArchived } from '../stale-core.ts';
-import { TODO_ARCHIVE_WINDOW_CUSTOM_TYPE, TODO_EDIT_CUSTOM_TYPE, completionTransitions, fuzzyFind, listsEqual, makeSnapshot, normalizeStrict, revertedCompleted, todoListHash, validateTodos, type TodoEditOp } from '../todo-core.ts';
+import { TODO_ARCHIVE_WINDOW_CUSTOM_TYPE, TODO_EDIT_CUSTOM_TYPE, completionTransitions, fuzzyFind, listsEqual, makeSnapshot, revertedCompleted, todoListHash, validateTodos, type TodoEditOp } from '../todo-core.ts';
 import { formatTodoSummary, renderTodoGroups } from '../todo-window.ts';
 import { unifiedWidgetLines, type WorkerWidgetRow } from '../tree-view.ts';
 import { swallow } from '../swallow.ts';
@@ -32,7 +32,6 @@ export interface TodoUiSlot {
 
 export interface TodoDeps {
   todos: TodosService;
-  allowParallelInProgress: boolean;
   /** Warn above this size without rejecting otherwise valid plans. */
   maxItems: number;
   mirrorTodos: () => void;
@@ -80,7 +79,7 @@ export function widgetLines(
 
 export default function todoPlugin(ctx: Context): void {
   const surface = cordisGet(ctx, 'pi-herdr.surface');
-  const { todos, allowParallelInProgress, maxItems, mirrorTodos, appendEntry, state, stopReminder, getBlockedDepth, getWorkers } =
+  const { todos, maxItems, mirrorTodos, appendEntry, state, stopReminder, getBlockedDepth, getWorkers } =
     cordisGet(ctx, 'pi-herdr.todo-deps');
   const scoped = surface.forModule(import.meta.url);
 
@@ -280,24 +279,12 @@ export default function todoPlugin(ctx: Context): void {
     async execute(toolCallId: string, params: ToolParams, signal: AbortSignal | undefined, onUpdate: ((update: unknown) => void) | undefined, eventCtx: unknown) {
       void toolCallId;
       void signal;
-      const result = validateTodos(params?.todos, allowParallelInProgress);
+      const result = validateTodos(params?.todos);
       if (!result.ok) {
         // A1: an invalid list is a hard failure — throw so pi flags isError for the model.
         return toolError(result.error ?? 'invalid todo list');
       }
-      let next = result.items!;
-      const strictNotes: string[] = [];
-      if (todos.config.strict) {
-        const strict = normalizeStrict(next);
-        const demoted = next
-          .filter((it, i) => it.status === 'in_progress' && strict[i]?.status === 'pending')
-          .map((it) => it.content);
-        const promoted = strict
-          .find((it, i) => it.status === 'in_progress' && next[i]?.status !== 'in_progress')?.content;
-        if (demoted.length > 0) strictNotes.push(`demoted to pending: ${demoted.join(', ')}`);
-        if (promoted) strictNotes.push(`auto-promoted to in_progress: ${promoted}`);
-        next = strict;
-      }
+      const next = result.items!;
       // D35: skip persistence and mirroring when the authoritative list is unchanged.
       if (listsEqual(todos.items, next)) {
         return { content: [{ type: 'text', text: 'No change: todo list already matches.' }], details: {} };
@@ -315,7 +302,6 @@ export default function todoPlugin(ctx: Context): void {
       if (reverted.length > 0) {
         lines.push(`Warning: previously completed item(s) reverted to open: ${reverted.join(' | ')} — is that intentional?`);
       }
-      for (const n of strictNotes) lines.push(`Normalized (strict mode): ${n}`);
       return {
         content: [{ type: 'text', text: lines.join('\n') }],
         details: {

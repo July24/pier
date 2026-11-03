@@ -58,7 +58,7 @@ export function parseDelegationContext(raw: string | undefined | null): Delegati
   }
 }
 
-/** env map for spawnPaneInTaskTab/createTab; JSON like the role manifest next to it. */
+/** env map for spawnWorker; JSON like the role manifest next to it. */
 export function delegationEnv(ctx: DelegationContext): Record<string, string> {
   return { [DELEGATION_ENV]: JSON.stringify(ctx) };
 }

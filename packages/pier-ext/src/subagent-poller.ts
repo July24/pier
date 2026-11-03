@@ -244,7 +244,7 @@ export function createPoller(h: PollerHost): Poller {
             h.blockedGateNotified.add(paneId);
             const question = await h.session.readAskFlag(paneId);
             try {
-              await h.injectNotice(buildBlockedGateNotice({ paneId, description: current.description, question }));
+              await h.injectNotice(buildBlockedGateNotice({ paneId, description: current.description, question }), paneId);
             } catch {
               /* list_agents can recover a missed notice */
             }
@@ -387,7 +387,7 @@ export function createPoller(h: PollerHost): Poller {
           consume('pane closed before settling', 'poll-pane-closed', now());
           const notes = h.reconcileOnSettlement(current.description, 'failed');
           try {
-            await h.injectNotice(h.withReconcileNotes(formatPaneClosedNotice(paneId, current.description), notes));
+            await h.injectNotice(h.withReconcileNotes(formatPaneClosedNotice(paneId, current.description), notes), paneId);
           } catch { /* non-fatal */ }
           return;
         }
@@ -404,7 +404,7 @@ export function createPoller(h: PollerHost): Poller {
             notes,
           );
           try {
-            await h.injectNotice(notice);
+            await h.injectNotice(notice, paneId);
           } catch { /* non-fatal */ }
           return;
         }

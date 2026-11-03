@@ -7,7 +7,6 @@
 import { isPlainObject } from './guards.ts';
 
 export type PermissionAction = 'allow' | 'ask' | 'deny';
-export type TodosMode = 'serial' | 'parallel';
 /** D82: stance for unknown tools—visibility is a trust relationship (user→master via install; master→delegated via mirror). */
 export type UnknownToolStance = 'allow' | 'deny';
 
@@ -30,11 +29,6 @@ export interface RoleManifest {
      */
     unknownTools?: UnknownToolStance;
   };
-  services?: {
-    todos?: {
-      mode?: TodosMode;
-    };
-  };
 }
 
 export type ValidateResult =
@@ -56,6 +50,7 @@ export function validateRoleManifest(input: unknown): ValidateResult {
     return { ok: false, code: 'INVALID_ROLE_CONFIG', issues: ['role manifest must be a JSON object'] };
   }
 
+  // `services` (todos serial/parallel mode) is retired; older profiles still carry it, so it is ignored.
   const KNOWN_TOP = new Set(['role', 'version', 'model', 'description', 'guidelines', 'manifest', 'services']);
   for (const k of Object.keys(input)) {
     if (!KNOWN_TOP.has(k)) issues.push(`unknown top-level key "${k}" (not in the contract; check spelling)`);
@@ -127,21 +122,6 @@ export function validateRoleManifest(input: unknown): ValidateResult {
           if (!ACTIONS.includes(v as PermissionAction)) {
             issues.push(`rules["${k}"] must be one of ${ACTIONS.join('/')}, got ${JSON.stringify(v)}`);
           }
-        }
-      }
-    }
-  }
-
-  if (input.services !== undefined) {
-    if (!isPlainObject(input.services)) {
-      issues.push('services must be an object');
-    } else if (input.services.todos !== undefined) {
-      const t = input.services.todos;
-      if (!isPlainObject(t)) {
-        issues.push('services.todos must be an object');
-      } else {
-        if (t.mode !== undefined && t.mode !== 'serial' && t.mode !== 'parallel') {
-          issues.push(`services.todos.mode must be serial/parallel, got ${JSON.stringify(t.mode)}`);
         }
       }
     }

@@ -17,6 +17,7 @@ import type { TodosService } from './todos-service.ts';
 import type { TodoUiSlot } from './plugins/todo.ts';
 import type { SubagentPortBox } from './subagent-core.ts';
 import type { WorkerWidgetRow } from './tree-view.ts';
+import type { NoticeBuffer } from './index-notices.ts';
 
 export interface MasterPluginMount {
   pi: ExtensionAPI;
@@ -30,6 +31,8 @@ export interface MasterPluginMount {
   pipeServerBox: { current: Server | null };
   deliverNotice: (content: string, paneId?: string) => Promise<void>;
   noticePending: () => ReadonlySet<string>;
+  takeNotices: NoticeBuffer['takeNotices'];
+  awaitNotice: NoticeBuffer['awaitNotice'];
   getSessionId: () => string;
   getBlockedDepth: () => number;
   reconcileOnSettlement: (description: string, outcome: 'settled' | 'failed') => string[];
@@ -109,6 +112,8 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
     port: m.port,
     deliverNotice: m.deliverNotice,
     noticePending: m.noticePending,
+    takeNotices: m.takeNotices,
+    awaitNotice: m.awaitNotice,
     getSessionId: m.getSessionId,
     reconcileOnSettlement: m.reconcileOnSettlement,
     withReconcileNotes: m.withReconcileNotes,

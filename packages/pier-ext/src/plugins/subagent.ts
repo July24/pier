@@ -1,6 +1,6 @@
 /**
  * subagent — master-only plugin entry: tool registration, action dispatch, the resume / send / interrupt /
- * output / role / list actions, and port binding. Inbound deps arrive via `pi-herdr.subagent-deps`; outbound
+ * output / list actions, and port binding. Inbound deps arrive via `pi-herdr.subagent-deps`; outbound
  * pipe/settle queries bind atomically onto `port.current`. Settlement reconcile stays in index session state
  * and is consumed here.
  */
@@ -23,7 +23,6 @@ import {
   rekeySub,
   resolveTaskIdPrefix,
   taskIdResolutionError,
-  tabNameForTask,
   subRef,
   type AliveProbe,
   type SubEntry,
@@ -52,6 +51,8 @@ import { createPoller } from '../subagent-poller.ts';
 import { createGcController, createSubagentRegistry } from '../subagent-gc.ts';
 import { createSessionIo, executeSubagentOutput, type SubagentOutputCursor } from '../subagent-session.ts';
 import type { RoutingTelemetryRecord } from '../routing-telemetry.ts';
+import { listRoleNames } from '../role-loader.ts';
+import type { NoticeBuffer } from '../index-notices.ts';
 
 type ToolParams = Record<string, unknown> | undefined;
 
@@ -71,6 +72,9 @@ export interface SubagentDeps {
   deliverNotice?: (content: string, paneId?: string) => Promise<void>;
   /** Panes whose settlement notice is still buffered (GC exemption). */
   noticePending?: () => ReadonlySet<string>;
+  /** `subagent wait`: drain / await buffered notices tagged with the waited panes. */
+  takeNotices?: NoticeBuffer['takeNotices'];
+  awaitNotice?: NoticeBuffer['awaitNotice'];
   /** Terminal-family GC exemption (live terminal panes are not collected). */
   terminalState: TerminalStateSlot;
   /** Optional jev seam (settle attribution check); absent → fail-open legacy behavior. */
@@ -82,10 +86,10 @@ export interface SubagentDeps {
 /** Sent with every request: what a call needs. Details live in SUBAGENT_MANUAL (`action: "help"`). */
 const SUBAGENT_DESCRIPTION = [
   'Delegate a self-contained task to a subagent: an isolated pi session in its own herdr terminal pane (separate context — it does NOT see this conversation; a human can talk to it in that pane).',
-  'Actions (default spawn): spawn | send | output | list | interrupt | resume | role | help.',
+  'Actions (default spawn): spawn | wait | send | output | list | interrupt | resume | help.',
   'spawn: `prompt` is the COMPLETE task, since only the prompt reaches it; `description` labels the pane and is the todo-reconcile key — when delegating a todo entry, pass its content without the ` <sub>` marker and the entry auto-completes on settle. Several spawns in one message run in parallel (max 4).',
-  'A foreground spawn BLOCKS this call for up to ~5 minutes; pass run_in_background: true for long tasks. A background (or timed-out foreground) worker\'s settlement notice arrives automatically at your next tool boundary — no need to sleep or poll.',
-  'send: follow-up to a running or settled worker (steered between its tool calls). output: what it printed since your last check, plus its final report once done. resume: revive a collected task by taskId. role: switch a worker\'s role profile mid-session.',
+  'A foreground spawn BLOCKS this call for up to ~5 minutes; pass run_in_background: true for long tasks. A background (or timed-out foreground) worker\'s settlement notice arrives automatically at your next tool boundary; when you have nothing else to do, call wait instead of sleeping or polling list/output.',
+  'wait: block until a worker (agentId) or any running worker settles or needs a human; returns its notice. send: follow-up to a running or settled worker (steered between its tool calls). output: what it printed since your last check, plus its final report once done (for checking a stuck worker). resume: revive a collected task by taskId.',
   'help: the full manual (isolate/cwd/tab placement, role profiles, the delegation ledger).',
 ].join(' ');
 
@@ -93,13 +97,15 @@ const SUBAGENT_DESCRIPTION = [
 const SUBAGENT_MANUAL = [
   'subagent manual',
   '',
-  'spawn — the subagent shares this workspace and works independently; its result is its final text answer. Do not delegate the current step itself. Placement: by default panes group by git worktree — a subagent in your checkout shares your tab, one in a separate worktree gets its own tab named after the worktree directory. `tab` joins or creates a named task tab instead. `cwd` targets an existing directory or worktree (create worktrees with git worktree add).',
+  'spawn — the subagent shares this workspace and works independently; its result is its final text answer. Do not delegate the current step itself. Placement: by default the subagent gets no pane — the Herdr app lists it under your agent (a human can peek at it and type there) and closing your terminal ends it. `tab` gives it a pane in a named task tab (joined or created; `main` = your own tab); it still ends with your terminal. `cwd` targets an existing directory or worktree (create worktrees with git worktree add).',
   '',
   'isolate (default false) — creates a FRESH git worktree (branch pier/<slug> from your HEAD under ~/.herdr/worktrees/<repo>/). Choose it for heavy independent writing in parallel with your own edits or other workers, or work needing its own clean reviewable diff; omit it for read-mostly or sequential helper work (shared checkout, writes guarded by the write-lock); use cwd for an existing directory/worktree. Its writes cannot conflict with your checkout, its prompt is prefixed with commit discipline (commit to its own branch, never push), and on settle you get a diff summary (commits since base, files changed, uncommitted count). Review with git log/diff HEAD..<branch>, merge with git merge --no-ff <branch>; once merged and clean the worktree auto-removes (branch kept). Mutually exclusive with cwd.',
   '',
-  'role + allowed_tools — when role matches a profile (searched: workspace .pi-herdr/roles/ → user-global ~/.pi/agent/herdr-pi/roles/ → builtin), the worker toolset becomes baseline ∪ allowed_tools minus role-deny tools (deny always wins). Custom roles: drop a JSON profile into .pi-herdr/roles/ (master/worker-default reserved). Unknown role names stay display labels. action role switches a live worker (pi transcript tool delta: applies on its next request, survives resume); the reply reports the tool diff.',
+  'role + allowed_tools — `role` picks a profile from the enum in the schema: built-in worker-default (the default) plus the custom JSON profiles found when pier loaded (workspace .pi-herdr/roles/ → user-global ~/.pi/agent/herdr-pi/roles/). The worker toolset becomes baseline ∪ allowed_tools minus role-deny tools (deny always wins). A live worker\'s role is switched by a human with /pier-role in its terminal.',
   '',
   'list — background subagents with live state (running / idle), pane ids, last activity, role and description; foreground one-shot panes are not listed.',
+  '',
+  'wait — blocks until a background worker settles, fails, closes or starts waiting on a human, and returns that notice (final report included) as the result; it is then not delivered again. `agentId` waits for one worker, omitted waits for any running one; `timeout_ms` default 600000, max 1800000. Returns at once when nothing is running or a target is already blocked on a human. Use it when you have nothing else to do — instead of sleep or repeated list/output calls.',
   '',
   'output — `agentId` required; returns the delta since your last output call (default 6000 chars, max_chars 100-16000) with status (running/idle/blocked/settled), revision and a truncated flag. TUI chrome is stripped; once the worker has finished, the complete transcript report is attached. A "buffer scrolled or reset" note means the full text was returned — normal for fullscreen TUI panes.',
   '',
@@ -109,6 +115,11 @@ const SUBAGENT_MANUAL = [
 ].join('\n');
 
 const SUBAGENT_CONCURRENCY = 4;
+/** wait: default and ceiling for one blocking call; ESC aborts it earlier. */
+const WAIT_DEFAULT_MS = 600_000;
+const WAIT_MAX_MS = 1_800_000;
+/** wait: re-derive the running set at least this often while parked. */
+const WAIT_RECHECK_MS = 15_000;
 
 function defaultAgentSessionsDir(): string {
   const base = process.env.PI_CODING_AGENT_DIR || platformPaths.agentDataDir;
@@ -270,7 +281,7 @@ export default function subagentPlugin(ctx: Context): void {
   gc.startTicker(ctx);
   scoped.on('turn_start', () => gc.onTurnStart());
   const { readAskFlag, probeAlive } = session;
-  const { spawnPaneInTaskTab, launchParts, approveFor, waitSubReady, findExistingPane } = spawn;
+  const { spawnWorker, launchParts, approveFor, waitSubReady, findExistingPane } = spawn;
 
   /** P0-2: re-arm pollers for live running panes after a master restart, or settle notices stop arriving
    * and ledger rows stay 'running'. The `recover-*` requestId is never echoed by a worker, so this claim wins. */
@@ -351,8 +362,9 @@ export default function subagentPlugin(ctx: Context): void {
     // D86 trust matches spawn; revive has no tool context, so use the process cwd.
     const approve = await approveFor(entry.cwd, process.cwd());
     const argv = launchParts(resumeFile, null, approve);
-    const spawned = await spawnPaneInTaskTab(
-      { desiredTab: entry.tabName || latest.tabName || null, description: entry.description },
+    const spawned = await spawnWorker(
+      // A revived worker keeps the placement it was spawned with ('' = no pane).
+      { desiredTab: entry.tabName || latest.tabName || null },
       entry.cwd,
       {
         PI_HERDR_SUBAGENT: '1',
@@ -501,7 +513,7 @@ export default function subagentPlugin(ctx: Context): void {
       const entry = entryFromHistory(latest, {
         paneId: existing?.paneId ?? '',
         tabId: existing?.tabId ?? '',
-        tabName: latest.tabName ?? tabNameForTask(latest.description),
+        tabName: latest.tabName ?? '',
         status: 'running',
         createdAt: Date.now(),
         consumedAt: null,
@@ -538,7 +550,6 @@ export default function subagentPlugin(ctx: Context): void {
       /** One request from the closed pipe protocol; its `type`/`id` drive the reply and settle keys. */
       build(): PipeRequest;
       ok(res: Extract<PipeResponse, { type: 'ok' }>, reqId: string): unknown;
-      fail?(paneId: string): string;
       ready?: false;
     },
   ): Promise<unknown> {
@@ -555,8 +566,7 @@ export default function subagentPlugin(ctx: Context): void {
       }
       return opts.ok(res, payload.id);
     } catch (err) {
-      const what = opts.fail?.(entry.paneId) ?? `failed to reach subagent ${entry.paneId}`;
-      return toolError(`Error: ${what}: ${(err as Error).message}`);
+      return toolError(`Error: failed to reach subagent ${entry.paneId}: ${(err as Error).message}`);
     }
   }
 
@@ -611,20 +621,6 @@ export default function subagentPlugin(ctx: Context): void {
     });
   }
 
-  async function executeSubagentRole(params: ToolParams, toolCtx: unknown) {
-    const roleName = String(params?.role ?? '').trim();
-    if (!roleName) return toolError('Error: action "role" requires a target profile in `role` (same resolution as spawn)');
-    const { entry } = targetOf(params, toolCtx);
-    return pipeAction(entry, {
-      fail: (id) => `failed to switch subagent ${id} to role ${roleName}`,
-      build: () => ({ type: 'role', id: `role-${Date.now()}`, role: roleName }),
-      ok: (res) => ({
-        content: [{ type: 'text', text: `Subagent ${entry.paneId}: ${res.detail ?? `switched to ${roleName}`}` }],
-        details: { paneId: entry.paneId, role: roleName },
-      }),
-    });
-  }
-
   /** Live background registry, newest row per task; closed rows stay visible so send can revive them. */
   async function executeSubagentList() {
     const listed = [...subs.values()].filter((sub) => sub.background);
@@ -671,6 +667,52 @@ export default function subagentPlugin(ctx: Context): void {
     return { content: [{ type: 'text', text: lines.join('\n') }], details: {} };
   }
 
+  /** Block until a waited worker produces a notice (settled, failed, closed, or waiting on a human),
+   *  then return those notices as the result. They are taken out of the turn-gap buffer, so the same
+   *  settlement is never delivered twice; notices for other workers stay queued. */
+  async function executeSubagentWait(params: ToolParams, toolCtx: unknown, signal?: AbortSignal) {
+    const { takeNotices, awaitNotice } = d;
+    if (!takeNotices || !awaitNotice) return toolError('Error: action "wait" needs the master settlement buffer');
+    const targets = idParam(params, 'agentId', 'taskId')
+      ? [targetOf(params, toolCtx).entry]
+      : [...subs.values()].filter((sub) => sub.background && sub.status === 'running');
+    const ids = new Set(targets.map((t) => t.paneId));
+    const requested = Number(params?.timeout_ms);
+    const timeoutMs = Number.isFinite(requested) && requested > 0 ? Math.min(requested, WAIT_MAX_MS) : WAIT_DEFAULT_MS;
+    const deadline = Date.now() + timeoutMs;
+    const reply = (text: string, outcome: string) => ({ content: [{ type: 'text', text }], details: { outcome } });
+
+    // A gate raised before this call already spent its one notice: report the live block directly.
+    for (const t of targets) {
+      if (t.status !== 'running') continue;
+      const probe = await probeAlive(t.paneId, t.cwd).catch(() => null);
+      if (probe?.agentStatus !== 'blocked') continue;
+      const question = await readAskFlag(t.paneId);
+      const gate = `${subRef(t)} (${t.description}) is AWAITING HUMAN${question ? `: "${question}"` : ' decision'} — the human answers in its terminal, or send it the decision.`;
+      return reply([...takeNotices(ids), gate].join('\n\n'), 'blocked');
+    }
+    while (true) {
+      const taken = takeNotices(ids);
+      if (taken.length > 0) return reply(taken.join('\n\n'), 'notice');
+      const running = targets.filter((t) => t.status === 'running');
+      if (running.length === 0) {
+        return reply(targets.length === 0
+          ? 'No background subagent is running.'
+          : `Not running: ${targets.map((t) => `${subRef(t)} [${t.status}]`).join(', ')} — its settlement was already delivered; output returns the final report.`, 'none');
+      }
+      const left = deadline - Date.now();
+      if (left <= 0 || signal?.aborted) {
+        return reply(
+          `Still running after ${Math.round(timeoutMs / 1000)}s${signal?.aborted ? ' (aborted)' : ''}: ${running.map((t) => `${subRef(t)} ${t.description}`).join('; ')}. Wait again, inspect one with output, or keep working — settlement notices still arrive on their own.`,
+          signal?.aborted ? 'aborted' : 'timeout',
+        );
+      }
+      // Re-derive the running set periodically: a worker that ends without a tagged notice
+      // (interrupted, or settled while the master was idle) must not hold the wait to its deadline.
+      await awaitNotice(ids, Math.min(left, WAIT_RECHECK_MS), signal);
+    }
+  }
+
   const executeSubagentSpawn = createSpawnAction({
     client,
     env,
@@ -705,27 +747,31 @@ export default function subagentPlugin(ctx: Context): void {
     persistSubs,
   };
 
-  const ACTIONS: Record<string, (params: ToolParams, toolCtx: unknown, onUpdate?: (u: unknown) => void) => Promise<unknown>> = {
+  const ACTIONS: Record<string, (params: ToolParams, toolCtx: unknown, onUpdate?: (u: unknown) => void, signal?: AbortSignal) => Promise<unknown>> = {
     spawn: (params, toolCtx, onUpdate) => executeSubagentSpawn(params, toolCtx, onUpdate),
     resume: (params) => executeSubagentResume(params),
     list: () => executeSubagentList(),
+    wait: (params, toolCtx, _onUpdate, signal) => executeSubagentWait(params, toolCtx, signal),
     send: (params, toolCtx) => executeSubagentSend(params, toolCtx),
     interrupt: (params, toolCtx) => executeSubagentInterrupt(params, toolCtx),
     output: (params, toolCtx) => executeSubagentOutput(params, toolCtx, outputActionDeps),
-    role: (params, toolCtx) => executeSubagentRole(params, toolCtx),
     help: async () => ({ content: [{ type: 'text', text: SUBAGENT_MANUAL }], details: {} }),
   };
+
+  // Custom profiles are listed once at load: an enum stops the model from inventing role names.
+  const spawnRoles = ['worker-default', ...listRoleNames(process.cwd())];
 
   scoped.registerTool({
     name: 'subagent',
     label: 'Subagent',
     // B4: the model picks tools from the system prompt's snippet/guideline surface; delegation
     // decisions are made here, so state them rather than hoping for recall.
-    promptSnippet: 'subagent: delegate a self-contained task to a pi worker pane (spawn/isolate/background/send/output/interrupt/resume/list/role/help).',
+    promptSnippet: 'subagent: delegate a self-contained task to a pi worker pane (spawn/isolate/background/wait/send/output/interrupt/resume/list/help).',
     promptGuidelines: [
       'Use subagent for self-contained work whose result is what matters: output that would flood this context, long builds/test runs, or independent parts of a bigger change that can run in parallel.',
       'The worker does not see this conversation: put paths, acceptance criteria, the test command and what to report back into the prompt.',
       'Use isolate: true when the worker writes files you or another worker edit at the same time, or when its work needs its own reviewable branch.',
+      'You arbitrate: check each worker result before merging it, have a different worker review critical conclusions, and give parallel workers distinct file bounds and output shapes.',
       'Pass agentId, taskId, message and max_chars as top-level arguments, not inside a parameters object.',
     ],
     description: SUBAGENT_DESCRIPTION,
@@ -734,10 +780,10 @@ export default function subagentPlugin(ctx: Context): void {
         Type.Literal('spawn'),
         Type.Literal('resume'),
         Type.Literal('list'),
+        Type.Literal('wait'),
         Type.Literal('send'),
         Type.Literal('interrupt'),
         Type.Literal('output'),
-        Type.Literal('role'),
         Type.Literal('help'),
       ], { description: 'Default spawn' })),
       description: Type.Optional(Type.String({ description: '[spawn] Pane label; also the todo-reconcile key' })),
@@ -745,11 +791,12 @@ export default function subagentPlugin(ctx: Context): void {
       run_in_background: Type.Optional(Type.Boolean({ description: '[spawn] Return at once; the settlement notice arrives later (default false)' })),
       cwd: Type.Optional(Type.String({ description: '[spawn] Existing directory or worktree to run in (absolute or workspace-relative); exclusive with isolate' })),
       isolate: Type.Optional(Type.Boolean({ description: '[spawn] Run in a fresh git worktree (branch pier/<slug>) for heavy parallel writes or a reviewable diff; settle reports a diff summary (see help)' })),
-      role: Type.Optional(Type.String({ description: '[spawn|role] Role profile name; unknown names are display labels only' })),
-      tab: Type.Optional(Type.String({ description: '[spawn] Task tab to join or create (default: grouped by worktree)' })),
+      role: Type.Optional(Type.Union(spawnRoles.map((name) => Type.Literal(name)), { description: '[spawn] Role profile (default worker-default)' })),
+      tab: Type.Optional(Type.String({ description: '[spawn] Give the worker a pane in this task tab (joined or created; "main" = your tab). Default: no pane, listed under your agent' })),
       allowed_tools: Type.Optional(Type.Array(Type.String(), { description: '[spawn] Extra tools on top of the role baseline' })),
       taskId: Type.Optional(Type.String({ description: '[resume] Task id from the delegation ledger' })),
-      agentId: Type.Optional(Type.String({ description: '[send|interrupt|output|role] Slug, pane id, or slug@paneId as printed by spawn/list' })),
+      agentId: Type.Optional(Type.String({ description: '[send|interrupt|output|wait] Slug, pane id, or slug@paneId as printed by spawn/list' })),
+      timeout_ms: Type.Optional(Type.Integer({ description: `[wait] Default ${WAIT_DEFAULT_MS}, max ${WAIT_MAX_MS}` })),
       message: Type.Optional(Type.String({ description: '[send] Follow-up message' })),
       max_chars: Type.Optional(Type.Integer({ description: '[output] Output cap (default 6000, 100-16000)' })),
     }),
@@ -763,14 +810,13 @@ export default function subagentPlugin(ctx: Context): void {
     },
     async execute(toolCallId: string, params: ToolParams, signal: AbortSignal | undefined, onUpdate: ((update: unknown) => void) | undefined, toolCtx: unknown) {
       void toolCallId;
-      void signal;
       const flat = flattenToolParams(params);
       const action = typeof flat?.action === 'string' && flat.action.trim() ? flat.action.trim() : 'spawn';
       const handler = ACTIONS[action];
       if (!handler) {
         return toolError(`Error: unknown action "${action}" (valid: ${Object.keys(ACTIONS).join(', ')})`);
       }
-      return attachSubagentStructuredContent(action, await handler(flat, toolCtx, onUpdate));
+      return attachSubagentStructuredContent(action, await handler(flat, toolCtx, onUpdate, signal));
     },
   });
 }

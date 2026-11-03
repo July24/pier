@@ -3,7 +3,7 @@ import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   TODO_ARCHIVE_WINDOW_CUSTOM_TYPE, applyTodoEdits, boundedView, completionTransitions, currentActivity,
-  foldLatestTodosMeta, fuzzyFind, listsEqual, normalizeStrict, revertedCompleted, todoListHash, validateTodos,
+  foldLatestTodosMeta, fuzzyFind, listsEqual, revertedCompleted, todoListHash, validateTodos,
   type TodoItem,
 } from '../src/todo-core.ts';
 import { planTodoReadHook } from '../src/todo-read-hook.ts';
@@ -65,39 +65,18 @@ test('validateTodos: 硬拒矩阵（形状/字段/类型畸形）', () => {
     assert.equal(res.ok, false, `${name}: 必须拒`); assert.match(res.error!, expected, name);
   }
 });
-test('validateTodos: in_progress 并行策略（默认允许多条，serial 模式拒第 2 条）', () => {
+test('validateTodos: 多条 in_progress 一律放行（master 与 worker 同一规则）', () => {
   const two = [
     { content: 'a', status: 'in_progress' },
     { content: 'b', status: 'in_progress' },
   ];
-  assert.equal(validateTodos(two).ok, true, 'pi 工具并行执行的常态');
-  const res = validateTodos(two, false);
-  assert.equal(res.ok, false); assert.match(res.error!, /at most one task may be in_progress \(got 2\)/);
+  assert.equal(validateTodos(two).ok, true);
 });
 test('validateTodos: blocker 归一（非 blocked 态丢弃；空串视为缺省）', () => {
   const drop = validateTodos([{ content: 'a', status: 'completed', blocker: 'x' }]);
   assert.equal(drop.ok, true); assert.equal('blocker' in (drop as { items: TodoItem[] }).items[0], false);
   assert.equal(validateTodos([{ content: 'a', status: 'completed', blocker: '' }]).ok, true);
   assert.equal((validateTodos([{ content: 'a', status: 'blocked', blocker: '等审核' }]) as { items: TodoItem[] }).items[0].blocker, '等审核');
-});
-test('normalizeStrict: 多条 in_progress 保留第一条；无 in_progress 自动晋升第一条 pending', () => {
-  assert.deepEqual(normalizeStrict([
-    { content: 'a', status: 'in_progress' },
-    { content: 'b', status: 'in_progress' },
-    { content: 'c', status: 'pending' },
-  ]), [
-    { content: 'a', status: 'in_progress' },
-    { content: 'b', status: 'pending' },
-    { content: 'c', status: 'pending' },
-  ]);
-  assert.deepEqual(normalizeStrict([ // blocked/abandoned do not take part in promotion
-    { content: 'a', status: 'blocked', blocker: 'x' },
-    { content: 'b', status: 'pending' },
-  ]), [
-    { content: 'a', status: 'blocked', blocker: 'x' },
-    { content: 'b', status: 'in_progress' },
-  ]);
-  assert.deepEqual(normalizeStrict([{ content: 'a', status: 'completed' }]), [{ content: 'a', status: 'completed' }]); assert.deepEqual(normalizeStrict([]), []);
 });
 test('listsEqual: 全等判定（含 blocker/phase/长度）', () => {
   assert.equal(listsEqual([{ content: 'a', status: 'pending' }], [{ content: 'a', status: 'pending' }]), true);
@@ -375,27 +354,10 @@ test('stop 提醒文案：对账请求而非祈使——问用户是一等出口
   assert.match(content, /todo_write/);
 });
 
-/* ── todos-service: role-config resolution, rebuild, anti-freeze clock ── */
+/* ── todos-service: rebuild, anti-freeze clock ── */
 describe('todos-service', () => {
-  type Manifest = Parameters<typeof TodosService.configFromRuntime>[0];
-  const PARALLEL_MANIFEST = { role: 'x', tools: [], permissions: {}, services: { todos: { mode: 'parallel' } } } as Manifest;
-  const SERIAL_MANIFEST = { role: 'x', tools: [], permissions: {}, services: { todos: { mode: 'serial' } } } as Manifest;
-  const CONFIG_CASES: Array<[string, Manifest | null, boolean, { strict: boolean; allowParallelInProgress: boolean }]> = [
-    ['worker 无 manifest → strict serial（v1 语义保持）', null, true, { strict: true, allowParallelInProgress: false }],
-    ['master 无 manifest → parallel', null, false, { strict: false, allowParallelInProgress: true }],
-    ['worker 档案 mode=serial → 保持 serial', SERIAL_MANIFEST, true, { strict: true, allowParallelInProgress: false }],
-    // An explicit mode declaration beats the process default in both directions.
-    ['worker 档案 mode=parallel → 放行', PARALLEL_MANIFEST, true, { strict: true, allowParallelInProgress: true }],
-    ['master 档案 mode=parallel → 放行', PARALLEL_MANIFEST, false, { strict: false, allowParallelInProgress: true }],
-  ];
-  test('configFromRuntime: 进程默认 vs manifest services.todos.mode（显式声明优先）', () => {
-    for (const [name, manifest, isSubagent, expected] of CONFIG_CASES) {
-      const cfg = TodosService.configFromRuntime(manifest, isSubagent);
-      assert.equal(cfg.strict, expected.strict, `${name}: strict`); assert.equal(cfg.allowParallelInProgress, expected.allowParallelInProgress, `${name}: allowParallel`);
-    }
-  });
   test('replace/applyEdits: 状态迁移 + 事件；no-op 跳过时钟与事件', () => {
-    const svc = new TodosService(TodosService.configFromRuntime(null, false));
+    const svc = new TodosService();
     const updated: unknown[] = [];
     const edited: unknown[] = [];
     svc.on('todo.updated', (e) => updated.push(e));
@@ -411,7 +373,7 @@ describe('todos-service', () => {
     assert.equal(edited.length, 1); assert.equal(svc.lastWriteAt, t1);
   });
   test('rebuild + 反冻结：从分支折叠落定权威列表；lastWriteAt 三路径锚定', () => {
-    const svc = new TodosService(TodosService.configFromRuntime(null, false));
+    const svc = new TodosService();
     assert.equal(svc.lastWriteAt, null); // unknown start → conservative staleness
     svc.replace([{ content: 'a', status: 'pending' }]);
     assert.ok(typeof svc.lastWriteAt === 'number');
@@ -435,7 +397,7 @@ describe('todos-service', () => {
     assert.equal(svc.lastWriteAt, null);
   });
   test('rebuild: 归档重写窗口标记按列表身份折叠；列表一变即失效', () => {
-    const svc = new TodosService(TodosService.configFromRuntime(null, false));
+    const svc = new TodosService();
     const iso = '2026-08-24T09:11:20.291Z';
     const items: TodoItem[] = [{ content: 'B', status: 'completed' }];
     const marker = (list: readonly TodoItem[] = items) => ({

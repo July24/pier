@@ -13,6 +13,7 @@ import {
   type SubagentOutputCursor,
 } from '../src/subagent-session.ts';
 import { appendHistory } from '../src/history-store.ts';
+import { createNoticeBuffer, type NoticeBuffer } from '../src/index-notices.ts';
 import { preferredHistoryFile } from '../src/storage-layout.ts';
 import {
   TempHome, fakeCore, fire, jsonl, mountSubagent, runSubagent, runSubagentRejects, subsSnapshot, subEntry, terminalInfo,
@@ -588,4 +589,47 @@ test('session recovery: a still-running subagent gets its settlement watch re-ar
     await root.fiber.dispose();
     home.dispose();
   }
+});
+
+/* ── wait action ────────────────────────────────────────────────── */
+
+/** Mounts the plugin with a busy master's real notice buffer (a tool call is in flight). */
+async function withWaitBuffer(status: string, body: (pi: FakePi, buf: NoticeBuffer, sent: string[]) => Promise<void>) {
+  const sent: string[] = [];
+  const buf = createNoticeBuffer({ isBusy: () => true, send: async (content) => { sent.push(content); } });
+  const { root, pi } = await mountSubagent({
+    client: { ...NO_TERMINALS, getTerminal: async (id) => terminalInfo({ id, status: status as never }) },
+    subs: [worker('pA'), worker('pB')],
+    deps: { deliverNotice: buf.deliverNotice, takeNotices: buf.takeNotices, awaitNotice: buf.awaitNotice },
+  });
+  try {
+    await body(pi, buf, sent);
+  } finally {
+    await root.fiber.dispose();
+  }
+}
+
+test('wait action: returns the waited worker\'s notice as the result and never delivers it again', () =>
+  withWaitBuffer('working', async (pi, buf, sent) => {
+    const waiting = runSubagent(pi, { action: 'wait' });
+    await buf.deliverNotice('Background subagent pB finished. Its closing message: done', 'pB');
+    const res = await waiting;
+    assert.equal(res.details?.outcome, 'notice');
+    assert.match(res.content[0]!.text, /pB finished/);
+    await buf.deliverNotice('pA finished later', 'pA');
+    await buf.flush('followUp');
+    assert.deepEqual(sent, ['pA finished later'], 'the waited notice is not flushed a second time');
+  }));
+
+test('wait action: a worker already blocked on a human returns at once; a deadline returns the still-running set', async () => {
+  await withWaitBuffer('blocked', async (pi) => {
+    const res = await runSubagent(pi, { action: 'wait', agentId: 'pA' });
+    assert.equal(res.details?.outcome, 'blocked');
+    assert.match(res.content[0]!.text, /AWAITING HUMAN/);
+  });
+  await withWaitBuffer('working', async (pi) => {
+    const res = await runSubagent(pi, { action: 'wait', agentId: 'pA', timeout_ms: 20 });
+    assert.equal(res.details?.outcome, 'timeout');
+    assert.match(res.content[0]!.text, /Still running after .*pA/);
+  });
 });

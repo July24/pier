@@ -15,7 +15,7 @@ export interface ManifestSources {
 }
 
 /** What composeManifest produces: the runtime manifest minus the identity/section fields. */
-export type ComposedManifest = Omit<RuntimeRoleManifest, 'role' | 'version' | 'services' | 'guidelines'>;
+export type ComposedManifest = Omit<RuntimeRoleManifest, 'role' | 'version' | 'guidelines'>;
 
 export class ManifestError extends Error {
   readonly code: 'EMPTY_MANIFEST' | 'INVALID_ROLE_CONFIG';
@@ -97,7 +97,6 @@ export function toRuntimeManifest(composed: ComposedForRole): RuntimeRoleManifes
     tools: manifest.tools,
     permissions: manifest.permissions,
     unknownTools: manifest.unknownTools,
-    services: role.services ?? {},
     ...(role.guidelines?.length ? { guidelines: role.guidelines } : {}),
   };
 }

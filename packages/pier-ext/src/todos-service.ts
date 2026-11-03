@@ -1,12 +1,6 @@
 /** Single owner of todo state; every mutation path (tool, human edit, M17 reconcile, archive) lands here (D65, D75). */
 import { EventEmitter } from 'node:events';
 import { applyTodoEdits, completionTransitions, foldLatestTodosMeta, listsEqual, type TodoEdit, type TodoItem } from './todo-core.ts';
-import type { RuntimeRoleManifest } from './tool-gate.ts';
-
-export interface TodosConfig {
-  strict: boolean;
-  allowParallelInProgress: boolean;
-}
 
 export type TodoCompletionSource = 'tool' | 'reconcile' | 'human' | 'archive';
 
@@ -26,22 +20,6 @@ export class TodosService extends EventEmitter {
   }
   markArchiveWindowOffered(): void {
     this._archiveWindowOffered = true;
-  }
-  readonly config: TodosConfig;
-
-  constructor(config: TodosConfig) {
-    super();
-    this.config = config;
-  }
-
-  /** D75: subagents are strict (one in_progress); the role manifest may force parallel mode. */
-  static configFromRuntime(manifest: RuntimeRoleManifest | null, isSubagent: boolean): TodosConfig {
-    const strict = isSubagent;
-    const mode = manifest?.services?.todos?.mode;
-    return {
-      strict,
-      allowParallelInProgress: mode === 'parallel' || mode === 'serial' ? mode === 'parallel' : !strict,
-    };
   }
 
   replace(items: readonly TodoItem[], opts?: { source?: TodoCompletionSource }): { changed: boolean } {

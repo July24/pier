@@ -4,6 +4,7 @@
  * pi surface, the herdr-core client/environment and the state slot used by index GC; terminal-core holds the
  * pure, independently testable logic.
  */
+import { randomBytes } from 'node:crypto';
 import { open } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { resolve as resolvePath } from 'node:path';
@@ -45,8 +46,11 @@ import {
   stripAnsi,
   summarizeSessions,
   terminalReminderGraceMs,
+  TRUNCATE_MARKER,
   validateSendText,
   validateSignal,
+  withExitSentinel,
+  parseExitSentinel,
   type ReadCursor,
   type TerminalEntry,
 } from '../terminal-core.ts';
@@ -272,12 +276,12 @@ export default function terminalPlugin(ctx: Context): void {
     description: [
       'Persistent interactive shells in dedicated Herdr terminals; cwd, environment and background processes survive across calls.',
       'Actions: open, send (type a command), wait (block until output matches), read, signal (ctrl+c/ctrl+d/ctrl+z/esc/enter), close, list.',
-      'Long job: send "cmd; echo TERM_DONE_$?" and wait with regex "^TERM_DONE_[0-9]" — the shell echoes typed commands, so a literal "TERM_DONE_" would match its own echo. When output and sentinel go to a log ("cmd > run.log 2>&1; echo DONE_$? >> run.log"), wait with file: "run.log" instead of sleeping in bash.',
+      'A command that finishes: send with wait: true — it returns the exit code and the output, no sentinel needed. Output that appears without the command ending (a server\'s "listening on"): wait with pattern. A job logging to a file: wait with file instead of sleeping in bash.',
     ].join(' '),
     promptSnippet: 'terminal: a persistent shell in its own Herdr pane — use for dev servers, REPLs, and multi-step shell work that must keep state between calls.',
     promptGuidelines: [
       'Prefer bash for one-shot commands. Use terminal only when state must persist (server, REPL, watch loop, interactive prompt) or output appears later; open once and reuse the terminal_id.',
-      'wait returns the recent tail on timeout, so decide from it instead of re-polling.',
+      'send with wait: true returns when the command ends; wait returns the recent tail on timeout — decide from it instead of re-polling.',
       'Close the terminal when the work is done — it occupies a pane and is never auto-reclaimed.',
     ],
     parameters: Type.Object({
@@ -285,11 +289,11 @@ export default function terminalPlugin(ctx: Context): void {
       cwd: Type.Optional(Type.String({ description: '[open] Shell working directory (default: session cwd)' })),
       terminal_id: Type.Optional(Type.String({ description: '[open] Optional id for the new terminal (default term-N); [others] id returned by open' })),
       text: Type.Optional(Type.String({ description: '[send] Command text (Enter appended; multi-line runs line by line)' })),
+      wait: Type.Optional(Type.Boolean({ description: '[send] Block until the command finishes; returns its exit code and output (pier appends the exit sentinel)' })),
       pattern: Type.Optional(Type.String({ description: '[wait] Literal text or regex to wait for (must not occur in the sent command text)' })),
       file: Type.Optional(Type.String({ description: '[wait] Watch this log file instead of the terminal (relative to its cwd; may not exist yet)' })),
       regex: Type.Optional(Type.Boolean({ description: '[wait] pattern is a regex (default literal)' })),
-      timeout_ms: Type.Optional(Type.Number({ description: '[wait] Default 120000, max 600000' })),
-      pane_id: Type.Optional(Type.String({ description: '[read] Read another terminal in your own tab' })),
+      timeout_ms: Type.Optional(Type.Number({ description: '[wait, send wait] Default 120000, max 600000' })),
       max_chars: Type.Optional(Type.Number({ description: `[read] Output cap (default ${READ_MAX_CHARS})` })),
       key: Type.Optional(Type.String({ description: '[signal] ctrl+c | ctrl+d | ctrl+z | esc | enter' })),
     }),
@@ -363,7 +367,7 @@ export default function terminalPlugin(ctx: Context): void {
     return { content: [{ type: 'text', text }], details: { terminal_id: r.entry.terminalId, pane_id: info.id, status: info.status } };
   }
 
-  async function executeTerminalSend(params: ToolParams) {
+  async function executeTerminalSend(params: ToolParams, _ctx?: unknown, signal?: AbortSignal) {
     const entry = findOpenTerminal(params?.terminal_id);
     if (!entry) return fail(`unknown or closed terminal "${String(params?.terminal_id)}" (see action list)`);
     const v = validateSendText(typeof params?.text === 'string' ? params.text : '');
@@ -374,8 +378,19 @@ export default function terminalPlugin(ctx: Context): void {
         persistTerminals();
       }
     }
+    // wait: true needs the screen as it was before the send, so the result holds only this run's output.
+    let before: ReadCursor | null = null;
+    const nonce = params?.wait === true ? randomBytes(4).toString('hex') : null;
+    const text = nonce === null ? v.text : withExitSentinel(v.text, nonce, promptStrategyFor());
+    if (nonce !== null) {
+      try {
+        before = computeIncrement(null, { text: stripAnsi((await client.read(entry.paneId, { lines: SCREEN_HISTORY_LINES })).text) }, 1).cursor;
+      } catch {
+        /* No baseline: the whole screen counts as this run's output. */
+      }
+    }
     try {
-      await client.send(entry.paneId, v.text);
+      await client.send(entry.paneId, text);
     } catch (e) {
       if (isCoreErrorKind(e, 'blocked')) {
         return fail(
@@ -390,7 +405,7 @@ export default function terminalPlugin(ctx: Context): void {
     }
     // In-memory only (never persisted): the wait echo-hazard check needs the text this pane last
     // received, because the shell echoes typed commands back into the pane.
-    lastSentText.set(entry.terminalId, v.text);
+    lastSentText.set(entry.terminalId, text);
     touchTerminal(entry);
     // An incomplete command leaves the shell at a secondary prompt (`dquote>`, `heredoc>`, …):
     // every later send is swallowed by it, so surface the wedge instead of reporting success.
@@ -408,12 +423,65 @@ export default function terminalPlugin(ctx: Context): void {
           + 'terminal(action: "signal", key: "ctrl+c"), then re-send a complete command.',
       );
     }
+    if (nonce !== null) return awaitExitSentinel(entry, nonce, before, params, signal);
     const hint = redirectedSentinel(v.text);
     const fileHint = hint
       ? `\nnote: the sentinel ${hint.prefix}$? is written to ${hint.file}, not the pane — wait for it with `
         + `terminal(action: "wait", terminal_id: "${entry.terminalId}", file: "${hint.file}", pattern: "${echoSafeWaitSuggestion(hint.prefix) ?? hint.prefix}", regex: true) instead of sleeping.`
       : '';
     return { content: [{ type: 'text', text: `sent to ${entry.terminalId} (${v.text.length} chars)${fileHint}` }], details: { terminal_id: entry.terminalId } };
+  }
+
+  /** `send` with `wait: true`: poll the screen until this run's sentinel prints, then hand back the
+   *  exit status and the output since the send. The read cursor moves past it, so a later `read`
+   *  does not repeat it; on timeout it stays, and the returned `wait` call picks the run up. */
+  async function awaitExitSentinel(entry: TerminalEntry, nonce: string, before: ReadCursor | null, params: ToolParams, signal?: AbortSignal) {
+    const requested = typeof params?.timeout_ms === 'number' && params.timeout_ms > 0 ? params.timeout_ms : WAIT_DEFAULT_MS;
+    const timeoutMs = Math.min(Math.max(requested, 1000), WAIT_MAX_MS);
+    const started = Date.now();
+    let screen = '';
+    while (true) {
+      try {
+        screen = stripAnsi((await client.read(entry.paneId, { lines: SCREEN_HISTORY_LINES })).text);
+      } catch (e) {
+        return fail(coreUnavailableHint(e) ?? `wait failed (terminal may be closed): ${errText(e)}`);
+      }
+      const inc = computeIncrement(before, { text: screen }, screen.length + 1);
+      const run = parseExitSentinel(inc.mode === 'none' ? '' : inc.text, nonce);
+      if (run) {
+        storeReadCursor(entry, computeIncrement(readCursorOf(entry), { text: screen }, 1).cursor);
+        const output = run.output.length > TERM_READ_MAX ? `${TRUNCATE_MARKER}\n${run.output.slice(-TERM_READ_MAX)}` : run.output;
+        const status = run.exitCode === null ? 'finished (no exit code)' : `exit ${run.exitCode}`;
+        return {
+          content: [{ type: 'text', text: `${status} in ${entry.terminalId} after ${Math.round((Date.now() - started) / 1000)}s${output ? `:\n${output}` : ' (no output)'}` }],
+          details: { terminal_id: entry.terminalId, exit_code: run.exitCode },
+        };
+      }
+      const left = started + timeoutMs - Date.now();
+      if (left <= 0 || signal?.aborted) break;
+      const { promise, resolve } = Promise.withResolvers<void>();
+      setTimeout(resolve, Math.min(REGEX_WAIT_POLL_MS, left));
+      await promise;
+    }
+    const reason = signal?.aborted ? 'aborted' : 'timeout';
+    return {
+      content: [{
+        type: 'text',
+        text: `still running in ${entry.terminalId} after ${Math.round((Date.now() - started) / 1000)}s (${reason}) — do NOT re-send it. Keep waiting with `
+          + `terminal(action: "wait", terminal_id: "${entry.terminalId}", pattern: "^__PIER_${nonce}_[0-9]*__$", regex: true), or interrupt with signal ctrl+c.`
+          + `${screen ? `\nrecent output tail:\n${screen.slice(-WAIT_TAIL_CHARS)}` : ''}`,
+      }],
+      details: { terminal_id: entry.terminalId, exit_code: null, reason },
+    };
+  }
+
+  /** `read` and a finished `send` wait are the cursor's writers. */
+  function storeReadCursor(entry: TerminalEntry, cursor: ReadCursor): void {
+    entry.readLen = cursor.len;
+    entry.readTail = cursor.tail;
+    entry.readTextLen = cursor.textLen;
+    entry.readTextHash = cursor.textHash;
+    touchTerminal(entry);
   }
 
   async function executeTerminalWait(params: ToolParams, _ctx?: unknown, signal?: AbortSignal) {
@@ -605,46 +673,11 @@ export default function terminalPlugin(ctx: Context): void {
     };
   }
 
-  /** T5: a direct `pane_id` read is limited to terminals in this session's own app tab or to self-created
-   *  terminal panes, so one task can never read another's pane. Returns the error text instead of throwing. */
-  async function resolveDirectPaneId(paneId: string): Promise<{ ok: true; paneId: string } | { ok: false; error: string }> {
-    let live: TerminalInfo[];
-    try {
-      live = await client.listTerminals();
-    } catch (e) {
-      return { ok: false, error: coreUnavailableHint(e) ?? `terminal lookup failed: ${errText(e)}` };
-    }
-    const target = live.find((t) => t.id === paneId);
-    let ownTab = false;
-    if (target) {
-      try {
-        const placement = await client.placementLabels();
-        ownTab = Boolean(target.labels['herdr.tab'])
-          && target.labels['herdr.tab'] === placement['herdr.tab'];
-      } catch {
-        /* An unavailable placement probe leaves only self-created terminals readable. */
-      }
-    }
-    if (!target || !(ownTab || activeTerminalPaneIds(terminals).has(paneId))) {
-      return { ok: false, error: 'pane_id read is limited to panes in this session\'s own tab or self-created terminal panes' };
-    }
-    return { ok: true, paneId };
-  }
-
   async function executeTerminalRead(params: ToolParams) {
-    let paneId: string;
-    let entry: TerminalEntry | null = null;
-    if (typeof params?.terminal_id === 'string') {
-      entry = findOpenTerminal(params.terminal_id);
-      if (!entry) return fail(`unknown or closed terminal "${params.terminal_id}" (see action list)`);
-      paneId = entry.paneId;
-    } else if (typeof params?.pane_id === 'string') {
-      const resolved = await resolveDirectPaneId(params.pane_id);
-      if (!resolved.ok) return fail(resolved.error);
-      paneId = resolved.paneId;
-    } else {
-      return fail('provide terminal_id (or pane_id for a direct own-tab read)');
-    }
+    if (typeof params?.terminal_id !== 'string') return fail('provide terminal_id');
+    const entry = findOpenTerminal(params.terminal_id);
+    if (!entry) return fail(`unknown or closed terminal "${params.terminal_id}" (see action list)`);
+    const paneId = entry.paneId;
     const maxChars = typeof params?.max_chars === 'number' && params.max_chars > 0
       ? Math.min(params.max_chars, TERM_READ_MAX) : TERM_READ_MAX;
     let read: { text: string; complete: boolean };
@@ -670,15 +703,8 @@ export default function terminalPlugin(ctx: Context): void {
     // Cursor and output are both ANSI-stripped, so a wait's fresh/stale classification compares like
     // with like (`read` is the only writer of the cursor).
     const screen = stripAnsi(read.text);
-    const prev: ReadCursor | null = entry ? readCursorOf(entry) : null;
-    const inc = computeIncrement(prev, { text: screen }, maxChars);
-    if (entry) {
-      entry.readLen = inc.cursor.len;
-      entry.readTail = inc.cursor.tail;
-      entry.readTextLen = inc.cursor.textLen;
-      entry.readTextHash = inc.cursor.textHash;
-      touchTerminal(entry);
-    }
+    const inc = computeIncrement(readCursorOf(entry), { text: screen }, maxChars);
+    storeReadCursor(entry, inc.cursor);
     if (inc.mode === 'none') {
       return { content: [{ type: 'text', text: 'no new output' }], details: { mode: 'none', complete: read.complete } };
     }

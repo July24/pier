@@ -39,13 +39,9 @@ export interface TodoValidationResult {
   error?: string;
 }
 
-export function validateTodos(
-  todos: unknown,
-  allowParallelInProgress = true,
-): TodoValidationResult {
+export function validateTodos(todos: unknown): TodoValidationResult {
   if (!Array.isArray(todos)) return { ok: false, error: 'invalid todos: `todos` must be an array' };
   const seen = new Set<string>();
-  let inProgress = 0;
   const items: TodoItem[] = [];
   for (const raw of todos) {
     if (typeof raw !== 'object' || raw === null) return { ok: false, error: 'invalid todos: each todo must be an object' };
@@ -91,29 +87,9 @@ export function validateTodos(
         if (phase.trim() !== '') item.phase = phase;
       }
     }
-    if (status === 'in_progress' && ++inProgress > 1 && !allowParallelInProgress) {
-      return { ok: false, error: `invalid todos: at most one task may be in_progress (got ${inProgress})` };
-    }
     items.push(item);
   }
   return { ok: true, items };
-}
-
-/** Keep exactly one in_progress item, promoting the first pending one when none exists (D42). */
-export function normalizeStrict(items: readonly TodoItem[]): TodoItem[] {
-  if (items.length === 0) return [];
-  const out = items.map((it) => ({ ...it }));
-  let kept = false;
-  for (const it of out) {
-    if (it.status !== 'in_progress') continue;
-    if (kept) it.status = 'pending';
-    else kept = true;
-  }
-  if (!kept) {
-    const firstPending = out.find((it) => it.status === 'pending');
-    if (firstPending) firstPending.status = 'in_progress';
-  }
-  return out;
 }
 
 export function listsEqual(a: readonly TodoItem[], b: readonly TodoItem[]): boolean {

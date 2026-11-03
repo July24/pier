@@ -234,6 +234,29 @@ export function redirectedSentinel(text: string): { prefix: string; file: string
   return m ? { prefix: m[1]!, file: m[3]! } : null;
 }
 
+/** `send` with `wait: true`: the command plus an exit sentinel the model never has to write. The
+ *  sentinel line is `__PIER_<nonce>_<exit>__` on a line of its own; the typed form shows `%s` / `$(…)`
+ *  where the digits go, so the shell's echo of the command can never match it. */
+export function withExitSentinel(text: string, nonce: string, strategy: PromptStrategy): string {
+  const sentinel = strategy.family === 'powershell'
+    ? `"\`n__PIER_${nonce}_$(if ($?) { 0 } elseif ($LASTEXITCODE) { $LASTEXITCODE } else { 1 })__"`
+    : `printf '\\n__PIER_${nonce}_%s__\\n' "$?"`;
+  const body = text.replace(/[\s;]+$/, '');
+  // Joining with `;` keeps the sentinel out of the command's stdin. A trailing comment would swallow
+  // it and `cmd &;` is a syntax error, so those (and multi-line text) put it on its own line.
+  const ownLine = body.includes('\n') || / #/.test(body) || /[^&]&$/.test(body);
+  return `${body}${ownLine ? '\n' : '; '}${sentinel}`;
+}
+
+/** The sentinel line in pane text: exit status (null when PowerShell had none) and the output before
+ *  it, minus the typed lines that carry the nonce. Null until the sentinel has printed. */
+export function parseExitSentinel(paneText: string, nonce: string): { exitCode: number | null; output: string } | null {
+  const hit = new RegExp(`^__PIER_${nonce}_([0-9]*)__$`, 'm').exec(paneText);
+  if (!hit) return null;
+  const output = paneText.slice(0, hit.index).split('\n').filter((line) => !line.includes(`__PIER_${nonce}_`)).join('\n');
+  return { exitCode: hit[1] ? Number(hit[1]) : null, output: output.replace(/\n+$/, '') };
+}
+
 /**
  * Whether a wait pattern would match the terminal's own echoed input: the shell echoes typed
  * commands into the pane, so a pattern contained in the last sent text (`…; echo TERM_DONE_$?`

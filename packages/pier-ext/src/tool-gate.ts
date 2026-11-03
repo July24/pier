@@ -12,11 +12,6 @@ export interface RuntimeRoleManifest {
   permissions: Record<string, PermissionAction>;
   /** Stance for tools outside `tools`; 'allow' keeps user-installed extensions visible (D82). */
   unknownTools?: UnknownToolStance;
-  services?: {
-    todos?: {
-      mode?: 'serial' | 'parallel';
-    };
-  };
   /** P0 per-role guidelines (RFC §4.6): injected as a `pier-role` prompt section each turn. */
   guidelines?: string[];
 }

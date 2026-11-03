@@ -380,18 +380,16 @@ test('tabNameForTask: collapse, truncate, fall back', () => {
   assert.equal(tabNameForTask('   '), 'task');
 });
 
-test('planTabPlacement: a named tab or a worktree gets its own stable app tab; the main checkout joins the master', () => {
+test('planTabPlacement: no tab means no pane; a named tab gets a stable app tab; main joins the master', () => {
   const cases: Array<[string, Parameters<typeof planTabPlacement>[0], unknown]> = [
-    ['an explicit tab is its own tab', { desiredTab: '调研', description: 'x' }, { tabName: '调研', tabId: 'tbpier-' + fnvSlug('调研') }],
-    ['the same tab name always maps to the same app tab', { desiredTab: 'Spike Two', description: 'x' }, { tabName: 'Spike Two', tabId: 'tbpier-spike-two' }],
-    ['a whitespace-only tab name counts as absent', { desiredTab: '   ', description: 'spike', zone: { zone: 'main', tabName: null } }, { tabName: MAIN_TAB_NAME, tabId: null }],
-    ['the main checkout joins the master tab', { description: '现状', zone: { zone: 'main', tabName: null } }, { tabName: MAIN_TAB_NAME, tabId: null }],
-    ['a worktree gets a tab named after its directory', { description: 'bug#2', zone: { zone: 'worktree', tabName: 'hotfix-2' } }, { tabName: 'hotfix-2', tabId: 'tbpier-hotfix-2' }],
-    ['no zone derives the name from the description', { description: '网络调研现状' }, { tabName: '网络调研现状', tabId: 'tbpier-' + fnvSlug('网络调研现状') }],
-    ['a tab literally named main joins the master tab', { desiredTab: 'main', description: 'x' }, { tabName: MAIN_TAB_NAME, tabId: null }],
+    ['no tab: no pane', {}, { tabName: '', tabId: null }],
+    ['a null tab: no pane', { desiredTab: null }, { tabName: '', tabId: null }],
+    ['a whitespace-only tab name counts as absent', { desiredTab: '   ' }, { tabName: '', tabId: null }],
+    ['an explicit tab is its own tab', { desiredTab: '调研' }, { tabName: '调研', tabId: 'tbpier-' + fnvSlug('调研') }],
+    ['the same tab name always maps to the same app tab', { desiredTab: 'Spike Two' }, { tabName: 'Spike Two', tabId: 'tbpier-spike-two' }],
+    ['a tab literally named main joins the master tab', { desiredTab: 'Main' }, { tabName: MAIN_TAB_NAME, tabId: null }],
   ];
   for (const [name, input, expected] of cases) assert.deepEqual(planTabPlacement(input), expected, name);
-  assert.equal(planTabPlacement({ desiredTab: '调研', description: 'x' }).tabId, planTabPlacement({ desiredTab: '调研', description: 'y' }).tabId, 'repeat spawns join one tab');
 });
 
 /** Mirrors the id derivation in subagent-core for non-ASCII names (FNV-1a over code points). */
@@ -407,11 +405,11 @@ function fnvSlug(name: string): string {
 test('classifyWorktreeZone: main checkout, sibling worktree, unrelated dir, prefix trap', () => {
   const worktrees = ['F:/repo', 'F:/wt/hotfix-2', 'F:/wt/hotfix-3'];
   const cases: Array<[string, string, unknown]> = [
-    ['the main checkout and its children', 'F:\\repo\\packages', { zone: 'main', tabName: null }],
-    ['a sibling worktree, named after its directory', 'F:\\wt\\hotfix-2\\src', { zone: 'worktree', tabName: 'hotfix-2' }],
-    ['case-insensitive matching', 'f:/WT/HOTFIX-3', { zone: 'worktree', tabName: 'hotfix-3' }],
-    ['an unrelated directory is main', 'C:\\temp', { zone: 'main', tabName: null }],
-    ['a name prefix is not a parent (/repo-x vs /repo)', 'F:/repo-x', { zone: 'main', tabName: null }],
+    ['the main checkout and its children', 'F:\\repo\\packages', { zone: 'main' }],
+    ['a sibling worktree', 'F:\\wt\\hotfix-2\\src', { zone: 'worktree' }],
+    ['case-insensitive matching', 'f:/WT/HOTFIX-3', { zone: 'worktree' }],
+    ['an unrelated directory is main', 'C:\\temp', { zone: 'main' }],
+    ['a name prefix is not a parent (/repo-x vs /repo)', 'F:/repo-x', { zone: 'main' }],
   ];
   for (const [name, cwd, expected] of cases) {
     assert.deepEqual(classifyWorktreeZone({ cwd, masterCwd: 'F:/repo', worktrees }), expected, name);

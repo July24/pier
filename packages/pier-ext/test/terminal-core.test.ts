@@ -14,7 +14,8 @@ import {
   TERM_REMINDER_CUSTOM_TYPE, closeTerminal, compilePattern, computeIncrement, detectContinuationPrompt, detectFullscreenTUI,
   echoSafeWaitSuggestion, foldTerminalsRegistry, foregroundIsShell, hashPaneText,
   makeTerminalsRegistry, nextTerminalId, planTerminalReminder, planShellInit, promptStrategyFor, registerTerminal,
-  classifyWaitMatch, redirectedSentinel, regexLiteralPrefix, sentinelEchoHazard, stripAnsi, summarizeSessions, terminalIdleMs, validateSendText, validateSignal,
+  classifyWaitMatch, parseExitSentinel, redirectedSentinel, regexLiteralPrefix, sentinelEchoHazard, stripAnsi, summarizeSessions, terminalIdleMs, validateSendText, validateSignal,
+  withExitSentinel,
   type PromptStrategy, type TerminalEntry,
 } from '../src/terminal-core.ts';
 import { PiSurface } from '../src/pi-surface.ts';
@@ -430,11 +431,6 @@ test('plugins/terminal：wait/send/read 的动作契约（超时尾部、regex �
   await run(pi, { action: 'signal', terminal_id: 'term-1', key: 'ctrl+d' });
   assert.deepEqual(calls.keys.at(-1), { id: TERMINAL_ID, keys: ['ctrl+d'] });
 
-  // a direct pane_id read is limited to own-tab terminals and self-created terminal panes
-  const own = await run(pi, { action: 'read', pane_id: TERMINAL_ID });
-  assert.equal(own.details.mode, 'reset', 'a self-created terminal pane is readable');
-  client.listTerminals = async () => [terminalInfo({ id: 't9', labels: { 'herdr.tab': 'other' } })];
-  await assert.rejects(async () => { await run(pi, { action: 'read', pane_id: 't9' }); }, /limited to panes in this session's own tab/);
 });
 
 test('plugins/terminal：消耗完预算的 unavailable 等待按 timeout 报告', (t) => withCleanup(async () => {
@@ -779,3 +775,22 @@ test('plugins/terminal：nudge 在投递时计数——agent_start 取消宽限�
     mock.timers.reset();
   }
 })());
+
+test('withExitSentinel: joins with `;` only where that cannot break the command', () => {
+  const posix = (text: string) => withExitSentinel(text, 'n1', POSIX_PROMPT);
+  assert.equal(posix('make test;  '), `make test; printf '\\n__PIER_n1_%s__\\n' "$?"`, 'trailing separators are dropped');
+  for (const text of ['echo a # note', 'npm run dev &', 'echo a\necho b']) {
+    assert.match(posix(text), /\nprintf '\\n__PIER_n1_%s__\\n' "\$\?"$/, `${JSON.stringify(text)}: sentinel on its own line`);
+  }
+  assert.match(posix('a && b'), /^a && b; printf/, '`&&` is not a background job');
+  assert.match(withExitSentinel('dotnet build', 'n1', POWERSHELL_PROMPT), /^dotnet build; "`n__PIER_n1_\$\(if \(\$\?\)/);
+});
+
+test('parseExitSentinel: exit code and output come from the printed line, never the typed echo', () => {
+  const nonce = 'ab12cd34';
+  const echo = `% echo hi; printf '\\n__PIER_${nonce}_%s__\\n' "$?"`;
+  assert.equal(parseExitSentinel(`${echo}\nhi\n`, nonce), null, 'the echo alone is not a finished run');
+  assert.deepEqual(parseExitSentinel(`${echo}\nhi\nerr line\n\n__PIER_${nonce}_2__\n% `, nonce), { exitCode: 2, output: 'hi\nerr line' });
+  assert.deepEqual(parseExitSentinel(`__PIER_${nonce}___`, nonce), { exitCode: null, output: '' }, 'PowerShell without an exit code');
+  assert.equal(parseExitSentinel(`__PIER_other_0__`, nonce), null, 'another run\'s sentinel does not count');
+});

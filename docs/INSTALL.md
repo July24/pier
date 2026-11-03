@@ -58,7 +58,7 @@ hc --version                       # 应 ≥ 0.1.16
 # A. npm 源（用户模式）
 pi install npm:pi-pier
 
-# B. git 源（用户模式；根 package.json 的 pi 字段带扩展 + skill）
+# B. git 源（用户模式；根 package.json 的 pi 字段指向扩展）
 pi install git:github.com/July24/pier
 
 # C. 本地路径（开发期；注册进 settings.packages，随包自动加载）
@@ -72,16 +72,15 @@ pi -e ./packages/pier-ext/src/index.ts
 PI_HERDR_HMR=1 node --expose-internals "$(readlink -f "$(command -v pi)")" -e ./packages/pier-ext/src/index.ts
 ```
 
-卸载：`pi remove <同安装源>`。Skill（渐进式披露的模型手册）随包自动安装：
-`/skill:pi-herdr-workflow` 或模型按需读取。
+卸载：`pi remove <同安装源>`。
 
 ## 3. 使用
 
 1. 启动 herdr-core，打开一个终端（`hc run --bg pi`，或 Herdr app 的「新建终端」），
    在终端里跑 `pi`；扩展检测到 `HC_TERMINAL_ID` / `HC_TERMINAL_SOCKET` 后开始工作；
 2. 模型可调用 `todo_write`（进度显示在常驻 widget 与 `/todos`）、
-   `subagent`（spawn / list / send / interrupt / resume / output / role）、
-   `terminal`（open / send / read / signal / close / list）；
+   `subagent`（spawn / wait / list / send / interrupt / resume / output / help）、
+   `terminal`（open / send [`wait: true`] / wait / read / signal / close / list）；
 3. 每个子代理 = 独立 core 终端，app 把它挂成 master 所在 tab 的非焦点 pane；
    人类可 attach 该终端直接对话；blocked 状态来自 pi 原生 OSC 7501；
 4. 没有重启恢复：core 在 app 重启后保留终端，但 core 停止后 worker 结束；

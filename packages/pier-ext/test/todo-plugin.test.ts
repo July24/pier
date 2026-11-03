@@ -25,14 +25,13 @@ interface TodoDepsOverrides {
 /** One mount fixture for every test: real service + surface, individual deps overridable. */
 async function mount(pi: FakePi, over: TodoDepsOverrides = {}) {
   const { ledger, ...rest } = over;
-  const todos = new TodosService({ strict: false, allowParallelInProgress: true });
+  const todos = new TodosService();
   const surface = new PiSurface(pi as unknown as object, ledger);
   const state: { renderWidget: (ctx: unknown) => void; rerenderWidget?: () => void } = { renderWidget: () => {}, rerenderWidget: () => {} };
   const ctx = new Context();
   cordisProvide(ctx, 'pi-herdr.surface', surface);
   cordisProvide(ctx, 'pi-herdr.todo-deps', {
     todos,
-    allowParallelInProgress: true,
     maxItems: 15,
     state,
     mirrorTodos: () => {},

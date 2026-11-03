@@ -29,7 +29,6 @@ function pipeSession(over: Partial<PipeHandlerSession> = {}): PipeHandlerSession
     sendUserMessageAs: async () => {},
     abort: () => {},
     setPendingMachineRequest: () => {},
-    applyRoleSwitch: async () => ({ ok: true, message: 'stub' }),
     applyWorkerTodos: () => {},
     ...over,
   };
@@ -116,26 +115,6 @@ test('handlePipeRequest: the reply claim key is the id the parent pushed (B8)', 
   assert.deepEqual(claims, [`p2:${sentId}`]);
 });
 
-test('handlePipeRequest: role switch ok/error is relayed verbatim', async () => {
-  // P0 (RFC §4.4): the master switches a worker's role over the pipe; a mixed-version peer
-  // answering `unknown type role` must reach the model as that same error.
-  const calls: Array<{ role: string; by: string }> = [];
-  const ROLE_MSG = 'role worker-default → reviewer (+bash)';
-  const okSession = pipeSession({
-    paneId: 'w1',
-    applyRoleSwitch: async (role, by) => { calls.push({ role, by }); return { ok: true, message: ROLE_MSG }; },
-  });
-  const ok = await handlePipeRequest({ type: 'role', id: 'r1', role: 'reviewer' }, okSession);
-  assert.deepEqual(ok, { type: 'ok', id: 'r1', detail: ROLE_MSG });
-  assert.deepEqual(calls, [{ role: 'reviewer', by: 'w1' }], 'switchedBy = the pane that asked');
-
-  const errSession = pipeSession({
-    applyRoleSwitch: async () => ({ ok: false, message: 'Error: role "nope" unavailable: ROLE_NOT_FOUND' }),
-  });
-  const err = await handlePipeRequest({ type: 'role', id: 'r2', role: 'nope' }, errSession);
-  assert.deepEqual(err, { type: 'error', id: 'r2', message: 'Error: role "nope" unavailable: ROLE_NOT_FOUND' });
-});
-
 /* ── index-notices: D92 settlement-notice buffer ────────────────── */
 
 /** A buffer whose delivery sink is observable; `busy` picks the immediate or the queueing branch. */
@@ -183,6 +162,35 @@ test('createNoticeBuffer: a settlement landing during compaction is buffered and
   await buf.flush('followUp');
   assert.deepEqual(sent, [{ content: 'wA:p5F finished: report attached', mode: 'followUp' }]);
   assert.equal(buf.noticePending().size, 0);
+});
+
+test('createNoticeBuffer: a taken notice is not flushed again; other panes stay buffered and GC-exempt', async () => {
+  const { buf, sent } = noticeBuf(true);
+  await buf.deliverNotice('p1 finished', 'p1');
+  await buf.deliverNotice('p2 finished', 'p2');
+  await buf.deliverNotice('untagged recovery note');
+  assert.deepEqual(buf.takeNotices(new Set(['p1'])), ['p1 finished']);
+  assert.deepEqual(buf.takeNotices(new Set(['p1'])), [], 'a notice is handed out once');
+  assert.deepEqual([...buf.noticePending()], ['p2']);
+  await buf.flush('followUp');
+  assert.equal(sent.length, 1);
+  assert.doesNotMatch(sent[0].content, /p1 finished/);
+  assert.match(sent[0].content, /p2 finished/);
+  assert.match(sent[0].content, /untagged recovery note/);
+});
+
+test('createNoticeBuffer: awaitNotice wakes on a waited pane only, and times out or aborts to false', async () => {
+  const { buf } = noticeBuf(true);
+  const waiting = buf.awaitNotice(new Set(['p1']), 5_000);
+  await buf.deliverNotice('other', 'p2');
+  await buf.deliverNotice('mine', 'p1');
+  assert.equal(await waiting, true);
+  assert.equal(await buf.awaitNotice(new Set(['p1']), 5_000), true, 'an already-buffered notice resolves at once');
+  assert.equal(await buf.awaitNotice(new Set(['p9']), 10), false);
+  const ac = new AbortController();
+  const aborted = buf.awaitNotice(new Set(['p9']), 5_000, ac.signal);
+  ac.abort();
+  assert.equal(await aborted, false);
 });
 
 test('collapseNotices: empty → null; ≤3 verbatim; >3 → first three + count/pointer tail', () => {

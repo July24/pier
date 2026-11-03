@@ -28,16 +28,12 @@
   },
   "files": [
     "src",
-    "skills",
     "schemas",
     "README.md"
   ],
   "pi": {
     "extensions": [
       "./src/index.ts"
-    ],
-    "skills": [
-      "./skills/pi-herdr-workflow"
     ]
   },
   "scripts": {

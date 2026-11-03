@@ -48,10 +48,9 @@ export function baseTodoDeps(m: {
   todos: TodosService;
   todoUi: TodoUiSlot;
   mirrorTodos: () => void;
-}): Pick<TodoDeps, 'todos' | 'allowParallelInProgress' | 'maxItems' | 'mirrorTodos' | 'appendEntry' | 'state'> {
+}): Pick<TodoDeps, 'todos' | 'maxItems' | 'mirrorTodos' | 'appendEntry' | 'state'> {
   return {
     todos: m.todos,
-    allowParallelInProgress: m.todos.config.allowParallelInProgress,
     maxItems: 15,
     mirrorTodos: m.mirrorTodos,
     appendEntry: (customType: string, data: unknown) => {

@@ -64,13 +64,6 @@ export type PipeRequest =
     }
   | { type: 'interrupt'; id: string }
   | {
-      /** P0 (RFC §4.4): master switches a worker's role; the worker applies the manifest swap and
-       * replies ok/error. Mixed-version peers answer `unknown type role`, which the master surfaces. */
-      type: 'role';
-      id: string;
-      role: string;
-    }
-  | {
       /** D113 (RFC rfc-unified-widget): worker → master full todo push on every todo_write, so the
        * master's resident widget and /pier-tree render live worker state without polling herdr. */
       type: 'todo_sync';

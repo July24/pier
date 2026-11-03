@@ -34,9 +34,11 @@ export interface DialogState {
   cursor: number;
   /** Toggle state per authored option (never includes the Other row). */
   selected: readonly boolean[];
+  /** Folded to a one-line bar so the transcript above gets the room; only `collapse` acts while folded. */
+  collapsed: boolean;
 }
 
-type DialogKey = 'up' | 'down' | 'toggle' | 'confirm' | 'cancel' | 'all' | 'ignore';
+type DialogKey = 'up' | 'down' | 'toggle' | 'confirm' | 'cancel' | 'all' | 'collapse' | 'ignore';
 
 export type DialogOutcome =
   | { kind: 'selected'; labels: string[] }
@@ -58,6 +60,7 @@ export function createDialogState(config: DialogConfig): DialogState {
   return {
     cursor: start,
     selected: config.options.map((_, i) => config.multi && hasRecommended && i === start),
+    collapsed: false,
   };
 }
 
@@ -79,6 +82,9 @@ export function selectedLabels(state: DialogState, config: DialogConfig): string
 
 /** Apply one key. A returned outcome ends the interaction. */
 export function stepDialog(state: DialogState, key: DialogKey, config: DialogConfig): DialogStep {
+  // Folded: no blind answers or declines — only unfolding acts.
+  if (key === 'collapse') return { state: { ...state, collapsed: !state.collapsed } };
+  if (state.collapsed) return { state };
   const rows = rowCount(config);
   if (rows === 0) return key === 'cancel' ? { state, outcome: { kind: 'cancel' } } : { state };
   switch (key) {
@@ -131,6 +137,7 @@ const KEY_RESOLUTION: ReadonlyArray<{ key: DialogKey; binding?: string; sequence
   { key: 'up', binding: 'tui.select.up', sequences: ['\x1b[A', '\x1bOA', 'k'] },
   { key: 'down', binding: 'tui.select.down', sequences: ['\x1b[B', '\x1bOB', 'j'] },
   { key: 'toggle', sequences: [' '] },
+  { key: 'collapse', sequences: ['\t'] },
   { key: 'confirm', binding: 'tui.select.confirm', sequences: ['\r', '\n'] },
   { key: 'cancel', binding: 'tui.select.cancel', sequences: ['\x1b', '\x03'] },
 ];
@@ -226,10 +233,11 @@ export function dialogFooter(
   const all = hint(theme, 'a', 'all');
   const action = hint(theme, confirm, config.multi ? 'confirm' : 'select');
   const cancelHint = hint(theme, cancel, 'cancel');
-  const parts = config.multi ? [navigate, toggle, all, action, cancelHint] : [navigate, action, cancelHint];
+  const collapse = hint(theme, 'tab', 'collapse');
+  const parts = config.multi ? [navigate, toggle, all, action, cancelHint, collapse] : [navigate, action, cancelHint, collapse];
   const fits = (segs: string[]): boolean => styledWidth(segs.join('  ') + chip) <= (width ?? Infinity);
   // Narrow panes shed the most guessable extras first; the action keys and the live count are the floor.
-  for (const droppable of config.multi ? [all, navigate, cancelHint] : [navigate]) {
+  for (const droppable of config.multi ? [collapse, all, navigate, cancelHint] : [collapse, navigate]) {
     if (fits(parts)) break;
     parts.splice(parts.indexOf(droppable), 1);
   }
@@ -254,6 +262,14 @@ export function createDialogComponent(opts: DialogUiOptions): DialogComponent {
   return {
     render(width: number): string[] {
       const border = opts.theme.fg('border', '─'.repeat(Math.max(1, width)));
+      if (state.collapsed) {
+        return [
+          border,
+          truncateStyled(` ${opts.theme.fg('accent', opts.theme.bold(`▸ ${opts.title}`))}`, width),
+          truncateStyled(` ${hint(opts.theme, 'tab', 'expand to answer')}`, width),
+          border,
+        ];
+      }
       // Content wraps inside a 1-col margin each side (like pi's Text(text, 1, 0)) instead of clipping.
       const inner = Math.max(1, width - 2);
       const pad = (line: string): string => ` ${line}`;

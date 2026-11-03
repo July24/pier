@@ -227,38 +227,84 @@ function parseQuestion(raw: unknown): { ok: true; question: AskQuestion } | { ok
 
 type AskParams = Type.Static<typeof ASK_PARAMETERS>;
 
+/** Length of the JSON array at the start of `s` (string-aware bracket scan), or -1. */
+function leadingArrayEnd(s: string): number {
+  if (s[0] !== '[') return -1;
+  let depth = 0;
+  let inString = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inString) {
+      if (ch === '\\') i++;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') inString = true;
+    else if (ch === '[' || ch === '{') depth++;
+    else if ((ch === ']' || ch === '}') && --depth === 0) return i + 1;
+  }
+  return -1;
+}
+
+/** Parse a stringified array. Some models stream the sibling keys into the same string
+ *  (`[...], "question": "Q?"}]`); those trailing members come back as `spill`. */
+function parseStringArray(value: unknown): { items: unknown[]; spill: Record<string, unknown> } | undefined {
+  if (typeof value !== 'string') return undefined;
+  const text = value.trim();
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return Array.isArray(parsed) ? { items: parsed, spill: {} } : undefined;
+  } catch { /* fall through to the leading-array split */ }
+  const end = leadingArrayEnd(text);
+  if (end < 0) return undefined;
+  let items: unknown;
+  try {
+    items = JSON.parse(text.slice(0, end));
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(items)) return undefined;
+  const rest = text.slice(end).trim();
+  if (!rest.startsWith(',')) return undefined;
+  // The spilled members end with the closers of the enclosing object/array; drop them until it parses.
+  let body = `{${rest.slice(1)}`;
+  while (body.length > 1) {
+    try {
+      const spill = asRecord(JSON.parse(body));
+      return spill ? { items, spill } : undefined;
+    } catch {
+      if (!/[\]}]\s*$/.test(body)) return undefined;
+      body = body.replace(/[\]}]\s*$/, '');
+    }
+  }
+  return undefined;
+}
+
+/** Spilled members fill only keys the call did not send itself. */
+function withSpill(rec: Record<string, unknown>, key: string, parsed: { items: unknown[]; spill: Record<string, unknown> }): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...rec, [key]: parsed.items };
+  for (const [k, v] of Object.entries(parsed.spill)) if (!(k in rec)) next[k] = v;
+  return next;
+}
+
 /** Repair the argument spellings models have sent historically, before pi validates them: `options` or
- *  `questions` as a JSON string instead of an array. Only strings that parse to arrays are replaced, so
- *  anything genuinely malformed still reaches prepareAsk and gets its normal error text. */
+ *  `questions` as a JSON string instead of an array, including a string that also swallowed the keys
+ *  after it. Only strings with a parseable leading array are replaced, so anything genuinely malformed
+ *  still reaches prepareAsk and gets its normal error text. */
 export function prepareAskArguments(args: unknown): AskParams {
   const rec = asRecord(args);
   if (!rec) return {};
-  const parseArray = (value: unknown): unknown[] | undefined => {
-    if (typeof value !== 'string') return undefined;
-    try {
-      const parsed: unknown = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed : undefined;
-    } catch {
-      return undefined;
-    }
-  };
-  let changed = false;
-  const next: Record<string, unknown> = { ...rec };
-  const options = parseArray(rec.options);
-  if (options) {
-    next.options = options;
-    changed = true;
-  }
-  const questions = parseArray(rec.questions);
+  let next = rec;
+  const options = parseStringArray(rec.options);
+  if (options) next = withSpill(next, 'options', options);
+  const questions = parseStringArray(rec.questions);
   if (questions) {
-    next.questions = questions.map((item) => {
+    next = withSpill(next, 'questions', questions);
+    next.questions = questions.items.map((item) => {
       const question = asRecord(item);
-      const questionOptions = question ? parseArray(question.options) : undefined;
-      return question && questionOptions ? { ...question, options: questionOptions } : item;
+      const questionOptions = question ? parseStringArray(question.options) : undefined;
+      return question && questionOptions ? withSpill(question, 'options', questionOptions) : item;
     });
-    changed = true;
   }
-  return (changed ? next : rec) as AskParams;
+  return next as AskParams;
 }
 
 export function prepareAsk(params: unknown): PrepareAskResult {

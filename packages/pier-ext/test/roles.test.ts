@@ -26,7 +26,6 @@ test('validateRoleManifest: a good profile passes and keeps every field; omitted
   if (!r.ok) return;
   assert.equal(r.value.role, 'probe-role'); assert.equal(r.value.version, '1.1.0');
   assert.equal(r.value.manifest.rules?.bash, 'ask'); assert.equal(r.value.manifest.rules?.write, 'deny');
-  assert.equal(r.value.services?.todos?.mode, 'serial');
 
   const minimal = validateRoleManifest({ role: 'worker-default', version: '1.0.0', manifest: { tools: ['bash', 'read', 'todo_write', 'ask_user_question'] } });
   assert.equal(minimal.ok, true, JSON.stringify((minimal as { issues?: string[] }).issues));
@@ -35,8 +34,8 @@ test('validateRoleManifest: a good profile passes and keeps every field; omitted
     assert.equal(s.ok, true);
     if (s.ok) assert.equal(s.value.manifest.unknownTools, stance);
   }
-  // reminderLimit is no longer a contract key: ignored like any other unknown services.todos sub-key.
-  assert.equal(validateRoleManifest({ ...READONLY, services: { todos: { mode: 'serial', reminderLimit: 3 } } }).ok, true);
+  // `services` is retired: profiles that still carry it (any shape) keep loading.
+  assert.equal(validateRoleManifest({ ...READONLY, services: { todos: { mode: 'concurrent', reminderLimit: 3 } } }).ok, true);
 });
 
 test('validateRoleManifest: rejects every contract violation with a locatable issue', () => {
@@ -56,7 +55,6 @@ test('validateRoleManifest: rejects every contract violation with a locatable is
     { what: 'empty tools array', input: { ...READONLY, manifest: { ...READONLY.manifest, tools: [] } }, expect: 'todo_write' },
     { what: 'duplicate tool', input: { ...READONLY, manifest: { ...READONLY.manifest, tools: [...READONLY.manifest.tools, 'bash'] } }, expect: 'bash' },
     { what: 'non-string tool', input: { ...READONLY, manifest: { ...READONLY.manifest, tools: ['bash', 42, 'todo_write', 'ask_user_question'] } }, expect: 'tools' },
-    { what: 'service mode outside serial/parallel', input: { ...READONLY, services: { todos: { mode: 'concurrent' } } }, expect: 'mode' },
     { what: 'role name outside [a-z0-9-]+', input: { ...READONLY, role: 'Web Search' }, expect: 'role' },
   ];
   for (const { what, input, expect } of cases) {
@@ -232,7 +230,7 @@ test('toRuntimeManifest: one projection from a composed profile to the runtime s
   const runtime = toRuntimeManifest(composed);
   assert.equal(runtime.role, 'master'); assert.equal(runtime.version, composed.role.version);
   assert.deepEqual(runtime.tools, composed.manifest.tools); assert.deepEqual(runtime.permissions, composed.manifest.permissions);
-  assert.equal(runtime.unknownTools, composed.manifest.unknownTools); assert.deepEqual(runtime.services, composed.role.services ?? {});
+  assert.equal(runtime.unknownTools, composed.manifest.unknownTools);
   assert.equal(runtime.guidelines, undefined, 'master ships no guidelines');
 });
 

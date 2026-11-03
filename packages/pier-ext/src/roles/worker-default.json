@@ -1,7 +1,7 @@
 {
   "role": "worker-default",
-  "version": "1.6.0",
-  "description": "Default worker role (D83 inheritance): mirrors master.tools minus subagent/terminal (no nesting, resource ownership); excluded families explicitly denied — still banned under the D82 unknownTools=allow stance; todos serial. v1.6.0: removed report_progress (0 calls in a week, D125); v1.5.0: Phase 2 explicitly allowed report_progress; v1.4.0: refreshed the deny list after tool consolidation",
+  "version": "1.7.0",
+  "description": "Default worker role (D83 inheritance): mirrors master.tools minus subagent/terminal (no nesting, resource ownership); excluded families explicitly denied — still banned under the D82 unknownTools=allow stance. v1.7.0: dropped services.todos serial mode (it rejected lists instead of normalizing them); v1.6.0: removed report_progress (0 calls in a week, D125); v1.4.0: refreshed the deny list after tool consolidation",
   "manifest": {
     "unknownTools": "allow",
     "tools": [
@@ -14,8 +14,5 @@
       "terminal": "deny",
       "*": "allow"
     }
-  },
-  "services": {
-    "todos": { "mode": "serial" }
   }
 }

@@ -48,9 +48,6 @@
   "pi": {
     "extensions": [
       "./packages/pier-ext/src/index.ts"
-    ],
-    "skills": [
-      "./packages/pier-ext/skills/pi-herdr-workflow"
     ]
   }
 }

@@ -1,7 +1,7 @@
 {
   "role": "master",
-  "version": "1.4.0",
-  "description": "Master role (WS-D7 self-application; D83 mirror source): core tools (todos/coordination/subagent/terminal) + pi built-ins + web_search; D82 unknownTools=allow. v1.4.0: tool consolidation terminal 6→1, subagent 5→1",
+  "version": "1.5.0",
+  "description": "Master role (WS-D7 self-application; D83 mirror source): core tools (todos/coordination/subagent/terminal) + pi built-ins + web_search; D82 unknownTools=allow. v1.5.0: dropped services.todos; v1.4.0: tool consolidation terminal 6→1, subagent 5→1",
   "manifest": {
     "unknownTools": "allow",
     "tools": [
@@ -14,8 +14,5 @@
     "rules": {
       "*": "allow"
     }
-  },
-  "services": {
-    "todos": { "mode": "parallel" }
   }
 }

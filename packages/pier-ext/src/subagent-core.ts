@@ -25,7 +25,7 @@ export function buildLaunchLine(parts: readonly string[], platform: NodeJS.Platf
   return (win ? '& ' : '') + quoted.join(' ');
 }
 
-/** Tab name of the master's own tab: a worker placed there joins the master terminal's tab. */
+/** Explicit `tab` name that places the worker as a pane in the master terminal's own tab. */
 export const MAIN_TAB_NAME = 'main';
 
 /** App tab addresses must be stable across spawns (a named tab is joined, not recreated) and ASCII. */
@@ -49,8 +49,8 @@ function tabIdFor(name: string): string {
  */
 export const SUBAGENT_OUTPUT_SCHEMA = Type.Object({
   action: Type.Union([
-    Type.Literal('spawn'), Type.Literal('resume'), Type.Literal('list'),
-    Type.Literal('send'), Type.Literal('interrupt'), Type.Literal('output'), Type.Literal('role'), Type.Literal('help'),
+    Type.Literal('spawn'), Type.Literal('resume'), Type.Literal('list'), Type.Literal('wait'),
+    Type.Literal('send'), Type.Literal('interrupt'), Type.Literal('output'), Type.Literal('help'),
   ]),
   paneId: Type.Optional(Type.String()),
   taskId: Type.Optional(Type.String()),
@@ -283,8 +283,8 @@ export function sleepWhileSubsRunningNote(
   const longest = Math.max(0, ...[...command.matchAll(/\bsleep\s+(\d+)s?\b/g)].map((m) => Number(m[1])));
   if (longest < SLEEP_NOTE_MIN_SECONDS) return null;
   return `[pier] ${running.length} background subagent(s) running (${running.map(subRef).join(', ')}): their settlement `
-    + 'notice arrives automatically at your next tool boundary, so do not sleep to wait for them — keep working or end '
-    + 'your turn. Sleeping is only needed for other work (builds, logs).';
+    + 'notice arrives automatically at your next tool boundary, so do not sleep to wait for them — keep working, or call '
+    + 'subagent action "wait" to block until one finishes. Sleeping is only needed for other work (builds, logs).';
 }
 
 export interface SubsRegistry {
@@ -418,9 +418,9 @@ export function tabNameForTask(description: string): string {
 }
 
 export interface TabPlacementPlan {
-  /** Display name of the task tab; `main` when the worker shares the master's tab. */
+  /** Display name of the requested tab; `main` = the master's tab; '' = no pane (sub-agent row only). */
   tabName: string;
-  /** Address for the `herdr.tab` label; null = join the master terminal's tab. */
+  /** Address for the `herdr.tab` label; null = the master's tab, or no pane when `tabName` is ''. */
   tabId: string | null;
 }
 
@@ -434,10 +434,9 @@ export function isPathUnder(cwd: string, wt: string): boolean {
 
 export interface WorktreeZone {
   zone: 'main' | 'worktree';
-  tabName: string | null;
 }
 
-/** D86: subagents working in the master's checkout share its tab; another worktree gets its own. */
+/** D86 trust: the master's checkout (`main`) or one of its other git worktrees (`worktree`). */
 export function classifyWorktreeZone(opts: {
   cwd: string;
   masterCwd: string;
@@ -445,26 +444,17 @@ export function classifyWorktreeZone(opts: {
 }): WorktreeZone {
   for (const wt of opts.worktrees) {
     if (!isPathUnder(opts.cwd, wt)) continue;
-    if (isPathUnder(opts.masterCwd, wt)) return { zone: 'main', tabName: null };
-    const base = wt.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? 'worktree';
-    return { zone: 'worktree', tabName: base };
+    return { zone: isPathUnder(opts.masterCwd, wt) ? 'main' : 'worktree' };
   }
-  return { zone: 'main', tabName: null };
+  return { zone: 'main' };
 }
 
-/** Explicit `tab` and a worktree zone get their own app tab (the id is stable per name, so repeat
- *  spawns join instead of piling up tabs); a worker in the master's checkout joins the master tab. */
-export function planTabPlacement(opts: {
-  desiredTab?: string | null;
-  description: string;
-  zone?: WorktreeZone;
-}): TabPlacementPlan {
+/** D140: a worker gets no pane unless asked — the app lists it under its parent and peeks at it.
+ *  An explicit `tab` joins or creates that app tab (stable id per name); `main` is the master's tab. */
+export function planTabPlacement(opts: { desiredTab?: string | null }): TabPlacementPlan {
   const desired = opts.desiredTab != null ? String(opts.desiredTab).replace(/\s+/g, ' ').trim() : '';
-  if (desired) return placementFor(tabNameForTask(desired));
-  const zone = opts.zone;
-  if (zone?.zone === 'worktree' && zone.tabName) return placementFor(tabNameForTask(zone.tabName));
-  if (zone?.zone === 'main') return { tabName: MAIN_TAB_NAME, tabId: null };
-  return placementFor(tabNameForTask(opts.description));
+  if (!desired) return { tabName: '', tabId: null };
+  return placementFor(tabNameForTask(desired));
 }
 
 function placementFor(tabName: string): TabPlacementPlan {

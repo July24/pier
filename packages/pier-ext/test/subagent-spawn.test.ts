@@ -307,9 +307,11 @@ test('spawn env: the worker gets the spawn contract on top of the caller environ
     assert.equal(typeof delegation.taskId, 'string');
     assert.equal(delegation.role, 'worker-default');
     assert.equal(delegation.parentPipe, pipeNameFor(env.cwd, 't0'), 'the worker can dial the master pipe for todo_sync');
-    // A worker in the master's checkout joins the master's app tab instead of creating one.
-    assert.equal(env.spawnLabels[0]!['herdr.tab'], 'tb0');
-    assert.equal(env.spawnLabels[0]!['herdr.space'], 'sp0');
+    // D140: no `tab` means no placement labels — the app lists it under its parent, not as a pane.
+    assert.deepEqual(env.spawnLabels[0], {});
+    await runSubagent(env.pi, { description: '探查', prompt: PROMPT, tab: 'research' }, env.cwd);
+    assert.equal(env.spawnLabels[1]!['herdr.space'], 'sp0', 'an explicit tab still lands in this terminal\'s space');
+    assert.equal(env.spawnLabels[1]!['herdr.tab'], 'tbpier-research', 'the named tab is joined or created');
   });
 });
 

@@ -22,6 +22,12 @@ export interface NoticeBuffer {
   deliverNotice(content: string, paneId?: string): Promise<void>;
   noticePending(): ReadonlySet<string>;
   flush(mode: NoticeSendMode): Promise<void>;
+  /** `subagent wait`: remove and return the buffered notices tagged with one of `paneIds`, so the
+   *  tool result carries them instead of a later turn-gap delivery. */
+  takeNotices(paneIds: ReadonlySet<string>): string[];
+  /** Resolves true once a notice tagged with one of `paneIds` is buffered (or already is), false on
+   *  timeout or abort. */
+  awaitNotice(paneIds: ReadonlySet<string>, timeoutMs: number, signal?: AbortSignal): Promise<boolean>;
 }
 
 export function createNoticeBuffer(opts: {
@@ -36,11 +42,13 @@ export function createNoticeBuffer(opts: {
 }): NoticeBuffer {
   const pending: Array<{ content: string; paneId?: string }> = [];
   const pendingPaneIds = new Set<string>();
+  const waiters = new Set<{ paneIds: ReadonlySet<string>; wake: () => void }>();
   return {
     async deliverNotice(content, paneId) {
       if (content !== '' && paneId !== undefined) pendingPaneIds.add(paneId);
       if (opts.isBusy()) {
         pending.push({ content, paneId });
+        if (paneId !== undefined) for (const w of waiters) if (w.paneIds.has(paneId)) w.wake();
         return;
       }
       await opts.send(content, 'followUp');
@@ -62,6 +70,31 @@ export function createNoticeBuffer(opts: {
       }
       const collapsed = collapseNotices(ordered);
       if (collapsed) await opts.send(collapsed, mode);
+    },
+    takeNotices(paneIds) {
+      const taken = pending.filter((n) => n.paneId !== undefined && paneIds.has(n.paneId));
+      if (taken.length === 0) return [];
+      pending.splice(0, pending.length, ...pending.filter((n) => !taken.includes(n)));
+      // Taken notices are delivered by the tool result: their panes are no longer GC-exempt.
+      for (const { paneId } of taken) pendingPaneIds.delete(paneId!);
+      return taken.map((n) => n.content).filter((c) => c !== '');
+    },
+    awaitNotice(paneIds, timeoutMs, signal) {
+      if (pending.some((n) => n.paneId !== undefined && paneIds.has(n.paneId))) return Promise.resolve(true);
+      if (signal?.aborted) return Promise.resolve(false);
+      const { promise, resolve } = Promise.withResolvers<boolean>();
+      const done = (hit: boolean): void => {
+        clearTimeout(timer);
+        waiters.delete(waiter);
+        signal?.removeEventListener('abort', onAbort);
+        resolve(hit);
+      };
+      const waiter = { paneIds, wake: () => done(true) };
+      const onAbort = (): void => done(false);
+      const timer = setTimeout(() => done(false), Math.max(0, timeoutMs));
+      waiters.add(waiter);
+      signal?.addEventListener('abort', onAbort, { once: true });
+      return promise;
     },
   };
 }

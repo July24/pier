@@ -40,17 +40,7 @@
       "additionalProperties": false
     },
     "services": {
-      "type": "object",
-      "properties": {
-        "todos": {
-          "type": "object",
-          "properties": {
-            "mode": { "enum": ["serial", "parallel"] }
-          },
-          "additionalProperties": false
-        }
-      },
-      "additionalProperties": false
+      "description": "Retired (todos serial/parallel mode); accepted and ignored so older profiles keep loading"
     }
   },
   "required": ["role", "version", "manifest"],

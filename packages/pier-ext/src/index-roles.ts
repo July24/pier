@@ -17,7 +17,6 @@ import {
   type RoleState,
 } from './role-state.ts';
 import { RESERVED_ROLE_NAMES, listRoleNames, roleLayers } from './role-loader.ts';
-import { TodosService } from './todos-service.ts';
 import { APPROVAL_NEEDED_CUSTOM_TYPE, ROLE_MANIFEST_CUSTOM_TYPE } from './renderers.ts';
 import { planDenyHitRow, scanRoleAxisUsage, type RoutingTelemetryRecord } from './routing-telemetry.ts';
 
@@ -40,8 +39,6 @@ export interface RoleRuntimeDeps {
   /** Role-resolution base dir carried by the master at spawn (an isolate worker's own cwd resolves a different checkout). */
   roleBase: string;
   initialManifest: RuntimeRoleManifest | null;
-  isSubagent: boolean;
-  todos: TodosService;
   /** Best-effort routing telemetry (RFC docs/rfc-jev-role-routing.md §8); observation only, never gates. */
   appendRoutingLog: (row: RoutingTelemetryRecord) => void;
 }
@@ -52,12 +49,10 @@ export interface RoleRuntime {
   syncFromBranch(ctx: unknown): void;
   /** Phase 0 axis scan of the workspace+user role layers (master session_start only). */
   scanRoleUsage(): void;
-  /** Mid-session switch: /pier-role (human) and the pipe `role` request (master). */
-  applyRoleSwitch(roleName: string, switchedBy: string): Promise<{ ok: boolean; message: string }>;
 }
 
 export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
-  const { pi, todos, roleBase, appendRoutingLog } = d;
+  const { pi, roleBase, appendRoutingLog } = d;
   const roleState = initialRoleState(d.initialManifest);
   /**
    * Same-origin sync (RFC docs/rfc-pi-0.86-dynamic-tools.md §4.3): reconcile roleState against the CURRENT
@@ -166,8 +161,6 @@ export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
       permissions: next.permissions,
     });
     pi.setActiveTools(nextActive);
-    // TodosService captured services.todos.mode at startup; a mode switch must reach it.
-    todos.config.allowParallelInProgress = TodosService.configFromRuntime(next, d.isSubagent).allowParallelInProgress;
     roleState.manifest = next;
     roleState.origin = 'switch';
     roleState.switchedBy = switchedBy;
@@ -282,6 +275,5 @@ export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
     state: roleState,
     syncFromBranch,
     scanRoleUsage,
-    applyRoleSwitch,
   };
 }
