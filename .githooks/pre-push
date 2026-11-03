@@ -45,6 +45,13 @@ while read -r local_ref local_sha _remote_ref _remote_sha; do
     fail "版本不一致：tag=$ver, pi-pier=$ext, pier-setup=$root"
   fi
 
+  # pi 在扩展更新后按 package.json version 展示 CHANGELOG.md 里更新的条目，故发布 tag 必须有同版本标题
+  if ! git show "$tag:packages/pier-ext/CHANGELOG.md" 2>/dev/null | grep -qF "## [$ver]"; then
+    echo "✗ [publish-guard] packages/pier-ext/CHANGELOG.md 缺少 \"## [$ver]\" 条目" >&2
+    echo '  提示：在 CHANGELOG.md 顶部补本版本条目（格式 "## [x.y.z] - YYYY-MM-DD"）后重新提交并打 tag。' >&2
+    exit 1
+  fi
+
   echo "✓ [publish-guard] ${tag}：tag = pi-pier@${ext} = pier-setup@${root}，一致"
 done
 
