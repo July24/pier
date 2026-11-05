@@ -2,6 +2,21 @@
 
 pi shows the entries newer than your last seen version under "Extension Updates" after `pi update`.
 
+## [0.5.4] - 2026-11-05
+
+### Changed
+
+- Online compaction counts a `todo_write` that completes several items as that many boundaries, so batched completions no longer inflate the remaining-work estimate.
+- `terminal` `wait` accepts `file` without `pattern`: it waits until the file exists and is not empty, and does not return its content.
+- `subagent` `wait` on one worker now also returns when another running worker settles, and names the worker still running.
+
+### Fixed
+
+- `subagent` `output` returns the final report from the worker's transcript after its terminal was removed.
+- Online compaction no longer aborts a run when the only history before the cut is the system prompt.
+- Reducer timeouts are logged as `timeout` instead of `empty-output`.
+- The notice for a worker moved to background states the `agentId` to use.
+
 ## [0.5.3] - 2026-11-03
 
 ### Breaking Changes
