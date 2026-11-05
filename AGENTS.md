@@ -26,8 +26,8 @@ rm -rf /f/.tmp-ssh   # 立即删除 key 副本
 
 ## pi 配置：权威文件是 `~/.pi/agent/settings.json`
 
-`~/.pi/` 下还有一个顶层 `settings.json`——**pi 不读它**（`PI_CODING_AGENT_DIR` 默认根是 `~/.pi/agent`）。改默认 provider/model 只改顶层文件会看到新 pi 会话仍用旧模型。当前默认：`zai-coding-cn / glm-5.3`（2026-08-28 定；此前的 `opencode-go / ox-alpha-free` 已 401 失效）。两处文件已保持同步镜像。
+权威文件只有 `~/.pi/agent/settings.json`（`PI_CODING_AGENT_DIR` 默认根是 `~/.pi/agent`）；顶层 `~/.pi/settings.json` 已不存在，pi 也从未读过它。当前默认：`magpie / opencode-go/deepseek-v4.1-flash`（thinking `max`），以该文件为准。
 
 ## 中转模型可靠性（本机网络）
 
-`zai-coding-cn` 与 `opencode-go` 的 glm 系模型在 **toolCall 参数流中随机停摆**（pi spinner 挂在工具名 + `working` 不动、execute 无痕迹、会话 jsonl 截断在参数字符串中间、进程恒开一条 TCP）。排障时先怀疑它而不是插件代码；`opencode-go/kimi-k2.7-code` 实测稳定（spike 用 `D98_MODEL` env 切换）。pi 侧中断恢复：herdr `pane.send_keys {keys:["escape"]}` ESC 后重发。
+`zai-coding-cn` 与 `opencode-go` 的 glm 系模型在 **toolCall 参数流中随机停摆**（pi spinner 挂在工具名 + `working` 不动、execute 无痕迹、会话 jsonl 截断在参数字符串中间、进程恒开一条 TCP）。排障时先怀疑它而不是插件代码；`opencode-go/kimi-k2.7-code` 实测稳定（spike 用 `D98_MODEL` env 切换）。pi 侧中断恢复：`hc keys <terminal> esc` 后重发。

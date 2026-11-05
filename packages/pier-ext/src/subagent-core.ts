@@ -157,22 +157,22 @@ export function agoText(ms: number, nowMs: number): string {
 }
 
 export function buildAliveNotice(
-  opts: { paneId: string; description: string; scenario: 'moved-to-bg' | 'error-alive'; probe: AliveProbe },
+  opts: { paneId: string; ref: string; description: string; scenario: 'moved-to-bg' | 'error-alive'; probe: AliveProbe },
   nowMs: number,
 ): string {
-  const { paneId, description, scenario, probe } = opts;
+  const { paneId, ref, description, probe } = opts;
   const status = probe.agentStatus ?? 'unknown';
   const activity = probe.lastActivityMs != null ? `, last session activity ${agoText(probe.lastActivityMs, nowMs)}` : '';
-  if (scenario === 'moved-to-bg') {
+  if (opts.scenario === 'moved-to-bg') {
     return [
-      `Subagent "${description}" is still running in pane ${paneId} (agent_status=${status}${activity}).`,
+      `Subagent "${description}" (agentId: ${ref}) is still running in pane ${paneId} (agent_status=${status}${activity}).`,
       'The foreground wait has moved it to background so this call returns now.',
       'Do NOT redo its work and do NOT sleep or poll: when it settles, its result is delivered automatically as a settlement notice at your next turn boundary.',
-      'Use subagent(action: "list") to check its live state; subagent(action: "send") to give it follow-up work.',
+      `Use subagent(action: "list") to check its live state; subagent(action: "send", agentId: "${ref}") to give it follow-up work.`,
     ].join(' ');
   }
   return [
-    `The subagent "${description}" is ALIVE in pane ${paneId} (agent_status=${status}${activity}) — this "no readable output" result only means its final answer could not be read yet, NOT that the task failed.`,
+    `The subagent "${description}" (agentId: ${ref}) is ALIVE in pane ${paneId} (agent_status=${status}${activity}) — this "no readable output" result only means its final answer could not be read yet, NOT that the task failed.`,
     'Do NOT redo its work. It is being moved to background; you will be notified when it settles.',
     'Use subagent(action: "list") to check its live state.',
   ].join(' ');

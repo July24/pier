@@ -40,7 +40,7 @@ pier 是**一个 pi 扩展**，外加它与两个外部程序协作：
 - **任务 slug**（D112）：spawn 分配任务 slug（冲突加序号），工具输出一律 `slug@paneId`，`agentId` 接受 slug/终端 id/组合形式（revive 换终端后按 slug 兜底）。后台 worker 运行期间 master 的 bash 若 sleep ≥60s，结果会附一句指向 `subagent wait` 的提示（D125/D144；此前的 `report_progress` 工具一次都没被调用过，已删除）
 - **统一状态 widget**（D113/D114）：常驻 widget 一行一 agent——自己一行 `▶ 当前条 ✓d/n`，每个 running 子代理一行 `↳ slug ▶ 当前条 ✓d/n`（blocked 显示任务+原因，settled 不占行；自己的清单全部完成时直接隐藏，不再只剩一个 `✓N/N`）；worker `todo_write` 经 pipe 实时推送全量清单（事件驱动零轮询），`/pier-tree` 把完整委托树（自己 + 各 worker 全量 todo + settled 节点）打开为 **pi 内 overlay**（`ui.custom`，`esc`/`q` 关闭，打开期间实时刷新；裸 pi / RPC 模式回退为 pane 内通知）
 - **子代理输出预览**：`subagent(action: "output", agentId)` 返回后台子代理自上次调用以来的新输出——内存中的 per-terminal 游标经 core `terminal.read` 计算增量，结果带状态、revision、截断与 `restart` 标记（缓冲回卷/清屏），master 不必等到结算就能发现卡住的 worker。worker 完成后以完整 transcript 终稿替代终端里有损的渲染副本，之后的结算通知只指向那次交付、不再重复全文（D124）
-- **阻塞等待子代理**（D144）：`subagent(action: "wait", agentId?)` 阻塞到某个 worker 结算、失败、关闭或开始等人工，并把那条通知（含终稿）作为工具结果返回；通知从回合间隙缓冲中取出，不会再投递一次。master 无事可做时用它代替 `sleep` 与反复的 `list`/`output` 轮询
+- **阻塞等待子代理**（D144、D151）：`subagent(action: "wait", agentId?)` 阻塞到某个 worker 结算、失败、关闭或开始等人工，并把那条通知（含终稿）作为工具结果返回；通知从回合间隙缓冲中取出，不会再投递一次。等待单个 worker 时，其他运行中的 worker 有通知也会返回，并点名仍在运行的目标。master 无事可做时用它代替 `sleep` 与反复的 `list`/`output` 轮询
 - **终端命令带退出码**（D145）：`terminal(action: "send", text, wait: true)` 由 pier 自己追加带 nonce 的退出哨兵，返回退出码与命令输出；手写哨兵（及其回显陷阱）只剩不会结束的输出需要（服务的 "listening on"）
 - **软锁防争抢**：写路径把锁 beacon 作为 `pier.lock.<hash>` label 发布到各自终端；跨终端冲突时警告（默认）或阻止（`PI_HERDR_WRITE_LOCK=1`）。警告列出全部持有者；`/locks` 是人类视图，`hc get <terminal> --json` 暴露原始 label
 - **整棵树同一模型**：worker 沿用 master 当前的模型（包括 `/model` 切换后的）；不再有角色档案与按 worker 的工具闸门（D146）

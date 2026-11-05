@@ -24,12 +24,13 @@ function bashEvent(command: string, text: string = BODY): ToolResultEventLike {
 type Completions = Array<{ model: { id?: string }; context: { messages: Array<{ content: Array<{ text: string }> }> } }>;
 
 /** One factory for every test below; only the fields a test cares about are overridden. */
-function mockContext(opts: { sessionDir: string; sessionId?: string; isTrusted?: boolean; completeResponse?: unknown; completeError?: Error }): {
+function mockContext(opts: { sessionDir: string; sessionId?: string; isTrusted?: boolean; completeResponse?: unknown; completeError?: Error; signal?: AbortSignal }): {
   ctx: ExtensionContext; completeCalls: Completions; trustCalls: { count: number };
 } {
   const completeCalls: Completions = [];
   const trustCalls = { count: 0 };
   const ctx = {
+    signal: opts.signal,
     isProjectTrusted: () => { trustCalls.count++; return opts.isTrusted ?? true; },
     sessionManager: { getSessionDir: () => opts.sessionDir, getSessionId: () => opts.sessionId ?? 's1' }, model: { id: 'default-test-model', provider: 'test' },
     modelRegistry: {
@@ -118,6 +119,14 @@ test('EPR: every fail-open exit after archival leaves a reason row', withCleanup
   const empty = mockContext({ sessionDir: dir, sessionId: 'sess_empty', completeResponse: { content: [{ type: 'text', text: '  ' }], stopReason: 'stop' } });
   assert.equal(await handleReducerToolResult(bashEvent('npm test', rawLog), empty.ctx, logging), undefined);
   assert.equal((await reasonOf('sess_empty')).reason, 'empty-output');
+  // An abort the session did not ask for is the reducer's own latency budget; a session abort is not.
+  const aborted = { content: [], stopReason: 'aborted', errorMessage: 'Request was aborted' };
+  const timedOut = mockContext({ sessionDir: dir, sessionId: 'sess_timeout', completeResponse: aborted });
+  assert.equal(await handleReducerToolResult(bashEvent('npm test', rawLog), timedOut.ctx, logging), undefined);
+  assert.equal((await reasonOf('sess_timeout')).reason, 'timeout');
+  const userAbort = mockContext({ sessionDir: dir, sessionId: 'sess_user_abort', completeResponse: aborted, signal: AbortSignal.abort() });
+  assert.equal(await handleReducerToolResult(bashEvent('npm test', rawLog), userAbort.ctx, logging), undefined);
+  assert.equal((await reasonOf('sess_user_abort')).reason, 'empty-output');
   const noModel = mockContext({ sessionDir: dir, sessionId: 'sess_no_model' });
   (noModel.ctx as unknown as { modelRegistry: unknown }).modelRegistry = {};
   assert.equal(await handleReducerToolResult(bashEvent('npm test', rawLog), noModel.ctx, logging), undefined);

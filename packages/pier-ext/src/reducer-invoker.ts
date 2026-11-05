@@ -359,8 +359,12 @@ export async function handleReducerToolResult(
       ? output.text
       : '';
   if (!modelOutput.trim()) {
-    // pi's complete() reports provider failures as an empty `error` message instead of throwing.
-    await fallbackRow(output.stopReason === 'error' ? 'invoke-failed' : 'empty-output', durationMs, {
+    // pi's complete() reports provider failures as an empty `error` message instead of throwing, and an
+    // abort the session did not ask for can only be this call's own latency budget running out.
+    const reason = output.stopReason === 'error' ? 'invoke-failed'
+      : output.stopReason === 'aborted' && !ctx.signal?.aborted ? 'timeout'
+      : 'empty-output';
+    await fallbackRow(reason, durationMs, {
       ...(output.stopReason ? { stopReason: output.stopReason } : {}),
       ...(output.errorMessage ? { error: output.errorMessage } : {}),
     });

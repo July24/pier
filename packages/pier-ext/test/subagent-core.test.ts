@@ -234,7 +234,7 @@ test('agoText: relative times, clock skew clamps to zero', () => {
 
 test('buildAliveNotice: backgrounded pane — do not redo the work, a notice will arrive', () => {
   const text = buildAliveNotice(
-    { paneId: 'wA:p2', description: 'Explore CRM', scenario: 'moved-to-bg', probe: probe({ agentStatus: 'working', lastActivityMs: NOW - 12_000 }) },
+    { paneId: 'wA:p2', ref: 'explore-crm@wA:p2', description: 'Explore CRM', scenario: 'moved-to-bg', probe: probe({ agentStatus: 'working', lastActivityMs: NOW - 12_000 }) },
     NOW,
   );
   assert.match(text, /still running in pane wA:p2/);
@@ -245,18 +245,19 @@ test('buildAliveNotice: backgrounded pane — do not redo the work, a notice wil
   assert.match(text, /next turn boundary/);
   assert.match(text, /do NOT sleep or poll/i);
   assert.match(text, /subagent\(action: "list"\)/);
+  assert.match(text, /subagent\(action: "send", agentId: "explore-crm@wA:p2"\)/, 'the id to use is spelled out: masters passed the description');
 });
 
 test('buildAliveNotice: error-alive rewrites the failure wording', () => {
   const text = buildAliveNotice(
-    { paneId: 'wA:p3', description: 'Explore HR', scenario: 'error-alive', probe: probe({ agentStatus: 'idle', lastActivityMs: NOW - 45_000 }) },
+    { paneId: 'wA:p3', ref: 'wA:p3', description: 'Explore HR', scenario: 'error-alive', probe: probe({ agentStatus: 'idle', lastActivityMs: NOW - 45_000 }) },
     NOW,
   );
   assert.match(text, /is ALIVE in pane wA:p3/);
   assert.match(text, /NOT that the task failed/);
   assert.match(text, /no readable output.*could not be read yet/s);
   assert.match(text, /Do NOT redo its work/);
-  assert.ok(!buildAliveNotice({ paneId: 'wA:p4', description: 'X', scenario: 'moved-to-bg', probe: probe({ agentStatus: 'working' }) }, NOW)
+  assert.ok(!buildAliveNotice({ paneId: 'wA:p4', ref: 'wA:p4', description: 'X', scenario: 'moved-to-bg', probe: probe({ agentStatus: 'working' }) }, NOW)
     .includes('last session activity'), 'unknown activity omits the clause');
 });
 

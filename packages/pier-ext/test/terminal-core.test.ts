@@ -486,6 +486,26 @@ test('plugins/terminal：wait file: polls the log for a later match, reports an 
   assert.match(missing.content[0].text, /no match in .*never\.log within 1000ms \(timeout\)\.\n.*does not exist/);
 });
 
+test('plugins/terminal：wait file without pattern: waits past an empty file and never returns the content', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'pier-file-appear-'));
+  const token = join(dir, 'token');
+  writeFileSync(token, '');
+  const { pi } = await mountTerminal(t, { open: true });
+  // Real clock on purpose, as in the test above: the wait polls real file I/O, which mocked timers cannot sequence.
+  setTimeout(() => writeFileSync(token, 'ops_SECRETVALUE\n'), 300);
+  const res = await run(pi, { action: 'wait', terminal_id: 'term-1', file: token, timeout_ms: 5000 });
+  assert.equal(res.details.matched, true);
+  assert.equal(res.details.alreadyPresent, false, 'a just-created empty file is not the file having appeared');
+  assert.match(res.content[0].text, /exists and is not empty/);
+  assert.doesNotMatch(res.content[0].text, /SECRETVALUE/);
+
+  const missing = await run(pi, { action: 'wait', terminal_id: 'term-1', file: join(dir, 'never'), timeout_ms: 1000 });
+  assert.equal(missing.details.matched, false);
+  assert.match(missing.content[0].text, /does not exist/);
+
+  await assert.rejects(run(pi, { action: 'wait', terminal_id: 'term-1' }), /pattern is required.*or file/);
+});
+
 test('wait 哨兵自匹配：命中自己回显的 pattern 直接拒绝，可区分的 sentinel 照常等待', async (t) => {
   // 纯函数：literal/regex 是否会命中发送文本本身
   const sent = 'for r in 1 2 3; do pi -p "$(cat in_$r.txt)" > out_$r.json; done; echo G3FP_ALL_DONE';

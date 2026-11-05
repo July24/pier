@@ -290,8 +290,8 @@ export default function terminalPlugin(ctx: Context): void {
       terminal_id: Type.Optional(Type.String({ description: '[open] Optional id for the new terminal (default term-N); [others] id returned by open' })),
       text: Type.Optional(Type.String({ description: '[send] Command text (Enter appended; multi-line runs line by line)' })),
       wait: Type.Optional(Type.Boolean({ description: '[send] Block until the command finishes; returns its exit code and output (pier appends the exit sentinel)' })),
-      pattern: Type.Optional(Type.String({ description: '[wait] Literal text or regex to wait for (must not occur in the sent command text)' })),
-      file: Type.Optional(Type.String({ description: '[wait] Watch this log file instead of the terminal (relative to its cwd; may not exist yet)' })),
+      pattern: Type.Optional(Type.String({ description: '[wait] Literal text or regex to wait for (must not occur in the sent command text). Optional with file' })),
+      file: Type.Optional(Type.String({ description: '[wait] Watch this log file instead of the terminal (relative to its cwd; may not exist yet). Without pattern: wait until it exists and is not empty; its content is not returned' })),
       regex: Type.Optional(Type.Boolean({ description: '[wait] pattern is a regex (default literal)' })),
       timeout_ms: Type.Optional(Type.Number({ description: '[wait, send wait] Default 120000, max 600000' })),
       max_chars: Type.Optional(Type.Number({ description: `[read] Output cap (default ${READ_MAX_CHARS})` })),
@@ -490,17 +490,17 @@ export default function terminalPlugin(ctx: Context): void {
     // Waiting on a pane is use: keep it out of the "used this turn" cleanup nudge at settle.
     touchTerminal(entry);
     const raw = typeof params?.pattern === 'string' ? params.pattern : '';
-    if (!raw) return fail('pattern is required (literal text, or a regular expression with regex: true)');
+    const file = typeof params?.file === 'string' ? params.file.trim() : '';
+    if (!raw && !file) return fail('pattern is required (literal text, or a regular expression with regex: true), or file to wait for a file to appear');
     const useRegex = params?.regex === true;
-    if (useRegex) {
+    if (useRegex && raw) {
       try {
         compilePattern(raw);
       } catch (e) {
         return fail(`invalid regex: ${errText(e)}`);
       }
     }
-    if (typeof params?.file === 'string' && params.file.trim()) {
-      const file = params.file.trim();
+    if (file) {
       const path = file.startsWith('~/') ? resolvePath(homedir(), file.slice(2)) : resolvePath(entry.cwd, file);
       return waitForFile(entry, path, raw, useRegex, params, signal);
     }
@@ -627,7 +627,9 @@ export default function terminalPlugin(ctx: Context): void {
   }
 
   /** `wait` on a log file: the sentinel of a redirected job never reaches the pane. A match already in
-   *  the file when the wait starts returns at once, labelled, so a leftover from an earlier run is visible. */
+   *  the file when the wait starts returns at once, labelled, so a leftover from an earlier run is visible.
+   *  Without a pattern it waits for content to appear (a `>` redirect creates the file empty) and never
+   *  returns that content: such waits target files like credentials, not logs. */
   async function waitForFile(
     entry: TerminalEntry,
     path: string,
@@ -639,7 +641,10 @@ export default function terminalPlugin(ctx: Context): void {
     const requested = typeof params?.timeout_ms === 'number' && params.timeout_ms > 0 ? params.timeout_ms : WAIT_DEFAULT_MS;
     const timeoutMs = Math.min(Math.max(requested, 1000), WAIT_MAX_MS);
     const started = Date.now();
-    const matches = (text: string) => (useRegex ? compilePattern(pattern).test(text) : text.includes(pattern));
+    const matches = (text: string) => {
+      if (!pattern) return text.length > 0;
+      return useRegex ? compilePattern(pattern).test(text) : text.includes(pattern);
+    };
     let text: string | null = null;
     let wake: (() => void) | null = null;
     const onAbort = () => wake?.();
@@ -649,8 +654,9 @@ export default function terminalPlugin(ctx: Context): void {
         text = await readFileTail(path, FILE_WAIT_TAIL_BYTES);
         if (text !== null && matches(text)) {
           const when = tick === 0 ? 'already present when the wait started (truncate the log per run if this is an old one)' : `appeared after ${Math.round((Date.now() - started) / 1000)}s`;
+          const found = pattern ? `matched in ${path} — ${when}:\n${excerptAroundMatch(text, pattern, useRegex)}` : `${path} exists and is not empty — ${when}`;
           return {
-            content: [{ type: 'text', text: `matched in ${path} — ${when}:\n${excerptAroundMatch(text, pattern, useRegex)}` }],
+            content: [{ type: 'text', text: found }],
             details: { terminal_id: entry.terminalId, matched: true, pattern, file: path, alreadyPresent: tick === 0 },
           };
         }

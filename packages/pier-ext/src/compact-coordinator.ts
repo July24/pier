@@ -174,11 +174,14 @@ export class CompactCoordinator {
   private lastPromptTokens = 0;
 
   recordBoundaryCompleted(count: number, source?: TodoCompletionSource): void {
-    // Only model tool calls count, and the sample is the requests spent reaching this boundary.
+    // Only model tool calls count, and the sample is the requests spent per completed item: one write
+    // closing six items is six boundaries (55% of completions are batched; one 118-request sample for
+    // six items predicted 43 requests for the last one, where 1 was left).
     if (source !== 'tool' || count <= 0) return;
     this.pendingBoundaryCompleted = true;
     if (this.state.currentBoundaryRequestCount <= 0) return;
-    this.state.completedBoundaryRequestCounts.push(this.state.currentBoundaryRequestCount);
+    const perItem = this.state.currentBoundaryRequestCount / count;
+    for (let i = 0; i < count; i++) this.state.completedBoundaryRequestCounts.push(perItem);
     if (this.state.completedBoundaryRequestCounts.length > MAX_BOUNDARY_SAMPLES) {
       this.state.completedBoundaryRequestCounts.splice(
         0,

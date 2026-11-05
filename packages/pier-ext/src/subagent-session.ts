@@ -5,7 +5,7 @@
  * terminals), so settlement text can never cross sessions.
  */
 import { accessSync, constants, statSync } from 'node:fs';
-import type { CoreClientLike, CoreStatus } from './core-client.ts';
+import { isCoreErrorKind, type CoreClientLike, type CoreStatus } from './core-client.ts';
 import {
   bareSessionId,
   deriveSubSessionState,
@@ -16,7 +16,7 @@ import {
   type SessionEntryLike,
   type SubSessionState,
 } from './session-tail.ts';
-import { idParam, reportFingerprint, sleep, type AliveProbe, type SubEntry } from './subagent-core.ts';
+import { idParam, reportFingerprint, sleep, subRef, type AliveProbe, type SubEntry } from './subagent-core.ts';
 import { toolError } from './tool-error.ts';
 
 /* ── subagent output delta (pure) ───────────────────────────────── */
@@ -212,6 +212,9 @@ export interface SessionIo {
    * else accept herdr's per-pane report when fresh. An existing value is only replaced by the
    * authoritative report; null means "keep the old one" (never an mtime guess). */
   reattributeStaleSessionFile(paneId: string, cwd: string, sinceTs: number, preferred: string | null): Promise<string | null>;
+  /** The final report in a removed worker's own recorded transcript. Never searches: with the terminal
+   *  gone the candidate order would fall through to the newest file in the cwd, another session's. */
+  retainedReport(entry: Pick<SubEntry, 'cwd' | 'sessionFile'>): string | null;
 }
 
 interface FileStamp {
@@ -416,6 +419,12 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     return { text: null, pendingTool: false, activity: false, turnEnded: false, compacting: false };
   }
 
+  function retainedReport(entry: Pick<SubEntry, 'cwd' | 'sessionFile'>): string | null {
+    const file = resolveSessionFileValue(entry.cwd, h.sessionsDir(), entry.sessionFile);
+    const entries = file ? readSessionFile(file) : null;
+    return entries?.length ? deriveSubSessionState(entries, 0).text : null;
+  }
+
   /** Last assistant text of the best candidate regardless of stopReason: the settle attribution
    *  judgment asks what the tail we READ looks like, not whether it is final. */
   async function readSettleTail(
@@ -448,6 +457,7 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     readAskFlag,
     probeAlive,
     subSessionState,
+    retainedReport,
     readSettleTail,
     reattributeStaleSessionFile,
   };
@@ -486,6 +496,8 @@ export async function executeSubagentOutput(
     /** Last finalized assistant text from the worker's transcript: the pane read alone cannot
      * recover it when the fullscreen TUI shows only the status overlay. Optional for tests. */
     readFinalReport?: (paneId: string, entryCwd: string) => Promise<string | null>;
+    /** Report of a worker whose terminal is gone; the pane and its labels are no longer readable. */
+    readRetainedReport?: (entry: SubEntry) => string | null;
     /** Persists `entry.reportDelivered` so the settlement notice can skip a report already shown. */
     persistSubs?: () => void;
   },
@@ -504,15 +516,22 @@ export async function executeSubagentOutput(
   } catch {
   }
 
-  const status = resolveSubagentStatus({ localStatus: entry.status, status: terminalStatus });
+  let status = resolveSubagentStatus({ localStatus: entry.status, status: terminalStatus });
   const askQuestion = terminalStatus === 'blocked' ? await readBlockedQuestion(deps.client, entry.paneId) : null;
 
   let rawRead: SubagentOutputRead;
+  let terminalGone = false;
   try {
     const read = await deps.client.read(entry.paneId);
     rawRead = { text: read.text, complete: read.complete };
   } catch (err) {
-    return toolError(`Error: failed to read output for subagent ${entry.paneId}: ${(err as Error).message}`);
+    if (!isCoreErrorKind(err, 'not_found')) {
+      return toolError(`Error: failed to read output for subagent ${entry.paneId}: ${(err as Error).message}`);
+    }
+    // Finished terminals get removed; the report outlives them in the worker's transcript.
+    terminalGone = true;
+    status = 'settled';
+    rawRead = { text: '', complete: true };
   }
 
   const prevCursor = deps.outputCursors.get(entry.paneId);
@@ -525,10 +544,13 @@ export async function executeSubagentOutput(
 
   // Transcript fallback: the terminal delta can be empty (or footer-only) while the finished
   // report exists only in the session file. Surface it once per distinct report.
+  let report: string | null = null;
   let reportSection: string | null = null;
-  if ((status === 'settled' || status === 'idle') && deps.readFinalReport) {
+  if (status === 'settled' || status === 'idle') {
     try {
-      const report = await deps.readFinalReport(entry.paneId, entry.cwd);
+      report = terminalGone
+        ? deps.readRetainedReport?.(entry) ?? null
+        : await deps.readFinalReport?.(entry.paneId, entry.cwd) ?? null;
       const fingerprint = report ? reportFingerprint(report) : '';
       if (report && fingerprint && fingerprint !== deltaResult.nextCursor.reportTail) {
         const bounded = boundText(report, Math.max(1, Math.min(maxChars ?? OUTPUT_DEFAULT_MAX_CHARS, OUTPUT_HARD_CAP_CHARS)));
@@ -542,6 +564,9 @@ export async function executeSubagentOutput(
       }
     } catch {
     }
+  }
+  if (terminalGone && !report) {
+    return toolError(`Error: terminal ${entry.paneId} of subagent ${subRef(entry)} is gone and no report could be read from its transcript.`);
   }
   deps.outputCursors.set(entry.paneId, deltaResult.nextCursor);
   const revision = deps.nextRevision(entry.paneId);

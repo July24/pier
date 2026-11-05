@@ -1,7 +1,7 @@
 /**
  * Minimal herdr-core (`hc`) client used inside the pi extension.
  *
- * Written against hc 0.1.16 (protocol generation 1); the request shapes pier builds are pinned to the
+ * Written against hc 0.1.18 (protocol generation 1); the request shapes pier builds are pinned to the
  * OpenRPC snapshot in test/fixtures/hc-contract.json (`hc schema`). After a core upgrade, regenerate
  * the fixture and re-run the contract test.
  *  - Transport is JSON-RPC 2.0, one message per line, plain mode; one connection per request.
@@ -16,7 +16,7 @@
 import * as net from 'node:net';
 
 /** Core release the request shapes were written and contract-tested against. */
-export const CORE_VERSION_PINNED = '0.1.16';
+export const CORE_VERSION_PINNED = '0.1.18';
 
 /* ── Types ──────────────────────────────────────────────────────────── */
 

@@ -305,11 +305,13 @@ export function resolveCacheRatioFromCost(
   return TOKEN_ACCOUNT_CACHE_RATIO;
 }
 
+/** Entries pi would summarize. System messages are prompt state: pi's compaction skips them, so a
+ *  branch whose only history is the persisted system prompt has nothing to compact. */
 function compactionMessageCount(entries: readonly SessionEntry[], startIndex: number, endIndex: number): number {
   let count = 0;
   for (let index = startIndex; index < endIndex; index++) {
     const entry = entries[index];
-    if (entry && entry.type !== 'compaction' && sessionEntryToContextMessages(entry).length > 0) count++;
+    if (entry && entry.type !== 'compaction' && sessionEntryToContextMessages(entry).some((m) => m.role !== 'system')) count++;
   }
   return count;
 }

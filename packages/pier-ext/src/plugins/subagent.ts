@@ -99,7 +99,7 @@ const SUBAGENT_MANUAL = [
   '',
   'list — background subagents with live state (running / idle), pane ids, last activity and description; foreground one-shot panes are not listed.',
   '',
-  'wait — blocks until a background worker settles, fails, closes or starts waiting on a human, and returns that notice (final report included) as the result; it is then not delivered again. `agentId` waits for one worker, omitted waits for any running one; `timeout_ms` default 600000, max 1800000. Returns at once when nothing is running or a target is already blocked on a human. Use it when you have nothing else to do — instead of sleep or repeated list/output calls.',
+  'wait — blocks until a background worker settles, fails, closes or starts waiting on a human, and returns that notice (final report included) as the result; it is then not delivered again. `agentId` waits for one worker, omitted waits for any running one; a report from another running worker also ends the wait, naming the target still running. `timeout_ms` default 600000, max 1800000. Returns at once when nothing is running or a target is already blocked on a human. Use it when you have nothing else to do — instead of sleep or repeated list/output calls.',
   '',
   'output — `agentId` required; returns the delta since your last output call (default 6000 chars, max_chars 100-16000) with status (running/idle/blocked/settled), revision and a truncated flag. TUI chrome is stripped; once the worker has finished, the complete transcript report is attached. A "buffer scrolled or reset" note means the full text was returned — normal for fullscreen TUI panes.',
   '',
@@ -338,7 +338,7 @@ export default function subagentPlugin(ctx: Context): void {
       persistSubs();
     }
     return {
-      content: [{ type: 'text', text: buildAliveNotice({ paneId, description: entry.description, scenario: 'error-alive', probe }, Date.now()) }],
+      content: [{ type: 'text', text: buildAliveNotice({ paneId, ref: subRef(entry), description: entry.description, scenario: 'error-alive', probe }, Date.now()) }],
     };
   });
 
@@ -660,9 +660,10 @@ export default function subagentPlugin(ctx: Context): void {
     return { content: [{ type: 'text', text: lines.join('\n') }], details: {} };
   }
 
-  /** Block until a waited worker produces a notice (settled, failed, closed, or waiting on a human),
-   *  then return those notices as the result. They are taken out of the turn-gap buffer, so the same
-   *  settlement is never delivered twice; notices for other workers stay queued. */
+  /** Block until a worker produces a notice (settled, failed, closed, or waiting on a human), then
+   *  return it as the result. They are taken out of the turn-gap buffer, so the same settlement is
+   *  never delivered twice. A wait on one worker also wakes for the other running workers: their
+   *  reports must not sit queued behind a target that may take much longer. */
   async function executeSubagentWait(params: ToolParams, toolCtx: unknown, signal?: AbortSignal) {
     const { takeNotices, awaitNotice } = d;
     if (!takeNotices || !awaitNotice) return toolError('Error: action "wait" needs the master settlement buffer');
@@ -670,6 +671,10 @@ export default function subagentPlugin(ctx: Context): void {
       ? [targetOf(params, toolCtx).entry]
       : [...subs.values()].filter((sub) => sub.background && sub.status === 'running');
     const ids = new Set(targets.map((t) => t.paneId));
+    const others = new Set([...subs.values()]
+      .filter((sub) => sub.background && sub.status === 'running' && !ids.has(sub.paneId))
+      .map((sub) => sub.paneId));
+    const watched = new Set([...ids, ...others]);
     const requested = Number(params?.timeout_ms);
     const timeoutMs = Number.isFinite(requested) && requested > 0 ? Math.min(requested, WAIT_MAX_MS) : WAIT_DEFAULT_MS;
     const deadline = Date.now() + timeoutMs;
@@ -686,7 +691,12 @@ export default function subagentPlugin(ctx: Context): void {
     }
     while (true) {
       const taken = takeNotices(ids);
-      if (taken.length > 0) return reply(taken.join('\n\n'), 'notice');
+      const otherTaken = takeNotices(others);
+      if (taken.length > 0) return reply([...taken, ...otherTaken].join('\n\n'), 'notice');
+      if (otherTaken.length > 0) {
+        const waiting = targets.filter((t) => t.status === 'running').map(subRef).join(', ');
+        return reply([...otherTaken, `Still running: ${waiting} — wait again for it, or act on the report above first.`].join('\n\n'), 'notice');
+      }
       const running = targets.filter((t) => t.status === 'running');
       if (running.length === 0) {
         return reply(targets.length === 0
@@ -702,7 +712,7 @@ export default function subagentPlugin(ctx: Context): void {
       }
       // Re-derive the running set periodically: a worker that ends without a tagged notice
       // (interrupted, or settled while the master was idle) must not hold the wait to its deadline.
-      await awaitNotice(ids, Math.min(left, WAIT_RECHECK_MS), signal);
+      await awaitNotice(watched, Math.min(left, WAIT_RECHECK_MS), signal);
     }
   }
 
@@ -736,6 +746,7 @@ export default function subagentPlugin(ctx: Context): void {
     // carry the final report. No preferred file — start from the worker's `pier.session` label, not a stale registry value.
     readFinalReport: async (paneId: string, entryCwd: string) =>
       (await session.subSessionState(paneId, entryCwd, 0)).text,
+    readRetainedReport: session.retainedReport,
     persistSubs,
   };
 

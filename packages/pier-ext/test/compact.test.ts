@@ -135,6 +135,17 @@ test('nativeCompactionFeasible: an empty or small branch is not compactable', ()
   assert.equal(nativeCompactionFeasible(smallBranch, 20000), false);
 });
 
+test('nativeCompactionFeasible: a persisted system prompt is not history pi can summarize', () => {
+  const msg = (id: string, parentId: string | null, message: unknown) => ({ type: 'message', id, parentId, timestamp: new Date().toISOString(), message });
+  // The keep window fills exactly at the first user message: only the system entry precedes the cut.
+  const branch = [
+    msg('sys', null, { role: 'system', content: '', sections: { preamble: 'You are a coding assistant.' } }),
+    msg('u1', 'sys', { role: 'user', content: [{ type: 'text', text: 'fix\n'.repeat(12_500) }] }),
+    msg('a1', 'u1', { role: 'assistant', content: [{ type: 'text', text: 'log line\n'.repeat(5_000) }] }),
+  ] as unknown as SessionEntry[];
+  assert.equal(nativeCompactionFeasible(branch, 20000), false);
+});
+
 /** The subset of `ctx.compact()` the coordinator passes. */
 interface CompactCall {
   customInstructions: string;
@@ -171,6 +182,16 @@ const bigBranch = () => Array.from({ length: 25 }, (_, i) => ({
 /** A real decision (the formula is covered above), only used to drive the settled branch. */
 const economicDecision = () => decide({ writeTokens: 60000, archiveTokens: 40000, contextTokens: 60000,
   completedBoundaryRequestCounts: [10], remainingBoundaries: 1, contextWindowTokens: 128000, priorCompactionCount: 1, cacheWriteReadRatio: 2.0 });
+
+test('CompactCoordinator: a write completing several items samples each of them', () => {
+  const coordinator = new CompactCoordinator();
+  for (let i = 0; i < 118; i++) coordinator.onBeforeProviderRequest(1000);
+  coordinator.recordBoundaryCompleted(6, 'tool');
+  assert.equal(coordinator.state.completedBoundaryRequestCounts.length, 6);
+  assert.equal(coordinator.state.currentBoundaryRequestCount, 0);
+  // A single 118-request sample predicted 43 requests for the one item left; 1 was.
+  assert.equal(coordinator.getRemainingHorizon(1), 17);
+});
 
 test('CompactCoordinator: only tool-sourced boundaries are sampled, extension input changes nothing', () => {
   const coordinator = new CompactCoordinator();

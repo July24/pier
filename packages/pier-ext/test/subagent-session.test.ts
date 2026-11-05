@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { CoreClientLike } from '../src/core-client.ts';
+import { CoreError, type CoreClientLike } from '../src/core-client.ts';
 import { SUBS_CUSTOM_TYPE, type SubEntry } from '../src/subagent-core.ts';
 import { sessionDirName } from '../src/session-tail.ts';
 import {
@@ -420,6 +420,34 @@ test('output action: an idle pane showing only its overlay still surfaces the tr
   home.dispose();
 });
 
+test('output action: a removed terminal still yields the report from the recorded transcript, once', async () => {
+  const home = new TempHome('pier-out-gone-');
+  const file = join(home.dir('sessions', 'sub-gone'), '2026-11-03T01-00-00-000Z_55555555-6666-4777-8888-999999999998.jsonl');
+  writeSession(file, [transcriptMessage('assistant', 'FINAL REPORT: survives terminal rm', Date.now())]);
+  const gone = {
+    getTerminal: async () => null,
+    read: async (): Promise<never> => { throw new CoreError('terminal.read', 'not_found', 'no terminal "pWorker"', null); },
+  };
+  const { root, pi } = await mountSubagent({
+    client: { ...NO_TERMINALS, ...gone },
+    subs: [{ ...worker('pWorker', 'closed'), sessionFile: file }],
+  });
+  try {
+    const first = await runSubagent(pi, { action: 'output', agentId: 'pWorker' });
+    assert.equal(first.details!.status, 'settled');
+    assert.match(first.content[0]!.text, /FINAL REPORT: survives terminal rm/);
+    const second = await runSubagent(pi, { action: 'output', agentId: 'pWorker' });
+    assert.doesNotMatch(second.content[0]!.text, /FINAL REPORT/, 'an unchanged report is not re-delivered');
+  } finally {
+    await root.fiber.dispose();
+    home.dispose();
+  }
+  // No recorded transcript: an explicit failure, never the newest session file in the cwd.
+  await withWorker(async (p) => {
+    await assert.rejects(runSubagent(p, { action: 'output', agentId: 'pWorker' }), /is gone and no report/);
+  }, gone, 'closed');
+});
+
 /** Shape of a real worker pane read (01a17b50): padded frame rows, the rendered report with its
  *  markdown stripped and long lines cut at pane width, then pi's cwd + token footer. */
 const RENDERED_PANE = [
@@ -619,6 +647,18 @@ test('wait action: returns the waited worker\'s notice as the result and never d
     await buf.deliverNotice('pA finished later', 'pA');
     await buf.flush('followUp');
     assert.deepEqual(sent, ['pA finished later'], 'the waited notice is not flushed a second time');
+  }));
+
+test('wait action: a wait on one worker wakes for another worker\'s notice and names who is left', () =>
+  withWaitBuffer('working', async (pi, buf, sent) => {
+    const waiting = runSubagent(pi, { action: 'wait', agentId: 'pA' });
+    await buf.deliverNotice('pB finished', 'pB');
+    const res = await waiting;
+    assert.equal(res.details?.outcome, 'notice');
+    assert.match(res.content[0]!.text, /pB finished/);
+    assert.match(res.content[0]!.text, /Still running: .*pA/);
+    await buf.flush('followUp');
+    assert.deepEqual(sent, [], 'the report is delivered by the result only');
   }));
 
 test('wait action: a worker already blocked on a human returns at once; a deadline returns the still-running set', async () => {

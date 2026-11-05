@@ -92,8 +92,8 @@ PI_HERDR_HMR=1 node --expose-internals "$(readlink -f "$(command -v pi)")" -e ./
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| herdr-core 0.1.16 / macOS | ✅ 实测 | RPC `terminal.run` 起终端、app 自动挂 pane、OSC 7501 状态、`terminal.read/wait/send` 全链路 |
-| herdr-core 0.1.16 / Windows | 未实测 | core 走同一 RPC 接口；路径与引号差异按 core 实现为准 |
+| herdr-core 0.1.18 / macOS | ✅ 实测 | RPC `terminal.run` 起终端、app 自动挂 pane、OSC 7501 状态、`terminal.read/wait/send` 全链路 |
+| herdr-core 0.1.18 / Windows | 未实测 | core 走同一 RPC 接口；路径与引号差异按 core 实现为准 |
 | Linux | 未实测（理论可用） | 与 macOS 同走 POSIX 分支 |
 | 非 herdr-core 环境用 pi | ✅ 实测 | 自动降级：不注册 `subagent`/`terminal`/`/locks`；todo_write / ask_user_question 照常可用 |
 | 关闭 Herdr app | ✅ 设计如此 | core 里的终端继续运行；重开 app 后侧边栏状态完整 |

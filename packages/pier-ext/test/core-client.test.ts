@@ -133,7 +133,7 @@ test('coreUnavailableHint: transport failures get a hint, domain errors do not',
   assert.equal(coreUnavailableHint(new Error('invalid regex')), null);
 });
 
-/* ── contract: requests stay inside the hc 0.1.16 OpenRPC snapshot ── */
+/* ── contract: requests stay inside the hc 0.1.18 OpenRPC snapshot ── */
 
 interface OpenRpc { methods: Array<{ name: string; params: Array<{ name: string; required?: boolean }> }> }
 const schema = JSON.parse(readFileSync(new URL('./fixtures/hc-contract.json', import.meta.url), 'utf8')) as OpenRpc;

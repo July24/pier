@@ -657,7 +657,7 @@ export function createSpawnAction(h: SpawnActionHost) {
         if (isAlive(probe, Date.now())) {
           handToPoller(`prompt-${taskId}`);
           return {
-            content: [{ type: 'text', text: `${buildAliveNotice({ paneId, description: spec.description, scenario: 'moved-to-bg', probe }, Date.now())}${formatIsolateLocation(isolateMeta)}` }],
+            content: [{ type: 'text', text: `${buildAliveNotice({ paneId, ref: subRef(entry), description: spec.description, scenario: 'moved-to-bg', probe }, Date.now())}${formatIsolateLocation(isolateMeta)}` }],
             details: { paneId, taskId, background: true, movedToBackground: true, role: kind },
           };
         }
