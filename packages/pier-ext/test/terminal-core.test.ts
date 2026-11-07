@@ -161,6 +161,9 @@ test('promptStrategyFor/planShellInit：env 优先于 $SHELL；未初始化才�
     // `"$?"` are syntax errors, so the sentinel never printed and every `wait: true` timed out.
     [{ SHELL: '/bin/fish' }, FISH_PROMPT, 'fish shell'],
     [{ SHELL: '/usr/local/bin/fish' }, FISH_PROMPT, 'fish shell elsewhere'],
+    // fish has no native Windows binary (WSL/MSYS2 only), but through one of those the
+    // basename can be `fish.exe` — same rule as pwsh.exe above.
+    [{ SHELL: 'C:\\msys64\\usr\\bin\\fish.exe' }, FISH_PROMPT, 'fish.exe on Windows'],
     [{ PIER_TERMINAL_PROMPT: 'fish' }, FISH_PROMPT, 'explicit fish'],
   ];
   for (const [env, expected, label] of strategies) assert.equal(promptStrategyFor(env), expected, label);

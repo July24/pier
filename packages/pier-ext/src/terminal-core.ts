@@ -22,6 +22,7 @@ const PROMPT_STRATEGIES: Record<string, PromptStrategy> = {
   bash: POSIX_PROMPT,
   zsh: POSIX_PROMPT,
   fish: FISH_PROMPT,
+  'fish.exe': FISH_PROMPT,
   pwsh: POWERSHELL_PROMPT,
   'pwsh.exe': POWERSHELL_PROMPT,
   powershell: POWERSHELL_PROMPT,
