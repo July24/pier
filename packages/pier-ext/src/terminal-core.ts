@@ -5,19 +5,24 @@ export const TERMINALS_CUSTOM_TYPE = 'pi-herdr.terminals';
 export const MAX_TERMINALS = 8;
 export const READ_MAX_CHARS = 8000;
 
-/** Shell family that determines which history-expansion init line is safe to send. */
+/** Shell family that determines which history-expansion init line and exit-status spelling are safe. */
 export interface PromptStrategy {
-  readonly family: 'posix' | 'powershell';
+  readonly family: 'posix' | 'powershell' | 'fish';
 }
 
 export const POSIX_PROMPT: PromptStrategy = { family: 'posix' };
 
 export const POWERSHELL_PROMPT: PromptStrategy = { family: 'powershell' };
 
+/** fish rejects the POSIX fragments (`if … then … fi`, `"$?"`) as syntax errors. */
+export const FISH_PROMPT: PromptStrategy = { family: 'fish' };
+
 /** Shell name (lowercased basename from $SHELL, or a PIER_TERMINAL_PROMPT value) → strategy. */
 const PROMPT_STRATEGIES: Record<string, PromptStrategy> = {
   bash: POSIX_PROMPT,
   zsh: POSIX_PROMPT,
+  fish: FISH_PROMPT,
+  'fish.exe': FISH_PROMPT,
   pwsh: POWERSHELL_PROMPT,
   'pwsh.exe': POWERSHELL_PROMPT,
   powershell: POWERSHELL_PROMPT,
@@ -240,7 +245,9 @@ export function redirectedSentinel(text: string): { prefix: string; file: string
 export function withExitSentinel(text: string, nonce: string, strategy: PromptStrategy): string {
   const sentinel = strategy.family === 'powershell'
     ? `"\`n__PIER_${nonce}_$(if ($?) { 0 } elseif ($LASTEXITCODE) { $LASTEXITCODE } else { 1 })__"`
-    : `printf '\\n__PIER_${nonce}_%s__\\n' "$?"`;
+    : strategy.family === 'fish'
+      ? `printf '\\n__PIER_${nonce}_%s__\\n' "$status"`
+      : `printf '\\n__PIER_${nonce}_%s__\\n' "$?"`;
   const body = text.replace(/[\s;]+$/, '');
   // Joining with `;` keeps the sentinel out of the command's stdin. A trailing comment would swallow
   // it and `cmd &;` is a syntax error, so those (and multi-line text) put it on its own line.
@@ -485,7 +492,7 @@ export const SHELL_INIT_COMMAND = 'if [ -n "$ZSH_VERSION" ]; then setopt NO_BANG
 /**
  * Plan the shell init command: disable history expansion, where `!` in ordinary commands (`!|`,
  * `if [ ! -f ... ]`, `!$`) otherwise triggers `zsh: event not found: \|` and wedges the shell.
- * PowerShell rejects the syntax and has no `!` history expansion, so it is skipped.
+ * PowerShell and fish reject the syntax; neither has `!` history expansion, so both are skipped.
  * Limit: the top-level shell only — a nested `bash -i` re-enables its own defaults; init is sent
  * once per terminal unless the send failed.
  */
@@ -494,7 +501,8 @@ export function planShellInit(opts: {
   initialized?: boolean;
 }): ShellInitPlan {
   if (opts.initialized) return { shouldInit: false, command: null };
-  if ((opts.strategy ?? POSIX_PROMPT).family === 'powershell') return { shouldInit: false, command: null };
+  const family = (opts.strategy ?? POSIX_PROMPT).family;
+  if (family === 'powershell' || family === 'fish') return { shouldInit: false, command: null };
   return { shouldInit: true, command: SHELL_INIT_COMMAND };
 }
 
