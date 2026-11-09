@@ -5,7 +5,7 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "pier-setup": "./install.mjs"
+    "pier-setup": "install.mjs"
   },
   "files": [
     "install.mjs"
