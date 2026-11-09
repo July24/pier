@@ -32,6 +32,7 @@ import {
   detectContinuationPrompt,
   detectFullscreenTUI,
   echoSafeWaitSuggestion,
+  exitStatusVar,
   excerptAroundMatch,
   foldTerminalsRegistry,
   foregroundIsShell,
@@ -426,7 +427,7 @@ export default function terminalPlugin(ctx: Context): void {
     if (nonce !== null) return awaitExitSentinel(entry, nonce, before, params, signal);
     const hint = redirectedSentinel(v.text);
     const fileHint = hint
-      ? `\nnote: the sentinel ${hint.prefix}$? is written to ${hint.file}, not the pane — wait for it with `
+      ? `\nnote: the sentinel ${hint.prefix}${exitStatusVar(promptStrategyFor())} is written to ${hint.file}, not the pane — wait for it with `
         + `terminal(action: "wait", terminal_id: "${entry.terminalId}", file: "${hint.file}", pattern: "${echoSafeWaitSuggestion(hint.prefix) ?? hint.prefix}", regex: true) instead of sleeping.`
       : '';
     return { content: [{ type: 'text', text: `sent to ${entry.terminalId} (${v.text.length} chars)${fileHint}` }], details: { terminal_id: entry.terminalId } };
@@ -511,11 +512,12 @@ export default function terminalPlugin(ctx: Context): void {
       const shown = raw.length > 80 ? `${raw.slice(0, 80)}…` : raw;
       const literal = useRegex ? regexLiteralPrefix(raw) : raw;
       const suggestion = echoSafeWaitSuggestion(literal);
+      const status = exitStatusVar(promptStrategyFor());
       const advice = suggestion
-        ? `For future sends, use a sentinel distinguishable from its echo: send \`cmd; echo ${literal}$?\` and wait with regex "${suggestion}" `
-          + '(the echoed command shows `$?`, which that regex cannot match).'
-        : 'For future sends, use a sentinel distinguishable from its echo: send `cmd; echo DONE_$?` and wait with regex "^DONE_[0-9]" '
-          + '(the echo contains `DONE_$?`, which that regex cannot match).';
+        ? `For future sends, use a sentinel distinguishable from its echo: send \`cmd; echo ${literal}${status}\` and wait with regex "${suggestion}" `
+          + `(the echoed command shows \`${status}\`, which that regex cannot match).`
+        : `For future sends, use a sentinel distinguishable from its echo: send \`cmd; echo DONE_${status}\` and wait with regex "^DONE_[0-9]" `
+          + `(the echo contains \`DONE_${status}\`, which that regex cannot match).`;
       return fail(
         `pattern "${shown}" also appears in the command text sent to ${entry.terminalId} — the shell echoes typed commands, `
         + 'so the wait would match its own echo and return before the job finishes. '

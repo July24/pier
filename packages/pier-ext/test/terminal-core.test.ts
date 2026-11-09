@@ -472,6 +472,9 @@ test('redirectedSentinel: a `$?` sentinel appended to a log is found with its fi
   assert.deepEqual(redirectedSentinel(`make; echo "DONE_$?" > 'build.log'`), { prefix: 'DONE_', file: 'build.log' });
   assert.equal(redirectedSentinel('make; echo DONE_$?'), null, 'a sentinel printed to the pane needs no file wait');
   assert.equal(redirectedSentinel('echo hello > out.txt'), null, 'no `$?` sentinel, no hint');
+  // fish spells the status `$status`; a fish sentinel redirected into a log is the same hazard.
+  assert.deepEqual(redirectedSentinel('make > b.log; echo "DONE_$status" >> b.log'), { prefix: 'DONE_', file: 'b.log' });
+  assert.equal(redirectedSentinel('echo X_$statusline >> b.log'), null, 'a longer variable name is not the exit status');
 });
 
 test('plugins/terminal：wait file: polls the log for a later match, reports an old one, and times out on a missing file', async (t) => {
@@ -683,6 +686,21 @@ test('wait 回显前缀：regex 的静态前缀命中命令回显即拒绝，并
       await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: 'APN_BUILD2_EXIT_0', regex: true, timeout_ms: 5000 });
     },
     /\^APN_BUILD2_EXIT_\[0-9\]/,
+  );
+});
+
+test('wait 回显前缀：fish 下哨兵建议与日志提示写 `$status`，回显检测也认 `$status`', async (t) => {
+  assert.equal(sentinelEchoHazard({ pattern: 'X_0$', regex: true, lastSentText: 'run; echo X_$status' }), true,
+    'the echoed `$status` becomes a digit only after the run, like `$?`');
+  const { pi } = await mountTerminal(t, { open: true });
+  process.env.PIER_TERMINAL_PROMPT = 'fish'; // restored by mountTerminal's t.after
+  // `$?` is a fish syntax error, so advice a fish user follows must not contain it.
+  const sent = await run(pi, { action: 'send', terminal_id: 'term-1', text: 'make > b.log; echo DONE_$status >> b.log' });
+  assert.match(sent.content[0].text, /the sentinel DONE_\$status is written to b\.log/);
+  await run(pi, { action: 'send', terminal_id: 'term-1', text: 'run; echo APN_EXIT_$status' });
+  await assert.rejects(
+    async () => { await run(pi, { action: 'wait', terminal_id: 'term-1', pattern: 'APN_EXIT_[0-9]', regex: true, timeout_ms: 5000 }); },
+    (err: Error) => /send `cmd; echo APN_EXIT_\$status`/.test(err.message) && !err.message.includes('$?'),
   );
 });
 

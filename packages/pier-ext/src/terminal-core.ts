@@ -229,13 +229,22 @@ export function echoSafeWaitSuggestion(literal: string): string | null {
   return `^${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[0-9]`;
 }
 
+/** How the shell spells the last exit status in a sentinel (`echo DONE_$?`): fish rejects `$?` as a
+ *  syntax error and uses `$status`. */
+export function exitStatusVar(strategy: PromptStrategy): string {
+  return strategy.family === 'fish' ? '$status' : '$?';
+}
+
+/** A typed exit-status reference, either spelling (`$?` or fish's `$status`). */
+const EXIT_STATUS_REF = /\$(?:\?|status\b)/g;
+
 /**
- * A `cmd; echo RUN_EXIT_$? >> /tmp/run.log` sentinel lands in the log file, never in the pane a
- * plain wait watches: one session slept 240-420 s at a time polling such a log with bash. Returns
- * the sentinel's literal prefix and the file it is redirected into, or null.
+ * A `cmd; echo RUN_EXIT_$? >> /tmp/run.log` sentinel (fish: `$status`) lands in the log file, never
+ * in the pane a plain wait watches: one session slept 240-420 s at a time polling such a log with
+ * bash. Returns the sentinel's literal prefix and the file it is redirected into, or null.
  */
 export function redirectedSentinel(text: string): { prefix: string; file: string } | null {
-  const m = /\becho\s+["']?([A-Za-z][A-Za-z0-9_]*?)\$\?["']?\s*>>?\s*(["']?)([^\s;&|"']+)\2/.exec(text);
+  const m = /\becho\s+["']?([A-Za-z][A-Za-z0-9_]*?)\$(?:\?|status\b)["']?\s*>>?\s*(["']?)([^\s;&|"']+)\2/.exec(text);
   return m ? { prefix: m[1]!, file: m[3]! } : null;
 }
 
@@ -245,9 +254,7 @@ export function redirectedSentinel(text: string): { prefix: string; file: string
 export function withExitSentinel(text: string, nonce: string, strategy: PromptStrategy): string {
   const sentinel = strategy.family === 'powershell'
     ? `"\`n__PIER_${nonce}_$(if ($?) { 0 } elseif ($LASTEXITCODE) { $LASTEXITCODE } else { 1 })__"`
-    : strategy.family === 'fish'
-      ? `printf '\\n__PIER_${nonce}_%s__\\n' "$status"`
-      : `printf '\\n__PIER_${nonce}_%s__\\n' "$?"`;
+    : `printf '\\n__PIER_${nonce}_%s__\\n' "${exitStatusVar(strategy)}"`;
   const body = text.replace(/[\s;]+$/, '');
   // Joining with `;` keeps the sentinel out of the command's stdin. A trailing comment would swallow
   // it and `cmd &;` is a syntax error, so those (and multi-line text) put it on its own line.
@@ -288,7 +295,8 @@ export function sentinelEchoHazard(opts: {
       // prefix (`^DONE_[0-9]` vs `cmd; echo DONE_$?`); only unanchored patterns need the substring check.
       const prefix = regexLiteralPrefix(opts.pattern);
       if (!opts.pattern.startsWith('^') && prefix.length >= 3 && sent.includes(prefix)) return true;
-      return sent.includes('$?') && re.test(sent.replace(/\$\?/g, '0'));
+      const zeroed = sent.replace(EXIT_STATUS_REF, '0');
+      return zeroed !== sent && re.test(zeroed);
     } catch {
       return false; // invalid regex is rejected by the caller before this runs
     }
