@@ -45,7 +45,7 @@ export const PIER_OPTIONS: readonly OptionSpec[] = [
   { name: 'PIER_GC_TICK_MS', legacy: 'PI_HERDR_GC_TICK_MS', fallback: '30000', min: 1000, policy: 'gcTickMs', description: 'idle GC sweep cadence (panes/worktrees)' },
   { name: 'PIER_FOREGROUND_PATIENCE_MS', legacy: 'PI_HERDR_FOREGROUND_PATIENCE_MS', fallback: '300000', min: 0, policy: 'foregroundPatienceMs', description: 'foreground patience before demoting a subagent to background' },
   { name: 'PIER_SESSION_TTL_SECONDS', legacy: 'PI_HERDR_SESSION_TTL_SECONDS', fallback: '600', min: 0, policy: 'sessionTtlSeconds', description: 'session retention after a subagent exits, before GC' },
-  { name: 'PIER_TERMINAL_PROMPT', legacy: 'PI_HERDR_TERMINAL_PROMPT', fallback: '(auto from $SHELL)', description: 'prompt strategy for terminal readiness: bash|zsh|powershell|pwsh' },
+  { name: 'PIER_TERMINAL_PROMPT', legacy: 'PI_HERDR_TERMINAL_PROMPT', fallback: '(auto from $SHELL)', description: 'prompt strategy for terminal readiness: bash|zsh|fish|powershell|pwsh' },
   { name: 'PIER_SLIM_FRAME', legacy: 'PI_HERDR_SLIM_FRAME', fallback: '1', description: 'mutation frame around todo-tool cards (0 disables)' },
   { name: 'PIER_TRACE', legacy: 'PI_HERDR_TRACE', fallback: '', description: 'write diagnostics (renderers, swallowed errors) to stderr (or to this file when it is a path)' },
   { name: 'PIER_TERM_IDLE_MS', legacy: 'PI_HERDR_TERM_IDLE_MS', fallback: '300000', min: 1, description: 'idle time before the second cleanup nudge for an open terminal (per-terminal max 2; 0/NaN falls back to the default)' },

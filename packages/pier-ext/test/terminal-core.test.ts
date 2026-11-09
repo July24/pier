@@ -4,13 +4,14 @@
 import { test, mock, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFileSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
 import { cordisProvide } from '../src/cordis-services.ts';
 import terminalPlugin from '../src/plugins/terminal.ts';
 import {
-  MAX_TERMINALS, POSIX_PROMPT, POWERSHELL_PROMPT, SHELL_INIT_COMMAND, SIGNAL_KEYS, TERMINALS_CUSTOM_TYPE, TERM_REMINDERS_MAX,
+  FISH_PROMPT, MAX_TERMINALS, POSIX_PROMPT, POWERSHELL_PROMPT, SHELL_INIT_COMMAND, SIGNAL_KEYS, TERMINALS_CUSTOM_TYPE, TERM_REMINDERS_MAX,
   TERM_REMINDER_CUSTOM_TYPE, closeTerminal, compilePattern, computeIncrement, detectContinuationPrompt, detectFullscreenTUI,
   echoSafeWaitSuggestion, foldTerminalsRegistry, foregroundIsShell, hashPaneText,
   makeTerminalsRegistry, nextTerminalId, planTerminalReminder, planShellInit, promptStrategyFor, registerTerminal,
@@ -156,12 +157,21 @@ test('promptStrategyFor/planShellInit：env 优先于 $SHELL；未初始化才�
     [{ SHELL: '/usr/bin/pwsh' }, POWERSHELL_PROMPT, 'pwsh shell'],
     [{ SHELL: 'C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' }, POWERSHELL_PROMPT, 'powershell shell'],
     [{ PIER_TERMINAL_PROMPT: 'powershell', SHELL: '/bin/zsh' }, POWERSHELL_PROMPT, 'explicit configuration beats $SHELL'],
+    // fish rejects both POSIX fragments pier used to send unconditionally: `if … then … fi` and
+    // `"$?"` are syntax errors, so the sentinel never printed and every `wait: true` timed out.
+    [{ SHELL: '/bin/fish' }, FISH_PROMPT, 'fish shell'],
+    [{ SHELL: '/usr/local/bin/fish' }, FISH_PROMPT, 'fish shell elsewhere'],
+    // fish has no native Windows binary (WSL/MSYS2 only), but through one of those the
+    // basename can be `fish.exe` — same rule as pwsh.exe above.
+    [{ SHELL: 'C:\\msys64\\usr\\bin\\fish.exe' }, FISH_PROMPT, 'fish.exe on Windows'],
+    [{ PIER_TERMINAL_PROMPT: 'fish' }, FISH_PROMPT, 'explicit fish'],
   ];
   for (const [env, expected, label] of strategies) assert.equal(promptStrategyFor(env), expected, label);
 
   type PlanOpts = { strategy?: PromptStrategy; initialized?: boolean };
   const init: PlanOpts[] = [{}, { strategy: POSIX_PROMPT }];
-  const skip: PlanOpts[] = [{ initialized: true }, { strategy: POWERSHELL_PROMPT }];
+  // fish has no history expansion, so it needs no init line — and the bash/zsh one is a syntax error there.
+  const skip: PlanOpts[] = [{ initialized: true }, { strategy: POWERSHELL_PROMPT }, { strategy: FISH_PROMPT }];
   // `set +H` alone leaves zsh history expansion on (`echo "E$!"` wedges at dquote>): the init must
   // select zsh's `setopt NO_BANG_HIST` and keep bash's `set +H`.
   assert.match(SHELL_INIT_COMMAND, /ZSH_VERSION/); assert.match(SHELL_INIT_COMMAND, /setopt NO_BANG_HIST/);
@@ -309,7 +319,15 @@ interface MountedTerminal {
 
 /** Mounts plugins/terminal.ts through a real cordis Context + PiSurface over fakeCore, optionally
  *  running `action: open` first; returns the recorded client calls the assertions need. */
-async function mountTerminal(t: TestContext, opts: { client?: Partial<CoreClientLike>; open?: boolean } = {}): Promise<MountedTerminal> {
+async function mountTerminal(t: TestContext, opts: { client?: Partial<CoreClientLike>; open?: boolean; prompt?: string } = {}): Promise<MountedTerminal> {
+  // Pin the shell family: the strategy otherwise comes from the developer's $SHELL, and a fish host
+  // would silently change what these tests send.
+  const previousPrompt = process.env.PIER_TERMINAL_PROMPT;
+  process.env.PIER_TERMINAL_PROMPT = opts.prompt ?? 'bash';
+  t.after(() => {
+    if (previousPrompt === undefined) delete process.env.PIER_TERMINAL_PROMPT;
+    else process.env.PIER_TERMINAL_PROMPT = previousPrompt;
+  });
   const calls: MountedTerminal['calls'] = {
     run: [], send: [], keys: [], interrupt: [], read: [], waitForOutput: [], kill: [], remove: [],
   };
@@ -804,6 +822,17 @@ test('withExitSentinel: joins with `;` only where that cannot break the command'
   }
   assert.match(posix('a && b'), /^a && b; printf/, '`&&` is not a background job');
   assert.match(withExitSentinel('dotnet build', 'n1', POWERSHELL_PROMPT), /^dotnet build; "`n__PIER_n1_\$\(if \(\$\?\)/);
+  // fish spells the last exit status `$status`; `"$?"` is a syntax error that prints no sentinel.
+  const fish = (text: string) => withExitSentinel(text, 'n1', FISH_PROMPT);
+  assert.equal(fish('make test;  '), `make test; printf '\\n__PIER_n1_%s__\\n' "$status"`);
+  assert.match(fish('echo a # note'), /\nprintf '\\n__PIER_n1_%s__\\n' "\$status"$/);
+});
+
+test('terminal-core: the fish sentinel really prints an exit status in fish', () => {
+  // Guard the spelling against the shell itself: a fish-valid command line must yield the sentinel.
+  const run = spawnSync('fish', ['-c', withExitSentinel('false', 'feed', FISH_PROMPT)], { encoding: 'utf8' });
+  if (run.error) return; // no fish on this machine
+  assert.deepEqual(parseExitSentinel(run.stdout, 'feed'), { exitCode: 1, output: '' });
 });
 
 test('parseExitSentinel: exit code and output come from the printed line, never the typed echo', () => {
