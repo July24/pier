@@ -319,11 +319,11 @@ interface MountedTerminal {
 
 /** Mounts plugins/terminal.ts through a real cordis Context + PiSurface over fakeCore, optionally
  *  running `action: open` first; returns the recorded client calls the assertions need. */
-async function mountTerminal(t: TestContext, opts: { client?: Partial<CoreClientLike>; open?: boolean; prompt?: string } = {}): Promise<MountedTerminal> {
+async function mountTerminal(t: TestContext, opts: { client?: Partial<CoreClientLike>; open?: boolean } = {}): Promise<MountedTerminal> {
   // Pin the shell family: the strategy otherwise comes from the developer's $SHELL, and a fish host
   // would silently change what these tests send.
   const previousPrompt = process.env.PIER_TERMINAL_PROMPT;
-  process.env.PIER_TERMINAL_PROMPT = opts.prompt ?? 'bash';
+  process.env.PIER_TERMINAL_PROMPT = 'bash';
   t.after(() => {
     if (previousPrompt === undefined) delete process.env.PIER_TERMINAL_PROMPT;
     else process.env.PIER_TERMINAL_PROMPT = previousPrompt;
@@ -828,10 +828,15 @@ test('withExitSentinel: joins with `;` only where that cannot break the command'
   assert.match(fish('echo a # note'), /\nprintf '\\n__PIER_n1_%s__\\n' "\$status"$/);
 });
 
-test('terminal-core: the fish sentinel really prints an exit status in fish', () => {
+test('terminal-core: the fish sentinel really prints an exit status in fish', (t) => {
   // Guard the spelling against the shell itself: a fish-valid command line must yield the sentinel.
-  const run = spawnSync('fish', ['-c', withExitSentinel('false', 'feed', FISH_PROMPT)], { encoding: 'utf8' });
-  if (run.error) return; // no fish on this machine
+  // --no-config: a config.fish that prints anything would land in the parsed output.
+  const run = spawnSync('fish', ['--no-config', '-c', withExitSentinel('false', 'feed', FISH_PROMPT)], { encoding: 'utf8' });
+  if (run.error) {
+    t.skip('fish not installed');
+    return;
+  }
+  assert.equal(run.status, 0, run.stderr);
   assert.deepEqual(parseExitSentinel(run.stdout, 'feed'), { exitCode: 1, output: '' });
 });
 
