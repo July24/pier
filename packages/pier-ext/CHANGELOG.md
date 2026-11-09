@@ -2,6 +2,13 @@
 
 pi shows the entries newer than your last seen version under "Extension Updates" after `pi update`.
 
+## [0.5.5] - 2026-11-09
+
+### Fixed
+
+- A fresh install starts again: since 0.5.4, pi failed on start with `Cannot read properties of undefined (reading 'entry')` because newer cordis plugins were installed alongside the pinned cordis 4.0.1, with npm and with `npmCommand: ["bun"]`.
+- `terminal` `send` with `wait: true` no longer times out on fish: pier no longer sends a POSIX init line there and reads the exit status from `$status`. `PIER_TERMINAL_PROMPT` accepts `fish`.
+
 ## [0.5.4] - 2026-11-05
 
 ### Changed
