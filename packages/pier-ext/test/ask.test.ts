@@ -429,7 +429,7 @@ test('formatAskContent: option / Other notes / empty multi / decline', () => {
   const formatted = (answer: AskAnswer): string => formatAskContent({ answers: [answer], cancelled: false });
   assert.match(formatted({ question: 'Which database?', kind: 'option', answer: 'Redis' }), /"Which database\?"="Redis"/);
   assert.match(formatted({ question: 'Which database?', kind: 'custom', answer: 'Other', customInput: 'SQLite' }), /"Which database\?"="Other" user notes: SQLite/);
-  assert.match(formatted({ question: 'Which database?', kind: 'multi', answer: null, selected: [] }), /"Which database\?"="\(none\)"/);
+  assert.match(formatted({ question: 'Which database?', kind: 'multi', answer: null, selected: [] }), /"Which database\?"="\(no option selected\)"/);
   assert.match(formatted({ question: 'Which database?', kind: 'multi', answer: null, selected: ['Redis', 'Postgres'], customInput: 'and a sidecar' }),
     /"Which database\?"="Redis, Postgres" user notes: and a sidecar/);
   assert.equal(formatAskContent({ answers: [], cancelled: true }), DECLINE_TEXT);
@@ -482,16 +482,16 @@ test('runAsk: numbered input without a select dialog; a non-number becomes a cus
   assert.equal(typed.details.answers[0]?.customInput, 'just sqlite');
 });
 
-test('runAsk multi: comma-separated numbers dedupe; non-numeric is custom; an empty submission is (none)', async () => {
+test('runAsk multi: comma-separated numbers dedupe; non-numeric is custom; an empty submission selects nothing', async () => {
   const ask = (input: string) => askOne(q({ multi: true }), { input: async () => input });
   assert.deepEqual((await ask('2, 2, 1')).details.answers[0]?.selected, ['Postgres', 'Redis']);
   assert.equal((await ask('both, via a sidecar')).details.answers[0]?.kind, 'custom');
   const empty = await ask('  ');
   assert.deepEqual(empty.details.answers[0]?.selected, []);
-  assert.match(empty.content[0]?.text ?? '', /\(none\)/);
+  assert.match(empty.content[0]?.text ?? '', /\(no option selected\)/);
 });
 
-test('runAsk: declining the second question keeps the first answer and says the rest were declined', async () => {
+test('runAsk: declining the second question keeps the first answer and says the rest were cancelled', async () => {
   let n = 0;
   const ui: AskUi = { select: async (_title, options) => { n += 1; return n === 1 ? options[0] : undefined; }, input: async () => 'unused' };
   const result = await runAsk({ mode: 'questionnaire', questions: [q(), q({ question: 'SQL?' })] }, ui);
@@ -500,7 +500,7 @@ test('runAsk: declining the second question keeps the first answer and says the 
   assert.equal(result.details.answers[0]?.answer, 'Redis');
   const text = result.content[0]?.text ?? '';
   assert.match(text, /"Which database\?"="Redis"/);
-  assert.match(text, /declined the remaining/);
+  assert.match(text, /cancelled the remaining questions — do not assume/);
   assert.notEqual(text, DECLINE_TEXT);
 });
 

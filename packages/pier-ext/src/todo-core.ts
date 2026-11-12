@@ -291,14 +291,26 @@ export interface BoundedView {
   hiddenOpen: number;
 }
 
-/** Keep the newest open items, then fill leftover budget with the newest completions (D39). */
+/**
+ * Keep the in-progress items and the earliest open items, then fill leftover budget with the newest
+ * completions. Open items run in list order, so the earliest ones are next up: keeping the newest
+ * instead dropped exactly the steps the model was about to take.
+ */
 export function boundedView(items: readonly TodoItem[], budget: number): BoundedView {
   if (items.length <= budget) {
     return { visible: items.map((it) => ({ ...it })), hiddenCompleted: 0, hiddenOpen: 0 };
   }
   const completed = items.filter((it) => it.status === 'completed');
   const open = items.filter((it) => it.status !== 'completed');
-  const visible = open.length > budget ? open.slice(-budget) : open;
+  let visible = open;
+  if (open.length > budget) {
+    const keep = new Set(open.filter((it) => it.status === 'in_progress').slice(0, budget));
+    for (const it of open) {
+      if (keep.size >= budget) break;
+      keep.add(it);
+    }
+    visible = open.filter((it) => keep.has(it));
+  }
   const hiddenOpen = open.length - visible.length;
   let hiddenCompleted = completed.length;
   let final = visible;

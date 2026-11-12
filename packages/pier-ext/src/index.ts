@@ -270,7 +270,8 @@ export default async function (pi: ExtensionAPI) {
     runningTools.delete(event.toolCallId);
     // pi ≥ 1.1 records the real execution time on the event; the tools ledger replaces wall-clock
     // estimates in the efficiency trial with measured numbers. Absent on older pi — nothing logged.
-    if (typeof event.durationMs === 'number' && sessionRoot) {
+    // The ask picker's duration is the human's answer time (observed up to 4 h), not tool latency.
+    if (typeof event.durationMs === 'number' && sessionRoot && tool !== ASK_TOOL_NAME) {
       try {
         await appendEfficiencyLog(efficiencyLogPath(sessionRoot, 'tools'), {
           sessionId: sessionId || 'unknown',

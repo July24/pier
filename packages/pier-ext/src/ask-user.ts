@@ -10,7 +10,7 @@ export const ASK_TOOL_NAME = 'ask_user_question';
 export const OTHER_OPTION = OTHER_ROW_LABEL;
 
 export const DECLINE_TEXT =
-  'User declined to answer the questions. Continue with your best judgment, or ask different questions.';
+  'User declined to answer the questions. Do not assume answers: continue only with work that does not depend on them, or ask in chat.';
 export const NO_UI_TEXT =
   'Error: UI not available (running in non-interactive mode). The user never saw the questions — do NOT treat this as a decline. Ask the questions as plain chat text instead, without using this tool.';
 
@@ -533,15 +533,17 @@ export function formatAskContent(details: AskDetails): string {
       return `"${answer.question}"="${OTHER_ANSWER}"${notes}`;
     }
     if (answer.kind === 'multi') {
-      const labels = answer.selected?.length ? answer.selected.join(', ') : '(none)';
+      const labels = answer.selected?.length ? answer.selected.join(', ') : '(no option selected)';
       const notes = answer.customInput ? ` user notes: ${answer.customInput}` : '';
       return `"${answer.question}"="${labels}"${notes}`;
     }
     return `"${answer.question}"="${answer.answer ?? ''}"`;
   });
   const answered = `User has answered your questions: ${entries.join(', ')}.`;
+  // A cancel is not consent: "best judgment" here once read as license to act on the skipped
+  // questions (one of them asked whether to delete ~150 GB).
   return details.cancelled
-    ? `${answered} The user declined the remaining questions — continue with these answers and your best judgment.`
+    ? `${answered} The user cancelled the remaining questions — do not assume answers for them; ask again in chat before acting on anything they cover.`
     : `${answered} You can now continue with the user's answers in mind.`;
 }
 

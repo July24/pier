@@ -2,6 +2,19 @@
 
 pi shows the entries newer than your last seen version under "Extension Updates" after `pi update`.
 
+## [Unreleased]
+
+### Changed
+
+- The todo list recited at each turn keeps the in-progress item and the earliest open items, which are the next steps, and says how many later items it left out.
+- Online compaction keeps re-evaluating every 10 requests after you send a message, and also in sessions that never use `todo_write`.
+- `compact.jsonl` records the compaction decision before the run is interrupted, not only after the summary.
+
+### Fixed
+
+- Cancelling `ask_user_question` no longer tells the model to continue with its best judgment; it is told not to assume answers and to ask in chat. An empty multi-select reads `(no option selected)`.
+- The tools ledger no longer counts the time you take to answer `ask_user_question` as tool latency.
+
 ## [0.5.5] - 2026-11-09
 
 ### Fixed

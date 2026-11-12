@@ -167,6 +167,7 @@ export function planTodoReadHook(opts: {
   const c = countTodos(opts.items);
   const view = boundedView(opts.items, 6);
   const lines = view.visible.map((it) => todoLine(it));
+  if (view.hiddenOpen > 0) lines.push(`… +${view.hiddenOpen} later open item(s) not shown`);
   const activity = currentActivity(opts.items);
   const head = `todos ▶${c.inProgress} ○${c.pending} ■${c.blocked} ✓${c.completed}`
     + (activity ? ` · ${activity}` : '');

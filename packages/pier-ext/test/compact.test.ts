@@ -427,6 +427,24 @@ test('P1-3: a failed compaction backs off, pays no abort during the window, and 
   assert.equal(coordinator.state.compactBackoffTurnEnds, 0, 'the backoff resets on success');
 });
 
+test('CompactCoordinator: without any todo boundary, a human turn still gets evaluated every N requests', () => {
+  const coordinator = new CompactCoordinator();
+  const config = { ...configBase, keepRecentTokens: 48000 } as never;
+  const mock = mockContext({ tokens: 50000, branch: bigBranch() });
+  const turn = (): void => {
+    coordinator.onBeforeProviderRequest(50000);
+    coordinator.onTurnEnd({ ctx: mock.ctx, todos: [], config, pi: turnPi(), lastStopReason: 'toolUse' });
+  };
+  for (let i = 0; i < DEFERRED_REEVALUATION_REQUESTS - 1; i++) turn();
+  assert.equal(coordinator.state.lastEvaluationRequestCount, -1, 'not due before N requests');
+  turn();
+  assert.equal(coordinator.state.lastEvaluationRequestCount, DEFERRED_REEVALUATION_REQUESTS, 'a session that never calls todo_write is evaluated');
+  // A human message restarts the clock from the current count; it no longer disables re-evaluation.
+  coordinator.onInput({ text: 'next', source: 'interactive' });
+  for (let i = 0; i < DEFERRED_REEVALUATION_REQUESTS; i++) turn();
+  assert.equal(coordinator.state.lastEvaluationRequestCount, DEFERRED_REEVALUATION_REQUESTS * 2);
+});
+
 test('CompactCoordinator: a deferred decision is re-evaluated every N requests without a new boundary', () => {
   const coordinator = new CompactCoordinator();
   const todos: TodoItem[] = [{ content: 'Done', status: 'completed' }];

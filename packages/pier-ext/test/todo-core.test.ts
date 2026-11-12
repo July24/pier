@@ -180,7 +180,7 @@ test('fuzzyFind: 精确 → 前缀 → 子串，歧义列出候选', () => {
   ];
   assert.deepEqual(fuzzyFind(items2, 'bug'), ['修 board 路径 bug']); assert.deepEqual(fuzzyFind(items2, '不存在'), []);
 });
-test('boundedView: 预算内原样；超预算隐最老保最新（open 截头部，completed 尾部填充）', () => {
+test('boundedView: 预算内原样；超预算保留进行中项与最早的未完成项（下一步），completed 尾部填充', () => {
   const items: TodoItem[] = [
     { content: 'o1', status: 'pending' },
     { content: 'o2', status: 'in_progress' },
@@ -194,8 +194,15 @@ test('boundedView: 预算内原样；超预算隐最老保最新（open 截头�
     { content: 'c1', status: 'completed' },
     { content: 'c2', status: 'completed' },
   ];
-  const v = boundedView(big, 2); // open over budget: keep o2/o3, hide the oldest open and all completed
-  assert.deepEqual(v.visible.map((i) => i.content), ['o2', 'o3']); assert.equal(v.hiddenOpen, 1);
+  const v = boundedView(big, 2); // open over budget: keep o1/o2 (next up), hide the later open and all completed
+  assert.deepEqual(v.visible.map((i) => i.content), ['o1', 'o2']); assert.equal(v.hiddenOpen, 1);
+  const active: TodoItem[] = [
+    { content: 'o1', status: 'pending' },
+    { content: 'o2', status: 'pending' },
+    { content: 'o3', status: 'in_progress' },
+  ];
+  const va = boundedView(active, 2); // the in-progress item survives even when it sits late in the list
+  assert.deepEqual(va.visible.map((i) => i.content), ['o1', 'o3']); assert.equal(va.hiddenOpen, 1);
   assert.equal(v.hiddenCompleted, 2);
   const v2 = boundedView(big, 4); // leftover budget goes to the newest completion (c2), not the oldest
   assert.deepEqual(v2.visible.map((i) => i.content), ['o1', 'o2', 'o3', 'c2']); assert.equal(v2.hiddenCompleted, 1);

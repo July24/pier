@@ -248,7 +248,9 @@ export class CompactCoordinator {
     this.selectedCompaction = null;
     this.intentionalAbort = false;
     this.pendingBoundaryCompleted = false;
-    this.state.lastEvaluationRequestCount = -1;
+    // A human turn restarts the re-evaluation clock instead of disabling it: with -1 here, periodic
+    // re-evaluation stayed off until the next todo boundary (observed: ~150 requests, 228K→364K).
+    this.state.lastEvaluationRequestCount = this.state.currentBoundaryRequestCount;
     // completedBoundaryRequestCounts deliberately survives: it measures requests-per-boundary pacing,
     // which holds across human turns — clearing it pinned expectedRemainingRequests at 1 every prompt.
     this.state.carriedDebtTokens = 0;
@@ -280,10 +282,11 @@ export class CompactCoordinator {
     // further requests, up to 249). Only a tool-call turn proves the work continues; a final 'stop'
     // turn must not trigger a summary (and a spurious continuation) after the task is done.
     const requestCount = this.state.currentBoundaryRequestCount;
+    // -1 = nothing evaluated in this window yet: count from its start, so a session that never
+    // calls todo_write is still evaluated (window protection included) every N tool-call requests.
     const deferredDue =
       opts.lastStopReason === 'toolUse' &&
-      this.state.lastEvaluationRequestCount >= 0 &&
-      requestCount - this.state.lastEvaluationRequestCount >= DEFERRED_REEVALUATION_REQUESTS;
+      requestCount - Math.max(0, this.state.lastEvaluationRequestCount) >= DEFERRED_REEVALUATION_REQUESTS;
     if (!boundary && !deferredDue) return;
 
     const usage = opts.ctx.getContextUsage?.();
@@ -361,6 +364,9 @@ export class CompactCoordinator {
     this.state.lastEvaluationRequestCount = -1;
     this.selectedCompaction = decision;
     this.intentionalAbort = true;
+    // Logged before the abort: the completion record comes only after the summary, so an abort that
+    // interrupted the run was otherwise unauditable when the summary failed or took long.
+    if (opts.config.logEnabled) this.logDecision(opts.ctx, decision);
     opts.cancelReminder?.();
     opts.ctx.abort();
   }
