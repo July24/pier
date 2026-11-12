@@ -2,7 +2,7 @@
 
 pi shows the entries newer than your last seen version under "Extension Updates" after `pi update`.
 
-## [Unreleased]
+## [0.5.6] - 2026-11-12
 
 ### Changed
 
@@ -13,6 +13,7 @@ pi shows the entries newer than your last seen version under "Extension Updates"
 ### Fixed
 
 - Cancelling `ask_user_question` no longer tells the model to continue with its best judgment; it is told not to assume answers and to ask in chat. An empty multi-select reads `(no option selected)`.
+- On fish, `terminal` hints spell the exit status `$status` instead of `$?`.
 - The tools ledger no longer counts the time you take to answer `ask_user_question` as tool latency.
 
 ## [0.5.5] - 2026-11-09

@@ -1,6 +1,6 @@
 {
   "name": "pi-pier",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "description": "pier: pi extension that fuses pi agent sessions with herdr-core terminals shown by the Herdr app — todo_write loop closure + interactive subagents in isolated terminals",
   "license": "MIT",
   "type": "module",

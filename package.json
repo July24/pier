@@ -1,6 +1,6 @@
 {
   "name": "pier-setup",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "description": "One-shot installer for pier: install / update / version / uninstall for pi-pier on herdr-core",
   "license": "MIT",
   "type": "module",
