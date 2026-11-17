@@ -84,7 +84,7 @@ export async function runRoutingHealth(deps: RoutingHealthDeps): Promise<Routing
       lines: [
         'pier routing health',
         `  OFF  routing ${deps.routing.enabled ? 'has an empty routing.spawnModels' : 'is disabled (routing.enabled=false)'} — workers run the master's model`,
-        '  → run /pier-config with no argument and ask the agent to set up a model pool (docs/rfc-spawn-model-routing.md)',
+        '  → run /pier-config with no argument and ask the agent to set up a model pool',
       ],
     };
   }

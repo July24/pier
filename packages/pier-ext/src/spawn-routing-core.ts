@@ -1,5 +1,5 @@
 /**
- * Spawn model routing (RFC docs/rfc-spawn-model-routing.md, D159): pick a worker's model and thinking
+ * Spawn model routing (D159): pick a worker's model and thinking
  * level from the user's pool. jev supplies a model choice and a difficulty score; the pool domain,
  * escalation, effort bands and per-model effort allowlists are code. Every failure falls back to the
  * pre-routing launch (master model, no --thinking), so routing off stays byte-identical.

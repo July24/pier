@@ -47,7 +47,7 @@ export const CONFIG_GUIDANCE_PROMPT = [
   '   (untrusted project) must be reported as such instead of edited blindly.',
   '2. Route by plane:',
   '   - efficiency (D100-D103): read `docs/efficiency-trial.md` before proposing values.',
-  '   - efficiency → routing (D159, subagent model + thinking level): read `docs/rfc-spawn-model-routing.md`. To build a pool:',
+  '   - efficiency → routing (D159, subagent model + thinking level): `/pier-config show efficiency` lists the routing.* keys. To build a pool:',
   '     a) list candidates with `pi --list-models` and keep only models the user actually runs; ask which 2-8 to include;',
   '     b) for each, agree a tier (cheap | balanced | heavy; config order is the preference within a tier), a one-line English',
   '        `description` of what it is for (jev picks from these lines, so name task kinds, not marketing), and optionally an',

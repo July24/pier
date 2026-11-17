@@ -80,7 +80,7 @@
     },
     "routing": {
       "type": "object",
-      "description": "Spawn model routing (RFC docs/rfc-spawn-model-routing.md, D159): subagent spawns pick model + thinking level from a user pool; jev fills unspecified fields, every failure runs the master model",
+      "description": "Spawn model routing (D159): subagent spawns pick model + thinking level from a user pool; jev fills unspecified fields, every failure runs the master model",
       "properties": {
         "enabled": { "type": "boolean", "default": false, "description": "Enable routing (auto-pick also needs jev.enabled + an API key; explicit model/effort only needs the pool)" },
         "spawnModels": {

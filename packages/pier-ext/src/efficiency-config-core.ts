@@ -76,7 +76,7 @@ export interface EfficiencyConfig {
   observationPack: ObservationPackConfig;
   evidencePreservingReducer: EvidencePreservingReducerConfig;
   jev: JevConfig;
-  /** D159 spawn model routing (RFC docs/rfc-spawn-model-routing.md); asks go through `jev`. */
+  /** D159 spawn model routing (spawn-routing-core.ts); asks go through `jev`. */
   routing: RoutingConfig;
 }
 

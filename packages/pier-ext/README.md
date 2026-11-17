@@ -63,7 +63,7 @@ The installer verifies node / pi / `hc` versions and prints an informational lin
 - **Blocking dialogs report blocked**: pi's native OSC 7501 reporter covers the inherently blocking `ctx.ui` dialogs (`select` / `confirm` / `input` / `editor`) and permission dialogs from any extension; since pi 1.5 pier opens its `ui.custom` ask picker with `blocked: { kind: "question" }`, so pi reports it too and restores the run state when it closes. pier writes no status itself.
 - **Readable transcript**: pier's own session entries (todo edits, subagent/terminal registries, delegation) and its reminder messages render as compact cards instead of raw JSON
 - **Soft locks**: write paths publish per-terminal `pier.lock.<hash>` labels; conflicts warn (default) or block (`PI_HERDR_WRITE_LOCK=1`) instead of racing silently. Warnings name **every** holder — the audience split is: agent reads its own tool-result warning, human reads `/locks` (or `hc get <terminal> --json` for the raw label table). `write`/`edit` only — `bash` writes are not covered
-- **Model routing** (D159): with `routing.spawnModels` configured, each spawn gets a pool model and `--thinking` level for its task — jev scores the task, code escalates unconfident picks on hard tasks and snaps the effort to the model's `efforts` list; any failure, or no pool, runs the master's current model (`--provider/--model` from the master's live model, so a `/model` switch carries over, D146). See `docs/rfc-spawn-model-routing.md`; no role profiles or tool gates
+- **Model routing** (D159): with `routing.spawnModels` configured, each spawn gets a pool model and `--thinking` level for its task — jev scores the task, code escalates unconfident picks on hard tasks and snaps the effort to the model's `efforts` list; any failure, or no pool, runs the master's current model (`--provider/--model` from the master's live model, so a `/model` switch carries over, D146). `/pier-config health` probes the pool and jev live; no role profiles or tool gates
 - **Settlement notices folded**: background subagent completions inject between turns (max 3 shown, rest collapsed) instead of flood-filling at run end
 
 ## Scope & degradation
@@ -78,7 +78,7 @@ This extension mutates the pi session even outside a core terminal. After `pi in
 | Hidden inject (`before_agent_start` todo-read; settle reminder) | live | live |
 | `subagent`, `terminal` | **not registered** | live |
 | `/locks`, write-lock on `write`/`edit` | not installed | live |
-| `/pier-config` (read-only config guide over 3 planes) | live | live |
+| `/pier-config` (read-only config guide over 3 planes; `health` probes the subagent model pool) | live | live |
 | slim-frame overlay, pipe, isolate worktree | off | live |
 
 Session JSONL custom types (`pi-herdr.todo-edit`, `.subs`, `.terminals`, `.todo-read`, `.todo-reminder`, …) persist across `/resume` even without core.

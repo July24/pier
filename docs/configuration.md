@@ -47,7 +47,7 @@
 | 让长测试日志变成收据 | `efficiency` → `evidencePreservingReducer` | 开 `enabled`，并把 `model` 指向一个便宜的模型；只想归档不提炼 → `localOnly: true` | 新会话 |
 | 让多步任务自动压缩上下文 | `efficiency` → `onlineContextCompact` | 开 `enabled`；不确定缓存比率时留 `cacheWriteReadRatio: "auto"` | 新会话 |
 | 临时开一天观察 | `env` | `PI_HERDR_OBS_PACK_ENABLE=1 PI_HERDR_OBS_PACK_LOG=1 pi` | 仅该进程 |
-| 子代理换模型 | `efficiency` → `routing` / `pi` | 配 `routing.spawnModels` 模型池并开 `routing.enabled`：spawn 时 jev 按任务挑池内模型与 thinking，`efforts` 限定某模型可用的级别（如只写 `["max"]`）；master 也可在 spawn 参数里显式给 `model`/`effort`（须在池内）。没配池子时 worker 沿用 master 当前模型（D146）。详见 `docs/rfc-spawn-model-routing.md` | 下一次派发（配置改动需新会话） |
+| 子代理换模型 | `efficiency` → `routing` / `pi` | 配 `routing.spawnModels` 模型池并开 `routing.enabled`：spawn 时 jev 按任务挑池内模型与 thinking，`efforts` 限定某模型可用的级别（如只写 `["max"]`）；master 也可在 spawn 参数里显式给 `model`/`effort`（须在池内）。没配池子时 worker 沿用 master 当前模型（D146）。不带参数跑 `/pier-config` 让 agent 引导配置，写完用 `/pier-config health` 实测 | 下一次派发（配置改动需新会话） |
 | 关掉 pi 的自动压缩 | `pi` | 用 pi 的 `/settings`；注意 `compaction.enabled=false` 会连带禁用 OCC（除非 `PI_HERDR_COMPACT_ENABLE=1` 强制） | 新会话 |
 | 让 OCC 的保留窗口跟随 pi | `pi` / `efficiency` | 不在效率配置里写 `keepRecentTokens` 即继承 pi 的值；显式写了就以效率配置为准 | 新会话 |
 | 调子代理超时/GC/轮询 | `env` | `PIER_SUBAGENT_TIMEOUT_MS`、`PIER_GC_TICK_MS`、`PIER_POLL_INTERVAL_MS` … | 新进程 |
@@ -82,5 +82,4 @@
 |---|---|
 | [`docs/efficiency-trial.md`](efficiency-trial.md) | D100–D103 试用指南（开哪个、看什么、怎么判划算、反馈模板） |
 | [`docs/rfc-core-app-migration.md`](rfc-core-app-migration.md) | herdr-core + Herdr app 切换方案（状态源、label、pipe-channel、删除项） |
-| [`docs/rfc-spawn-model-routing.md`](rfc-spawn-model-routing.md) | D159 subagent 模型/effort 路由：模型池配置、jev 决策流程、fallback、测评 |
 | [`schemas/efficiency-config.schema.json`](../packages/pier-ext/schemas/efficiency-config.schema.json) | 契约（键与类型） |

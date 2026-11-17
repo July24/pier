@@ -43,7 +43,7 @@ pier 是**一个 pi 扩展**，外加它与两个外部程序协作：
 - **阻塞等待子代理**（D144、D151）：`subagent(action: "wait", agentId?)` 阻塞到某个 worker 结算、失败、关闭或开始等人工，并把那条通知（含终稿）作为工具结果返回；通知从回合间隙缓冲中取出，不会再投递一次。等待单个 worker 时，其他运行中的 worker 有通知也会返回，并点名仍在运行的目标。master 无事可做时用它代替 `sleep` 与反复的 `list`/`output` 轮询
 - **终端命令带退出码**（D145）：`terminal(action: "send", text, wait: true)` 由 pier 自己追加带 nonce 的退出哨兵，返回退出码与命令输出；手写哨兵（及其回显陷阱）只剩不会结束的输出需要（服务的 "listening on"）
 - **软锁防争抢**：写路径把锁 beacon 作为 `pier.lock.<hash>` label 发布到各自终端；跨终端冲突时警告（默认）或阻止（`PI_HERDR_WRITE_LOCK=1`）。警告列出全部持有者；`/locks` 是人类视图，`hc get <terminal> --json` 暴露原始 label
-- **worker 模型路由**：配了模型池（`routing.spawnModels`）时，每次派发按任务从池里选模型和 thinking 级别——jev 给任务打分，升档与每个模型的 effort 白名单由代码执行，任何失败都退回 master 当前模型；没配池子时 worker 沿用 master 的模型（D146、D159，见 `docs/rfc-spawn-model-routing.md`）。不再有角色档案与按 worker 的工具闸门
+- **worker 模型路由**：配了模型池（`routing.spawnModels`）时，每次派发按任务从池里选模型和 thinking 级别——jev 给任务打分，升档与每个模型的 effort 白名单由代码执行，任何失败都退回 master 当前模型；没配池子时 worker 沿用 master 的模型（D146、D159）。`/pier-config health` 实测模型池与 jev。不再有角色档案与按 worker 的工具闸门
 - **人类闸门**：子代理 `ask_user_question` → 终端上报 blocked，app 据此展示（并按自身规则提醒）；答案作为工具结果返回。不再做启发式的「人工接管」检测。
 - **选择题选择器**：`multi: true` 的问题直接渲染成可勾选列表（空格逐行切换、`a` 全选、回车确认、esc 拒绝，实时显示已选数量），末行固定为自由输入；`allowOther: false` 则纯选择。`tab` 把选择器折叠成两行横条，把屏幕让给上方对话记录，回看完再按 `tab` 展开，光标与勾选保持不变；折叠期间只有 `tab` 生效，回车/esc 不会盲答或拒绝。RPC 模式 / 旧版 pi 自动回退到「输入编号」的文本路径
 - **阻塞式对话框上报 blocked**：pi 原生 OSC 7501 上报覆盖**任何扩展**的 `select` / `confirm` / `input` / `editor` 与权限弹窗；pi 1.5 起 pier 的 `ui.custom` ask 选择器也以 `blocked: { kind: "question" }` 打开、由 pi 上报。pier 自己不写任何状态。
@@ -205,7 +205,7 @@ npm test          # typecheck + node --test（todo 重放 / 反冻结 / GC / 生
 | `PIER_JEV_TIMEOUT_MS` | `2000` | ms | 单次 jev 调用总预算(AbortController 硬杀) |
 | `PIER_JEV_MIN_CONFIDENCE` | `0.6` | – | Choice/Score 答案采纳的最低置信度 |
 | `PIER_JEV_BASE_URL` | – | – | API 根地址覆盖(中转/网关);api.typesafe.ai 被地区封锁时可用 `https://openrouter.ai/api`(模型 `typesafe/jev-1.13`) |
-| `PIER_ROUTING_ENABLE` | `0` | 开关 | 按 `routing.spawnModels` 路由 subagent 模型(D159),详见 `docs/rfc-spawn-model-routing.md` |
+| `PIER_ROUTING_ENABLE` | `0` | 开关 | 按 `routing.spawnModels` 路由 subagent 模型(D159);各键与默认值见 `/pier-config show efficiency` |
 
 **命名**：`PIER_*` 是 pier 选项的规范前缀；历史写法 `PI_HERDR_*` 仍作为别名被读取（空值视为未设置）。
 交给子进程的**契约**名保持不变（`PI_HERDR_SUBAGENT`、`PI_HERDR_ROLE_MANIFEST`、`PI_HERDR_TUI`、
@@ -242,7 +242,7 @@ PI_HERDR_OBS_PACK_ENABLE=1 PI_HERDR_OBS_PACK_LOG=1 pi   # 从这里开始
 （[论文](https://arxiv.org/abs/2609.20519) · [博客](https://nvlabs.github.io/SoL-Pi/)）——
 其通过规模化自动研究循环发现的四个 harness 级效率机制中的三个（第四个 Action Fusion 未采纳）。
 pier 在自有栈上独立实现，并叠加了 jev 决策层（诊断门 / 摘录选窗 / 结算归因 / 子代理模型路由的小型
-System One 分类，见 [rfc-jev-integration.md](docs/rfc-jev-integration.md)、[rfc-spawn-model-routing.md](docs/rfc-spawn-model-routing.md)）
+System One 分类，见 [rfc-jev-integration.md](docs/rfc-jev-integration.md)）
 与四平面效率配置 + 分机制 JSONL 遥测。
 
 ## 设计原则
