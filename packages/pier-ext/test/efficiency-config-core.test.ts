@@ -113,6 +113,14 @@ test('validateEfficiencyConfig: a fully customized config passes and keeps every
     observationPack: { enabled: true, logEnabled: true, thresholdBytes: 20480, fullSends: 3, recallChunkBytes: 32768, excerptBytes: 512 },
     evidencePreservingReducer: { enabled: true, logEnabled: true, model: 'cliproxy/gemini-3.8-flash-high', minBytes: 8192, maxChars: 500000, maxOutputTokens: 1024, timeoutMs: 4000, localOnly: true },
     jev: { enabled: true, logEnabled: true, baseUrl: 'https://relay.example/v1', model: 'jev-1.13.1', timeoutMs: 3000, minConfidence: 0.75, apiKey: 'k' },
+    routing: {
+      enabled: true,
+      spawnModels: [
+        { id: 'magpie/remote-magpie/claude/claude-opus-5-5', tier: 'heavy' as const, description: 'hard work', efforts: ['high' as const, 'xhigh' as const] },
+        { id: 'magpie/mistral/deepseek-v4-1-flash-1017', tier: 'cheap' as const, description: 'mechanical steps' },
+      ],
+      minModelConfidence: 0.7, escalateDifficulty: 2.5, effortLowBelow: 1, effortMediumBelow: 2, timeoutMs: 1500,
+    },
   };
   const res = validateEfficiencyConfig(custom);
   assert.deepEqual(res.issues, []); assert.equal(res.ok, true);
@@ -194,6 +202,15 @@ test('resolveEfficiencyConfig: jev env keys outrank the config value, TYPESAFE_A
   const byConfig = resolveEfficiencyConfig({ userConfig: { jev: { apiKey: 'ck' } }, env: {} });
   assert.equal(byConfig.jev.apiKey, 'ck'); assert.equal(byConfig.jev.enabled, false, 'key alone does not enable the layer');
   assert.equal(resolveEfficiencyConfig({ env: {} }).jev.apiKey, undefined);
+});
+
+test('resolveEfficiencyConfig: a host key env only fills the key for its own host', () => {
+  const keys = { OPENROUTER_API_KEY: 'or-key', TYPESAFE_API_KEY: 'ts-key' };
+  const viaOpenRouter = resolveEfficiencyConfig({ userConfig: { jev: { baseUrl: 'https://openrouter.ai/api' } }, env: keys });
+  assert.equal(viaOpenRouter.jev.apiKey, 'or-key', 'the TypeSafe key is never sent to OpenRouter');
+  assert.equal(resolveEfficiencyConfig({ env: keys }).jev.apiKey, 'ts-key', 'the OpenRouter key is never sent to TypeSafe');
+  assert.equal(resolveEfficiencyConfig({ env: { ...keys, PIER_JEV_BASE_URL: 'https://openrouter.ai/api' } }).jev.apiKey, 'or-key', 'an env baseUrl picks the host too');
+  assert.equal(resolveEfficiencyConfig({ userConfig: { jev: { baseUrl: 'https://openrouter.ai/api', apiKey: 'ck' } }, env: keys }).jev.apiKey, 'ck', 'an explicit key wins');
 });
 
 test('resolveEfficiencyConfig: invalid env values warn and keep the previous value', () => {

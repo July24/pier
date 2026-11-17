@@ -43,7 +43,7 @@ pier is **one pi extension** plus the two external programs it talks to:
 - **Blocking subagent wait** (D144, D151): `subagent(action: "wait", agentId?)` blocks until a worker settles, fails, closes or starts waiting on a human, and returns that notice — final report included — as the tool result; the notice is taken out of the turn-gap buffer so it is never delivered twice. A wait on one worker also returns when another running worker reports, naming the target still running. It replaces `sleep` and repeated `list`/`output` polling while the master has nothing else to do
 - **Terminal commands with exit codes** (D145): `terminal(action: "send", text, wait: true)` appends a nonce'd exit sentinel itself and returns the exit code plus the command's output; hand-written sentinels and the echo trap they fell into are only needed for output that never ends (a server's "listening on")
 - **Soft write-locks**: each terminal publishes lock beacons as `pier.lock.<hash>` labels on `write`/`edit` paths; cross-terminal conflicts warn (default) or block (`PI_HERDR_WRITE_LOCK=1`). The warning lists every holder; `/locks` is the human view of the same table, and `hc get <terminal> --json` exposes the raw labels to agents
-- **One model for the whole tree**: a worker runs the master's current model (a `/model` switch included); there are no role profiles or per-worker tool gates (D146)
+- **Model routing for workers**: with a model pool configured (`routing.spawnModels`), each spawn picks a pool model and thinking level for the task — jev scores the task, code applies escalation and per-model effort allowlists, and any failure runs the master's current model; without a pool, workers run the master's model (D146, D159 — `docs/rfc-spawn-model-routing.md`). There are no role profiles or per-worker tool gates
 - **Human gate**: subagent `ask_user_question` → the terminal is reported blocked, so the app shows it and (per its own rules) notifies; the answer returns as the tool result. There is no heuristic "human takeover" detection any more.
 - **Ask picker**: every choice question renders through one pier-owned picker in the TUI — single-select (arrows + enter/space pick the highlighted row) and `multi: true` toggle list (checkboxes: space toggles, `a` toggles all, live selection count) share the same framed chrome, `recommended` seeds the cursor (and pre-checks in multi), and the free-text row stays last; `allowOther: false` gives pure choice. `tab` folds the picker to a two-line bar so the transcript above gets the room, and `tab` again unfolds it with cursor and toggles intact; while folded only `tab` acts, so enter/esc cannot answer or decline blind. The host select dialog and typed-index prompts remain the fallbacks for RPC mode and older pi
 - **Blocking dialogs report blocked**: pi's native OSC 7501 reporter covers `select` / `confirm` / `input` / `editor` and permission dialogs from *any* extension, and since pi 1.5 pier's `ui.custom` ask picker too (opened with `blocked: { kind: "question" }`). pier writes no status itself.
@@ -165,7 +165,7 @@ Other agents running in core terminals are visible to the app but are not tracke
 ### Usage
 
 1. Start herdr-core and open a terminal (`hc run --bg pi`, or a terminal from the Herdr app), then run `pi` inside it; the extension detects `HC_TERMINAL_ID` / `HC_TERMINAL_SOCKET` and starts talking to core
-2. The model can call `todo_write` (progress shown in the resident widget and `/todos`), `subagent` (spawn / wait / list / send / interrupt / resume / output / help), `terminal` (open / send [`wait: true`] / wait / read / signal / close / list)
+2. The model can call `todo_write` (progress shown in the resident widget and `/todos`), `subagent` (spawn / wait / list / send / interrupt / resume / output / help; spawn takes optional pool-checked `model` / `effort`), `terminal` (open / send [`wait: true`] / wait / read / signal / close / list)
 3. Every subagent = its own core terminal, listed by the app under the master and killed with it; an explicit `tab` makes it an unfocused pane of that tab (a new name gets its own tab automatically)
 4. No restart recovery: core keeps terminals alive across app restarts, but if core stops the workers are gone. Resume the master with `/resume`; revive a finished worker with `subagent(action: "resume", taskId)`
 5. `/pier-tree` opens the delegation tree as an in-pi overlay
@@ -182,7 +182,7 @@ docs/              # install guide, configuration overview, migration RFC
 
 ```sh
 npm install --ignore-scripts
-npm test          # typecheck + node --test (todo replay / anti-freeze / GC / lifecycle / renderers / ask picker / subagent output / jev decision layer)
+npm test          # typecheck + node --test (todo replay / anti-freeze / GC / lifecycle / renderers / ask picker / subagent output / jev decision layer / spawn model routing)
 ```
 
 ## Configuration
@@ -205,11 +205,12 @@ Runtime policies and operational limits are centralized in `runtime-policy.ts` (
 | `PIER_TRACE` | – | flag | Write diagnostics (tool renderers, swallowed errors) to stderr |
 | `PIER_JEV_ENABLE` | `0` | flag | Jev decision layer (TypeSafe System One classification) master switch; every call site fails open — see `docs/rfc-jev-integration.md` |
 | `PIER_JEV_LOG` | `0` | flag | Write `efficiency-logs/jev.jsonl` (metadata + hashes only, never bodies) |
-| `PIER_JEV_API_KEY` | – | – | API key; precedence env > config `jev.apiKey` > `TYPESAFE_API_KEY` |
+| `PIER_JEV_API_KEY` | – | – | API key; precedence env > config `jev.apiKey` > `OPENROUTER_API_KEY` when `jev.baseUrl` is OpenRouter, else `TYPESAFE_API_KEY` |
 | `PIER_JEV_MODEL` | `jev-1.13.0` | – | Pinned versioned model id (aliases drift silently and skew tuned thresholds) |
 | `PIER_JEV_TIMEOUT_MS` | `2000` | ms | Total per-call budget (AbortController hard kill) |
 | `PIER_JEV_MIN_CONFIDENCE` | `0.6` | – | Minimum Choice/Score confidence to adopt an answer |
-| `PIER_JEV_BASE_URL` | – | – | API root override (relay/gateway) |
+| `PIER_JEV_BASE_URL` | – | – | API root override (relay/gateway); `https://openrouter.ai/api` serves the same API (model `typesafe/jev-1.13`) where api.typesafe.ai is region-blocked |
+| `PIER_ROUTING_ENABLE` | `0` | flag | Spawn model routing over `routing.spawnModels` (D159) — see `docs/rfc-spawn-model-routing.md` |
 
 **Naming:** `PIER_*` is the canonical namespace for pier options; the historical `PI_HERDR_*` spelling
 of the same knob is still read as an alias (an empty value counts as unset). Names handed to child
@@ -239,7 +240,8 @@ Three token-saving mechanisms ship **disabled by default** and are safe to try o
 scaled auto-research loops. pier adopts three of them (ObservationPack / EPR / OCC; the fourth,
 Action Fusion, is not adopted) and re-implements them on its own stack, extending the originals
 with a jev decision layer (small System One classifications at the diagnostic gate, excerpt-window
-pick, and settle attribution — [rfc-jev-integration.md](docs/rfc-jev-integration.md)),
+pick, settle attribution and subagent model routing — [rfc-jev-integration.md](docs/rfc-jev-integration.md),
+[rfc-spawn-model-routing.md](docs/rfc-spawn-model-routing.md)),
 and the 4-plane efficiency config with per-mechanism JSONL telemetry (D100–D103).
 
 - **ObservationPack** — large tool outputs are projected as placeholders after the first `fullSends` requests, with paged retrieval via `obs_recall` (session JSONL stays untouched).

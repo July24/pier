@@ -2,6 +2,15 @@
 
 pi shows the entries newer than your last seen version under "Extension Updates" after `pi update`.
 
+## [Unreleased]
+
+### Added
+
+- Subagent model routing: list a model pool under `routing.spawnModels` in the pier efficiency config and enable `routing.enabled`, and each spawn picks a pool model and thinking level for its task. jev scores the task; an unconfident pick on a hard task moves up a tier, and a model's `efforts` list limits the thinking levels it runs with (`["max"]` always runs max). The spawn result names the model and why. If jev is off, unreachable or unsure, the worker runs your current model as before.
+- `subagent` spawn accepts `model` (a pool model, full id or unique suffix) and `effort` to pin either one; values outside the pool or the model's `efforts` are rejected before anything starts.
+- `/pier-config check` reports pool models pi does not know.
+- jev can run through OpenRouter: set `jev.baseUrl` to `https://openrouter.ai/api` and `jev.model` to `typesafe/jev-1.13`; without `jev.apiKey` pier uses `OPENROUTER_API_KEY`. A TypeSafe key is never sent to OpenRouter, and an OpenRouter key never to TypeSafe.
+
 ## [0.5.6] - 2026-11-12
 
 ### Changed

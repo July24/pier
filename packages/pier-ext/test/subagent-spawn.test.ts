@@ -6,6 +6,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import type { Server, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DEFAULT_EFFICIENCY_CONFIG } from '../src/efficiency-config-core.ts';
 import type { CoreClientLike } from '../src/core-client.ts';
 import { pipeNameFor, startPipeServer, type PipeRequest } from '../src/pipe-channel.ts';
 import { appendHistory } from '../src/history-store.ts';
@@ -187,7 +188,7 @@ interface PipeEnv {
  * `paneSeq` hands out p2, p3, … (one pipe server per id) for multi-worker tests. */
 async function withPipeEnv(
   fn: (env: PipeEnv) => Promise<void>,
-  opts: { childCwd?: string; paneSeq?: boolean } = {},
+  opts: { childCwd?: string; paneSeq?: boolean; deps?: Record<string, unknown> } = {},
 ): Promise<void> {
   const home = new TempHome('pier-spawn-home-');
   const cwd = mkdtempSync(join(tmpdir(), 'pier-spawn-cwd-'));
@@ -246,6 +247,7 @@ async function withPipeEnv(
       },
       kill: async (id) => { env.retired.push(id); },
     },
+    ...(opts.deps ? { deps: opts.deps } : {}),
   });
   env.pi = pi;
   env.port = port;
@@ -484,4 +486,91 @@ test('slugs: spawn allocates and dedupes; list/send accept slug, slug@paneId, an
     const stale = await runSubagent(env.pi, { action: 'send', agentId: 'fix-auth-flow@pOld', message: 'still me' }, env.cwd);
     assert.match(stale.content[0]!.text, /Message sent to subagent fix-auth-flow@p2/);
   }, { paneSeq: true });
+});
+
+/* ── D159 spawn model routing ──────────────────────────────────── */
+
+const ROUTING_POOL = [
+  { id: 'magpie/remote-magpie/claude/claude-opus-5-5', tier: 'heavy' as const, description: 'hard work' },
+  { id: 'magpie/cloudflareaigateway/claude-sonnet-5-5', tier: 'balanced' as const, description: 'single fixes' },
+  { id: 'magpie/mistral/deepseek-v4-1-flash-1017', tier: 'cheap' as const, description: 'mechanical steps', efforts: ['max' as const] },
+];
+
+function routingDeps(answer: (request: { questions: Record<string, unknown> }) => unknown, asked: unknown[]): Record<string, unknown> {
+  return {
+    routing: {
+      getConfig: () => ({ ...DEFAULT_EFFICIENCY_CONFIG.routing, enabled: true, spawnModels: ROUTING_POOL }),
+      getMinConfidence: () => 0.6,
+      jev: {
+        available: true,
+        ask: async (request: { questions: Record<string, unknown> }, meta: { enrich?: (o: { ok: boolean; answers: unknown }) => unknown }) => {
+          asked.push(request);
+          const answers = answer(request);
+          if (!answers) {
+            meta.enrich?.({ ok: false, answers: null });
+            return { ok: false, reason: 'timeout', latencyMs: 2000 };
+          }
+          meta.enrich?.({ ok: true, answers });
+          return { ok: true, answers, model: 'jev-1.13.0', usage: {}, latencyMs: 5 };
+        },
+      },
+    },
+  };
+}
+
+const MASTER_CTX = (cwd: string) => ({ cwd, model: { provider: 'opencode-go', id: 'kimi-k2.7-code' } });
+const flagValue = (argv: readonly string[], flag: string): string | undefined => (argv.includes(flag) ? argv[argv.indexOf(flag) + 1] : undefined);
+
+test('spawn routing: jev picks the pool model, the pool pins its effort, and the result names the route', async () => {
+  const asked: unknown[] = [];
+  const deps = routingDeps(() => ({
+    model: { type: 'choice', choice: 'magpie/mistral/deepseek-v4-1-flash-1017', probabilities: {}, confidence: 0.98 },
+    difficulty: { type: 'score', score: 0.3, probabilities: {}, confidence: 0.95 },
+  }), asked);
+  await withPipeEnv(async (env) => {
+    const execute = env.pi.tools.get('subagent')!.execute!;
+    const result = await execute('tc', { description: 'rename', prompt: PROMPT }, undefined, undefined, MASTER_CTX(env.cwd)) as { content: Array<{ text: string }> };
+    const argv = env.spawnArgv[0]!;
+    assert.equal(flagValue(argv, '--provider'), 'magpie');
+    assert.equal(flagValue(argv, '--model'), 'mistral/deepseek-v4-1-flash-1017');
+    assert.equal(flagValue(argv, '--thinking'), 'max', 'low difficulty maps to low, then the max-only pool entry pins max');
+    assert.match(result.content[0]!.text, /model deepseek-v4-1-flash-1017 · thinking max · via jev/);
+    assert.equal(asked.length, 1);
+  }, { deps });
+});
+
+test('spawn routing: a failed jev ask runs the master model exactly as before', async () => {
+  const deps = routingDeps(() => null, []);
+  await withPipeEnv(async (env) => {
+    const execute = env.pi.tools.get('subagent')!.execute!;
+    const result = await execute('tc', { description: 'fix', prompt: PROMPT }, undefined, undefined, MASTER_CTX(env.cwd)) as { content: Array<{ text: string }> };
+    const argv = env.spawnArgv[0]!;
+    assert.equal(flagValue(argv, '--model'), 'kimi-k2.7-code');
+    assert.equal(argv.includes('--thinking'), false);
+    assert.match(result.content[0]!.text, /routing fell back \(jev timeout\)/);
+  }, { deps });
+});
+
+test('spawn routing: explicit model/effort skip jev; out-of-pool and disallowed values fail before any terminal', async () => {
+  const asked: unknown[] = [];
+  const deps = routingDeps(() => null, asked);
+  await withPipeEnv(async (env) => {
+    const execute = env.pi.tools.get('subagent')!.execute!;
+    await execute('tc', { description: 'review', prompt: PROMPT, model: 'claude-opus-5-5', effort: 'xhigh' }, undefined, undefined, MASTER_CTX(env.cwd));
+    assert.equal(flagValue(env.spawnArgv[0]!, '--model'), 'remote-magpie/claude/claude-opus-5-5');
+    assert.equal(flagValue(env.spawnArgv[0]!, '--thinking'), 'xhigh');
+    assert.equal(asked.length, 0, 'both fields fixed → no jev ask');
+
+    const rejects = async (params: Record<string, unknown>): Promise<string> => {
+      try {
+        await execute('tc', { description: 'x', prompt: PROMPT, ...params }, undefined, undefined, MASTER_CTX(env.cwd));
+      } catch (err) {
+        return (err as Error).message;
+      }
+      throw new Error('expected the spawn to be rejected');
+    };
+    assert.match(await rejects({ model: 'gpt-6' }), /not in the model pool/);
+    assert.match(await rejects({ model: 'deepseek-v4-1-flash-1017', effort: 'low' }), /not allowed .* \(allowed: max\)/);
+    assert.equal(env.spawnArgv.length, 1, 'rejected spawns create no terminal');
+  }, { deps });
 });

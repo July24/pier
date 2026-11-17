@@ -11,7 +11,7 @@ import { PIER_OPTIONS } from './pier-options.ts';
 
 export type ConfigPlaneId = 'efficiency' | 'pi' | 'env';
 
-export type ConfigKind = 'boolean' | 'number' | 'string' | 'enum';
+export type ConfigKind = 'boolean' | 'number' | 'string' | 'enum' | 'list';
 
 export interface ConfigKnob {
   readonly plane: ConfigPlaneId;
@@ -89,11 +89,18 @@ const EFFICIENCY_KNOBS: readonly ConfigKnob[] = [
   { plane: 'efficiency', key: 'evidencePreservingReducer.localOnly', kind: 'boolean', defaultValue: false, impact: 'Archive the raw log but never call a model', docRef: 'docs/efficiency-trial.md' },
   { plane: 'efficiency', key: 'jev.enabled', kind: 'boolean', defaultValue: false, envVar: 'PIER_JEV_ENABLE', impact: 'Jev decision layer (System One classification) master switch; every call site fails open', docRef: 'docs/rfc-jev-integration.md' },
   { plane: 'efficiency', key: 'jev.logEnabled', kind: 'boolean', defaultValue: false, envVar: 'PIER_JEV_LOG', impact: 'Write jev.jsonl question outcomes (no request/response bodies)', docRef: 'docs/rfc-jev-integration.md' },
-  { plane: 'efficiency', key: 'jev.baseUrl', kind: 'string', envVar: 'PIER_JEV_BASE_URL', impact: 'API root override (relay/gateway); default https://api.typesafe.ai', docRef: 'docs/rfc-jev-integration.md' },
+  { plane: 'efficiency', key: 'jev.baseUrl', kind: 'string', envVar: 'PIER_JEV_BASE_URL', impact: 'API root override (relay/gateway); default https://api.typesafe.ai; https://openrouter.ai/api serves the same System One API (model typesafe/jev-1.13)', docRef: 'docs/rfc-jev-integration.md' },
   { plane: 'efficiency', key: 'jev.model', kind: 'string', defaultValue: 'jev-1.13.0', envVar: 'PIER_JEV_MODEL', impact: 'Pinned versioned model id; aliases drift silently and skew tuned thresholds', docRef: 'docs/rfc-jev-integration.md' },
   { plane: 'efficiency', key: 'jev.timeoutMs', kind: 'number', defaultValue: 2000, min: 500, envVar: 'PIER_JEV_TIMEOUT_MS', impact: 'Total per-call budget via AbortController hard kill', docRef: 'docs/rfc-jev-integration.md' },
   { plane: 'efficiency', key: 'jev.minConfidence', kind: 'number', defaultValue: 0.6, min: 0, envVar: 'PIER_JEV_MIN_CONFIDENCE', impact: 'Minimum Choice/Score confidence to adopt an answer; below counts as unanswered', docRef: 'docs/rfc-jev-integration.md' },
-  { plane: 'efficiency', key: 'jev.apiKey', kind: 'string', envVar: 'PIER_JEV_API_KEY', impact: 'API key; PIER_JEV_API_KEY env > config value > TYPESAFE_API_KEY env', docRef: 'docs/rfc-jev-integration.md' },
+  { plane: 'efficiency', key: 'jev.apiKey', kind: 'string', envVar: 'PIER_JEV_API_KEY', impact: 'API key; PIER_JEV_API_KEY env > config value > OPENROUTER_API_KEY env (OpenRouter baseUrl) or TYPESAFE_API_KEY env (otherwise)', docRef: 'docs/rfc-jev-integration.md' },
+  { plane: 'efficiency', key: 'routing.enabled', kind: 'boolean', defaultValue: false, envVar: 'PIER_ROUTING_ENABLE', impact: 'Spawn model routing: subagent spawns pick model + thinking from routing.spawnModels (jev fills unspecified fields; failures run the master model)', docRef: 'docs/rfc-spawn-model-routing.md' },
+  { plane: 'efficiency', key: 'routing.spawnModels', kind: 'list', impact: 'Model pool (2-8): [{id: "provider/model", tier: cheap|balanced|heavy, description, efforts?: thinking levels}]; the only models a routed or explicit spawn may use', docRef: 'docs/rfc-spawn-model-routing.md' },
+  { plane: 'efficiency', key: 'routing.minModelConfidence', kind: 'number', defaultValue: 0.6, min: 0, impact: 'jev model picks below this confidence escalate one tier when difficulty >= escalateDifficulty', docRef: 'docs/rfc-spawn-model-routing.md' },
+  { plane: 'efficiency', key: 'routing.escalateDifficulty', kind: 'number', defaultValue: 3.0, min: 0, impact: 'Difficulty score (0-4) at which an unconfident pick escalates', docRef: 'docs/rfc-spawn-model-routing.md' },
+  { plane: 'efficiency', key: 'routing.effortLowBelow', kind: 'number', defaultValue: 1.2, min: 0, impact: 'Difficulty below this routes thinking `low` (then clamped to the model\'s efforts)', docRef: 'docs/rfc-spawn-model-routing.md' },
+  { plane: 'efficiency', key: 'routing.effortMediumBelow', kind: 'number', defaultValue: 2.6, min: 0, impact: 'Difficulty below this routes thinking `medium`; above it `high`', docRef: 'docs/rfc-spawn-model-routing.md' },
+  { plane: 'efficiency', key: 'routing.timeoutMs', kind: 'number', defaultValue: 2000, min: 500, impact: 'jev budget for one routing ask; a timeout runs the master model', docRef: 'docs/rfc-spawn-model-routing.md' },
 ];
 
 /** Pi-owned keys pier only reads. */

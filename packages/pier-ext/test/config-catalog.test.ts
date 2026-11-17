@@ -45,7 +45,7 @@ function schemaPropertyPaths(file: string): string[] {
 
 test('drift guards: the catalog matches the JSON schema and the runtime env reads', () => {
   const schemaKeys = schemaPropertyPaths('efficiency-config.schema.json').filter(
-    (k) => k !== 'version' && !/^onlineContextCompact$|^observationPack$|^evidencePreservingReducer$|^jev$/.test(k),
+    (k) => k !== 'version' && !/^onlineContextCompact$|^observationPack$|^evidencePreservingReducer$|^jev$|^routing$/.test(k),
   );
   const catalog = new Set(knobsOfPlane('efficiency'));
   for (const key of schemaKeys) assert.equal(catalog.has(key), true, `schema key "${key}" is missing from the catalog`);

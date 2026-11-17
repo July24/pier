@@ -689,6 +689,7 @@ export default async function (pi: ExtensionAPI) {
       isCompactionInFlight: () => coordinator.compactionInFlight,
       isIntentionalAbort: () => coordinator.intentionalAbort,
       jev: { ask: (request, meta) => jevRuntime.ask(request, meta), getMinConfidence: () => effConfig.jev.minConfidence },
+      routing: { getConfig: () => effConfig.routing, getMinConfidence: () => effConfig.jev.minConfidence, jev: jevRuntime },
     });
 
     /* ── /pier-tree (D113): full todo × subagent delegation tree; the resident widget is minimal ── */

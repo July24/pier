@@ -464,7 +464,7 @@ function placementFor(tabName: string): TabPlacementPlan {
 /** D97: fullscreen is what makes the pane a static frame the master can read. */
 export function buildLaunchParts(
   runtime: { nodePath: string; cliPath: string; extPath: string },
-  opts: { resumeFile?: string | null; model?: string | null; approve?: boolean } = {},
+  opts: { resumeFile?: string | null; model?: string | null; thinking?: string | null; approve?: boolean } = {},
   env: { PI_HERDR_TUI?: string | undefined } = process.env,
 ): string[] {
   const parts = [runtime.nodePath, runtime.cliPath];
@@ -476,6 +476,7 @@ export function buildLaunchParts(
     if (provider) parts.push('--provider', provider);
     parts.push('--model', model);
   }
+  if (opts.thinking) parts.push('--thinking', opts.thinking);
   if (opts.resumeFile) parts.push('--session', opts.resumeFile);
   return parts;
 }

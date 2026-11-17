@@ -46,7 +46,7 @@ import type { TerminalStateSlot } from './terminal.ts';
 import { bareSessionId, resolveSessionFileValue } from '../session-tail.ts';
 import { DELEGATION_ENV, type DelegationContext } from '../delegation-core.ts';
 import type { JevRuntime } from '../jev-client.ts';
-import { createGitIo, createSpawnAction, createSpawner } from '../subagent-spawn.ts';
+import { createGitIo, createSpawnAction, createSpawner, type SpawnRouting } from '../subagent-spawn.ts';
 import { createPoller } from '../subagent-poller.ts';
 import { createGcController, createSubagentRegistry } from '../subagent-gc.ts';
 import { createSessionIo, executeSubagentOutput, type SubagentOutputCursor } from '../subagent-session.ts';
@@ -77,6 +77,8 @@ export interface SubagentDeps {
   terminalState: TerminalStateSlot;
   /** Optional jev seam (settle attribution check); absent → fail-open legacy behavior. */
   jev?: { ask: JevRuntime['ask']; getMinConfidence: () => number };
+  /** D159 spawn model routing; absent = workers run the master's model. */
+  routing?: SpawnRouting;
 }
 
 /** Sent with every request: what a call needs. Details live in SUBAGENT_MANUAL (`action: "help"`). */
@@ -730,6 +732,7 @@ export default function subagentPlugin(ctx: Context): void {
     spawn,
     poller,
     getSessionId: d.getSessionId,
+    ...(d.routing ? { routing: d.routing } : {}),
   });
 
   const outputActionDeps = {
@@ -792,6 +795,11 @@ export default function subagentPlugin(ctx: Context): void {
       cwd: Type.Optional(Type.String({ description: '[spawn] Existing directory or worktree to run in (absolute or workspace-relative); exclusive with isolate' })),
       isolate: Type.Optional(Type.Boolean({ description: '[spawn] Run in a fresh git worktree (branch pier/<slug>) for heavy parallel writes or a reviewable diff; settle reports a diff summary (see help)' })),
       tab: Type.Optional(Type.String({ description: '[spawn] Give the worker a pane in this task tab (joined or created; "main" = your tab). Default: no pane, listed under your agent' })),
+      model: Type.Optional(Type.String({ description: '[spawn] Usually omit: the model pool routes it. Pin a pool model (full id or unique suffix) only when the user asks for one' })),
+      effort: Type.Optional(Type.Union(
+        ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map((level) => Type.Literal(level)),
+        { description: '[spawn] Usually omit: routed from task difficulty. Thinking level for the worker; must be allowed by the pinned model' },
+      )),
       taskId: Type.Optional(Type.String({ description: '[resume] Task id from the delegation ledger' })),
       agentId: Type.Optional(Type.String({ description: '[send|interrupt|output|wait] Slug, pane id, or slug@paneId as printed by spawn/list' })),
       timeout_ms: Type.Optional(Type.Integer({ description: `[wait] Default ${WAIT_DEFAULT_MS}, max ${WAIT_MAX_MS}` })),

@@ -31,6 +31,7 @@ import {
   loadPiNativeCompactionSettings,
   validateEfficiencyConfig,
 } from './efficiency-config-core.ts';
+import { registryModelProbe } from './spawn-routing-core.ts';
 import { formatOptionRows } from './pier-options.ts';
 import { formatSwallowedErrors } from './swallow.ts';
 import { CORE_VERSION_PINNED } from './core-client.ts';
@@ -72,6 +73,8 @@ export interface ConfigGuideDeps {
   agentDir?: string;
   /** User-level efficiency config path (defaults to ~/.pi/agent/herdr-pi/config.json). */
   userConfigPath?: string;
+  /** pi model registry probe for routing.spawnModels ids (absent: structure-only check). */
+  modelExists?: (id: string) => boolean;
 }
 
 export interface ConfigGuideSnapshot {
@@ -117,6 +120,19 @@ export function collectConfigSnapshot(deps: ConfigGuideDeps = {}): ConfigGuideSn
   }
   if (userLayer.value !== undefined) {
     for (const issue of validateEfficiencyConfig(userLayer.value).issues) efficiencyIssues.push(`${userConfigPath}: ${issue}`);
+  }
+  // D159: a pool id pi cannot resolve is silently dropped from routing, so name it here.
+  if (deps.modelExists) {
+    const layers: Array<[string, unknown]> = [
+      [workspaceConfigPath, workspaceTrusted ? workspaceLayer.value : undefined],
+      [userConfigPath, userLayer.value],
+    ];
+    for (const [path, value] of layers) {
+      if (value === undefined) continue;
+      for (const model of validateEfficiencyConfig(value).config.routing.spawnModels) {
+        if (!deps.modelExists(model.id)) efficiencyIssues.push(`${path}: routing.spawnModels id "${model.id}" is not a model pi knows (see pi --list-models)`);
+      }
+    }
   }
   files.efficiency.push(
     { path: workspaceConfigPath, label: 'workspace', exists: workspaceLayer.value !== undefined, ignored: !workspaceTrusted },
@@ -272,7 +288,8 @@ export function installConfigCommand(deps: ConfigCommandDeps): void {
 
       let snapshot: ConfigGuideSnapshot;
       try {
-        snapshot = collect({ cwd, isProjectTrusted });
+        const modelExists = registryModelProbe(ctx);
+        snapshot = collect({ cwd, isProjectTrusted, ...(modelExists ? { modelExists } : {}) });
       } catch (err) {
         emit(`pier-config: failed to read configuration (${err instanceof Error ? err.message : String(err)})`, 'error');
         return;

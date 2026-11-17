@@ -12,6 +12,7 @@ import todoPlugin from './plugins/todo.ts';
 import subagentPlugin from './plugins/subagent.ts';
 import type { CoreClientLike, CoreEnv } from './core-client.ts';
 import type { JevRuntime } from './jev-client.ts';
+import type { SpawnRouting } from './subagent-spawn.ts';
 import type { TodosService } from './todos-service.ts';
 import type { TodoUiSlot } from './plugins/todo.ts';
 import type { SubagentPortBox } from './subagent-core.ts';
@@ -41,6 +42,8 @@ export interface MasterPluginMount {
   isIntentionalAbort?: () => boolean;
   /** Optional jev seam for subagent settle attribution (fail-open when absent). */
   jev?: { ask: JevRuntime['ask']; getMinConfidence: () => number };
+  /** D159 spawn model routing (pool + jev); absent = workers run the master's model. */
+  routing?: SpawnRouting;
   /** D113: running subagent rows joined with their cached todos — feeds the unified widget. */
   getWorkers?: () => readonly WorkerWidgetRow[];
 }
@@ -117,6 +120,7 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
     claimSettleNotice: m.claimSettleNotice,
     terminalState: terminalDeps.state,
     ...(m.jev ? { jev: m.jev } : {}),
+    ...(m.routing ? { routing: m.routing } : {}),
   });
   await loadEntry(sessionRoot, useLoader, './plugins/subagent.ts', subagentPlugin);
 

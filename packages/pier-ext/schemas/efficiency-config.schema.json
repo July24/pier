@@ -70,11 +70,46 @@
       "properties": {
         "enabled": { "type": "boolean", "default": false, "description": "Enable the jev decision layer (calls are only made once apiKey is configured)" },
         "logEnabled": { "type": "boolean", "default": false, "description": "Write efficiency-logs/jev.jsonl (no request/response bodies)" },
-        "baseUrl": { "type": "string", "description": "API base URL override (proxy/gateway); defaults to https://api.typesafe.ai" },
+        "baseUrl": { "type": "string", "description": "API base URL override (proxy/gateway); defaults to https://api.typesafe.ai. https://openrouter.ai/api serves the same System One API (model typesafe/jev-1.13)" },
         "model": { "type": "string", "default": "jev-1.13.0", "description": "Pinned versioned model id; aliases drift silently and skew calibration thresholds" },
         "timeoutMs": { "type": "integer", "default": 2000, "minimum": 500, "description": "Total budget per call (hard kill via AbortController; the SDK has no total-budget mode)" },
         "minConfidence": { "type": "number", "default": 0.6, "minimum": 0, "maximum": 1, "description": "Minimum confidence for accepting a Choice/Score answer; below it the answer is treated as unanswered" },
-        "apiKey": { "type": "string", "description": "API key. Resolution order: PIER_JEV_API_KEY env var > this field > TYPESAFE_API_KEY env var" }
+        "apiKey": { "type": "string", "description": "API key. Resolution order: PIER_JEV_API_KEY env var > this field > OPENROUTER_API_KEY (when baseUrl is OpenRouter) or TYPESAFE_API_KEY env var" }
+      },
+      "additionalProperties": false
+    },
+    "routing": {
+      "type": "object",
+      "description": "Spawn model routing (RFC docs/rfc-spawn-model-routing.md, D159): subagent spawns pick model + thinking level from a user pool; jev fills unspecified fields, every failure runs the master model",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false, "description": "Enable routing (auto-pick also needs jev.enabled + an API key; explicit model/effort only needs the pool)" },
+        "spawnModels": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 8,
+          "description": "The model pool; the only models a routed or explicit spawn may use",
+          "items": {
+            "type": "object",
+            "required": ["id", "tier", "description"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string", "pattern": "^[^/]+/.*[^/]$", "description": "provider/model as pi --provider/--model accepts it" },
+              "tier": { "enum": ["cheap", "balanced", "heavy"], "description": "Escalation order; config order is the preference within a tier" },
+              "description": { "type": "string", "minLength": 1, "description": "One human-written line on what the model is for: jev's main evidence" },
+              "efforts": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"] },
+                "description": "Allowed thinking levels; the routed effort snaps to the nearest one (ties go up). Absent = any level"
+              }
+            }
+          }
+        },
+        "minModelConfidence": { "type": "number", "default": 0.6, "minimum": 0, "maximum": 1, "description": "A jev pick below this confidence escalates one tier when difficulty >= escalateDifficulty" },
+        "escalateDifficulty": { "type": "number", "default": 3.0, "minimum": 0, "maximum": 4, "description": "Difficulty score (0-4) at which an unconfident pick escalates" },
+        "effortLowBelow": { "type": "number", "default": 1.2, "minimum": 0, "maximum": 4, "description": "Difficulty below this routes thinking low" },
+        "effortMediumBelow": { "type": "number", "default": 2.6, "minimum": 0, "maximum": 4, "description": "Difficulty below this routes thinking medium; above it high" },
+        "timeoutMs": { "type": "integer", "default": 2000, "minimum": 500, "description": "jev budget for one routing ask" }
       },
       "additionalProperties": false
     }

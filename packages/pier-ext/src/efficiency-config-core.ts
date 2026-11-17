@@ -10,6 +10,7 @@
  */
 
 import { isPlainObject } from './guards.ts';
+import { parseSpawnModels, type RoutingConfig } from './spawn-routing-core.ts';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -64,7 +65,8 @@ export interface JevConfig {
   timeoutMs: number;
   /** Minimum Choice/Score confidence to accept an answer; below = treat the question as unanswered. */
   minConfidence: number;
-  /** Resolution: PIER_JEV_API_KEY env > this value > TYPESAFE_API_KEY env (SDK convention). */
+  /** Resolution: PIER_JEV_API_KEY env > this value > the host's own key env: OPENROUTER_API_KEY when
+   *  baseUrl is OpenRouter (it serves the same System One API), else TYPESAFE_API_KEY (SDK convention). */
   apiKey?: string;
 }
 
@@ -74,6 +76,8 @@ export interface EfficiencyConfig {
   observationPack: ObservationPackConfig;
   evidencePreservingReducer: EvidencePreservingReducerConfig;
   jev: JevConfig;
+  /** D159 spawn model routing (RFC docs/rfc-spawn-model-routing.md); asks go through `jev`. */
+  routing: RoutingConfig;
 }
 
 export const DEFAULT_EFFICIENCY_CONFIG: EfficiencyConfig = Object.freeze({
@@ -91,9 +95,13 @@ export const DEFAULT_EFFICIENCY_CONFIG: EfficiencyConfig = Object.freeze({
     maxOutputTokens: 2048, timeoutMs: 5000, localOnly: false,
   }),
   jev: Object.freeze({ enabled: false, logEnabled: false, model: 'jev-1.13.0', timeoutMs: 2000, minConfidence: 0.6 }),
+  routing: Object.freeze({
+    enabled: false, spawnModels: Object.freeze([]), minModelConfidence: 0.6, escalateDifficulty: 3.0,
+    effortLowBelow: 1.2, effortMediumBelow: 2.6, timeoutMs: 2000,
+  }),
 });
 
-type FieldKind = 'bool' | 'int' | 'number' | 'ratio' | 'string' | 'optionalString' | 'enum';
+type FieldKind = 'bool' | 'int' | 'number' | 'ratio' | 'string' | 'optionalString' | 'enum' | 'spawnModels';
 
 interface FieldSpec {
   readonly key: string;
@@ -109,7 +117,7 @@ interface FieldSpec {
 
 /** A section is `{enabled, ...fields}`; field order fixes the order of reported issues. */
 interface SectionSpec {
-  readonly name: 'onlineContextCompact' | 'observationPack' | 'evidencePreservingReducer' | 'jev';
+  readonly name: 'onlineContextCompact' | 'observationPack' | 'evidencePreservingReducer' | 'jev' | 'routing';
   readonly fields: readonly FieldSpec[];
 }
 
@@ -150,9 +158,18 @@ const SECTIONS: readonly SectionSpec[] = [
     { key: 'minConfidence', kind: 'number', min: 0, max: 1 },
     { key: 'apiKey', kind: 'optionalString' },
   ] },
+  { name: 'routing', fields: [
+    { key: 'enabled', kind: 'bool' },
+    { key: 'spawnModels', kind: 'spawnModels' },
+    { key: 'minModelConfidence', kind: 'number', min: 0, max: 1 },
+    { key: 'escalateDifficulty', kind: 'number', min: 0, max: 4 },
+    { key: 'effortLowBelow', kind: 'number', min: 0, max: 4 },
+    { key: 'effortMediumBelow', kind: 'number', min: 0, max: 4 },
+    { key: 'timeoutMs', kind: 'int', min: 500 },
+  ] },
 ];
 
-function issueFor(section: string, field: FieldSpec): string {
+function issueFor(section: string, field: FieldSpec, raw?: unknown): string {
   const path = `${section}.${field.key}`;
   switch (field.kind) {
     case 'bool':
@@ -167,6 +184,8 @@ function issueFor(section: string, field: FieldSpec): string {
       return `${path} must be "auto" or a non-negative finite number`;
     case 'enum':
       return `${path} must be one of ${(field.values ?? []).join(' | ')}`;
+    case 'spawnModels':
+      return parseSpawnModels(raw).issue ?? `${path} is invalid`;
     default:
       return `${path} must be a non-empty string`;
   }
@@ -204,6 +223,12 @@ function applyField(target: Record<string, unknown>, field: FieldSpec, raw: unkn
     case 'enum':
       if (typeof raw !== 'string' || !(field.values ?? []).includes(raw)) return false;
       break;
+    case 'spawnModels': {
+      const parsed = parseSpawnModels(raw).value;
+      if (!parsed) return false;
+      target[field.key] = parsed;
+      return true;
+    }
   }
   target[field.key] = raw;
   return true;
@@ -216,6 +241,7 @@ function defaults(): EfficiencyConfig {
     observationPack: { ...DEFAULT_EFFICIENCY_CONFIG.observationPack },
     evidencePreservingReducer: { ...DEFAULT_EFFICIENCY_CONFIG.evidencePreservingReducer },
     jev: { ...DEFAULT_EFFICIENCY_CONFIG.jev },
+    routing: { ...DEFAULT_EFFICIENCY_CONFIG.routing },
   };
 }
 
@@ -253,7 +279,7 @@ export function validateEfficiencyConfig(raw: unknown): ValidateConfigResult {
           if (!section.fields.some((f) => f.key === key)) issues.push(`${section.name} unknown config key: "${key}"`);
         }
         for (const field of section.fields) {
-          if (!applyField(target, field, rawSection[field.key])) issues.push(issueFor(section.name, field));
+          if (!applyField(target, field, rawSection[field.key])) issues.push(issueFor(section.name, field, rawSection[field.key]));
         }
       }
     }
@@ -277,8 +303,6 @@ interface EnvOverride {
   readonly key: string;
   readonly kind: 'bool' | 'string' | 'ratio' | 'int' | 'unit';
   readonly min?: number;
-  /** Set only when the config left the key unset (foreign-convention fallback). */
-  readonly fallbackOnly?: boolean;
 }
 
 /** Highest-precedence layer; an empty value counts as unset everywhere. */
@@ -299,8 +323,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: 'PIER_JEV_TIMEOUT_MS', section: 'jev', key: 'timeoutMs', kind: 'int', min: 500 },
   { env: 'PIER_JEV_MIN_CONFIDENCE', section: 'jev', key: 'minConfidence', kind: 'unit' },
   { env: 'PIER_JEV_API_KEY', section: 'jev', key: 'apiKey', kind: 'string' },
-  // TYPESAFE_API_KEY is a foreign (SDK) convention, so it ranks below the config file too.
-  { env: 'TYPESAFE_API_KEY', section: 'jev', key: 'apiKey', kind: 'string', fallbackOnly: true },
+  { env: 'PIER_ROUTING_ENABLE', section: 'routing', key: 'enabled', kind: 'bool' },
 ];
 
 function applyEnvOverrides(
@@ -312,7 +335,6 @@ function applyEnvOverrides(
     const raw = env[override.env];
     if (raw === undefined || raw === '') continue;
     const target = config[override.section] as unknown as Record<string, unknown>;
-    if (override.fallbackOnly && target[override.key] !== undefined) continue;
 
     if (override.kind === 'bool') {
       const parsed = parseEnvBool(raw);
@@ -341,6 +363,21 @@ function applyEnvOverrides(
       : override.kind === 'int' ? ` (must be an integer >= ${override.min})`
       : '';
     warn(`invalid environment variable ${override.env}="${raw}"${requirement}, ignored`);
+  }
+  // A foreign-convention key fills only a hole, and only for its own host: never send a TypeSafe key
+  // to OpenRouter or the reverse.
+  if (config.jev.apiKey === undefined) {
+    const hostKey = isOpenRouterBase(config.jev.baseUrl) ? env.OPENROUTER_API_KEY : env.TYPESAFE_API_KEY;
+    if (hostKey?.trim()) config.jev.apiKey = hostKey.trim();
+  }
+}
+
+function isOpenRouterBase(baseUrl: string | undefined): boolean {
+  if (!baseUrl) return false;
+  try {
+    return new URL(baseUrl).hostname.endsWith('openrouter.ai');
+  } catch {
+    return false;
   }
 }
 

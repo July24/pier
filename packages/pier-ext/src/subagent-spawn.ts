@@ -17,6 +17,10 @@ import { platformPaths } from './platform-paths.ts';
 import { runtimePolicy } from './runtime-policy.ts';
 import { toolError } from './tool-error.ts';
 import type { HistoryEntry } from './history-store.ts';
+import type { JevRuntime } from './jev-client.ts';
+import { DEFAULT_EFFICIENCY_CONFIG } from './efficiency-config-core.ts';
+import { sha256Hex } from './observation-core.ts';
+import { planSpawnRoute, registryModelProbe, resolveSpawnRoute, type RoutingConfig } from './spawn-routing-core.ts';
 import {
   FOREGROUND_POLL_MS,
   Semaphore,
@@ -272,7 +276,7 @@ export interface Spawner {
     envOver: Record<string, string>,
     argv: readonly string[],
   ): Promise<{ tabId: string; paneId: string; tabName: string }>;
-  launchParts(resumeFile?: string | null, model?: string | null, approve?: boolean): string[];
+  launchParts(resumeFile?: string | null, model?: string | null, approve?: boolean, thinking?: string | null): string[];
   approveFor(cwd: string, masterCwd: string): Promise<boolean>;
   waitSubReady(cwd: string, paneId: string): Promise<ReadyOutcome>;
   findExistingPane(sessionFile: string | null): Promise<{ paneId: string; tabId: string } | null>;
@@ -409,7 +413,7 @@ export function createSpawner(h: SpawnerHost): Spawner {
 
   return {
     spawnWorker,
-    launchParts: (resumeFile, model, approve) => buildLaunchParts(h.runtime, { resumeFile, model, approve: approve ?? false }),
+    launchParts: (resumeFile, model, approve, thinking) => buildLaunchParts(h.runtime, { resumeFile, model, thinking, approve: approve ?? false }),
     approveFor,
     waitSubReady,
     findExistingPane,
@@ -433,6 +437,15 @@ interface SpawnActionHost {
   poller: Poller;
   /** Master session id for the delegation identity handed to the worker. */
   getSessionId: () => string;
+  /** D159 model routing; absent = workers run the master's model (pre-routing behavior). */
+  routing?: SpawnRouting;
+}
+
+export interface SpawnRouting {
+  getConfig(): RoutingConfig;
+  /** jev.minConfidence: the difficulty answer below it counts as unanswered. */
+  getMinConfidence(): number;
+  jev: Pick<JevRuntime, 'available' | 'ask'>;
 }
 
 export function createSpawnAction(h: SpawnActionHost) {
@@ -461,6 +474,25 @@ export function createSpawnAction(h: SpawnActionHost) {
         masterModel = provider ? `${provider}/${model.id}` : model.id;
       }
     }
+    // D159: validate explicit model/effort before any side effect; the jev ask overlaps worktree setup.
+    const routingConfig = h.routing?.getConfig() ?? DEFAULT_EFFICIENCY_CONFIG.routing;
+    const planned = planSpawnRoute(params, routingConfig);
+    if (!planned.ok) return toolError(planned.error);
+    const jev = h.routing?.jev;
+    const routePromise = resolveSpawnRoute(planned.plan, { description: spec.description, prompt: spec.prompt }, masterModel, {
+      config: routingConfig,
+      minConfidence: h.routing?.getMinConfidence() ?? 1,
+      // A context without a registry (tests, RPC) trusts the pool as configured.
+      modelExists: registryModelProbe(toolCtx) ?? (() => true),
+      ask: jev?.available
+        ? async (request, timeoutMs, enrich) => jev.ask(request, {
+          questionId: 'spawn-route',
+          timeoutMs,
+          extra: { taskSha8: sha256Hex(spec.prompt).slice(0, 8), poolSize: routingConfig.spawnModels.length },
+          enrich: ({ answers }) => enrich(answers),
+        })
+        : null,
+    });
     // Delegation identity (RFC rfc-delegation-identity §2.1): the worker learns who delegated it.
     const delegationEnvPatch = delegationEnv({
       parentPaneId: env?.terminalId ?? '',
@@ -517,12 +549,16 @@ export function createSpawnAction(h: SpawnActionHost) {
     const zone = classifyWorktreeZone({ cwd, masterCwd, worktrees: await git.listWorktrees(masterCwd) });
     // D86 trust: pass -a only for the master's checkout/worktrees; external dirs stay behind pi's Trust dialog.
     const approve = isPathUnder(cwd, masterCwd) || zone.zone === 'worktree';
+    const route = await routePromise;
+    if (route.note) onUpdate?.(makeProgressUpdate(route.note));
+    // Every result names where the worker runs: the isolate worktree, then the routed model line.
+    const resultTail = `${formatIsolateLocation(isolateMeta)}${route.note ? `\n${route.note}` : ''}`;
 
     const release = await h.subSemaphore.acquire();
     let paneId = '';
     try {
       const spawnedAt = Date.now();
-      const argv = launchParts(null, masterModel, approve);
+      const argv = launchParts(null, route.model, approve, route.thinking);
       const spawned = await spawnWorker(
         { desiredTab: tab },
         cwd,
@@ -588,7 +624,7 @@ export function createSpawnAction(h: SpawnActionHost) {
       if (background) {
         handToPoller(`prompt-${taskId}`);
         return {
-          content: [{ type: 'text', text: `started subagent ${subRef(entry)} (task ${taskId})${formatIsolateLocation(isolateMeta)}` }],
+          content: [{ type: 'text', text: `started subagent ${subRef(entry)} (task ${taskId})${resultTail}` }],
           details: { paneId, taskId, background: true, role: kind, slug },
         };
       }
@@ -621,7 +657,7 @@ export function createSpawnAction(h: SpawnActionHost) {
           const question = await readAskFlag(paneId);
           handToPoller(`prompt-${taskId}`);
           return {
-            content: [{ type: 'text', text: `${buildBlockedGateNotice({ paneId, description: spec.description, question })}${formatIsolateLocation(isolateMeta)}` }],
+            content: [{ type: 'text', text: `${buildBlockedGateNotice({ paneId, description: spec.description, question })}${resultTail}` }],
             details: { paneId, taskId, background: true, blocked: true, role: kind },
           };
         }
@@ -635,7 +671,7 @@ export function createSpawnAction(h: SpawnActionHost) {
           // the master for the whole patience window.
           handToPoller(`prompt-${taskId}`);
           return {
-            content: [{ type: 'text', text: `Subagent "${spec.description}" reported an error (${workerError}). It stays backgrounded — check subagent(action: "output"), and its settlement notice will arrive automatically.${formatIsolateLocation(isolateMeta)}` }],
+            content: [{ type: 'text', text: `Subagent "${spec.description}" reported an error (${workerError}). It stays backgrounded — check subagent(action: "output"), and its settlement notice will arrive automatically.${resultTail}` }],
             details: { paneId, taskId, background: true, role: kind, workerError },
           };
         }
@@ -657,7 +693,7 @@ export function createSpawnAction(h: SpawnActionHost) {
         if (isAlive(probe, Date.now())) {
           handToPoller(`prompt-${taskId}`);
           return {
-            content: [{ type: 'text', text: `${buildAliveNotice({ paneId, ref: subRef(entry), description: spec.description, scenario: 'moved-to-bg', probe }, Date.now())}${formatIsolateLocation(isolateMeta)}` }],
+            content: [{ type: 'text', text: `${buildAliveNotice({ paneId, ref: subRef(entry), description: spec.description, scenario: 'moved-to-bg', probe }, Date.now())}${resultTail}` }],
             details: { paneId, taskId, background: true, movedToBackground: true, role: kind },
           };
         }
@@ -674,7 +710,7 @@ export function createSpawnAction(h: SpawnActionHost) {
       h.persistSubs();
       h.writeHistory(entry, { outcome: outcome.kind === 'completed' ? text : null }, 'fg-settle');
       return {
-        content: [{ type: 'text', text: `${formatSubagentResult(outcome, spec.description)}${formatIsolateLocation(isolateMeta)}` }],
+        content: [{ type: 'text', text: `${formatSubagentResult(outcome, spec.description)}${resultTail}` }],
         details: { paneId, taskId, background, role: kind },
       };
     } catch (err) {
