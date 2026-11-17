@@ -2,7 +2,7 @@
 
 pi shows the entries newer than your last seen version under "Extension Updates" after `pi update`.
 
-## [Unreleased]
+## [0.6.0] - 2026-11-17
 
 ### Added
 
