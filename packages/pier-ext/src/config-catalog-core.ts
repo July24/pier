@@ -266,10 +266,11 @@ export function renderIndex(lines: {
     lines.efficiency.some((e) => e.knob.key === `${prefix}.enabled` && e.value === 'true') ? 'on' : 'off';
   return [
     'pier config — 3 planes, env > workspace > user > default',
-    `  efficiency  ${summarizePlane(lines.efficiency)} — OCC ${mechanism('onlineContextCompact')} / OBS ${mechanism('observationPack')} / EPR ${mechanism('evidencePreservingReducer')}`,
+    `  efficiency  ${summarizePlane(lines.efficiency)} — OCC ${mechanism('onlineContextCompact')} / OBS ${mechanism('observationPack')} / EPR ${mechanism('evidencePreservingReducer')} / subagent routing ${mechanism('routing')}`,
     `  pi          ${summarizePlane(lines.pi)} — OCC reads compaction.* only`,
     `  env         ${summarizePlane(lines.env)}`,
     '  show: /pier-config show <efficiency|pi|env|all>   check: /pier-config check   report: /pier-config doc',
+    '  health: /pier-config health — live probe of the subagent model pool and jev',
   ];
 }
 

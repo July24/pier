@@ -1,6 +1,6 @@
 /**
  * D104 `/pier-config`: probes the three configuration planes (real files + process env), renders
- * `show|check|doc|doctor`, and registers the command.
+ * `show|check|doc|doctor|health`, and registers the command.
  *
  * Read-only by design: effective values are reported with their provenance and the actual edit goes
  * to the agent under the write-lock + diff-confirmation flow; only the opt-in `doc` report writes a
@@ -30,7 +30,10 @@ import {
   defaultWorkspaceEfficiencyConfigFile,
   loadPiNativeCompactionSettings,
   validateEfficiencyConfig,
+  type EfficiencyConfig,
 } from './efficiency-config-core.ts';
+import type { JevRuntime } from './jev-client.ts';
+import { runRoutingHealth, type RoutingHealthDeps } from './routing-health.ts';
 import { registryModelProbe } from './spawn-routing-core.ts';
 import { formatOptionRows } from './pier-options.ts';
 import { formatSwallowedErrors } from './swallow.ts';
@@ -44,6 +47,14 @@ export const CONFIG_GUIDANCE_PROMPT = [
   '   (untrusted project) must be reported as such instead of edited blindly.',
   '2. Route by plane:',
   '   - efficiency (D100-D103): read `docs/efficiency-trial.md` before proposing values.',
+  '   - efficiency → routing (D159, subagent model + thinking level): read `docs/rfc-spawn-model-routing.md`. To build a pool:',
+  '     a) list candidates with `pi --list-models` and keep only models the user actually runs; ask which 2-8 to include;',
+  '     b) for each, agree a tier (cheap | balanced | heavy; config order is the preference within a tier), a one-line English',
+  '        `description` of what it is for (jev picks from these lines, so name task kinds, not marketing), and optionally an',
+  '        `efforts` allowlist of thinking levels (e.g. ["max"] = always max);',
+  '     c) auto-pick needs jev: if api.typesafe.ai is unreachable and OPENROUTER_API_KEY is set, propose `jev.baseUrl`',
+  '        "https://openrouter.ai/api" + `jev.model` "typesafe/jev-1.13" (the key is read from the env, never written);',
+  '     d) after writing, run `/pier-config check` and then `/pier-config health`, which probes every pool model and jev live.',
   "   - pi (settings.json): recommend pi's own `/settings`; the only OCC-relevant keys here are `compaction.enabled` and",
   '     `compaction.keepRecentTokens` (read-only from our side).',
   '   - env (PIER_* / PI_HERDR_*): affects new processes only; state that explicitly.',
@@ -51,7 +62,8 @@ export const CONFIG_GUIDANCE_PROMPT = [
   '   and 2-3 recommended values for common scenarios. Then ask what the user actually wants to achieve.',
   '4. Before writing: show a precise diff (file path, current -> proposed value) and the activation path',
   '   (hot / needs `/reload` / needs a new session or process restart). Wait for explicit confirmation. Change ONE plane at a time.',
-  '5. Apply with the normal `edit`/`write` tools (write locks apply), then run `/pier-config check` and report the result back.',
+  '5. Apply with the normal `edit`/`write` tools (write locks apply), then run `/pier-config check` and report the result back',
+  '   (after a routing change also `/pier-config health`).',
   '6. If a change cannot take effect in the current process, say so and tell the user exactly what to restart.',
   '',
   'Forbidden: dumping `process.env`; writing secrets or tokens into any config file; editing multiple planes before confirmation;',
@@ -232,10 +244,41 @@ export interface ConfigCommandDeps {
   collect?: (deps: ConfigGuideDeps) => ConfigGuideSnapshot;
   /** Overridable so tests can pin the report destination. */
   reportDir?: (cwd: string) => string;
+  /** `health`: the session's effective efficiency config and its jev runtime (absent → health is unavailable). */
+  routingHealth?: { getConfig: () => EfficiencyConfig; jev: Pick<JevRuntime, 'available' | 'ask'> };
+}
+
+/** pi's registry as the health probe: lookup by `provider/model` id, and one tiny completion under a 30s budget. */
+function piPoolProbe(registry: ExtensionContext['modelRegistry']): Pick<RoutingHealthDeps, 'lookup' | 'ping'> {
+  const find = (id: string) => registry.find(id.slice(0, id.indexOf('/')), id.slice(id.indexOf('/') + 1));
+  return {
+    lookup: (id) => {
+      const model = find(id);
+      return model ? { reasoning: model.reasoning, thinkingLevelMap: model.thinkingLevelMap, hasAuth: registry.hasConfiguredAuth(model) } : null;
+    },
+    ping: async (id) => {
+      const startedAt = Date.now();
+      const model = find(id);
+      if (!model) return { ok: false, error: 'not registered', latencyMs: 0 };
+      try {
+        const reply = await registry.complete(
+          model,
+          { systemPrompt: 'Health check. Reply with OK.', messages: [{ role: 'user', content: [{ type: 'text', text: 'OK?' }], timestamp: Date.now() }] },
+          { maxTokens: 16, cacheRetention: 'none', signal: AbortSignal.timeout(30_000) },
+        );
+        const latencyMs = Date.now() - startedAt;
+        return reply.stopReason === 'error' || reply.stopReason === 'aborted'
+          ? { ok: false, error: reply.errorMessage ?? reply.stopReason, latencyMs }
+          : { ok: true, latencyMs };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err), latencyMs: Date.now() - startedAt };
+      }
+    },
+  };
 }
 
 const PLANE_IDS: readonly ConfigPlaneId[] = CONFIG_PLANES.map((p) => p.id);
-const SUBCOMMANDS = ['show', 'check', 'doc', 'doctor'] as const;
+const SUBCOMMANDS = ['show', 'check', 'doc', 'doctor', 'health'] as const;
 
 function parseArgs(args: unknown): { sub: (typeof SUBCOMMANDS)[number] | 'index'; rest: string } {
   const raw = typeof args === 'string'
@@ -258,14 +301,18 @@ export function installConfigCommand(deps: ConfigCommandDeps): void {
 
   pi.registerCommand('pier-config', {
     description:
-      'Show pier configuration (3 planes) with effective values and sources; `check` validates them; `doctor` lists option values and swallowed errors; no argument hands a guided change to the agent',
+      'Show pier configuration (3 planes) with effective values and sources; `check` validates them; `health` probes the subagent model pool and jev live; `doctor` lists option values and swallowed errors; no argument hands a guided change to the agent',
     getArgumentCompletions: (prefix: string) => {
       const tokens = (prefix ?? '').split(/\s+/);
       const head = tokens[0] ?? '';
       if (tokens.length <= 1) {
-        return ['show', 'check', 'doc', 'doctor', 'all', ...PLANE_IDS]
+        return ['show', 'check', 'doc', 'doctor', 'health', 'all', ...PLANE_IDS]
           .filter((c) => c.startsWith(head))
-          .map((c) => ({ value: c, label: c, description: c === 'doc' ? 'write a config report file' : undefined }));
+          .map((c) => ({
+            value: c,
+            label: c,
+            description: c === 'doc' ? 'write a config report file' : c === 'health' ? 'probe pool models + jev (sends tiny requests)' : undefined,
+          }));
       }
       if (head === 'show') {
         const last = tokens[tokens.length - 1] ?? '';
@@ -299,6 +346,23 @@ export function installConfigCommand(deps: ConfigCommandDeps): void {
 
       if (sub === 'check') {
         emit([`pier config check (workspace trusted: ${snapshot.workspaceTrusted})`, ...renderGuide(snapshot, 'check')].join('\n'));
+        return;
+      }
+
+      if (sub === 'health') {
+        if (!deps.routingHealth) {
+          emit('pier-config health: unavailable in this process (no routing runtime)', 'warning');
+          return;
+        }
+        const config = deps.routingHealth.getConfig();
+        emit(`pier routing health: probing ${config.routing.spawnModels.length} pool model(s) and jev…`);
+        const report = await runRoutingHealth({
+          routing: config.routing,
+          jevConfig: config.jev,
+          jev: deps.routingHealth.jev,
+          ...piPoolProbe(ctx.modelRegistry),
+        });
+        emit(report.lines.join('\n'), report.ok ? 'info' : 'warning');
         return;
       }
 

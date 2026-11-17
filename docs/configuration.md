@@ -12,6 +12,7 @@
 /pier-config                 # 3 平面索引（≤10 行）+ 把引导交给 agent
 /pier-config show all        # 每个键的 生效值 / 来源 / 默认 / 影响一句话
 /pier-config check           # 未知键、类型越界、未受信被忽略、JSON 损坏、env 非法
+/pier-config health          # 子代理模型池实测：每个模型是否已注册、有凭据、efforts 是否支持、能否应答；jev 是否可达（会发极小请求）
 /pier-config doc             # 生成机器真值报告 → <repo>/.pi-herdr/config-report.md（建议把该文件加进 .gitignore）
 ```
 
@@ -69,6 +70,7 @@
 - **未受信项目**：工作区 `efficiency` 层不被采纳（由信任门控），`show` 会标注。
 - **常见症状对照**：
   - "改了没生效" → `check` 看是否未知键/类型错误被回退；再确认是否用了工作区层而项目未受信；最后确认是否需要重启进程。
+  - "子代理没按池子选模型" → `health`：FAIL 的池模型不会被选；jev 一行 FAIL 时自动选择全部退回 master 模型（451 会提示改走 OpenRouter）。想从零配池子：不带参数跑 `/pier-config`，让 agent 按引导流程（列模型 → 定档位/描述/efforts → 写入 → check → health）完成。
   - "OCC 明明开了却没压" → `show pi` 看 `compaction.enabled`；`show efficiency` 看 `onlineContextCompact.enabled` 的来源与 note。
   - "日志/对象在哪" → `<sessionDir>/herdr-pi/<sessionId>/efficiency-logs/*.jsonl` 与 `*-pack/objects/`（见 `docs/efficiency-trial.md` §3）。
 

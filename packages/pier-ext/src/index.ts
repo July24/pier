@@ -621,7 +621,7 @@ export default async function (pi: ExtensionAPI) {
     },
   });
 
-  installConfigCommand({ pi });
+  installConfigCommand({ pi, routingHealth: { getConfig: () => effConfig, jev: jevRuntime } });
 
   /* ── ask_user_question (v1.3 M8 human gate; master and subagents) ── */
   pi.registerTool({

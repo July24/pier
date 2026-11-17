@@ -10,6 +10,8 @@ pi shows the entries newer than your last seen version under "Extension Updates"
 - `subagent` spawn accepts `model` (a pool model, full id or unique suffix) and `effort` to pin either one; values outside the pool or the model's `efforts` are rejected before anything starts.
 - `/pier-config check` reports pool models pi does not know.
 - jev can run through OpenRouter: set `jev.baseUrl` to `https://openrouter.ai/api` and `jev.model` to `typesafe/jev-1.13`; without `jev.apiKey` pier uses `OPENROUTER_API_KEY`. A TypeSafe key is never sent to OpenRouter, and an OpenRouter key never to TypeSafe.
+- `/pier-config health` checks each pool model live (known to pi, has credentials, supports its `efforts`, answers a tiny request) and that jev answers a routing question, with the fix for each failure.
+- `/pier-config` with no argument now walks the agent through setting up a model pool and jev, and its index shows whether subagent routing is on.
 
 ## [0.5.6] - 2026-11-12
 

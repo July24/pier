@@ -212,6 +212,7 @@ npm test          # typecheck + node --test（todo 重放 / 反冻结 / GC / 生
 `PI_HERDR_META_KEY`）——改名会让正在运行的 worker 与父进程对不上。
 core 自身身份变量（`HC_TERMINAL_ID`、`HC_TERMINAL_SOCKET`）由 core 注入，pier 只读。
 `/pier-config doctor` 会列出每个选项的生效值与来源，以及本会话被有意吞掉的异常。
+`/pier-config health` 实测子代理模型池（每个模型是否已注册、有凭据、efforts 是否支持、能否应答）与 jev 是否可达；不带参数的 `/pier-config` 会引导 agent 配置模型池。
 
 **状态与 label**：状态只来自程序自己发出的 OSC 7501——pi 原生上报，pier 从不合成状态。
 元数据是 `pier.*` 下的终端 label（`pier.session`、`pier.todo`、`pier.lock.<hash>`），

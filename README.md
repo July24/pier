@@ -260,6 +260,7 @@ Everything above (plus pi settings and the `PIER_*`/`PI_HERDR_*` env knobs) is a
 /pier-config            # 3-plane index; hands a guided change to the agent
 /pier-config show all   # effective value + source (env > workspace > user > default) per key
 /pier-config check      # validation across planes   ·   /pier-config doc → written report
+/pier-config health     # live probe: each subagent pool model (registered, credentials, efforts, one tiny request) + jev
 ```
 
 Read-only by design — see **[docs/configuration.md](docs/configuration.md)** for the plane map and the "which plane do I edit?" table.
