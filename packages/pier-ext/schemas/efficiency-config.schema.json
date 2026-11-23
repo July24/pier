@@ -72,7 +72,7 @@
         "logEnabled": { "type": "boolean", "default": false, "description": "Write efficiency-logs/jev.jsonl (no request/response bodies)" },
         "baseUrl": { "type": "string", "description": "API base URL override (proxy/gateway); defaults to https://api.typesafe.ai. https://openrouter.ai/api serves the same System One API (model typesafe/jev-1.13)" },
         "model": { "type": "string", "default": "jev-1.13.0", "description": "Pinned versioned model id; aliases drift silently and skew calibration thresholds" },
-        "timeoutMs": { "type": "integer", "default": 2000, "minimum": 500, "description": "Total budget per call (hard kill via AbortController; the SDK has no total-budget mode)" },
+        "timeoutMs": { "type": "integer", "default": 3500, "minimum": 500, "description": "Total budget per call (hard kill via AbortController; the SDK has no total-budget mode)" },
         "minConfidence": { "type": "number", "default": 0.6, "minimum": 0, "maximum": 1, "description": "Minimum confidence for accepting a Choice/Score answer; below it the answer is treated as unanswered" },
         "apiKey": { "type": "string", "description": "API key. Resolution order: PIER_JEV_API_KEY env var > this field > OPENROUTER_API_KEY (when baseUrl is OpenRouter) or TYPESAFE_API_KEY env var" }
       },

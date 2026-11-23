@@ -39,6 +39,7 @@ import { TODO_LABEL, formatPaneTitle } from './pane-title.ts';
 import { registerSlimFrame, updateSlimFrame } from './slim-frame.ts';
 import { planIndexMode } from './index-runtime.ts';
 import { emptySubagentPortBox, sleepWhileSubsRunningNote } from './subagent-core.ts';
+import { sleepPollsFileNote } from './terminal-core.ts';
 import { writeWorkerMarker, readWorkerMarker } from './worker-marker.ts';
 import { openTreeOverlay, type TreeOverlayHandle } from './tree-overlay.ts';
 import {
@@ -295,12 +296,14 @@ export default async function (pi: ExtensionAPI) {
     });
   });
 
-  /* ── Masters sleep-polled background workers (sleep 120…840) instead of trusting the settlement notice. ── */
+  /* ── Masters sleep-polled background workers (sleep 120…840) instead of trusting the settlement
+   *    notice, and sleep-polled job logs instead of waiting on them in a terminal. ── */
   if (!isSubagent) {
     pi.on('tool_result', async (event: unknown) => {
       const rec = (event ?? {}) as { toolName?: unknown; input?: { command?: unknown }; content?: unknown };
       if (rec.toolName !== 'bash' || typeof rec.input?.command !== 'string') return;
-      const note = sleepWhileSubsRunningNote(rec.input.command, subagentPort.current?.listRunningSubs() ?? []);
+      const note = sleepWhileSubsRunningNote(rec.input.command, subagentPort.current?.listRunningSubs() ?? [])
+        ?? (env ? sleepPollsFileNote(rec.input.command) : null);
       if (!note) return;
       const content = Array.isArray(rec.content) ? rec.content as Array<{ type: 'text'; text: string }> : [];
       return { content: [...content, { type: 'text' as const, text: note }] };

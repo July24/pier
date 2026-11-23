@@ -247,6 +247,25 @@ function packCandidateAt(
   };
 }
 
+/** Results the model re-reads across many steps, kept out of the send-count projection: a recalled
+ *  chunk (packing it again just forces another recall) and a skill's SKILL.md (operating
+ *  instructions). The compaction batch still packs them. */
+function staysFullWhileLive(messages: readonly unknown[], index: number): boolean {
+  const msg = messages[index] as ContextMessage | undefined;
+  if (msg?.toolName === RECALL_TOOL_NAME) return true;
+  if (msg?.toolName !== 'read' || typeof msg.toolCallId !== 'string') return false;
+  for (let i = index - 1; i >= 0; i--) {
+    const prior = messages[i] as { role?: unknown; content?: unknown } | undefined;
+    if (prior?.role !== 'assistant' || !Array.isArray(prior.content)) continue;
+    for (const block of prior.content as Array<{ type?: unknown; id?: unknown; arguments?: unknown }>) {
+      if (block?.type !== 'toolCall' || block.id !== msg.toolCallId) continue;
+      const path = (block.arguments as { path?: unknown } | null | undefined)?.path;
+      return typeof path === 'string' && /(^|[\\/])SKILL\.md$/.test(path);
+    }
+  }
+  return false;
+}
+
 /** A resumed process starts with an empty memo, but the content-addressed object is still on disk.
  *  Rebuild the deterministic placeholder from it instead of asking jev again, rewriting the object,
  *  and logging the same saving twice. Returns null when the object is not (verifiably) there. */
@@ -455,6 +474,7 @@ async function projectPlaceholders(
 
     const candidate = packCandidateAt(projected, i, sessionRoot, obsConfig.thresholdBytes);
     if (!candidate) continue;
+    if (staysFullWhileLive(projected, i)) continue;
 
     // Resume: the object survived the restart even though the memo did not. Project the same
     // deterministic placeholder without re-asking jev or re-logging the saving.

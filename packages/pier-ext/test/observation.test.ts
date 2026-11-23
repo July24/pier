@@ -156,6 +156,28 @@ test('ObservationPack: 注册 obs_recall；活跃窗口内原样，超窗后投�
   });
 });
 
+test('ObservationPack: a recalled chunk and a skill SKILL.md stay full between compactions; other reads pack', async () => {
+  await inSession(async (sessionDir) => {
+    const { project } = mountObservation();
+    const ctx = ctxFor(sessionDir, 'session_test_live');
+    const readCall = (id: string, path: string) => ({ role: 'assistant', content: [{ type: 'toolCall', id, name: 'read', arguments: { path } }] });
+    const recalled = longLog('recalled line of an earlier observation');
+    const skill = longLog('skill instruction the agent keeps following');
+    const source = longLog('source line of an ordinary large file read');
+    const out = await project([
+      toolResult(recalled, 'tc_recall', RECALL_TOOL_NAME),
+      readCall('tc_skill', '/repo/.agents/skills/kibana/SKILL.md'),
+      toolResult(skill, 'tc_skill', 'read'),
+      readCall('tc_src', '/repo/src/NOT_SKILL.md'),
+      toolResult(source, 'tc_src', 'read'),
+      assistant(),
+    ], ctx);
+    assert.equal(out.messages[0].content[0].text, recalled, 'packing a recall only forces another recall');
+    assert.equal(out.messages[2].content[0].text, skill);
+    assert.match(out.messages[4].content[0].text, /large tool result replaced/);
+  });
+});
+
 test('ObservationPack: 错误结果与 EPR receipt 都不打包', async () => {
   await inSession(async (sessionDir) => {
     const { project } = mountObservation();

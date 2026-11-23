@@ -94,7 +94,8 @@ export const DEFAULT_EFFICIENCY_CONFIG: EfficiencyConfig = Object.freeze({
     enabled: false, logEnabled: false, minBytes: 4096, maxChars: 600000,
     maxOutputTokens: 2048, timeoutMs: 5000, localOnly: false,
   }),
-  jev: Object.freeze({ enabled: false, logEnabled: false, model: 'jev-1.13.0', timeoutMs: 2000, minConfidence: 0.6 }),
+  // 3500: through OpenRouter the answered calls took up to 1996 ms and 11 of 24 excerpt asks died at a 2000 ms cap.
+  jev: Object.freeze({ enabled: false, logEnabled: false, model: 'jev-1.13.0', timeoutMs: 3500, minConfidence: 0.6 }),
   routing: Object.freeze({
     enabled: false, spawnModels: Object.freeze([]), minModelConfidence: 0.6, escalateDifficulty: 3.0,
     effortLowBelow: 1.2, effortMediumBelow: 2.6, timeoutMs: 2000,

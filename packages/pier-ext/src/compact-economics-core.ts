@@ -41,6 +41,7 @@ type CompactionReason =
   | 'deferred_economic'
   | 'deferred_subsequent_margin'
   | 'deferred_carried_debt'
+  | 'deferred_holding_cost'
   | 'horizon_unavailable'
   | 'cache_ratio_unavailable'
   | 'native_not_compactable'
@@ -75,6 +76,8 @@ export interface CompactionDecision {
   readonly priorCompactionCount: number;
   readonly carriedDebtTokens: number;
   readonly cacheDebtRepaymentTokens: number;
+  /** Archive tokens carried per request since the last compaction, priced like the saving; null = not measured. */
+  readonly holdingCostTokens: number | null;
   readonly compact: boolean;
   readonly reason: CompactionReason;
 }
@@ -163,6 +166,11 @@ export function decideCompaction(input: {
   readonly prefixCacheHitRate?: number;
   /** Requests observed since the last boundary/compaction; a floor on the remaining horizon. */
   readonly observedRequestsSinceBoundary?: number;
+  /**
+   * Sum over the requests since the last compaction of the tokens a compaction would have archived
+   * (token·requests). Omitted = the timing gate is not applied.
+   */
+  readonly heldExcessTokenRequests?: number;
   readonly economics?: CompactionEconomics;
 }): CompactionDecision {
   const economics = input.economics ?? DEFAULT_COMPACTION_ECONOMICS;
@@ -197,6 +205,15 @@ export function decideCompaction(input: {
   const combinedBreakevenRequests = compressible && incrementalWriteCost !== null
     ? (input.carriedDebtTokens + incrementalWriteCost) / savingTokensPerRequest
     : null;
+  // Timing, not payback: the horizon gates below say a compaction pays for itself eventually, which
+  // on a long session is true of almost any archive — an Opus session compacted every 11 requests for
+  // 40K tokens, 45-55 s each. Compacting is worth its fixed cost only once carrying the archive has
+  // cost as much (the lot-size rule: interval ≈ sqrt(2 × cost / growth)).
+  const holdingCostTokens = input.heldExcessTokenRequests === undefined
+    ? null
+    : Math.max(0, input.heldExcessTokenRequests) * (prefixCacheHitRate + (1 - prefixCacheHitRate) * missPriceRatio);
+  const holdingCostOpen =
+    holdingCostTokens === null || incrementalWriteCost === null || holdingCostTokens >= incrementalWriteCost;
 
   const firstCompaction = input.priorCompactionCount === 0;
   const horizonRequests = horizon?.expectedRemainingRequests ?? null;
@@ -237,7 +254,8 @@ export function decideCompaction(input: {
     combinedBreakevenRequests !== null &&
     combinedBreakevenRequests <= horizonRequests;
 
-  const economic = firstCompaction ? firstEconomic : baseEconomic && subsequentMarginOpen && carriedDebtGateOpen;
+  const paysBack = firstCompaction ? firstEconomic : baseEconomic && subsequentMarginOpen && carriedDebtGateOpen;
+  const economic = paysBack && holdingCostOpen;
   const compact = compressible && (windowProtection || economic);
 
   // Ordered guards: first hit wins, so the tail entry is the fallback.
@@ -249,6 +267,7 @@ export function decideCompaction(input: {
     ['cache_ratio_unavailable', breakevenRequests === null],
     ['deferred_subsequent_margin', !firstCompaction && baseEconomic && !subsequentMarginOpen],
     ['deferred_carried_debt', !firstCompaction && baseEconomic && !carriedDebtGateOpen],
+    ['deferred_holding_cost', paysBack && !holdingCostOpen],
     ['deferred_economic', true],
   ] as Array<[CompactionReason, boolean]>).find(([, hit]) => hit)![0];
 
@@ -268,6 +287,7 @@ export function decideCompaction(input: {
     priorCompactionCount: input.priorCompactionCount,
     carriedDebtTokens: input.carriedDebtTokens,
     cacheDebtRepaymentTokens: input.cacheDebtRepaymentTokens,
+    holdingCostTokens,
     compact,
     reason,
   };

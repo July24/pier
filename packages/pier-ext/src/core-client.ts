@@ -1,7 +1,7 @@
 /**
  * Minimal herdr-core (`hc`) client used inside the pi extension.
  *
- * Written against hc 0.1.18 (protocol generation 1); the request shapes pier builds are pinned to the
+ * Written against hc 0.1.22 (protocol generation 1); the request shapes pier builds are pinned to the
  * OpenRPC snapshot in test/fixtures/hc-contract.json (`hc schema`). After a core upgrade, regenerate
  * the fixture and re-run the contract test.
  *  - Transport is JSON-RPC 2.0, one message per line, plain mode; one connection per request.
@@ -16,7 +16,7 @@
 import * as net from 'node:net';
 
 /** Core release the request shapes were written and contract-tested against. */
-export const CORE_VERSION_PINNED = '0.1.18';
+export const CORE_VERSION_PINNED = '0.1.22';
 
 /* ── Types ──────────────────────────────────────────────────────────── */
 
@@ -100,6 +100,18 @@ export class CoreError extends Error {
 export function isCoreErrorKind(err: unknown, kind: string): boolean {
   return err instanceof CoreError && err.kind === kind;
 }
+
+/** No reply within the client's budget. The request reached core, so it may still take effect. */
+export class CoreTimeoutError extends Error {
+  constructor(method: string) {
+    super(`hc ${method}: timeout`);
+    this.name = 'CoreTimeoutError';
+  }
+}
+
+/** `terminal.send` reply budget: core holds a send while a person has an unsent draft in that
+ *  terminal (`draft_wait`, 60 s by default) and then for ~3 s of quiet. */
+export const SEND_TIMEOUT_MS = 75_000;
 
 /* ── Environment ─────────────────────────────────────────────────────── */
 
@@ -526,7 +538,7 @@ export class CoreClient implements CoreClientLike {
       sock.destroy();
       settle();
     };
-    const timer = setTimeout(() => finish(() => reject(new Error(`hc ${method}: timeout`))), timeoutMs);
+    const timer = setTimeout(() => finish(() => reject(new CoreTimeoutError(method))), timeoutMs);
     sock.on('connect', () => {
       sock.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n', (err) => {
         if (err) finish(() => reject(err));
@@ -628,7 +640,7 @@ export class CoreClient implements CoreClientLike {
       text,
       caller: this.env.terminalId,
       ...(opts.force ? { force: true } : {}),
-    }, 30_000);
+    }, SEND_TIMEOUT_MS);
   }
 
   async keys(id: string, keys: readonly string[]): Promise<void> {

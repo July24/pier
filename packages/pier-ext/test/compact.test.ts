@@ -94,6 +94,18 @@ test('decideCompaction: one named reason per decision shape', () => {
   }
 });
 
+test('decideCompaction: a compaction that pays back still waits until carrying the archive has cost as much as compacting', () => {
+  // ratio 12.5 → compacting costs 40000 × 11.5 = 460000 cache-read tokens
+  const early = decideCompaction({ ...decideBase, heldExcessTokenRequests: 400000 });
+  assert.equal(early.compact, false); assert.equal(early.reason, 'deferred_holding_cost');
+  assert.equal(decideCompaction({ ...decideBase, heldExcessTokenRequests: 460000 }).reason, 'economic');
+  // Misses bill the carried archive at the write price: 400000 × (0.9 + 0.1 × 12.5) = 860000
+  assert.equal(decideCompaction({ ...decideBase, heldExcessTokenRequests: 400000, prefixCacheHitRate: 0.9 }).compact, true);
+  // A context about to overflow is compacted whatever the timing says.
+  const full = decideCompaction({ ...decideBase, contextTokens: 195000, heldExcessTokenRequests: 0 });
+  assert.equal(full.compact, true); assert.equal(full.reason, 'window_protection');
+});
+
 test('decideCompaction: prefix cache misses raise the expected saving and can open the decision', () => {
   // ratio 10 → increment 9 → all-hit breakeven 40000 × 9 / 21000 ≈ 17.1 exceeds the first-compaction horizon.
   const shape = { ...decideBase, remainingBoundaries: 1, cacheWriteReadRatio: 10 };
@@ -182,6 +194,11 @@ const bigBranch = () => Array.from({ length: 25 }, (_, i) => ({
 /** A real decision (the formula is covered above), only used to drive the settled branch. */
 const economicDecision = () => decide({ writeTokens: 60000, archiveTokens: 40000, contextTokens: 60000,
   completedBoundaryRequestCounts: [10], remainingBoundaries: 1, contextWindowTokens: 128000, priorCompactionCount: 1, cacheWriteReadRatio: 2.0 });
+/** A coordinator whose requests since the last compaction have long carried a large archive. */
+const longHeld = (coordinator: CompactCoordinator): void => {
+  coordinator.state.heldRequests = 1000;
+  coordinator.state.heldContextTokens = 1000 * 200000;
+};
 
 test('CompactCoordinator: a write completing several items samples each of them', () => {
   const coordinator = new CompactCoordinator();
@@ -260,10 +277,27 @@ test('CompactCoordinator: turn_end does not abort when disabled, with a queued m
   assert.equal(coordinator.state.lastContextTokens, 35000);
 });
 
+test('CompactCoordinator: a boundary right after the last compaction defers; the same context carried for many requests compacts', () => {
+  const todos: TodoItem[] = [{ content: 'Remaining task', status: 'in_progress' }];
+  const arm = (requests: number): { coordinator: CompactCoordinator; aborts: () => number } => {
+    const coordinator = new CompactCoordinator();
+    for (let i = 0; i < requests; i++) coordinator.onBeforeProviderRequest(60000);
+    coordinator.state.completedBoundaryRequestCounts = [10];
+    coordinator.pendingBoundaryCompleted = true;
+    const mock = mockContext({ tokens: 60000, branch: bigBranch() });
+    coordinator.onTurnEnd({ ctx: mock.ctx, todos, config: CONFIG, pi: turnPi(), lastStopReason: null });
+    return { coordinator, aborts: mock.abortCalls };
+  };
+  const early = arm(1);
+  assert.equal(early.aborts(), 0); assert.equal(early.coordinator.selectedCompaction, null);
+  assert.equal(arm(200).aborts(), 1);
+});
+
 test('CompactCoordinator: abort → compact → markers → silent continuation', async () => {
   const coordinator = new CompactCoordinator();
   coordinator.state.completedBoundaryRequestCounts = [10];
   coordinator.pendingBoundaryCompleted = true;
+  longHeld(coordinator);
   const todos: TodoItem[] = [
     { content: 'Done item', status: 'completed' },
     { content: 'Remaining task', status: 'in_progress', blocker: 'awaiting approval' },
@@ -396,6 +430,7 @@ test('P1-3: a failed compaction backs off, pays no abort during the window, and 
   const rearm = (): void => {
     coordinator.state.completedBoundaryRequestCounts = [1];
     coordinator.pendingBoundaryCompleted = true;
+    longHeld(coordinator);
   };
   rearm();
   coordinator.onTurnEnd({ ctx, todos, config: CONFIG, pi: turnPi(), lastStopReason: null });
@@ -485,6 +520,7 @@ test('CompactCoordinator: a selected compaction that cannot start is dropped ins
   coordinator.state.completedBoundaryRequestCounts = [10];
   coordinator.state.currentBoundaryRequestCount = 10;
   coordinator.pendingBoundaryCompleted = true;
+  longHeld(coordinator);
   coordinator.onTurnEnd({ ctx: idle.ctx, todos: [], config: CONFIG, pi: turnPi(), lastStopReason: null });
   assert.equal(idle.abortCalls(), 1);
 });

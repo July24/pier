@@ -2,6 +2,21 @@
 
 pi shows the entries newer than your last seen version under "Extension Updates" after `pi update`.
 
+## [0.6.1] - 2026-11-23
+
+### Changed
+
+- Online compaction waits until carrying the old context has cost as much as compacting it. Long sessions on models with expensive cache writes compacted every dozen requests, 45-55 seconds each; they now compact less often. A context close to the window limit is still compacted right away, and `compact.jsonl` records the new deferral as `deferred_holding_cost`.
+- A chunk returned by `obs_recall` and a skill's `SKILL.md` are no longer folded back into a placeholder after two requests; they stay in full until the next compaction.
+- `jev.timeoutMs` defaults to 3500 ms instead of 2000 ms: through OpenRouter almost half of the excerpt questions timed out.
+- A bash call that sleeps a minute or more and then reads a file gets a note pointing to `terminal` `send` with `wait: true` and `wait` with `file`.
+- `terminal` `send` of a command ending in a hand-written exit sentinel (`; echo DONE_$?`) suggests `wait: true`.
+- Tested with pi 1.6.0 and herdr-core 0.1.22. The minimum versions are unchanged (pi 1.5.0, hc 0.1.16).
+
+### Fixed
+
+- `terminal` `send` no longer reports "herdr-core unreachable" when someone is typing in that terminal. herdr-core 0.1.19 and later hold a send for up to 60 seconds while a person has an unsent draft; pier now waits 75 seconds, and a send that is still unconfirmed says the text may yet arrive and must not be re-sent blindly.
+
 ## [0.6.0] - 2026-11-17
 
 ### Added

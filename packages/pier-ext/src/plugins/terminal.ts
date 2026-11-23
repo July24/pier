@@ -13,6 +13,7 @@ import { Type } from 'typebox';
 import { cordisGet } from '../cordis-services.ts';
 import {
   childEnvironment,
+  CoreTimeoutError,
   coreUnavailableHint,
   isCoreErrorKind,
   type CoreClientLike,
@@ -37,6 +38,7 @@ import {
   foldTerminalsRegistry,
   foregroundIsShell,
   makeTerminalsRegistry,
+  paneSentinel,
   planTerminalReminder,
   planShellInit,
   promptStrategyFor,
@@ -400,6 +402,21 @@ export default function terminalPlugin(ctx: Context): void {
             + `(${errText(e)})`,
         );
       }
+      if (isCoreErrorKind(e, 'cancelled')) {
+        return fail(
+          `core cancelled the send to ${entry.terminalId} before typing it, so the text was NOT sent `
+            + `(${errText(e)}). Read the pane to see what the terminal is doing, then send again.`,
+        );
+      }
+      // Core holds a send while a person has an unsent draft in the terminal. Giving up here does
+      // not withdraw it: a blind re-send would run the command twice.
+      if (e instanceof CoreTimeoutError) {
+        return fail(
+          `core did not confirm the send to ${entry.terminalId} in time — a person may be typing in that terminal, `
+            + 'and core delivers once their draft is sent or cleared. The text may still arrive: do NOT re-send it. '
+            + 'Use action read to check whether the command appeared before deciding.',
+        );
+      }
       // A dead core socket would otherwise read as "pane may be closed", which sends the
       // model hunting for a pane that is fine. Prefer the actionable transport sentence.
       return fail(coreUnavailableHint(e) ?? `send failed (terminal may be closed): ${errText(e)}`);
@@ -430,7 +447,10 @@ export default function terminalPlugin(ctx: Context): void {
       ? `\nnote: the sentinel ${hint.prefix}${exitStatusVar(promptStrategyFor())} is written to ${hint.file}, not the pane — wait for it with `
         + `terminal(action: "wait", terminal_id: "${entry.terminalId}", file: "${hint.file}", pattern: "${echoSafeWaitSuggestion(hint.prefix) ?? hint.prefix}", regex: true) instead of sleeping.`
       : '';
-    return { content: [{ type: 'text', text: `sent to ${entry.terminalId} (${v.text.length} chars)${fileHint}` }], details: { terminal_id: entry.terminalId } };
+    const waitHint = !hint && paneSentinel(v.text)
+      ? '\nnote: next time pass wait: true instead of writing an exit sentinel — send then returns the exit code and output in this one call.'
+      : '';
+    return { content: [{ type: 'text', text: `sent to ${entry.terminalId} (${v.text.length} chars)${fileHint}${waitHint}` }], details: { terminal_id: entry.terminalId } };
   }
 
   /** `send` with `wait: true`: poll the screen until this run's sentinel prints, then hand back the

@@ -15,13 +15,13 @@ import {
   TERM_REMINDER_CUSTOM_TYPE, closeTerminal, compilePattern, computeIncrement, detectContinuationPrompt, detectFullscreenTUI,
   echoSafeWaitSuggestion, foldTerminalsRegistry, foregroundIsShell, hashPaneText,
   makeTerminalsRegistry, nextTerminalId, planTerminalReminder, planShellInit, promptStrategyFor, registerTerminal,
-  classifyWaitMatch, parseExitSentinel, redirectedSentinel, regexLiteralPrefix, sentinelEchoHazard, stripAnsi, summarizeSessions, terminalIdleMs, validateSendText, validateSignal,
+  classifyWaitMatch, paneSentinel, parseExitSentinel, redirectedSentinel, regexLiteralPrefix, sentinelEchoHazard, sleepPollsFileNote, stripAnsi, summarizeSessions, terminalIdleMs, validateSendText, validateSignal,
   withExitSentinel,
   type PromptStrategy, type TerminalEntry,
 } from '../src/terminal-core.ts';
 import { PiSurface } from '../src/pi-surface.ts';
 import { DisposeLedger } from '../src/ledger.ts';
-import { CoreError, type CoreClientLike } from '../src/core-client.ts';
+import { CoreError, CoreTimeoutError, type CoreClientLike } from '../src/core-client.ts';
 import { fakeCore, fakePi, fire, terminalInfo, withCleanup, type FakePi } from './test-utils.ts';
 
 const base = { paneId: 'pane-a', tabId: 'tab-1', cwd: 'F:/work', label: 'dev server', createdAt: 1000, lastActivityAt: 1000 };
@@ -438,6 +438,18 @@ test('plugins/terminal：wait/send/read 的动作契约（超时尾部、regex �
     /is blocked .*text was NOT sent/s,
   );
 
+  // send: a held send (a person's unsent draft) that outlives the reply budget may still be typed
+  client.send = async () => { throw new CoreTimeoutError('terminal.send'); };
+  await assert.rejects(
+    async () => { await run(pi, { action: 'send', terminal_id: 'term-1', text: 'echo next' }); },
+    (err: Error) => /do NOT re-send/.test(err.message) && !/unreachable/.test(err.message),
+  );
+  client.send = async () => { throw new CoreError('terminal.send', 'cancelled', 'cancelled', null); };
+  await assert.rejects(
+    async () => { await run(pi, { action: 'send', terminal_id: 'term-1', text: 'echo next' }); },
+    /cancelled the send .*text was NOT sent/s,
+  );
+
   client.send = async (id, text) => { calls.send.push({ id, text }); };
   const sent = await run(pi, { action: 'send', terminal_id: 'term-1', text: 'echo next' });
   assert.match(sent.content[0].text, /sent to term-1/);
@@ -475,6 +487,21 @@ test('redirectedSentinel: a `$?` sentinel appended to a log is found with its fi
   // fish spells the status `$status`; a fish sentinel redirected into a log is the same hazard.
   assert.deepEqual(redirectedSentinel('make > b.log; echo "DONE_$status" >> b.log'), { prefix: 'DONE_', file: 'b.log' });
   assert.equal(redirectedSentinel('echo X_$statusline >> b.log'), null, 'a longer variable name is not the exit status');
+});
+
+test('paneSentinel: only a trailing exit-status echo to the pane is one', () => {
+  assert.equal(paneSentinel('mvn -q compile > /tmp/c.log 2>&1; echo CRM_COMPILE_EXIT=$?'), 'CRM_COMPILE_EXIT=');
+  assert.equal(paneSentinel('make; echo "DONE_$status"\n'), 'DONE_');
+  assert.equal(paneSentinel('make; echo DONE_$? >> build.log'), null, 'a redirected sentinel gets the file-wait hint instead');
+  assert.equal(paneSentinel('echo $HOME'), null); assert.equal(paneSentinel('echo RC=$?; make'), null, 'not the last thing the command does');
+});
+
+test('sleepPollsFileNote: a long sleep in front of a file read is a poll; other sleeps are not', () => {
+  assert.match(sleepPollsFileNote('sleep 240; cat /tmp/pre2024b.out 2>/dev/null | tail -6; echo ---')!, /slept 240s before reading \/tmp\/pre2024b\.out/);
+  assert.match(sleepPollsFileNote('cd x && sleep 90s && tail -5 ./build.log')!, /file: "\.\/build\.log"/);
+  assert.equal(sleepPollsFileNote('sleep 30; tail -5 /tmp/build.log'), null, 'a short poll is left alone');
+  assert.equal(sleepPollsFileNote('sleep 100; python3 kibana.py search -q x'), null, 'waiting on a remote system is not a log poll');
+  assert.equal(sleepPollsFileNote('cat /tmp/a.log; sleep 120'), null, 'the read has to come after the sleep');
 });
 
 test('plugins/terminal：wait file: polls the log for a later match, reports an old one, and times out on a missing file', async (t) => {

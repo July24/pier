@@ -67,6 +67,9 @@ interface CoordinatorState {
   cacheReadTokens: number;
   /** P1-3: turn-end compact decisions to skip after a failure (each abort costs an in-flight turn). */
   compactBackoffTurnEnds: number;
+  /** Sum of the context tokens of every request since the last compaction, and how many there were. */
+  heldContextTokens: number;
+  heldRequests: number;
 }
 
 const NUMERIC_STATE_FIELDS = [
@@ -83,6 +86,8 @@ const NUMERIC_STATE_FIELDS = [
   'cachePrefixTokens',
   'cacheReadTokens',
   'compactBackoffTurnEnds',
+  'heldContextTokens',
+  'heldRequests',
 ] as const satisfies readonly (keyof CoordinatorState)[];
 
 function initialCoordinatorState(): CoordinatorState {
@@ -103,6 +108,8 @@ function initialCoordinatorState(): CoordinatorState {
     cachePrefixTokens: 0,
     cacheReadTokens: 0,
     compactBackoffTurnEnds: 0,
+    heldContextTokens: 0,
+    heldRequests: 0,
   };
 }
 
@@ -193,6 +200,10 @@ export class CompactCoordinator {
 
   onBeforeProviderRequest(contextTokens: number): void {
     this.state.currentBoundaryRequestCount++;
+    if (contextTokens > 0) {
+      this.state.heldContextTokens += contextTokens;
+      this.state.heldRequests++;
+    }
     // Fallback calibration: when pi omitted estimatedTokensAfter, the first request after a
     // compaction measures the retained context (summary + kept turns + fixed overhead) directly.
     if (
@@ -313,6 +324,12 @@ export class CompactCoordinator {
       archiveTokens,
       memoTokens,
       contextTokens,
+      // What those requests carried above the floor a compaction would have left behind.
+      heldExcessTokenRequests: Math.max(
+        0,
+        this.state.heldContextTokens
+          - this.state.heldRequests * (contextTokens - Math.max(0, archiveTokens - memoTokens)),
+      ),
       completedBoundaryRequestCounts: this.state.completedBoundaryRequestCounts,
       remainingBoundaries: horizonTodos(opts.todos).length,
       observedRequestsSinceBoundary: requestCount,
@@ -468,6 +485,8 @@ export class CompactCoordinator {
     this.state.cacheDebtRepaymentTokens = decision.savingTokensPerRequest;
     // The summary replaced the prefix: the next request is a cold rewrite the debt already prices.
     this.lastPromptTokens = 0;
+    this.state.heldContextTokens = 0;
+    this.state.heldRequests = 0;
     this.state.retainedTokensAfterCompaction =
       typeof compaction?.estimatedTokensAfter === 'number' ? compaction.estimatedTokensAfter : 0;
     // The pacing window restarts after a compaction: requests before it measured the old context.
@@ -644,6 +663,7 @@ export class CompactCoordinator {
       incrementalCacheCostRatio: decision.incrementalCacheCostRatio,
       prefixCacheHitRate: decision.prefixCacheHitRate,
       savingTokensPerRequest: decision.savingTokensPerRequest,
+      holdingCostTokens: decision.holdingCostTokens,
       remainingBoundaries: decision.remainingBoundaries,
       model: ctx.model?.id ?? undefined,
       provider: ctx.model?.provider ?? undefined,

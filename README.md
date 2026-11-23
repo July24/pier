@@ -207,7 +207,7 @@ Runtime policies and operational limits are centralized in `runtime-policy.ts` (
 | `PIER_JEV_LOG` | `0` | flag | Write `efficiency-logs/jev.jsonl` (metadata + hashes only, never bodies) |
 | `PIER_JEV_API_KEY` | – | – | API key; precedence env > config `jev.apiKey` > `OPENROUTER_API_KEY` when `jev.baseUrl` is OpenRouter, else `TYPESAFE_API_KEY` |
 | `PIER_JEV_MODEL` | `jev-1.13.0` | – | Pinned versioned model id (aliases drift silently and skew tuned thresholds) |
-| `PIER_JEV_TIMEOUT_MS` | `2000` | ms | Total per-call budget (AbortController hard kill) |
+| `PIER_JEV_TIMEOUT_MS` | `3500` | ms | Total per-call budget (AbortController hard kill) |
 | `PIER_JEV_MIN_CONFIDENCE` | `0.6` | – | Minimum Choice/Score confidence to adopt an answer |
 | `PIER_JEV_BASE_URL` | – | – | API root override (relay/gateway); `https://openrouter.ai/api` serves the same API (model `typesafe/jev-1.13`) where api.typesafe.ai is region-blocked |
 | `PIER_ROUTING_ENABLE` | `0` | flag | Spawn model routing over `routing.spawnModels` (D159); keys and defaults via `/pier-config show efficiency` |

@@ -248,6 +248,33 @@ export function redirectedSentinel(text: string): { prefix: string; file: string
   return m ? { prefix: m[1]!, file: m[3]! } : null;
 }
 
+/** A hand-written exit sentinel printed to the pane (`make; echo BUILD_EXIT=$?`): the job `send`
+ *  with `wait: true` does in one call. Returns the sentinel's literal prefix, or null. */
+export function paneSentinel(text: string): string | null {
+  if (redirectedSentinel(text)) return null;
+  return /\becho\s+["']?([A-Za-z][A-Za-z0-9_]*[=_:-]?)\$(?:\?|status\b)["']?\s*$/.exec(text.trimEnd())?.[1] ?? null;
+}
+
+/** From a minute up, a bash sleep in front of a file read is a poll on a background job. */
+const SLEEP_POLL_MIN_SECONDS = 60;
+
+/**
+ * Note for a bash call that sleeps and then reads a file (`sleep 240; cat /tmp/job.out`): one session
+ * spent 1165 s this way, a blind interval per call, although a terminal wait returns the moment the
+ * job is done. Null for short sleeps and for sleeps not followed by a file read.
+ */
+export function sleepPollsFileNote(command: string): string | null {
+  for (const m of command.matchAll(/\bsleep\s+(\d+)s?\s*(?:;|&&)([^\n]*)/g)) {
+    if (Number(m[1]) < SLEEP_POLL_MIN_SECONDS) continue;
+    const file = /\b(?:cat|tail|head|grep)\b[^;|&]*?\s((?:~|\.{1,2})?\/[^\s;|&"']+)/.exec(m[2]!)?.[1];
+    if (!file) continue;
+    return `[pier] this call slept ${m[1]}s before reading ${file}. To wait on a long job without polling, run it in a terminal: `
+      + 'terminal(action: "send", wait: true) returns its exit code and output the moment it exits, and '
+      + `terminal(action: "wait", file: "${file}", pattern: …) returns as soon as that file shows a marker.`;
+  }
+  return null;
+}
+
 /** `send` with `wait: true`: the command plus an exit sentinel the model never has to write. The
  *  sentinel line is `__PIER_<nonce>_<exit>__` on a line of its own; the typed form shows `%s` / `$(…)`
  *  where the digits go, so the shell's echo of the command can never match it. */

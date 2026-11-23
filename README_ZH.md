@@ -202,7 +202,7 @@ npm test          # typecheck + node --test（todo 重放 / 反冻结 / GC / 生
 | `PIER_JEV_LOG` | `0` | 开关 | 写 `efficiency-logs/jev.jsonl`(只记元数据与 hash,不记明文) |
 | `PIER_JEV_API_KEY` | – | – | API key;优先级 env > 配置 `jev.apiKey` > `OPENROUTER_API_KEY`(`jev.baseUrl` 为 OpenRouter 时)或 `TYPESAFE_API_KEY` |
 | `PIER_JEV_MODEL` | `jev-1.13.0` | – | 钉住的版本化模型 id(别名漂移会破坏校准阈值) |
-| `PIER_JEV_TIMEOUT_MS` | `2000` | ms | 单次 jev 调用总预算(AbortController 硬杀) |
+| `PIER_JEV_TIMEOUT_MS` | `3500` | ms | 单次 jev 调用总预算(AbortController 硬杀) |
 | `PIER_JEV_MIN_CONFIDENCE` | `0.6` | – | Choice/Score 答案采纳的最低置信度 |
 | `PIER_JEV_BASE_URL` | – | – | API 根地址覆盖(中转/网关);api.typesafe.ai 被地区封锁时可用 `https://openrouter.ai/api`(模型 `typesafe/jev-1.13`) |
 | `PIER_ROUTING_ENABLE` | `0` | 开关 | 按 `routing.spawnModels` 路由 subagent 模型(D159);各键与默认值见 `/pier-config show efficiency` |
